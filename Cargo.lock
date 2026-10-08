@@ -2570,7 +2570,9 @@ dependencies = [
 name = "sb-scan"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "sb-core",
+ "windows",
 ]
 
 [[package]]
