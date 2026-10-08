@@ -441,8 +441,11 @@ impl<A: FsAdapter> Aggregator<A> {
                 self.finish(state);
                 return;
             }
+            // Publish the first change at once so a first view can render
+            // early; coalesce later changes per interval.
             if self.revision != self.published_revision
-                && self.last_publish.elapsed() >= self.config.progress_interval
+                && (self.published_revision == 0
+                    || self.last_publish.elapsed() >= self.config.progress_interval)
             {
                 self.publish(ScanState::Scanning);
             }

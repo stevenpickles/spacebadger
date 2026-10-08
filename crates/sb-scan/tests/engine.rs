@@ -280,7 +280,7 @@ fn progress_events_are_coalesced() {
     let events: Vec<_> = rx.try_iter().collect();
     assert_eq!(
         events,
-        [ScanState::Complete],
-        "one final event, none per directory"
+        [ScanState::Scanning, ScanState::Complete],
+        "the first change and the final state, none per directory"
     );
 }
