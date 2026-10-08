@@ -1,0 +1,13 @@
+[package]
+name = "sb-scan"
+description = "SpaceBadger filesystem traversal and platform metadata adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sb-core.workspace = true
+
+[lints]
+workspace = true
