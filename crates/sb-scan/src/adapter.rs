@@ -119,8 +119,9 @@ pub fn classify_io(err: &std::io::Error) -> ErrorKind {
         if matches!(code, 21 | 53 | 55 | 59 | 64 | 1167 | 433) {
             return ErrorKind::Disconnected;
         }
-        // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER.
-        if matches!(code, 1 | 50 | 87) {
+        // ERROR_INVALID_FUNCTION, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION,
+        // ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER.
+        if matches!(code, 1 | 32 | 33 | 50 | 87) {
             return ErrorKind::Unavailable;
         }
     }

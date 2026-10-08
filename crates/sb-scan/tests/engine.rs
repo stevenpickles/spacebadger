@@ -129,10 +129,12 @@ fn links_mounts_and_special_files_are_skipped_and_counted() {
     assert_eq!(o.count(OmissionReason::UnknownReparse), 1);
     assert_eq!(o.count(OmissionReason::Vanished), 1);
     assert_eq!(o.errors(), 1);
-    assert_eq!(
-        o.samples(OmissionReason::Symlink),
-        [Path::new("/fake/link")]
-    );
+    let symlinks: Vec<_> = o
+        .samples(OmissionReason::Symlink)
+        .iter()
+        .map(|s| s.path.as_path())
+        .collect();
+    assert_eq!(symlinks, [Path::new("/fake/link")]);
 }
 
 #[test]
@@ -157,6 +159,9 @@ fn errors_are_reported_and_traversal_continues() {
         "bounded samples"
     );
     assert_eq!(o.count(OmissionReason::Disconnected), 1);
+    let gone = &o.samples(OmissionReason::Disconnected)[0];
+    assert_eq!(gone.path, Path::new("/fake/gone"));
+    assert_eq!(gone.detail.as_deref(), Some("injected"));
     assert_eq!(tree.dir_state(find(&tree, "denied")), DirState::Failed);
 }
 

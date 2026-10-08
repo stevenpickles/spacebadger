@@ -102,19 +102,32 @@ impl OmissionReason {
     }
 }
 
+/// One example of an omission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmissionSample {
+    pub path: PathBuf,
+    /// The OS error message, when the omission came from an error.
+    pub detail: Option<String>,
+}
+
 /// Omission counts by reason with a bounded sample of paths per reason.
 #[derive(Debug, Clone, Default)]
 pub struct Omissions {
     counts: BTreeMap<OmissionReason, u64>,
-    samples: BTreeMap<OmissionReason, Vec<PathBuf>>,
+    samples: BTreeMap<OmissionReason, Vec<OmissionSample>>,
 }
 
 impl Omissions {
-    fn add(&mut self, reason: OmissionReason, limit: usize, path: impl FnOnce() -> PathBuf) {
+    fn add(
+        &mut self,
+        reason: OmissionReason,
+        limit: usize,
+        sample: impl FnOnce() -> OmissionSample,
+    ) {
         *self.counts.entry(reason).or_default() += 1;
         let samples = self.samples.entry(reason).or_default();
         if samples.len() < limit {
-            samples.push(path());
+            samples.push(sample());
         }
     }
 
@@ -134,7 +147,7 @@ impl Omissions {
             .sum()
     }
 
-    pub fn samples(&self, reason: OmissionReason) -> &[PathBuf] {
+    pub fn samples(&self, reason: OmissionReason) -> &[OmissionSample] {
         self.samples.get(&reason).map_or(&[], Vec::as_slice)
     }
 
@@ -503,7 +516,10 @@ impl<A: FsAdapter> Aggregator<A> {
                     Err(err) => {
                         let reason = OmissionReason::from_error(err.kind);
                         self.omissions
-                            .add(reason, self.config.sample_limit, || path.clone());
+                            .add(reason, self.config.sample_limit, || OmissionSample {
+                                path: path.clone(),
+                                detail: Some(err.message.clone()),
+                            });
                         self.tree
                             .write()
                             .unwrap()
@@ -549,7 +565,10 @@ impl<A: FsAdapter> Aggregator<A> {
                 EntryKind::Failed(kind) => Some(OmissionReason::from_error(kind)),
             };
             if let Some(reason) = skipped {
-                self.omissions.add(reason, limit, || path.join(&entry.name));
+                self.omissions.add(reason, limit, || OmissionSample {
+                    path: path.join(&entry.name),
+                    detail: None,
+                });
                 continue;
             }
             let added = if entry.kind == EntryKind::Directory {
