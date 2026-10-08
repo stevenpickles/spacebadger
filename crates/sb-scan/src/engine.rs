@@ -543,6 +543,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 EntryKind::MountPoint => Some(OmissionReason::MountPoint),
                 EntryKind::Special => Some(OmissionReason::SpecialFile),
                 EntryKind::UnknownReparse => Some(OmissionReason::UnknownReparse),
+                EntryKind::Failed(kind) => Some(OmissionReason::from_error(kind)),
             };
             if let Some(reason) = skipped {
                 self.omissions.add(reason, limit, || path.join(&entry.name));

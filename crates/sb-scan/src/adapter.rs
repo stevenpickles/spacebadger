@@ -21,6 +21,8 @@ pub enum EntryKind {
     Special,
     /// A redirection the scanner doesn't understand. Never followed.
     UnknownReparse,
+    /// Listed, but its metadata couldn't be read (e.g. it vanished).
+    Failed(ErrorKind),
 }
 
 /// Identity used to count hard-linked files once.

@@ -116,7 +116,8 @@ fn links_mounts_and_special_files_are_skipped_and_counted() {
         .other("junction", EntryKind::MountPoint)
         .other("sub/mnt", EntryKind::MountPoint)
         .other("fifo", EntryKind::Special)
-        .other("weird", EntryKind::UnknownReparse);
+        .other("weird", EntryKind::UnknownReparse)
+        .other("vanished", EntryKind::Failed(ErrorKind::Vanished));
     let (progress, _) = run(&fs);
     let o = &progress.omissions;
 
@@ -126,7 +127,8 @@ fn links_mounts_and_special_files_are_skipped_and_counted() {
     assert_eq!(o.count(OmissionReason::MountPoint), 2);
     assert_eq!(o.count(OmissionReason::SpecialFile), 1);
     assert_eq!(o.count(OmissionReason::UnknownReparse), 1);
-    assert_eq!(o.errors(), 0);
+    assert_eq!(o.count(OmissionReason::Vanished), 1);
+    assert_eq!(o.errors(), 1);
     assert_eq!(
         o.samples(OmissionReason::Symlink),
         [Path::new("/fake/link")]
