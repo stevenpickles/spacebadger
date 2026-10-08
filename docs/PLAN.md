@@ -61,3 +61,4 @@ Derived from [`spacebadger-implementation-brief.md`](../spacebadger-implementati
 ## Decisions log
 
 - 2026-10-08: Tauri 2.12 (stable) over 3.0-alpha. `ts-rs` over `tauri-specta` (RC). Svelte 5 + Vite for UI chrome; treemap drawn on canvas.
+- 2026-10-08: Windows scanner reads allocated size from directory enumeration (`FileIdExtdDirectoryInfo`) and detects hard-link aliases by directory file ID instead of opening every file; alternate data streams are not counted. Evidence: [`docs/validation/windows-m1.md`](validation/windows-m1.md).
