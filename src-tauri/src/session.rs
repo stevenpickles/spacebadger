@@ -2,19 +2,48 @@
 //! scanner's types to the protocol's.
 
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
+use sb_core::search::{Matcher, Search};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
 
+/// Nodes a new search examines per hold of the tree's read lock, so the
+/// scanner can keep writing while a large tree is searched.
+const SEARCH_STEP: usize = 200_000;
+
+/// Largest page of search results returned at once.
+const MAX_PAGE: u32 = 500;
+
+// Lock order: `search` before the tree, and `order` last.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
     order: Mutex<OrderCache>,
+    search: Mutex<Option<ActiveSearch>>,
+    /// Number of the most recently requested search.
+    latest_search: AtomicU32,
+}
+
+struct ActiveSearch {
+    id: u32,
+    search: Search,
+    /// Sibling order for the filtered map.
+    order: OrderCache,
+    /// Matches sorted by size, for the result list.
+    sorted: Option<Sorted>,
+}
+
+struct Sorted {
+    metric: layout::Metric,
+    version: u64,
+    files: Vec<NodeId>,
 }
 
 impl Session {
@@ -32,6 +61,8 @@ impl Session {
             root,
             scan,
             order: Mutex::new(OrderCache::default()),
+            search: Mutex::new(None),
+            latest_search: AtomicU32::new(0),
         }
     }
 
@@ -54,24 +85,37 @@ impl Session {
     pub fn layout(&self, req: &proto::LayoutRequest) -> Result<Vec<u8>, String> {
         let progress = self.scan.progress();
         let finished = progress.state.is_finished();
-        let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        let view = node(&tree, req.view)?;
-        let metric = match req.metric {
-            proto::Metric::Allocated => layout::Metric::Allocated,
-            proto::Metric::Logical => layout::Metric::Logical,
-        };
+        let metric = metric(req.metric);
         let params = LayoutParams::new(
             req.width.clamp(0.0, 16_384.0),
             req.height.clamp(0.0, 16_384.0),
         );
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let view = node(&tree, req.view)?;
         // While scanning, keep sibling order stable; once finished, sort afresh.
-        let result = {
-            let mut order = self
-                .order
-                .lock()
-                .map_err(|_| "layout state is unavailable")?;
-            layout::layout(&tree, view, metric, None, &params, &mut order, !finished)
+        let result = match req.search {
+            Some(id) => {
+                let active = current_search(&mut search, id, &tree)?;
+                layout::layout(
+                    &tree,
+                    view,
+                    metric,
+                    Some(&active.search),
+                    &params,
+                    &mut active.order,
+                    !finished,
+                )
+            }
+            None => {
+                drop(search);
+                let mut order = self
+                    .order
+                    .lock()
+                    .map_err(|_| "layout state is unavailable")?;
+                layout::layout(&tree, view, metric, None, &params, &mut order, !finished)
+            }
         };
 
         let mut rects = Vec::with_capacity(result.rects.len());
@@ -115,6 +159,122 @@ impl Session {
             flags: header_flags,
         };
         Ok(proto::wire::encode(&header, &rects, &labels))
+    }
+
+    /// Starts filtering by `query`, replacing any earlier search; an empty
+    /// query clears the filter. Examines the tree in steps and gives up early
+    /// if a newer search is requested meanwhile.
+    pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
+        let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
+        let superseded = || format!("search {id} was replaced by a newer one");
+        let Some(matcher) = Matcher::new(query) else {
+            let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
+            if self.latest_search.load(Ordering::SeqCst) == id {
+                *current = None;
+            }
+            return Ok(None);
+        };
+        let tree_lock = self.scan.tree();
+        let mut search = Search::new(matcher);
+        loop {
+            if self.latest_search.load(Ordering::SeqCst) != id {
+                return Err(superseded());
+            }
+            let tree = tree_lock.read().map_err(|_| "scan data is unavailable")?;
+            if search.catch_up(&tree, SEARCH_STEP) {
+                break;
+            }
+        }
+        let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
+        if self.latest_search.load(Ordering::SeqCst) != id {
+            return Err(superseded());
+        }
+        let tree = tree_lock.read().map_err(|_| "scan data is unavailable")?;
+        search.catch_up(&tree, usize::MAX);
+        let active = current.insert(ActiveSearch {
+            id,
+            search,
+            order: OrderCache::default(),
+            sorted: None,
+        });
+        Ok(Some(self.summary(active)))
+    }
+
+    /// Matching totals for search `id`, brought up to date with the scan.
+    pub fn search_summary(&self, id: u32) -> Result<proto::SearchSummary, String> {
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let active = current_search(&mut search, id, &tree)?;
+        Ok(self.summary(active))
+    }
+
+    fn summary(&self, active: &ActiveSearch) -> proto::SearchSummary {
+        let totals = active.search.totals(NodeId::ROOT);
+        proto::SearchSummary {
+            generation: self.generation(),
+            search: active.id,
+            query: active.search.matcher().query().to_owned(),
+            files: u64::from(totals.files),
+            logical: totals.logical,
+            allocated: totals.allocated,
+            unknown_allocation_files: u64::from(totals.unknown),
+        }
+    }
+
+    /// One page of matching files, largest first.
+    pub fn search_results(
+        &self,
+        req: &proto::SearchResultsRequest,
+    ) -> Result<proto::SearchPage, String> {
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let active = current_search(&mut search, req.search, &tree)?;
+        let metric = metric(req.metric);
+        let version = active.search.version();
+        let stale = active
+            .sorted
+            .as_ref()
+            .is_none_or(|s| s.metric != metric || s.version != version);
+        if stale {
+            let mut files = active.search.matches().to_vec();
+            files.sort_unstable_by_key(|&f| (Reverse(metric.weight(&tree, f)), f.index()));
+            active.sorted = Some(Sorted {
+                metric,
+                version,
+                files,
+            });
+        }
+        let files = &active.sorted.as_ref().expect("sorted above").files;
+        let start = (req.offset as usize).min(files.len());
+        let end = start
+            .saturating_add(req.limit.min(MAX_PAGE) as usize)
+            .min(files.len());
+        let rows = files[start..end]
+            .iter()
+            .map(|&f| {
+                let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
+                let path = tree.path(parent);
+                let folder = path.strip_prefix(tree.root_path()).unwrap_or(&path);
+                proto::SearchRow {
+                    node: f.index() as u32,
+                    name: tree.name(f).to_string_lossy().into_owned(),
+                    parent: parent.index() as u32,
+                    folder: display_path(folder),
+                    logical: tree.logical(f),
+                    allocated: tree.file_allocated(f).get(),
+                    alias: tree.flags(f) & flags::HARDLINK_ALIAS != 0,
+                }
+            })
+            .collect();
+        Ok(proto::SearchPage {
+            generation: self.generation(),
+            search: active.id,
+            offset: start as u32,
+            total: files.len() as u32,
+            rows,
+        })
     }
 
     pub fn details(&self, id: u32) -> Result<proto::NodeDetails, String> {
@@ -165,6 +325,27 @@ impl Session {
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
         Ok(tree.path(node(&tree, id)?))
+    }
+}
+
+/// The active search if it is `id`, caught up with `tree`.
+fn current_search<'a>(
+    search: &'a mut Option<ActiveSearch>,
+    id: u32,
+    tree: &Tree,
+) -> Result<&'a mut ActiveSearch, String> {
+    let active = search
+        .as_mut()
+        .filter(|a| a.id == id)
+        .ok_or_else(|| format!("search {id} is no longer current"))?;
+    active.search.catch_up(tree, usize::MAX);
+    Ok(active)
+}
+
+fn metric(m: proto::Metric) -> layout::Metric {
+    match m {
+        proto::Metric::Allocated => layout::Metric::Allocated,
+        proto::Metric::Logical => layout::Metric::Logical,
     }
 }
 
