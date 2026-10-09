@@ -13,7 +13,7 @@ mod memory;
 mod synth;
 
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache, RectKind};
-use sb_core::search::{Matcher, Search};
+use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::tree::{FileSizes, NodeId, Tree};
 use sb_protocol::wire;
 use std::process::Command;
@@ -241,13 +241,18 @@ fn run(nodes: usize, seed: u64) {
             });
             files
         });
+        // What the result list asks for: the first page after a change.
+        let (page, _) = time(3, || {
+            Ranked::new(&s, Metric::Allocated).top(&tree, 100).len()
+        });
         println!(
-            "search:  {query:?} {} matches in {}; filtered layout {} ({} rects); sort results {}",
+            "search:  {query:?} {} matches in {}; filtered layout {} ({} rects); full sort {}, first page {}",
             s.matches().len(),
             ms(searched),
             ms(filtered),
             fl.rects.len(),
-            ms(sort)
+            ms(sort),
+            ms(page)
         );
     }
 
