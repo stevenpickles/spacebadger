@@ -120,7 +120,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            app.manage(AppState::default());
+            let state = AppState::default();
+            // `spacebadger <folder>` starts scanning that folder right away.
+            if let Some(root) = std::env::args_os().nth(1) {
+                state.start(app.handle(), PathBuf::from(root));
+            }
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
