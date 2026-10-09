@@ -224,6 +224,68 @@ impl Search {
     }
 }
 
+/// Matching files largest first, sorted only as far as has been asked for.
+///
+/// A result list shows a page at a time from the top, so sorting every
+/// match on each change is wasted work: selecting the largest `n` is linear,
+/// and only that prefix is sorted. Deeper pages extend the sorted prefix.
+#[derive(Debug)]
+pub struct Ranked {
+    metric: Metric,
+    version: u64,
+    files: Vec<NodeId>,
+    /// `files[..sorted]` is in final order; the rest are all smaller.
+    sorted: usize,
+}
+
+/// Smallest prefix sorted at once, so scrolling doesn't re-select often.
+const MIN_RANKED: usize = 1_000;
+
+impl Ranked {
+    pub fn new(search: &Search, metric: Metric) -> Self {
+        Self {
+            metric,
+            version: search.version(),
+            files: search.matches().to_vec(),
+            sorted: 0,
+        }
+    }
+
+    /// Whether this ranking still reflects `search` under `metric`.
+    pub fn is_current(&self, search: &Search, metric: Metric) -> bool {
+        self.metric == metric && self.version == search.version()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// The `n` largest matches in order (ties by node ID).
+    pub fn top(&mut self, tree: &Tree, n: usize) -> &[NodeId] {
+        let n = n.min(self.files.len());
+        if n > self.sorted {
+            let metric = self.metric;
+            let key = |f: &NodeId| (std::cmp::Reverse(metric.weight(tree, *f)), f.index());
+            let want = n
+                .max(self.sorted.saturating_mul(2))
+                .max(MIN_RANKED)
+                .min(self.files.len());
+            let rest = &mut self.files[self.sorted..];
+            let k = want - self.sorted;
+            if k < rest.len() {
+                rest.select_nth_unstable_by_key(k - 1, key);
+            }
+            rest[..k].sort_unstable_by_key(key);
+            self.sorted = want;
+        }
+        &self.files[..n]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +400,29 @@ mod tests {
         assert_eq!(root.logical, 300);
         assert_eq!(root.unknown, 1);
         assert_eq!(s.totals(d), root);
+    }
+
+    #[test]
+    fn ranking_matches_a_full_sort_at_every_depth() {
+        let mut t = Tree::new("/r");
+        let mut x = 12345u64;
+        for i in 0..5_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let size = (x >> 40) % 10_000;
+            t.add_file(NodeId::ROOT, format!("f{i}").as_ref(), sizes(size, size), 0)
+                .unwrap();
+        }
+        let s = search("f", &t);
+        let mut expected = s.matches().to_vec();
+        expected.sort_unstable_by_key(|&f| (std::cmp::Reverse(t.allocated(f)), f.index()));
+        let mut ranked = Ranked::new(&s, Metric::Allocated);
+        assert_eq!(ranked.top(&t, 10), &expected[..10]);
+        assert_eq!(ranked.top(&t, 2_500), &expected[..2_500]);
+        assert_eq!(ranked.top(&t, usize::MAX), &expected[..]);
+        assert!(ranked.is_current(&s, Metric::Allocated));
+        assert!(!ranked.is_current(&s, Metric::Logical));
     }
 
     #[test]
