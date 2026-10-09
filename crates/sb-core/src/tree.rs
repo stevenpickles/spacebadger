@@ -5,6 +5,10 @@
 //! are rebuilt on demand. Directory sizes are maintained incrementally: adding
 //! or updating a file adjusts every ancestor, so readers always see consistent
 //! aggregates without a rebuild.
+//!
+//! Nodes can be removed (after the item is deleted from disk). Removed nodes
+//! keep their IDs, which are never reused, but are unlinked from their
+//! parent and report zero sizes.
 
 use crate::size::Allocated;
 use std::collections::HashMap;
@@ -38,6 +42,8 @@ pub mod flags {
     pub const HARDLINKED: u8 = 1 << 2;
     /// A cloud-provider file (placeholder or synced file).
     pub const CLOUD: u8 = 1 << 3;
+    /// Removed from the tree (deleted from disk) along with its contents.
+    pub const REMOVED: u8 = 1 << 4;
 }
 
 /// Traversal state of a directory.
@@ -107,8 +113,9 @@ pub struct Tree {
     /// Hard-link alias → owning node.
     alias_owner: HashMap<u32, u32>,
     dir_count: u64,
-    /// Files whose sizes changed after they were added, in order. Lets
-    /// overlays such as search catch up without rescanning the tree.
+    /// Files whose sizes changed after they were added (including removed
+    /// files), in order. Lets overlays such as search catch up without
+    /// rescanning the tree.
     changes: Vec<u32>,
 }
 
@@ -193,7 +200,7 @@ impl Tree {
 
     /// Adds an empty directory under `parent` in the [`DirState::Pending`] state.
     pub fn add_dir(&mut self, parent: NodeId, name: &OsStr) -> Result<NodeId, CapacityExceeded> {
-        debug_assert!(self.is_dir(parent));
+        debug_assert!(self.is_dir(parent) && !self.is_removed(parent));
         self.push(parent.0, name, flags::DIRECTORY)
     }
 
@@ -205,7 +212,7 @@ impl Tree {
         sizes: FileSizes,
         extra_flags: u8,
     ) -> Result<NodeId, CapacityExceeded> {
-        debug_assert!(self.is_dir(parent));
+        debug_assert!(self.is_dir(parent) && !self.is_removed(parent));
         let id = self.push(parent.0, name, extra_flags & !flags::DIRECTORY)?;
         let i = id.index();
         self.files[i] = 1;
@@ -230,6 +237,9 @@ impl Tree {
     pub fn update_file(&mut self, node: NodeId, sizes: FileSizes) {
         let i = node.index();
         debug_assert!(!self.is_dir(node));
+        if self.is_removed(node) {
+            return;
+        }
         let alias = self.flags[i] & flags::HARDLINK_ALIAS != 0;
         let new_logical = sizes.logical;
         let (new_allocated, new_unknown): (u64, u32) = match sizes.allocated.get() {
@@ -254,6 +264,9 @@ impl Tree {
     /// keeps its logical length but contributes no allocation.
     pub fn mark_alias(&mut self, alias: NodeId, owner: NodeId) {
         let i = alias.index();
+        if self.is_removed(alias) || self.is_removed(owner) {
+            return;
+        }
         self.flags[owner.index()] |= flags::HARDLINKED;
         if self.flags[i] & flags::HARDLINK_ALIAS != 0 {
             return;
@@ -370,10 +383,122 @@ impl Tree {
         self.alias_owner.get(&alias.0).map(|&o| NodeId(o))
     }
 
-    /// Files whose sizes changed after being added, oldest first. Entries
-    /// may repeat; new entries are only ever appended.
+    /// Files whose sizes changed after being added, oldest first; removed
+    /// files are included. Entries may repeat; new entries are only ever
+    /// appended.
     pub fn changed_files(&self) -> &[u32] {
         &self.changes
+    }
+
+    /// Whether `node` was removed, directly or with a removed folder.
+    pub fn is_removed(&self, node: NodeId) -> bool {
+        self.flags[node.index()] & flags::REMOVED != 0
+    }
+
+    /// Removes `node` and everything under it, as after deleting it from
+    /// disk, and takes its sizes off every ancestor. Returns `false` for the
+    /// root or a node already removed.
+    ///
+    /// A removed file that owned a hard link's allocation hands it to a
+    /// remaining alias, since the data stays on disk while any name for it
+    /// does.
+    pub fn remove(&mut self, node: NodeId) -> bool {
+        if node == NodeId::ROOT || !self.contains(node) || self.is_removed(node) {
+            return false;
+        }
+        let i = node.index();
+        let (logical, allocated, unknown, files) = (
+            self.logical[i],
+            self.allocated[i],
+            self.unknown[i],
+            self.files[i],
+        );
+        self.for_each_ancestor(node, |t, a| {
+            t.logical[a] -= logical;
+            t.allocated[a] -= allocated;
+            t.unknown[a] -= unknown;
+            t.files[a] -= files;
+        });
+        self.unlink(node);
+
+        let mut orphaned = Vec::new();
+        let mut stack = vec![node.0];
+        while let Some(n) = stack.pop() {
+            let j = n as usize;
+            let mut c = self.first_child[j];
+            while c != NONE {
+                stack.push(c);
+                c = self.next_sibling[c as usize];
+            }
+            let node_flags = self.flags[j];
+            if node_flags & flags::DIRECTORY != 0 {
+                self.dir_count -= 1;
+            } else {
+                self.changes.push(n);
+                if node_flags & flags::HARDLINK_ALIAS != 0 {
+                    self.alias_owner.remove(&n);
+                } else if node_flags & flags::HARDLINKED != 0 && self.unknown[j] == 0 {
+                    orphaned.push((n, self.allocated[j]));
+                }
+            }
+            self.flags[j] |= flags::REMOVED;
+            self.logical[j] = 0;
+            self.allocated[j] = 0;
+            self.unknown[j] = 0;
+            self.files[j] = 0;
+        }
+        for (owner, allocated) in orphaned {
+            self.hand_over(owner, allocated);
+        }
+        true
+    }
+
+    /// Detaches `node` from its parent's list of children.
+    fn unlink(&mut self, node: NodeId) {
+        let parent = self.parent[node.index()] as usize;
+        let next = self.next_sibling[node.index()];
+        if self.first_child[parent] == node.0 {
+            self.first_child[parent] = next;
+            return;
+        }
+        let mut c = self.first_child[parent];
+        while c != NONE {
+            let after = self.next_sibling[c as usize];
+            if after == node.0 {
+                self.next_sibling[c as usize] = next;
+                return;
+            }
+            c = after;
+        }
+    }
+
+    /// Makes a remaining alias of removed `owner` the owner of its
+    /// allocation, and points the other aliases at it.
+    fn hand_over(&mut self, owner: u32, allocated: u64) {
+        let mut aliases: Vec<u32> = self
+            .alias_owner
+            .iter()
+            .filter(|&(_, &o)| o == owner)
+            .map(|(&a, _)| a)
+            .collect();
+        aliases.sort_unstable();
+        let Some((&heir, rest)) = aliases.split_first() else {
+            return;
+        };
+        self.alias_owner.remove(&heir);
+        for a in rest {
+            self.alias_owner.insert(*a, heir);
+        }
+        let h = heir as usize;
+        self.flags[h] &= !flags::HARDLINK_ALIAS;
+        if rest.is_empty() {
+            self.flags[h] &= !flags::HARDLINKED;
+        }
+        if self.unknown[h] == 0 {
+            self.allocated[h] = allocated;
+            self.changes.push(heir);
+            self.for_each_ancestor(NodeId(heir), |t, a| t.allocated[a] += allocated);
+        }
     }
 
     pub fn alias_count(&self) -> usize {
@@ -515,6 +640,107 @@ mod tests {
         assert_eq!(names, ["g", "ü file.txt"]);
         assert_eq!(t.parent(f), Some(a));
         assert_eq!(t.parent(NodeId::ROOT), None);
+    }
+
+    #[test]
+    fn removing_a_folder_takes_its_sizes_off_the_ancestors() {
+        let mut t = Tree::new("/root");
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        let x = t.add_file(b, "x".as_ref(), sizes(10, 4096), 0).unwrap();
+        let y = t
+            .add_file(
+                b,
+                "y".as_ref(),
+                FileSizes {
+                    logical: 7,
+                    allocated: Allocated::UNKNOWN,
+                },
+                0,
+            )
+            .unwrap();
+        let z = t.add_file(c, "z".as_ref(), sizes(1, 512), 0).unwrap();
+        let w = t.add_file(a, "w".as_ref(), sizes(2, 1024), 0).unwrap();
+
+        assert!(t.remove(b));
+        assert_eq!(t.logical(a), 3);
+        assert_eq!(t.allocated(a), 1536);
+        assert_eq!(t.unknown_allocation_files(a), 0);
+        assert_eq!(t.file_count(NodeId::ROOT), 2);
+        assert_eq!(t.dir_count(), 3);
+        let left: Vec<_> = t.children(a).map(|n| name(&t, n)).collect();
+        assert_eq!(left, ["w", "c"]);
+        for n in [b, x, y] {
+            assert!(t.is_removed(n));
+            assert_eq!((t.logical(n), t.allocated(n)), (0, 0));
+        }
+        assert!(!t.is_removed(z));
+        let mut changed = t.changed_files().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, [x.index() as u32, y.index() as u32]);
+
+        // Removing again, or removing the root, does nothing.
+        assert!(!t.remove(b));
+        assert!(!t.remove(x));
+        assert!(!t.remove(NodeId::ROOT));
+
+        // A file in the middle of a sibling list.
+        assert!(t.remove(w));
+        let left: Vec<_> = t.children(a).map(|n| name(&t, n)).collect();
+        assert_eq!(left, ["c"]);
+        assert_eq!(t.logical(NodeId::ROOT), 1);
+        assert_eq!(t.allocated(NodeId::ROOT), 512);
+        assert!(t.remove(c));
+        assert_eq!(t.children(a).count(), 0);
+        assert_eq!(t.allocated(NodeId::ROOT), 0);
+        assert_eq!(t.dir_count(), 2);
+    }
+
+    #[test]
+    fn removing_a_hard_link_owner_hands_allocation_to_an_alias() {
+        let mut t = Tree::new("/root");
+        let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
+        let owner = t
+            .add_file(NodeId::ROOT, "a".as_ref(), sizes(100, 4096), 0)
+            .unwrap();
+        let first = t.add_file(d, "b".as_ref(), sizes(100, 4096), 0).unwrap();
+        let second = t.add_file(d, "c".as_ref(), sizes(100, 4096), 0).unwrap();
+        t.mark_alias(first, owner);
+        t.mark_alias(second, owner);
+        assert_eq!(t.allocated(NodeId::ROOT), 4096);
+
+        assert!(t.remove(owner));
+        assert_eq!(t.allocated(NodeId::ROOT), 4096, "the data is still on disk");
+        assert_eq!(t.allocated(d), 4096);
+        assert_eq!(t.alias_owner(first), None);
+        assert_eq!(t.alias_owner(second), Some(first));
+        assert_eq!(t.alias_count(), 1);
+        assert!(t.changed_files().contains(&(first.index() as u32)));
+
+        // Removing the last two names frees it.
+        assert!(t.remove(first));
+        assert_eq!(t.alias_owner(second), None);
+        assert_eq!(
+            t.flags(second) & (flags::HARDLINK_ALIAS | flags::HARDLINKED),
+            0
+        );
+        assert_eq!(t.allocated(NodeId::ROOT), 4096);
+        assert!(t.remove(second));
+        assert_eq!(t.allocated(NodeId::ROOT), 0);
+        assert_eq!(t.alias_count(), 0);
+    }
+
+    #[test]
+    fn removed_nodes_ignore_late_updates() {
+        let mut t = Tree::new("/root");
+        let f = t
+            .add_file(NodeId::ROOT, "f".as_ref(), sizes(10, 4096), 0)
+            .unwrap();
+        t.remove(f);
+        t.update_file(f, sizes(20, 8192));
+        assert_eq!(t.allocated(NodeId::ROOT), 0);
+        assert_eq!(t.logical(f), 0);
     }
 
     #[test]
