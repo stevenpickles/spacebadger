@@ -4,6 +4,7 @@
 //! (UI) thread. Every scan-specific request names its generation; requests
 //! for an older generation are refused so stale replies never mix scans.
 
+mod delete;
 mod session;
 
 use sb_protocol::{
