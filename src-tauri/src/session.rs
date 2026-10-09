@@ -1,6 +1,7 @@
 //! One scan and the view state derived from it, plus conversions from the
 //! scanner's types to the protocol's.
 
+use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Search};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
@@ -140,6 +141,11 @@ impl Session {
                 depth: r.depth,
                 kind: r.kind as u8,
                 flags: r.flags,
+                file_type: if r.kind == RectKind::File {
+                    FileType::of(tree.name(r.node)) as u8
+                } else {
+                    0
+                },
             });
         }
         let labels: Vec<(u32, &str)> = names.iter().map(|(i, s)| (*i, s.as_ref())).collect();
