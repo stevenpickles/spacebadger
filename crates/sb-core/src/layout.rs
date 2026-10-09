@@ -120,7 +120,8 @@ pub const REORDER_HYSTERESIS: f64 = 1.5;
 /// Remembers sibling order between layouts of one scan.
 #[derive(Debug, Default)]
 pub struct OrderCache {
-    order: HashMap<NodeId, Vec<NodeId>>,
+    /// Folder → rank of each child in the last order used.
+    rank: HashMap<NodeId, HashMap<NodeId, u32>>,
 }
 
 /// Upper bound on cached folders; the cache is cleared when exceeded.
@@ -128,7 +129,7 @@ const ORDER_CACHE_LIMIT: usize = 100_000;
 
 impl OrderCache {
     pub fn clear(&mut self) {
-        self.order.clear();
+        self.rank.clear();
     }
 
     /// Orders `children` (with weights) largest first, keeping the previous
@@ -143,19 +144,27 @@ impl OrderCache {
         let sort = |c: &mut Vec<(NodeId, u64)>| {
             c.sort_unstable_by_key(|&(id, w)| (Reverse(w), id.index()))
         };
-        if stable && let Some(prev) = self.order.get(&dir) {
-            let rank: HashMap<NodeId, usize> =
-                prev.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-            let (mut known, mut new): (Vec<_>, Vec<_>) =
-                children.iter().partition(|(id, _)| rank.contains_key(id));
-            known.sort_unstable_by_key(|(id, _)| rank[id]);
+        if stable && let Some(rank) = self.rank.get(&dir) {
+            let mut known = Vec::with_capacity(children.len());
+            let mut new = Vec::new();
+            for &(id, w) in &children {
+                match rank.get(&id) {
+                    Some(&r) => known.push((r, id, w)),
+                    None => new.push((id, w)),
+                }
+            }
+            known.sort_unstable_by_key(|&(r, _, _)| r);
+            let mut known: Vec<_> = known.into_iter().map(|(_, id, w)| (id, w)).collect();
+            let unchanged = new.is_empty();
             sort(&mut new);
             known.extend(new);
             let drifted = known
                 .windows(2)
                 .any(|p| p[1].1 as f64 > p[0].1 as f64 * REORDER_HYSTERESIS);
             if !drifted {
-                self.remember(dir, &known);
+                if !unchanged {
+                    self.remember(dir, &known);
+                }
                 return known;
             }
         }
@@ -165,11 +174,15 @@ impl OrderCache {
     }
 
     fn remember(&mut self, dir: NodeId, children: &[(NodeId, u64)]) {
-        if self.order.len() >= ORDER_CACHE_LIMIT && !self.order.contains_key(&dir) {
-            self.order.clear();
+        if self.rank.len() >= ORDER_CACHE_LIMIT && !self.rank.contains_key(&dir) {
+            self.rank.clear();
         }
-        self.order
-            .insert(dir, children.iter().map(|&(id, _)| id).collect());
+        let rank = children
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, _))| (id, i as u32))
+            .collect();
+        self.rank.insert(dir, rank);
     }
 }
 
