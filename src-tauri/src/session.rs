@@ -4,7 +4,7 @@
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
-use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState};
+use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -23,7 +23,7 @@ impl Session {
         let scan = Scan::start(
             root.clone(),
             NativeFs::new(),
-            ScanConfig::default(),
+            native::scan_config(&root),
             move |p| {
                 on_status(status(&display, p));
             },

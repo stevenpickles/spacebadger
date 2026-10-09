@@ -187,3 +187,13 @@ fn missing_root_fails() {
         progress.state
     );
 }
+
+#[test]
+fn local_folders_use_the_default_worker_count() {
+    let local = std::env::temp_dir();
+    assert!(!sb_scan::native::is_remote(&local));
+    assert_eq!(
+        sb_scan::native::scan_config(&local).workers,
+        ScanConfig::default().workers
+    );
+}
