@@ -34,3 +34,15 @@ export function formatElapsed(ms: number): string {
 export function plural(n: number, one: string, many = `${one}s`): string {
   return `${formatCount(n)} ${n === 1 ? one : many}`;
 }
+
+/**
+ * What a set of selected items holds, e.g. "4 files and 1 folder (2 files
+ * inside)". `files` counts every file, including those inside the folders.
+ */
+export function describeItems(items: number, folders: number, files: number): string {
+  const loose = items - folders;
+  const parts: string[] = [];
+  if (loose > 0) parts.push(plural(loose, "file"));
+  if (folders > 0) parts.push(`${plural(folders, "folder")} (${plural(files - loose, "file")} inside)`);
+  return parts.join(" and ");
+}
