@@ -29,6 +29,7 @@
   import type { SearchRow } from "./lib/protocol/SearchRow";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import SearchResults from "./lib/SearchResults.svelte";
+  import SmallItems from "./lib/SmallItems.svelte";
   import type { MenuRequest, Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
@@ -281,6 +282,25 @@
     return null;
   });
 
+  // The small-items list stays open while its items are selected, until it's
+  // closed or the map it came from changes.
+  let smallOf = $state<{ folder: number; count: number; name: string } | null>(null);
+
+  $effect(() => {
+    const sel = selection;
+    const info = otherInfo;
+    if (!sel?.other || !info) return;
+    const name = selectedDetails?.node === sel.node ? selectedDetails.name : (smallOf?.name ?? "");
+    if (smallOf?.folder !== sel.node || smallOf.count !== info.items || smallOf.name !== name) {
+      smallOf = { folder: sel.node, count: info.items, name };
+    }
+  });
+
+  $effect(() => {
+    void [generation, view, metric, searchId];
+    smallOf = null;
+  });
+
   function openFolder(node: number) {
     view = node;
     selection = null;
@@ -496,6 +516,23 @@
       />
       {#if showOmissions && status}
         <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
+      {/if}
+      {#if smallOf && generation !== null}
+        {#key smallOf.folder}
+          <SmallItems
+            {generation}
+            folder={smallOf.folder}
+            folderName={smallOf.name}
+            count={smallOf.count}
+            {metric}
+            search={searchId ?? null}
+            revision={status?.revision ?? 0}
+            selected={selection && !selection.other ? selection.node : null}
+            onselect={(node) => (selection = { node, other: false })}
+            onopen={openFolder}
+            onclose={() => (smallOf = null)}
+          />
+        {/key}
       {/if}
       {#if search && generation !== null}
         <SearchResults
