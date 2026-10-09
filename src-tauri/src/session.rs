@@ -414,10 +414,15 @@ impl Session {
     /// Deletes the selected items from disk and removes those now gone from
     /// the scan, which is published as a new revision. Refused while the
     /// scan runs, since the scanner may still be adding to them.
-    pub fn delete(
+    pub fn delete(&self, nodes: &[u32]) -> Result<proto::DeleteReport, String> {
+        self.delete_using(nodes, delete::delete)
+    }
+
+    /// [`Session::delete`] with the per-item delete passed in, for tests.
+    fn delete_using(
         &self,
         nodes: &[u32],
-        mode: proto::DeleteMode,
+        delete_one: impl Fn(&Path, bool) -> Outcome,
     ) -> Result<proto::DeleteReport, String> {
         let _one_at_a_time = self
             .deleting
@@ -439,7 +444,7 @@ impl Session {
         let mut already_gone = 0;
         let mut failed = Vec::new();
         for (n, path, folder) in targets {
-            match delete::delete(&path, folder, mode) {
+            match delete_one(&path, folder) {
                 Outcome::Deleted => gone.push(n),
                 Outcome::AlreadyGone => {
                     already_gone += 1;
@@ -454,7 +459,6 @@ impl Session {
         }
         let mut report = proto::DeleteReport {
             generation: self.generation(),
-            mode,
             deleted: Vec::new(),
             already_gone,
             failed,
@@ -624,6 +628,18 @@ mod tests {
             .is_some_and(|s| s.phase != proto::ScanPhase::Scanning)
     }
 
+    /// Stands in for the trash.
+    fn remove(path: &Path, folder: bool) -> Outcome {
+        delete::delete_with(path, folder, |p| {
+            let r = if folder {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_file(p)
+            };
+            r.map_err(|e| e.to_string())
+        })
+    }
+
     fn child(tree: &Tree, parent: NodeId, name: &str) -> NodeId {
         tree.children(parent)
             .find(|&c| tree.name(c) == name)
@@ -662,9 +678,7 @@ mod tests {
         assert_eq!(summary.missing, 1, "the scan root is never an item");
 
         let before = session.scan.progress().revision;
-        let report = session
-            .delete(&[id(a), id(old)], proto::DeleteMode::Permanent)
-            .unwrap();
+        let report = session.delete_using(&[id(a), id(old)], remove).unwrap();
         assert_eq!(report.deleted, [id(old)]);
         assert!(report.failed.is_empty());
         assert_eq!((report.files, report.logical), (2, 8000));
@@ -681,9 +695,7 @@ mod tests {
 
         // Already gone: removed from the scan without an error.
         std::fs::remove_file(tmp.0.join("keep.txt")).unwrap();
-        let report = session
-            .delete(&[id(keep)], proto::DeleteMode::Permanent)
-            .unwrap();
+        let report = session.delete_using(&[id(keep)], remove).unwrap();
         assert_eq!((report.deleted.len(), report.already_gone), (1, 1));
         assert_eq!(session.status().files, 0);
     }

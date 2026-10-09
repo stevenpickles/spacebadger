@@ -14,7 +14,7 @@ use ts_rs::TS;
 pub mod wire;
 
 /// Incremented whenever a command or event shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
@@ -390,18 +390,10 @@ pub struct SelectionSummary {
 /// Most items listed in a [`SelectionSummary`].
 pub const SELECTION_SAMPLES: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub enum DeleteMode {
-    /// Move to the Recycle Bin (Windows) or Trash (macOS, Linux).
-    Recycle,
-    /// Delete without keeping a copy.
-    Permanent,
-}
-
-/// Deletes selected files and folders (folders with everything in them).
-/// Refused while the scan is running.
+/// Moves selected files and folders (folders with everything in them) to
+/// the Recycle Bin (Windows) or Trash (macOS, Linux). Nothing is ever
+/// deleted permanently. Refused unless deleting was allowed in this run of
+/// the app, and while the scan is running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -409,7 +401,6 @@ pub struct DeleteRequest {
     #[ts(type = "number")]
     pub generation: u64,
     pub nodes: Vec<u32>,
-    pub mode: DeleteMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -429,7 +420,6 @@ pub struct DeleteFailure {
 pub struct DeleteReport {
     #[ts(type = "number")]
     pub generation: u64,
-    pub mode: DeleteMode,
     /// Items now gone from disk and from the scan.
     pub deleted: Vec<u32>,
     /// Of those, items that were already gone before the delete.

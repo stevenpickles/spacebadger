@@ -5,6 +5,8 @@
 //! for an older generation are refused so stale replies never mix scans.
 
 mod delete;
+#[cfg(windows)]
+mod recycle_windows;
 mod session;
 
 use sb_protocol::{
@@ -15,6 +17,7 @@ use sb_protocol::{
 use session::Session;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -23,6 +26,9 @@ use tauri_plugin_dialog::DialogExt;
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<Arc<Session>>>,
+    /// Deleting was turned on in this run of the app. Never saved, so every
+    /// start begins with it off.
+    delete_allowed: AtomicBool,
 }
 
 impl AppState {
@@ -183,15 +189,26 @@ async fn selection_summary(
     state.session(request.generation)?.selection(&request.nodes)
 }
 
-/// Deletes selected items (folders with their contents) and removes them
-/// from the scan. Runs on a blocking thread: large folders take a while.
+/// Turns deleting on or off for this run of the app; returns the new state.
+#[tauri::command]
+fn set_delete_allowed(state: State<'_, AppState>, allowed: bool) -> bool {
+    state.delete_allowed.store(allowed, Ordering::SeqCst);
+    allowed
+}
+
+/// Moves selected items (folders with their contents) to the Recycle Bin or
+/// Trash and removes them from the scan. Refused unless deleting is turned
+/// on. Runs on a blocking thread: large folders take a while.
 #[tauri::command]
 async fn delete_items(
     state: State<'_, AppState>,
     request: DeleteRequest,
 ) -> Result<DeleteReport, String> {
+    if !state.delete_allowed.load(Ordering::SeqCst) {
+        return Err("Deleting is turned off. Turn on “Allow deleting” first.".into());
+    }
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.delete(&request.nodes, request.mode))
+    tauri::async_runtime::spawn_blocking(move || session.delete(&request.nodes))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -250,6 +267,7 @@ pub fn run() {
             small_items,
             volume_info,
             selection_summary,
+            set_delete_allowed,
             delete_items
         ])
         .run(tauri::generate_context!())
