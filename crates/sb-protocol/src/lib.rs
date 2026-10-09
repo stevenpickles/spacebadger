@@ -268,6 +268,27 @@ pub struct SearchPage {
     pub rows: Vec<SearchRow>,
 }
 
+/// Capacity of the volume holding the scan root, for the volume overview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VolumeInfo {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// The scan root is the volume's top folder, so the scan covers the
+    /// whole volume. The overview is only offered then.
+    pub is_root: bool,
+    #[ts(type = "number")]
+    pub capacity: u64,
+    #[ts(type = "number")]
+    pub free: u64,
+    pub filesystem: Option<String>,
+    /// Filesystem structures that could be measured (the NTFS master file
+    /// table, when elevated).
+    #[ts(type = "number | null")]
+    pub metadata: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
