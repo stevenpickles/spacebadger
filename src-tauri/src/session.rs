@@ -159,6 +159,13 @@ impl Session {
             ancestors,
         })
     }
+
+    /// The native path of a node, for file manager actions.
+    pub fn path(&self, id: u32) -> Result<PathBuf, String> {
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        Ok(tree.path(node(&tree, id)?))
+    }
 }
 
 fn node(tree: &Tree, id: u32) -> Result<NodeId, String> {

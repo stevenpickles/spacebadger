@@ -2,14 +2,17 @@
   import {
     appInfo,
     EXPECTED_PROTOCOL_VERSION,
+    fileManagerName,
     nodeDetails,
     onScanStatus,
     scanCancel,
     scanChoose,
     scanRefresh,
     scanStatus,
+    reveal,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
+  import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Details from "./lib/Details.svelte";
   import { plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
@@ -18,7 +21,7 @@
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
-  import type { Selection } from "./lib/selection";
+  import type { MenuRequest, Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
 
@@ -37,6 +40,9 @@
   let showOmissions = $state(false);
   let problem = $state<string | null>(null);
   let privileged = $state(false);
+  let fileManager = $state(fileManagerName(""));
+  let menu = $state.raw<MenuRequest | null>(null);
+  let notice = $state<string | null>(null);
 
   const scanning = $derived(status?.phase.kind === "scanning");
   const elapsedMs = $derived(
@@ -46,6 +52,7 @@
   appInfo().then(
     (info) => {
       privileged = info.privilegedAccess;
+      fileManager = fileManagerName(info.os);
       if (info.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
         problem = `The backend speaks protocol ${info.protocolVersion}, but this interface expects ${EXPECTED_PROTOCOL_VERSION}.`;
       }
@@ -63,6 +70,7 @@
     viewDetails = null;
     selectedDetails = null;
     layout = null;
+    menu = null;
   }
 
   function receive(s: ScanStatus) {
@@ -153,6 +161,62 @@
     selection = { node: from, other: false };
   }
 
+  function showInFileManager(node: number) {
+    if (generation === null) return;
+    reveal(generation, node).catch((e: unknown) => (problem = String(e)));
+  }
+
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function flash(text: string) {
+    notice = text;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = null), 1800);
+  }
+
+  async function copyPath(node: number) {
+    if (generation === null) return;
+    try {
+      const d = await nodeDetails(generation, node);
+      await navigator.clipboard.writeText(d.path);
+      flash("Path copied");
+    } catch (e) {
+      problem = `Couldn't copy the path: ${String(e)}`;
+    }
+  }
+
+  function menuItems(r: MenuRequest): MenuItem[] {
+    // Empty space stands for the folder being viewed.
+    const node = r.selection?.node ?? view;
+    const kind = r.kind ?? "folder";
+    const items: MenuItem[] = [];
+    if (kind !== "file" && node !== view) {
+      const label = kind === "other" ? "Open folder in map" : "Open in map";
+      items.push({ label, hint: "Enter", action: () => openFolder(node) });
+    }
+    if (view !== ROOT) items.push({ label: "Up one level", hint: "Backspace", action: goUp });
+    items.push({
+      label: kind === "other" ? `Show folder in ${fileManager}` : `Show in ${fileManager}`,
+      action: () => showInFileManager(node),
+      separator: true,
+    });
+    if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    return items;
+  }
+
+  // Release builds replace the webview's own menu (Back, Reload, Inspect)
+  // everywhere except where text can be copied or edited.
+  $effect(() => {
+    if (!import.meta.env.PROD) return;
+    const suppress = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (t.closest("input, textarea") || !document.getSelection()?.isCollapsed) return;
+      e.preventDefault();
+    };
+    document.addEventListener("contextmenu", suppress);
+    return () => document.removeEventListener("contextmenu", suppress);
+  });
+
   const empty = $derived.by(() => {
     if (!layout || layout.total > 0 || !status) return null;
     if (status.phase.kind === "failed") return null;
@@ -223,6 +287,7 @@
           onopen={openFolder}
           onup={goUp}
           onlayout={(l) => (layout = l)}
+          onmenu={(r) => (menu = r)}
         />
         {#if empty}
           <div class="placeholder overlay"><p>{empty}</p></div>
@@ -230,7 +295,16 @@
       {/if}
     </main>
     <aside>
-      <Details {selection} details={selectedDetails} other={otherInfo} {view} onopen={openFolder} />
+      <Details
+        {selection}
+        details={selectedDetails}
+        other={otherInfo}
+        {view}
+        {fileManager}
+        onopen={openFolder}
+        onreveal={showInFileManager}
+        oncopy={copyPath}
+      />
       {#if showOmissions && status}
         <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
       {/if}
@@ -244,6 +318,17 @@
     {showOmissions}
     ontoggleomissions={() => (showOmissions = !showOmissions)}
   />
+
+  {#if menu}
+    <ContextMenu
+      x={menu.x}
+      y={menu.y}
+      label="Actions"
+      items={menuItems(menu)}
+      onclose={() => (menu = null)}
+    />
+  {/if}
+  <div class="notice" role="status">{#if notice}<span>{notice}</span>{/if}</div>
 </div>
 
 <style>
@@ -329,6 +414,21 @@
     background: none;
     color: inherit;
     cursor: pointer;
+  }
+  .notice {
+    position: fixed;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    pointer-events: none;
+  }
+  .notice span {
+    display: block;
+    padding: 6px 12px;
+    border-radius: 4px;
+    background: var(--fg);
+    color: var(--bg);
+    font-size: 12px;
   }
   .warn {
     background: var(--warn-bg);

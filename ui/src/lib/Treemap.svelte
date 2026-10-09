@@ -16,7 +16,7 @@
   } from "./layoutWire";
   import type { Metric } from "./protocol/Metric";
   import type { NodeDetails } from "./protocol/NodeDetails";
-  import { sameSelection, type Selection } from "./selection";
+  import { sameSelection, type ItemKind, type MenuRequest, type Selection } from "./selection";
 
   interface Props {
     generation: number;
@@ -31,10 +31,22 @@
     /** Backspace: go to the parent folder. */
     onup: () => void;
     onlayout?: (layout: DecodedLayout) => void;
+    /** Right-click, the Menu key, or Shift+F10. */
+    onmenu?: (request: MenuRequest) => void;
   }
 
-  let { generation, view, metric, revision, selection, onselect, onopen, onup, onlayout }: Props =
-    $props();
+  let {
+    generation,
+    view,
+    metric,
+    revision,
+    selection,
+    onselect,
+    onopen,
+    onup,
+    onlayout,
+    onmenu,
+  }: Props = $props();
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -244,6 +256,14 @@
     return { node: l.node[i]!, other: l.kind[i] === KIND_OTHER };
   }
 
+  function kindAt(i: number): ItemKind | null {
+    const kind = i >= 0 ? layout?.kind[i] : undefined;
+    if (kind === KIND_FILE) return "file";
+    if (kind === KIND_FOLDER) return "folder";
+    if (kind === KIND_OTHER) return "other";
+    return null;
+  }
+
   function point(e: MouseEvent): [number, number] {
     const r = canvas.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
@@ -309,6 +329,47 @@
     open(selectionAt(hitTest(l, x, y)));
   }
 
+  /** When the menu key or Shift+F10 last opened the menu. */
+  let keyMenuAt = -Infinity;
+
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    // Some webviews also send a contextmenu event for the menu key or
+    // Shift+F10. Keyboard-made events have no pointer type.
+    if ((e as PointerEvent).pointerType === "") {
+      if (performance.now() - keyMenuAt > 500) menuFromKeyboard();
+      return;
+    }
+    const l = layout;
+    if (!l) return;
+    const [x, y] = point(e);
+    const i = hitTest(l, x, y);
+    const target = selectionAt(i);
+    // Right-click selects what it points at, as in file managers.
+    if (target && !sameSelection(target, selection)) onselect(target);
+    onLeave();
+    container.focus();
+    onmenu?.({ selection: target, kind: kindAt(i), x: e.clientX, y: e.clientY });
+  }
+
+  /** Opens the menu for the selection, near its top-left corner. */
+  function menuFromKeyboard() {
+    keyMenuAt = performance.now();
+    const l = layout;
+    const r = canvas.getBoundingClientRect();
+    const i = selectedIndex(l, selection);
+    if (!l || i < 0) {
+      onmenu?.({ selection: null, kind: null, x: r.left + 8, y: r.top + 8 });
+      return;
+    }
+    onmenu?.({
+      selection,
+      kind: kindAt(i),
+      x: r.left + l.x[i]! + Math.min(l.w[i]! / 2, 24),
+      y: r.top + l.y[i]! + Math.min(l.h[i]! / 2, 16),
+    });
+  }
+
   /** Nearest rectangle at the same depth in the arrow's direction. */
   function neighbour(dx: number, dy: number): number {
     const l = layout;
@@ -353,6 +414,8 @@
       onup();
     } else if (e.key === "Escape") {
       onselect(null);
+    } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+      menuFromKeyboard();
     } else {
       return;
     }
@@ -391,11 +454,12 @@
   bind:this={container}
   tabindex="0"
   role="application"
-  aria-label="Treemap. Arrow keys move the selection, Enter opens a folder, Backspace goes up, Escape clears the selection."
+  aria-label="Treemap. Arrow keys move the selection, Enter opens a folder, Backspace goes up, Shift+F10 shows actions, Escape clears the selection."
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}
   ondblclick={onDblClick}
+  oncontextmenu={onContextMenu}
   onkeydown={onKey}
 >
   <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px" aria-hidden="true"

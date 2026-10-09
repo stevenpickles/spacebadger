@@ -11,7 +11,8 @@ use sb_protocol::{
     ScanStatus,
 };
 use session::Session;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -117,6 +118,33 @@ async fn node_details(
     state.session(generation)?.details(node)
 }
 
+/// Shows a scanned file or folder selected in the system file manager
+/// (Explorer, Finder, or the desktop's file manager).
+#[tauri::command]
+async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Result<(), String> {
+    let path = state.session(generation)?.path(node)?;
+    tauri::async_runtime::spawn_blocking(move || reveal_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn reveal_path(path: &Path) -> Result<(), String> {
+    let shown = session::display_path(path);
+    // The item may have been moved or deleted since it was scanned.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(format!(
+                "{shown} no longer exists. Refresh to update the map."
+            ));
+        }
+        Err(e) => return Err(format!("Couldn't reach {shown}: {e}")),
+    }
+    // Uses the platform API with the path as an argument, never a shell.
+    tauri_plugin_opener::reveal_item_in_dir(path)
+        .map_err(|e| format!("Couldn't show {shown} in the file manager: {e}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -136,7 +164,8 @@ pub fn run() {
             scan_cancel,
             scan_status,
             layout,
-            node_details
+            node_details,
+            reveal
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");
