@@ -3,9 +3,17 @@
   // change; at most one request is in flight, and changes that arrive
   // meanwhile are folded into one follow-up request (natural backpressure).
   import { nodeDetails, requestLayout } from "./api";
+  import {
+    depthColor,
+    neutralFolderColor,
+    otherSmallColor,
+    typeColor,
+    type ColorMode,
+  } from "./colors";
   import { formatBytes, plural } from "./format";
   import {
     decodeLayout,
+    FILE_TYPES,
     hitTest,
     KIND_FILE,
     KIND_FOLDER,
@@ -22,6 +30,7 @@
     generation: number;
     view: number;
     metric: Metric;
+    colors: ColorMode;
     /** Active filename search; only matching files are drawn. */
     search: number | null;
     /** Scan revision; a change triggers a new layout. */
@@ -41,6 +50,7 @@
     generation,
     view,
     metric,
+    colors,
     search,
     revision,
     selection,
@@ -130,14 +140,13 @@
 
   // ---- drawing ---------------------------------------------------------
 
-  const HUES = [212, 28, 145, 270, 188, 340, 50, 105];
-
   function fillFor(l: DecodedLayout, i: number): string {
     const kind = l.kind[i];
-    if (kind === KIND_OTHER) return dark ? "#4b505b" : "#c4c8cf";
-    const hue = HUES[(l.depth[i]! - 1) % HUES.length];
-    if (kind === KIND_FOLDER) return dark ? `hsl(${hue} 28% 30%)` : `hsl(${hue} 30% 62%)`;
-    return dark ? `hsl(${hue} 38% 42%)` : `hsl(${hue} 45% 80%)`;
+    if (kind === KIND_OTHER) return otherSmallColor(dark);
+    if (colors === "type") {
+      return kind === KIND_FOLDER ? neutralFolderColor(dark) : typeColor(l.ftype[i]!, dark);
+    }
+    return depthColor(l.depth[i]!, kind === KIND_FOLDER, dark);
   }
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
@@ -246,7 +255,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, hover, dark, width, height];
+    void [layout, selection, hover, dark, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -446,6 +455,7 @@
     } else {
       lines.push(formatBytes(l.weight[i]!));
     }
+    if (colors === "type" && l.kind[i] === KIND_FILE) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
     return { title: name, lines };
   });
 </script>
