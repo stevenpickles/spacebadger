@@ -22,6 +22,7 @@
     RF_INCOMPLETE,
     type DecodedLayout,
   } from "./layoutWire";
+  import { Samples } from "./perf";
   import type { Metric } from "./protocol/Metric";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import { sameSelection, type ItemKind, type MenuRequest, type Selection } from "./selection";
@@ -71,6 +72,28 @@
   let hoverDetails = $state.raw<NodeDetails | null>(null);
   let dark = $state(window.matchMedia("(prefers-color-scheme: dark)").matches);
 
+  // ---- diagnostics (toggle with ` while the map has focus) ---------------
+
+  const stats = { layout: new Samples(), draw: new Samples(), input: new Samples() };
+  /** When the last click or key arrived, until the next frame is drawn. */
+  let inputAt: number | null = null;
+  let showPerf = $state(false);
+  let perfText = $state("");
+
+  $effect(() => {
+    if (!showPerf) return;
+    const update = () => {
+      perfText = [
+        `layout round trip: ${stats.layout.summary()}`,
+        `draw: ${stats.draw.summary()}`,
+        `input to frame: ${stats.input.summary()}`,
+      ].join("\n");
+    };
+    update();
+    const timer = setInterval(update, 500);
+    return () => clearInterval(timer);
+  });
+
   // ---- layout requests -------------------------------------------------
 
   let nextRequest = 1;
@@ -96,6 +119,7 @@
         const want = { generation, view, metric, search };
         const request = nextRequest++;
         try {
+          const started = performance.now();
           const reply = decodeLayout(
             await requestLayout({ ...want, request, width, height }),
           );
@@ -107,6 +131,7 @@
             want.search === search &&
             reply.generation === generation
           ) {
+            stats.layout.add(performance.now() - started);
             layout = reply;
             error = null;
             onlayout?.(reply);
@@ -176,6 +201,17 @@
   }
 
   function draw() {
+    const started = performance.now();
+    paint();
+    const now = performance.now();
+    stats.draw.add(now - started);
+    if (inputAt !== null) {
+      stats.input.add(now - inputAt);
+      inputAt = null;
+    }
+  }
+
+  function paint() {
     const ctx = canvas?.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
@@ -318,6 +354,7 @@
   }
 
   function onClick(e: MouseEvent) {
+    inputAt = performance.now();
     const l = layout;
     if (!l) return;
     const [x, y] = point(e);
@@ -411,6 +448,12 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    if (e.key === "`") {
+      showPerf = !showPerf;
+      e.preventDefault();
+      return;
+    }
+    inputAt = performance.now();
     const moves: Record<string, [number, number]> = {
       ArrowLeft: [-1, 0],
       ArrowRight: [1, 0],
@@ -493,6 +536,9 @@
   {#if error}
     <p class="error" role="alert">Couldn't draw the map: {error}</p>
   {/if}
+  {#if showPerf}
+    <pre class="perf" aria-label="Timing diagnostics">{perfText}</pre>
+  {/if}
 </div>
 
 <style>
@@ -523,6 +569,18 @@
     pointer-events: none;
     font-size: 12px;
     overflow-wrap: anywhere;
+  }
+  .perf {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    margin: 0;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: rgb(0 0 0 / 0.75);
+    color: #fff;
+    font-size: 11px;
+    pointer-events: none;
   }
   .error {
     position: absolute;
