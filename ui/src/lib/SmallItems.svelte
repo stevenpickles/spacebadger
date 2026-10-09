@@ -6,6 +6,7 @@
   import { formatBytes, formatCount, plural } from "./format";
   import type { Metric } from "./protocol/Metric";
   import type { SmallItem } from "./protocol/SmallItem";
+  import { clickPick, listRange, type Pick } from "./selection";
 
   interface Props {
     generation: number;
@@ -16,8 +17,12 @@
     search: number | null;
     /** Scan revision; a change refreshes the loaded items. */
     revision: number;
-    selected: number | null;
-    onselect: (node: number) => void;
+    selected: Set<number>;
+    /** Where Shift ranges start. */
+    anchor: number | null;
+    onpick: (pick: Pick) => void;
+    /** Delete, or Shift+Delete for `permanent`. */
+    ondelete: (permanent: boolean) => void;
     onopen: (node: number) => void;
     onclose: () => void;
   }
@@ -31,7 +36,9 @@
     search,
     revision,
     selected,
-    onselect,
+    anchor,
+    onpick,
+    ondelete,
     onopen,
     onclose,
   }: Props = $props();
@@ -64,6 +71,18 @@
       (e: unknown) => (error = String(e)),
     );
   });
+
+  function onRowClick(e: MouseEvent, index: number, item: SmallItem) {
+    const from = anchor === null ? -1 : items.findIndex((i) => i.node === anchor);
+    const range = e.shiftKey && from >= 0 ? listRange(items, from, index, (i) => i.node) : null;
+    onpick(clickPick({ node: item.node, other: false }, e, range));
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key !== "Delete") return;
+    ondelete(e.shiftKey);
+    e.preventDefault();
+  }
 </script>
 
 <section class="small" aria-label="Small items in {folderName}">
@@ -74,10 +93,16 @@
     </div>
     <button type="button" class="close" onclick={onclose} aria-label="Close small items">✕</button>
   </header>
-  <ul>
-    {#each items as item (item.node)}
-      <li class:selected={item.node === selected}>
-        <button type="button" class="row" onclick={() => onselect(item.node)}>
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <ul onkeydown={onKey}>
+    {#each items as item, index (item.node)}
+      <li class:selected={selected.has(item.node)}>
+        <button
+          type="button"
+          class="row"
+          aria-pressed={selected.has(item.node)}
+          onclick={(e) => onRowClick(e, index, item)}
+        >
           <span class="name" title={item.name}>{item.name}</span>
           {#if item.folder}<span class="muted kind">folder</span>{/if}
           <span class="size">{formatBytes(item.weight)}</span>
@@ -145,7 +170,7 @@
     border-bottom: 1px solid var(--line);
   }
   li.selected {
-    background: var(--hover);
+    background: var(--selected);
     font-weight: 600;
   }
   .row {

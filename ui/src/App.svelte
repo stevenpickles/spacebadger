@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import {
     appInfo,
+    deleteItems,
     EXPECTED_PROTOCOL_VERSION,
     fileManagerName,
     nodeDetails,
@@ -12,25 +14,30 @@
     reveal,
     searchSet,
     searchSummary,
+    selectionSummary,
+    trashName,
     volumeInfo,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
+  import DeleteDialog from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
-  import { plural } from "./lib/format";
+  import { formatBytes, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
+  import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
   import type { SearchRow } from "./lib/protocol/SearchRow";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
+  import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
   import SearchResults from "./lib/SearchResults.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
-  import type { MenuRequest, Selection } from "./lib/selection";
+  import { applyPick, type MenuRequest, type Pick, type Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
   import type { VolumeInfo } from "./lib/protocol/VolumeInfo";
@@ -43,7 +50,15 @@
   let statusAt = $state(0);
   let now = $state(performance.now());
   let view = $state(ROOT);
+  /** The focused item: its details are shown and arrow keys start there. */
   let selection = $state<Selection | null>(null);
+  /** Selected files and folders, which actions such as delete apply to. */
+  let picked = $state.raw<number[]>([]);
+  const pickedSet = $derived(new Set(picked));
+  /** Where Shift ranges start. */
+  let anchor = $state<number | null>(null);
+  /** Totals when several items are selected. */
+  let multi = $state.raw<SelectionSummary | null>(null);
   let metric = $state<Metric>("allocated");
   let colors = $state<ColorMode>(savedColors());
   let viewDetails = $state.raw<NodeDetails | null>(null);
@@ -56,6 +71,15 @@
   let volume = $state.raw<VolumeInfo | null>(null);
   let showVolume = $state(saved("volume") === "on");
   let fileManager = $state(fileManagerName(""));
+  let trash = $state(trashName(""));
+  let confirmDelete = $state.raw<{
+    permanent: boolean;
+    nodes: number[];
+    summary: SelectionSummary;
+  } | null>(null);
+  let deleting = $state(false);
+  /** Counts completed deletes, which change free space. */
+  let deletions = $state(0);
   let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
   /** What's typed in the filter box. */
   let query = $state("");
@@ -65,6 +89,10 @@
   let notice = $state<string | null>(null);
 
   const scanning = $derived(status?.phase.kind === "scanning");
+  const deleteBlocked = $derived(
+    !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
+  );
+  const modKey = $derived(os === "macos" ? "⌘" : "Ctrl");
   const elapsedMs = $derived(
     status ? status.elapsedMs + (scanning ? Math.max(0, now - statusAt) : 0) : 0,
   );
@@ -74,6 +102,7 @@
       privileged = info.privilegedAccess;
       os = info.os;
       fileManager = fileManagerName(info.os);
+      trash = trashName(info.os);
       if (info.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
         problem = `The backend speaks protocol ${info.protocolVersion}, but this interface expects ${EXPECTED_PROTOCOL_VERSION}.`;
       }
@@ -112,7 +141,7 @@
     generation = next;
     status = null;
     view = ROOT;
-    selection = null;
+    pick(null);
     viewDetails = null;
     selectedDetails = null;
     layout = null;
@@ -162,7 +191,7 @@
   const finished = $derived(status !== null && status.phase.kind !== "scanning");
   $effect(() => {
     const gen = generation;
-    void finished;
+    void [finished, deletions];
     if (gen === null) return;
     volumeInfo(gen).then(
       (v) => {
@@ -226,7 +255,7 @@
   /** Opens a result's folder in the map with the file selected. */
   function showInMap(row: SearchRow) {
     view = row.parent;
-    selection = { node: row.node, other: false };
+    selectOnly(row.node);
   }
 
   function resultItems(row: SearchRow): MenuItem[] {
@@ -238,7 +267,148 @@
         separator: true,
       },
       { label: "Copy path", action: () => copyPath(row.node) },
+      ...deleteItemsFor(row.node),
     ];
+  }
+
+  // ---- selection and delete -------------------------------------------
+
+  function pick(p: Pick | null) {
+    if (!p) {
+      selection = null;
+      picked = [];
+      anchor = null;
+      return;
+    }
+    selection = p.focus;
+    picked = applyPick(picked, p);
+    if (!p.keepAnchor && !p.focus.other) anchor = p.focus.node;
+  }
+
+  function selectOnly(node: number) {
+    pick({ focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false });
+  }
+
+  // A different scan or filter starts with nothing selected.
+  $effect(() => {
+    void [generation, searchId];
+    untrack(() => {
+      picked = [];
+      anchor = null;
+    });
+  });
+
+  // Totals for several selected items follow the scan.
+  $effect(() => {
+    const gen = generation;
+    const nodes = picked;
+    void status?.revision;
+    if (gen === null || nodes.length < 2) {
+      multi = null;
+      return;
+    }
+    selectionSummary({ generation: gen, nodes }).then(
+      (s) => {
+        if (gen === generation && nodes === picked) multi = s;
+      },
+      () => {},
+    );
+  });
+
+  /** What delete applies to: the selected items, else the focused one. */
+  function deleteTargets(): number[] {
+    if (picked.length > 0) return picked;
+    return selection && !selection.other ? [selection.node] : [];
+  }
+
+  /** Menu entries to delete `node`, or the selection it belongs to. */
+  function deleteItemsFor(node: number): MenuItem[] {
+    const count = pickedSet.has(node) ? picked.length : 1;
+    const what = count > 1 ? `${count} items ` : "";
+    const blocked = { disabled: !!deleteBlocked, title: deleteBlocked ?? undefined };
+    return [
+      {
+        label: `Move ${what}to ${trash}`,
+        hint: "Del",
+        action: () => askDelete(false),
+        separator: true,
+        ...blocked,
+      },
+      {
+        label: `Delete ${what}permanently…`,
+        hint: "Shift+Del",
+        action: () => askDelete(true),
+        danger: true,
+        ...blocked,
+      },
+    ];
+  }
+
+  async function askDelete(permanent: boolean) {
+    const gen = generation;
+    const nodes = deleteTargets();
+    if (gen === null || nodes.length === 0 || confirmDelete) return;
+    if (deleteBlocked) {
+      flash(deleteBlocked);
+      return;
+    }
+    try {
+      const summary = await selectionSummary({ generation: gen, nodes });
+      if (gen === generation && summary.items > 0) confirmDelete = { permanent, nodes, summary };
+    } catch (e) {
+      problem = `Couldn't prepare the delete: ${String(e)}`;
+    }
+  }
+
+  async function confirmed() {
+    const c = confirmDelete;
+    const gen = generation;
+    if (!c || gen === null || deleting) return;
+    deleting = true;
+    try {
+      const report = await deleteItems({
+        generation: gen,
+        nodes: c.nodes,
+        mode: c.permanent ? "permanent" : "recycle",
+      });
+      if (gen === generation) afterDelete(report, c.summary);
+    } catch (e) {
+      problem = `Couldn't delete: ${String(e)}`;
+    } finally {
+      deleting = false;
+      confirmDelete = null;
+    }
+  }
+
+  function afterDelete(r: DeleteReport, asked: SelectionSummary) {
+    deletions++;
+    const gone = new Set(r.deleted);
+    // Leave a folder that was deleted along with the items.
+    const crumbs = viewDetails?.ancestors ?? [];
+    const at = crumbs.findIndex((c) => gone.has(c.node));
+    if (at > 0) openFolder(crumbs[at - 1]!.node);
+    // Items that couldn't be deleted stay selected.
+    const failed = r.failed.map((f) => f.node);
+    if (failed.length > 0) {
+      pick({ focus: { node: failed[0]!, other: false }, nodes: failed, mode: "replace", keepAnchor: false });
+    } else {
+      pick(null);
+    }
+    const done = r.deleted.length;
+    if (done > 0) {
+      const only = asked.items === 1 ? asked.samples[0] : undefined;
+      const what = only ? `“${only.name}”` : plural(done, "item");
+      const size = formatBytes(r.allocated);
+      flash(
+        r.mode === "recycle" ? `Moved ${what} (${size}) to the ${trash}` : `Deleted ${what} (${size})`,
+        4000,
+      );
+    }
+    if (failed.length > 0) {
+      const lines = r.failed.slice(0, 3).map((f) => `${f.path}: ${f.message}`);
+      if (r.failed.length > 3) lines.push(`…and ${plural(r.failed.length - 3, "more item")}.`);
+      problem = [`Couldn't delete ${plural(failed.length, "item")}:`, ...lines].join("\n");
+    }
   }
 
   // Breadcrumbs follow the view.
@@ -312,7 +482,7 @@
 
   function openFolder(node: number) {
     view = node;
-    selection = null;
+    pick(null);
   }
 
   function goUp() {
@@ -320,7 +490,7 @@
     if (!crumbs || crumbs.length < 2) return;
     const from = view;
     view = crumbs[crumbs.length - 2]!.node;
-    selection = { node: from, other: false };
+    selectOnly(from);
   }
 
   function showInFileManager(node: number) {
@@ -330,10 +500,10 @@
 
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function flash(text: string) {
+  function flash(text: string, ms = 1800) {
     notice = text;
     clearTimeout(noticeTimer);
-    noticeTimer = setTimeout(() => (notice = null), 1800);
+    noticeTimer = setTimeout(() => (notice = null), ms);
   }
 
   async function copyPath(node: number) {
@@ -363,6 +533,7 @@
       separator: true,
     });
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
   }
 
@@ -492,7 +663,10 @@
             search={search?.search ?? null}
             revision={status?.revision ?? 0}
             {selection}
-            onselect={(s) => (selection = s)}
+            selected={pickedSet}
+            {anchor}
+            onpick={pick}
+            ondelete={askDelete}
             onopen={openFolder}
             onup={goUp}
             onlayout={(l) => (layout = l)}
@@ -517,11 +691,16 @@
         {selection}
         details={selectedDetails}
         other={otherInfo}
+        {multi}
         {view}
         {fileManager}
+        trashName={trash}
+        {modKey}
+        {deleteBlocked}
         onopen={openFolder}
         onreveal={showInFileManager}
         oncopy={copyPath}
+        ondelete={askDelete}
       />
       {#if showOmissions && status}
         <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
@@ -536,8 +715,10 @@
             {metric}
             search={searchId ?? null}
             revision={status?.revision ?? 0}
-            selected={selection && !selection.other ? selection.node : null}
-            onselect={(node) => (selection = { node, other: false })}
+            selected={pickedSet}
+            {anchor}
+            onpick={pick}
+            ondelete={askDelete}
             onopen={openFolder}
             onclose={() => (smallOf = null)}
           />
@@ -551,8 +732,10 @@
           revision={status?.revision ?? 0}
           {scanning}
           scanned={metric === "allocated" ? (status?.allocated ?? 0) : (status?.logical ?? 0)}
-          selected={selection && !selection.other ? selection.node : null}
-          onselect={(node) => (selection = { node, other: false })}
+          selected={pickedSet}
+          {anchor}
+          onpick={pick}
+          ondelete={askDelete}
           onshow={showInMap}
           onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row) })}
         />
@@ -575,6 +758,18 @@
       label="Actions"
       items={menu.items}
       onclose={() => (menu = null)}
+    />
+  {/if}
+  {#if confirmDelete}
+    <DeleteDialog
+      summary={confirmDelete.summary}
+      permanent={confirmDelete.permanent}
+      trashName={trash}
+      filtered={search !== null}
+      {privileged}
+      busy={deleting}
+      onconfirm={confirmed}
+      oncancel={() => (confirmDelete = null)}
     />
   {/if}
   <div class="notice" role="status">{#if notice}<span>{notice}</span>{/if}</div>
@@ -702,6 +897,7 @@
     display: flex;
     justify-content: space-between;
     gap: 8px;
+    white-space: pre-line;
     padding: 6px 12px;
     border-bottom: 1px solid var(--line);
   }

@@ -25,7 +25,15 @@
   import { Samples } from "./perf";
   import type { Metric } from "./protocol/Metric";
   import type { NodeDetails } from "./protocol/NodeDetails";
-  import { sameSelection, type ItemKind, type MenuRequest, type Selection } from "./selection";
+  import {
+    clickPick,
+    siblingRange,
+    toggles,
+    type ItemKind,
+    type MenuRequest,
+    type Pick,
+    type Selection,
+  } from "./selection";
 
   interface Props {
     generation: number;
@@ -36,8 +44,16 @@
     search: number | null;
     /** Scan revision; a change triggers a new layout. */
     revision: number;
+    /** The focused item: the one with details, and where arrow keys start. */
     selection: Selection | null;
-    onselect: (selection: Selection | null) => void;
+    /** Selected files and folders (actions apply to these). */
+    selected: Set<number>;
+    /** Where Shift ranges start. */
+    anchor: number | null;
+    /** A click or key changed the selection; `null` clears it. */
+    onpick: (pick: Pick | null) => void;
+    /** Delete, or Shift+Delete for `permanent`. */
+    ondelete?: (permanent: boolean) => void;
     /** Double-click or Enter on a folder (or merged small items). */
     onopen: (node: number) => void;
     /** Backspace: go to the parent folder. */
@@ -55,7 +71,10 @@
     search,
     revision,
     selection,
-    onselect,
+    selected,
+    anchor,
+    onpick,
+    ondelete,
     onopen,
     onup,
     onlayout,
@@ -272,6 +291,20 @@
       ctx.restore();
     }
 
+    if (selected.size > 0) {
+      // Selected items are tinted, with everything drawn inside them.
+      ctx.fillStyle = dark ? "rgb(122 167 255 / 0.38)" : "rgb(37 99 201 / 0.3)";
+      ctx.strokeStyle = dark ? "#7aa7ff" : "#2563c9";
+      ctx.lineWidth = 2;
+      for (let i = 0; i < l.count; i++) {
+        if (l.kind[i] === KIND_OTHER || !selected.has(l.node[i]!)) continue;
+        ctx.fillRect(l.x[i]!, l.y[i]!, l.w[i]!, l.h[i]!);
+        if (l.w[i]! > 4 && l.h[i]! > 4) {
+          ctx.strokeRect(l.x[i]! + 1, l.y[i]! + 1, l.w[i]! - 2, l.h[i]! - 2);
+        }
+      }
+    }
+
     const hi = hover ? hover.index : -1;
     if (hi >= 0 && hi < l.count) {
       ctx.strokeStyle = dark ? "rgba(255,255,255,0.7)" : "rgba(0,0,0,0.55)";
@@ -291,7 +324,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, hover, dark, colors, width, height];
+    void [layout, selection, selected, hover, dark, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -353,13 +386,21 @@
     hoverDetails = null;
   }
 
+  /** Replaces the selection with the item at rectangle `i`. */
+  function only(i: number): Pick | null {
+    const focus = selectionAt(i);
+    return focus && { focus, nodes: focus.other ? [] : [focus.node], mode: "replace", keepAnchor: false };
+  }
+
   function onClick(e: MouseEvent) {
     inputAt = performance.now();
     const l = layout;
     if (!l) return;
     const [x, y] = point(e);
-    const next = selectionAt(hitTest(l, x, y));
-    if (!sameSelection(next, selection)) onselect(next);
+    const i = hitTest(l, x, y);
+    const focus = selectionAt(i);
+    if (focus) onpick(clickPick(focus, e, e.shiftKey ? siblingRange(l, anchor, i) : null));
+    else if (!toggles(e) && !e.shiftKey) onpick(null);
     container.focus();
   }
 
@@ -395,8 +436,13 @@
     const [x, y] = point(e);
     const i = hitTest(l, x, y);
     const target = selectionAt(i);
-    // Right-click selects what it points at, as in file managers.
-    if (target && !sameSelection(target, selection)) onselect(target);
+    // Right-click selects what it points at, as in file managers, but keeps
+    // a selection it points into so the menu acts on all of it.
+    if (target && !target.other && selected.has(target.node)) {
+      onpick({ focus: target, nodes: [], mode: "add", keepAnchor: true });
+    } else if (target) {
+      onpick(only(i));
+    }
     onLeave();
     container.focus();
     onmenu?.({ selection: target, kind: kindAt(i), x: e.clientX, y: e.clientY });
@@ -418,6 +464,19 @@
       x: r.left + l.x[i]! + Math.min(l.w[i]! / 2, 24),
       y: r.top + l.y[i]! + Math.min(l.h[i]! / 2, 16),
     });
+  }
+
+  /** Selects every file and folder drawn directly in the view. */
+  function selectAll() {
+    const l = layout;
+    if (!l) return;
+    const nodes: number[] = [];
+    for (let i = 0; i < l.count; i++) {
+      if (l.depth[i] === 1 && l.kind[i] !== KIND_OTHER) nodes.push(l.node[i]!);
+    }
+    if (nodes.length === 0) return;
+    const focus = selection ?? { node: nodes[0]!, other: false };
+    onpick({ focus, nodes, mode: "replace", keepAnchor: true });
   }
 
   /** Nearest rectangle at the same depth in the arrow's direction. */
@@ -463,13 +522,19 @@
     const move = moves[e.key];
     if (move && !e.altKey) {
       const i = neighbour(move[0], move[1]);
-      if (i >= 0) onselect(selectionAt(i));
+      if (i >= 0) onpick(only(i));
     } else if (e.key === "Enter") {
       open(selection);
     } else if (e.key === "Backspace" || (e.key === "ArrowUp" && e.altKey)) {
       onup();
     } else if (e.key === "Escape") {
-      onselect(null);
+      onpick(null);
+    } else if (e.key.toLowerCase() === "a" && toggles(e)) {
+      selectAll();
+    } else if (e.key === " " && toggles(e) && selection && !selection.other) {
+      onpick({ focus: selection, nodes: [selection.node], mode: "toggle", keepAnchor: false });
+    } else if (e.key === "Delete") {
+      ondelete?.(e.shiftKey);
     } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
       menuFromKeyboard();
     } else {
@@ -511,7 +576,7 @@
   bind:this={container}
   tabindex="0"
   role="application"
-  aria-label="Treemap. Arrow keys move the selection, Enter opens a folder, Backspace goes up, Shift+F10 shows actions, Escape clears the selection."
+  aria-label="Treemap. Arrow keys move the selection, Ctrl+click or Shift+click selects several items, Enter opens a folder, Backspace goes up, Delete moves the selection to the trash, Shift+F10 shows actions, Escape clears the selection."
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}
