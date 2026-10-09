@@ -2859,6 +2859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-bench"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+ "sb-protocol",
+ "windows",
+]
+
+[[package]]
 name = "sb-core"
 version = "0.1.0"
 
