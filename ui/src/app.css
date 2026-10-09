@@ -11,6 +11,8 @@
   --danger: #b3261e;
   --danger-bg: #f9dedc;
   --warn-bg: #fbefc9;
+  /* Used space no measured file accounts for. */
+  --gap: hsl(32 75% 62%);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 14px;
 }
@@ -28,6 +30,7 @@
     --danger: #ffb4ab;
     --danger-bg: #5c1f1b;
     --warn-bg: #4d3d0f;
+    --gap: hsl(32 55% 42%);
   }
 }
 
