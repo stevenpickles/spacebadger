@@ -37,8 +37,8 @@ const TABLE: &[(FileType, &[&str])] = &[
     (
         FileType::Audio,
         &[
-            "aac", "aif", "aiff", "alac", "flac", "m4a", "mid", "midi", "mp3", "ogg", "opus",
-            "wav", "wma",
+            "aac", "aif", "aiff", "alac", "flac", "m4a", "m4b", "mid", "midi", "mp3", "ogg",
+            "opus", "wav", "wma",
         ],
     ),
     (
@@ -129,6 +129,7 @@ mod tests {
     fn classifies_by_last_extension_ignoring_case() {
         assert_eq!(of("Holiday.MP4"), FileType::Video);
         assert_eq!(of("song.flac"), FileType::Audio);
+        assert_eq!(of("Dune.m4b"), FileType::Audio, "audiobook");
         assert_eq!(of("scan.tar.gz"), FileType::Archive);
         assert_eq!(of("report.final.pdf"), FileType::Document);
         assert_eq!(of("ubuntu.iso"), FileType::DiskImage);
