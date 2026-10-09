@@ -1,0 +1,20 @@
+[package]
+name = "sb-bench"
+description = "Scale benchmark for SpaceBadger's tree, search, layout, and wire format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sb-core.workspace = true
+sb-protocol.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

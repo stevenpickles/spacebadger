@@ -3,11 +3,10 @@
 
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
-use sb_core::search::{Matcher, Search};
+use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
-use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,14 +36,8 @@ struct ActiveSearch {
     search: Search,
     /// Sibling order for the filtered map.
     order: OrderCache,
-    /// Matches sorted by size, for the result list.
-    sorted: Option<Sorted>,
-}
-
-struct Sorted {
-    metric: layout::Metric,
-    version: u64,
-    files: Vec<NodeId>,
+    /// Matches ranked by size, for the result list.
+    ranked: Option<Ranked>,
 }
 
 impl Session {
@@ -201,7 +194,7 @@ impl Session {
             id,
             search,
             order: OrderCache::default(),
-            sorted: None,
+            ranked: None,
         });
         Ok(Some(self.summary(active)))
     }
@@ -238,26 +231,16 @@ impl Session {
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
         let active = current_search(&mut search, req.search, &tree)?;
         let metric = metric(req.metric);
-        let version = active.search.version();
-        let stale = active
-            .sorted
-            .as_ref()
-            .is_none_or(|s| s.metric != metric || s.version != version);
-        if stale {
-            let mut files = active.search.matches().to_vec();
-            files.sort_unstable_by_key(|&f| (Reverse(metric.weight(&tree, f)), f.index()));
-            active.sorted = Some(Sorted {
-                metric,
-                version,
-                files,
-            });
-        }
-        let files = &active.sorted.as_ref().expect("sorted above").files;
-        let start = (req.offset as usize).min(files.len());
+        let ranked = match &mut active.ranked {
+            Some(r) if r.is_current(&active.search, metric) => r,
+            slot => slot.insert(Ranked::new(&active.search, metric)),
+        };
+        let total = ranked.len();
+        let start = (req.offset as usize).min(total);
         let end = start
             .saturating_add(req.limit.min(MAX_PAGE) as usize)
-            .min(files.len());
-        let rows = files[start..end]
+            .min(total);
+        let rows = ranked.top(&tree, end)[start..]
             .iter()
             .map(|&f| {
                 let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
@@ -278,7 +261,7 @@ impl Session {
             generation: self.generation(),
             search: active.id,
             offset: start as u32,
-            total: files.len() as u32,
+            total: total as u32,
             rows,
         })
     }

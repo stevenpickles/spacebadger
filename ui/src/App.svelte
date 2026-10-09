@@ -301,6 +301,15 @@
     smallOf = null;
   });
 
+  // Selecting something outside the list's folder closes it.
+  $effect(() => {
+    const sel = selection;
+    const d = selectedDetails;
+    if (!smallOf || !sel || sel.other || d?.node !== sel.node) return;
+    const parent = d.ancestors[d.ancestors.length - 2]?.node;
+    if (parent !== smallOf.folder) smallOf = null;
+  });
+
   function openFolder(node: number) {
     view = node;
     selection = null;
