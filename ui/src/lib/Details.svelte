@@ -10,10 +10,15 @@
     /** Weight and count of a selected "other small items" region. */
     other: { weight: number; items: number } | null;
     view: number;
+    /** "Explorer", "Finder", or "file manager". */
+    fileManager: string;
     onopen: (node: number) => void;
+    onreveal: (node: number) => void;
+    oncopy: (node: number) => void;
   }
 
-  let { selection, details, other, view, onopen }: Props = $props();
+  let { selection, details, other, view, fileManager, onopen, onreveal, oncopy }: Props =
+    $props();
 
   const folderStates: Record<FolderState, string> = {
     pending: "Still being scanned",
@@ -38,9 +43,12 @@
       </dl>
     {/if}
     <p class="muted">These items are too small to draw at this size.</p>
-    {#if selection.node !== view}
-      <button type="button" onclick={() => onopen(selection.node)}>Open folder in map</button>
-    {/if}
+    <div class="actions">
+      {#if selection.node !== view}
+        <button type="button" onclick={() => onopen(selection.node)}>Open folder in map</button>
+      {/if}
+      <button type="button" onclick={() => onreveal(selection.node)}>Show folder in {fileManager}</button>
+    </div>
   {:else if details}
     <h2>{details.name}</h2>
     <p class="path">{details.path}</p>
@@ -79,9 +87,13 @@
     {:else if details.hardlinked}
       <p class="note">Hard-linked: its allocation is counted here, once.</p>
     {/if}
-    {#if details.folder && details.node !== view}
-      <button type="button" onclick={() => onopen(details.node)}>Open folder in map</button>
-    {/if}
+    <div class="actions">
+      {#if details.folder && details.node !== view}
+        <button type="button" onclick={() => onopen(details.node)}>Open folder in map</button>
+      {/if}
+      <button type="button" onclick={() => onreveal(details.node)}>Show in {fileManager}</button>
+      <button type="button" onclick={() => oncopy(details.node)}>Copy path</button>
+    </div>
   {:else}
     <p class="muted">Loading…</p>
   {/if}
@@ -120,5 +132,10 @@
   }
   .muted {
     color: var(--muted);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 </style>
