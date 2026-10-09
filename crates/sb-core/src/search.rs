@@ -8,9 +8,9 @@
 //! them, so the treemap can be drawn from matching bytes only. It catches up
 //! incrementally: new nodes are examined in ID order (IDs only grow), and
 //! files re-measured after being added are replayed from
-//! [`Tree::changed_files`]. Hard-link ownership is kept: an alias that
-//! matches contributes its logical length but no allocation, exactly as in
-//! the tree.
+//! [`Tree::changed_files`], which also lists removed files; those leave the
+//! matches. Hard-link ownership is kept: an alias that matches contributes
+//! its logical length but no allocation, exactly as in the tree.
 
 use crate::layout::Metric;
 use crate::tree::{NodeId, Tree};
@@ -74,7 +74,7 @@ impl Totals {
             logical: tree.logical(file),
             allocated: tree.allocated(file),
             unknown: tree.unknown_allocation_files(file),
-            files: 1,
+            files: u32::from(!tree.is_removed(file)),
         }
     }
 
@@ -124,19 +124,25 @@ impl Search {
     pub fn catch_up(&mut self, tree: &Tree, budget: usize) -> bool {
         // Changes to files not yet examined are picked up when they are.
         let changes = tree.changed_files();
+        let mut removed = false;
         for &raw in &changes[self.changes_seen..] {
             let file = NodeId::from_index(raw);
             if file.index() < self.next && self.slot[file.index()] != NONE {
                 self.refresh(tree, file);
+                removed |= tree.is_removed(file);
             }
         }
         self.changes_seen = changes.len();
+        if removed {
+            self.matches.retain(|&f| !tree.is_removed(f));
+        }
 
         let end = tree.len().min(self.next.saturating_add(budget));
         self.slot.resize(end, NONE);
         for i in self.next..end {
             let node = NodeId::from_index(i as u32);
-            if !tree.is_dir(node) && self.matcher.matches(tree.name(node)) {
+            if !tree.is_dir(node) && !tree.is_removed(node) && self.matcher.matches(tree.name(node))
+            {
                 self.add(tree, node);
             }
         }
@@ -183,6 +189,7 @@ impl Search {
             t.unknown = t
                 .unknown
                 .wrapping_add(new.unknown.wrapping_sub(old.unknown));
+            t.files = t.files.wrapping_add(new.files.wrapping_sub(old.files));
             cur = tree.parent(n);
         }
     }
@@ -423,6 +430,47 @@ mod tests {
         assert_eq!(ranked.top(&t, usize::MAX), &expected[..]);
         assert!(ranked.is_current(&s, Metric::Allocated));
         assert!(!ranked.is_current(&s, Metric::Logical));
+    }
+
+    #[test]
+    fn removed_files_leave_the_matches_and_totals() {
+        let mut t = Tree::new("/r");
+        let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
+        let e = t.add_dir(d, "e".as_ref()).unwrap();
+        let keep = t
+            .add_file(NodeId::ROOT, "a.log".as_ref(), sizes(1, 4096), 0)
+            .unwrap();
+        let gone = t.add_file(d, "b.log".as_ref(), sizes(2, 8192), 0).unwrap();
+        let deeper = t.add_file(e, "c.log".as_ref(), sizes(4, 4096), 0).unwrap();
+        let mut s = search("log", &t);
+        assert_eq!(s.totals(NodeId::ROOT).files, 3);
+        let v = s.version();
+
+        t.remove(gone);
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.totals(d).files, 1);
+        assert_eq!(s.totals(d).allocated, 4096);
+        assert!(s.version() > v);
+        assert_eq!(s.matches().len(), 2);
+
+        t.remove(d);
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.matches(), [keep]);
+        assert_eq!(
+            s.totals(NodeId::ROOT),
+            Totals {
+                logical: 1,
+                allocated: 4096,
+                unknown: 0,
+                files: 1
+            }
+        );
+        assert_eq!(s.totals(deeper).files, 0);
+
+        // A search started after the removal never sees the removed files.
+        let fresh = search("log", &t);
+        assert_eq!(fresh.matches(), [keep]);
+        assert_eq!(fresh.totals(NodeId::ROOT), s.totals(NodeId::ROOT));
     }
 
     #[test]
