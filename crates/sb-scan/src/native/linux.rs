@@ -228,6 +228,53 @@ pub fn is_remote(path: &Path) -> bool {
     rustix::fs::statfs(path).is_ok_and(|s| REMOTE.contains(&(s.f_type as u32)))
 }
 
+/// Capacity and free space from `statvfs`. The path is the volume's top
+/// folder when statx marks it as a mount root, or its mount ID or device
+/// differs from its parent's.
+pub fn volume_info(path: &Path) -> Option<super::VolumeInfo> {
+    let vfs = rustix::fs::statvfs(path).ok()?;
+    let stx = statx(CWD, path, STAT_FLAGS, STAT_MASK).ok()?;
+    let marked = stx
+        .stx_attributes_mask
+        .contains(StatxAttributes::MOUNT_ROOT)
+        && stx.stx_attributes.contains(StatxAttributes::MOUNT_ROOT);
+    let parent_differs = || {
+        let parent = path.join("..");
+        statx(CWD, &parent, STAT_FLAGS, STAT_MASK).is_ok_and(|p| {
+            dev(&p) != dev(&stx) || (mount_id(&p).is_some() && mount_id(&p) != mount_id(&stx))
+        })
+    };
+    let is_root = path == Path::new("/") || marked || parent_differs();
+    let filesystem = rustix::fs::statfs(path)
+        .ok()
+        .and_then(|s| filesystem_name(s.f_type as u32))
+        .map(str::to_owned);
+    Some(super::VolumeInfo {
+        is_root,
+        capacity: vfs.f_blocks.saturating_mul(vfs.f_frsize),
+        free: vfs.f_bfree.saturating_mul(vfs.f_frsize),
+        filesystem,
+        metadata: None,
+    })
+}
+
+/// Names for common `statfs` magic numbers.
+fn filesystem_name(magic: u32) -> Option<&'static str> {
+    Some(match magic {
+        0xEF53 => "ext4",
+        0x5846_5342 => "XFS",
+        0x9123_683E => "Btrfs",
+        0x2FC1_2FC1 => "ZFS",
+        0xF2F5_2010 => "F2FS",
+        0x0102_1994 => "tmpfs",
+        0x4D44 => "FAT",
+        0x2011_BAB0 => "exFAT",
+        0x7366_746E => "NTFS",
+        0x794C_7630 => "overlayfs",
+        _ => return None,
+    })
+}
+
 /// Whether the process runs as root, which bypasses permission checks.
 pub fn is_privileged() -> bool {
     rustix::process::geteuid().is_root()

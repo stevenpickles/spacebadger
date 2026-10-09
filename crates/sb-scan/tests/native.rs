@@ -197,3 +197,17 @@ fn local_folders_use_the_default_worker_count() {
         ScanConfig::default().workers
     );
 }
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn reports_volume_capacity_and_whether_the_root_is_the_volume_top() {
+    let folder = TempDir::new("volume");
+    let inside = sb_scan::native::volume_info(&folder.0).expect("volume info");
+    assert!(!inside.is_root, "a temporary folder is inside its volume");
+    assert!(inside.capacity > 0 && inside.free <= inside.capacity);
+
+    let top = folder.0.ancestors().last().expect("path has a root");
+    let volume = sb_scan::native::volume_info(top).expect("volume info");
+    assert!(volume.is_root, "{} is a volume's top folder", top.display());
+    assert_eq!(volume.capacity, inside.capacity);
+}

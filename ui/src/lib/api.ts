@@ -9,6 +9,7 @@ import type { ScanStatus } from "./protocol/ScanStatus";
 import type { SearchPage } from "./protocol/SearchPage";
 import type { SearchResultsRequest } from "./protocol/SearchResultsRequest";
 import type { SearchSummary } from "./protocol/SearchSummary";
+import type { VolumeInfo } from "./protocol/VolumeInfo";
 
 export const EXPECTED_PROTOCOL_VERSION = 2;
 
@@ -59,6 +60,11 @@ export function searchSummary(generation: number, search: number): Promise<Searc
 
 export function searchResults(request: SearchResultsRequest): Promise<SearchPage> {
   return invoke<SearchPage>("search_results", { request });
+}
+
+/** Capacity of the scanned volume; `null` where unavailable. */
+export function volumeInfo(generation: number): Promise<VolumeInfo | null> {
+  return invoke<VolumeInfo | null>("volume_info", { generation });
 }
 
 /** Shows the item selected in Explorer, Finder, or the desktop's file manager. */

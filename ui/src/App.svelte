@@ -12,6 +12,7 @@
     reveal,
     searchSet,
     searchSummary,
+    volumeInfo,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
   import type { ColorMode } from "./lib/colors";
@@ -31,6 +32,8 @@
   import type { MenuRequest, Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
+  import type { VolumeInfo } from "./lib/protocol/VolumeInfo";
+  import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
 
@@ -48,6 +51,9 @@
   let showOmissions = $state(false);
   let problem = $state<string | null>(null);
   let privileged = $state(false);
+  let os = $state("");
+  let volume = $state.raw<VolumeInfo | null>(null);
+  let showVolume = $state(saved("volume") === "on");
   let fileManager = $state(fileManagerName(""));
   let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
   /** What's typed in the filter box. */
@@ -65,6 +71,7 @@
   appInfo().then(
     (info) => {
       privileged = info.privilegedAccess;
+      os = info.os;
       fileManager = fileManagerName(info.os);
       if (info.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
         problem = `The backend speaks protocol ${info.protocolVersion}, but this interface expects ${EXPECTED_PROTOCOL_VERSION}.`;
@@ -73,22 +80,30 @@
     (e: unknown) => (problem = `Backend unavailable: ${String(e)}`),
   );
 
-  // The color mode is a per-viewer preference; storage may be unavailable.
-  function savedColors(): ColorMode {
+  // Display choices are per-viewer preferences; storage may be unavailable,
+  // and then the defaults apply.
+  function saved(key: string): string | null {
     try {
-      return localStorage.getItem("colors") === "type" ? "type" : "depth";
+      return localStorage.getItem(key);
     } catch {
-      return "depth";
+      return null;
     }
   }
 
-  $effect(() => {
+  function savedColors(): ColorMode {
+    return saved("colors") === "type" ? "type" : "depth";
+  }
+
+  function remember(key: string, value: string) {
     try {
-      localStorage.setItem("colors", colors);
+      localStorage.setItem(key, value);
     } catch {
-      // Not remembered; the default applies next time.
+      // Not remembered.
     }
-  });
+  }
+
+  $effect(() => remember("colors", colors));
+  $effect(() => remember("volume", showVolume ? "on" : "off"));
 
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
@@ -102,6 +117,7 @@
     layout = null;
     menu = null;
     search = null;
+    volume = null;
     // Keep the filter across Refresh and new roots.
     if (query) applySearch(query);
   }
@@ -139,6 +155,21 @@
   function cancel() {
     if (generation !== null) scanCancel(generation).catch((e: unknown) => (problem = String(e)));
   }
+
+  // Volume capacity, read when a scan starts and again when it ends, since
+  // free space may have changed meanwhile.
+  const finished = $derived(status !== null && status.phase.kind !== "scanning");
+  $effect(() => {
+    const gen = generation;
+    void finished;
+    if (gen === null) return;
+    volumeInfo(gen).then(
+      (v) => {
+        if (gen === generation) volume = v;
+      },
+      () => {},
+    );
+  });
 
   // ---- filename search ------------------------------------------------
 
@@ -351,6 +382,14 @@
       <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
       <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
     </div>
+    <label
+      class="check"
+      title={volume?.isRoot
+        ? "Show the volume's capacity, free space, and space not attributed to files"
+        : "Available when a whole drive or volume is scanned"}
+    >
+      <input type="checkbox" bind:checked={showVolume} disabled={!volume?.isRoot} /> Volume overview
+    </label>
     <div class="metric" role="radiogroup" aria-label="Colors">
       <label><input type="radio" bind:group={colors} value="depth" /> Depth colors</label>
       <label><input type="radio" bind:group={colors} value="type" /> File type colors</label>
@@ -387,6 +426,16 @@
     </div>
   {:else if status?.phase.kind === "failed"}
     <div class="banner error" role="alert">{status.phase.message}</div>
+  {/if}
+
+  {#if showVolume && volume?.isRoot && status}
+    {#if metric === "allocated" && !search}
+      <VolumeStrip {volume} {status} {os} onshowomissions={() => (showOmissions = true)} />
+    {:else}
+      <p class="volume-note">
+        The volume overview compares allocated space, so it's hidden with Logical size or a filter.
+      </p>
+    {/if}
   {/if}
 
   <div class="crumbs">
@@ -527,6 +576,20 @@
     color: var(--fg);
   }
   .muted {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 12px;
+    cursor: pointer;
+  }
+  .volume-note {
+    margin: 0;
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--line);
     color: var(--muted);
     font-size: 12px;
   }
