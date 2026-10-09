@@ -283,6 +283,18 @@ impl Session {
         })
     }
 
+    /// Capacity of the volume holding the root, read now (free space changes).
+    pub fn volume(&self) -> Option<proto::VolumeInfo> {
+        native::volume_info(&self.root).map(|v| proto::VolumeInfo {
+            generation: self.generation(),
+            is_root: v.is_root,
+            capacity: v.capacity,
+            free: v.free,
+            filesystem: v.filesystem,
+            metadata: v.metadata,
+        })
+    }
+
     pub fn details(&self, id: u32) -> Result<proto::NodeDetails, String> {
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;

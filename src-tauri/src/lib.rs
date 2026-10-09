@@ -8,7 +8,7 @@ mod session;
 
 use sb_protocol::{
     AppInfo, LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted,
-    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
+    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -150,6 +150,18 @@ async fn search_results(
     state.session(request.generation)?.search_results(&request)
 }
 
+/// Capacity and free space of the scanned volume; `None` where unavailable.
+#[tauri::command]
+async fn volume_info(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<Option<VolumeInfo>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.volume())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Shows a scanned file or folder selected in the system file manager
 /// (Explorer, Finder, or the desktop's file manager).
 #[tauri::command]
@@ -200,7 +212,8 @@ pub fn run() {
             reveal,
             search_set,
             search_summary,
-            search_results
+            search_results,
+            volume_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");
