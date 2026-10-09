@@ -15,6 +15,7 @@
     searchSet,
     searchSummary,
     selectionSummary,
+    setDeleteAllowed,
     trashName,
     volumeInfo,
   } from "./lib/api";
@@ -72,11 +73,9 @@
   let showVolume = $state(saved("volume") === "on");
   let fileManager = $state(fileManagerName(""));
   let trash = $state(trashName(""));
-  let confirmDelete = $state.raw<{
-    permanent: boolean;
-    nodes: number[];
-    summary: SelectionSummary;
-  } | null>(null);
+  /** Deleting is turned on. Never saved: every start begins with it off. */
+  let allowDelete = $state(false);
+  let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
   let deleting = $state(false);
   /** Counts completed deletes, which change free space. */
   let deletions = $state(0);
@@ -321,40 +320,49 @@
     return selection && !selection.other ? [selection.node] : [];
   }
 
-  /** Menu entries to delete `node`, or the selection it belongs to. */
+  /** Menu entry to delete `node`, or the selection it belongs to; none
+   * until deleting is turned on. */
   function deleteItemsFor(node: number): MenuItem[] {
+    if (!allowDelete) return [];
     const count = pickedSet.has(node) ? picked.length : 1;
     const what = count > 1 ? `${count} items ` : "";
-    const blocked = { disabled: !!deleteBlocked, title: deleteBlocked ?? undefined };
     return [
       {
-        label: `Move ${what}to ${trash}`,
+        label: `Move ${what}to ${trash}…`,
         hint: "Del",
-        action: () => askDelete(false),
+        action: askDelete,
         separator: true,
-        ...blocked,
-      },
-      {
-        label: `Delete ${what}permanently…`,
-        hint: "Shift+Del",
-        action: () => askDelete(true),
         danger: true,
-        ...blocked,
+        disabled: !!deleteBlocked,
+        title: deleteBlocked ?? undefined,
       },
     ];
   }
 
-  async function askDelete(permanent: boolean) {
+  async function changeAllowDelete(on: boolean) {
+    try {
+      allowDelete = await setDeleteAllowed(on);
+    } catch (e) {
+      allowDelete = false;
+      problem = `Couldn't change the delete setting: ${String(e)}`;
+    }
+  }
+
+  async function askDelete() {
     const gen = generation;
     const nodes = deleteTargets();
     if (gen === null || nodes.length === 0 || confirmDelete) return;
+    if (!allowDelete) {
+      flash(`Turn on “Allow deleting” in the toolbar to move items to the ${trash}.`, 3000);
+      return;
+    }
     if (deleteBlocked) {
       flash(deleteBlocked);
       return;
     }
     try {
       const summary = await selectionSummary({ generation: gen, nodes });
-      if (gen === generation && summary.items > 0) confirmDelete = { permanent, nodes, summary };
+      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary };
     } catch (e) {
       problem = `Couldn't prepare the delete: ${String(e)}`;
     }
@@ -366,11 +374,7 @@
     if (!c || gen === null || deleting) return;
     deleting = true;
     try {
-      const report = await deleteItems({
-        generation: gen,
-        nodes: c.nodes,
-        mode: c.permanent ? "permanent" : "recycle",
-      });
+      const report = await deleteItems({ generation: gen, nodes: c.nodes });
       if (gen === generation) afterDelete(report, c.summary);
     } catch (e) {
       problem = `Couldn't delete: ${String(e)}`;
@@ -399,15 +403,12 @@
       const only = asked.items === 1 ? asked.samples[0] : undefined;
       const what = only ? `“${only.name}”` : plural(done, "item");
       const size = formatBytes(r.allocated);
-      flash(
-        r.mode === "recycle" ? `Moved ${what} (${size}) to the ${trash}` : `Deleted ${what} (${size})`,
-        4000,
-      );
+      flash(`Moved ${what} (${size}) to the ${trash}`, 4000);
     }
     if (failed.length > 0) {
       const lines = r.failed.slice(0, 3).map((f) => `${f.path}: ${f.message}`);
       if (r.failed.length > 3) lines.push(`…and ${plural(r.failed.length - 3, "more item")}.`);
-      problem = [`Couldn't delete ${plural(failed.length, "item")}:`, ...lines].join("\n");
+      problem = [`Couldn't move ${plural(failed.length, "item")}:`, ...lines].join("\n");
     }
   }
 
@@ -606,6 +607,18 @@
       />
       {#if searching}<span class="muted" role="status">Searching…</span>{/if}
     </div>
+    <label
+      class="check allow"
+      class:on={allowDelete}
+      title="Lets you move items to the {trash}. Turns itself off when SpaceBadger closes."
+    >
+      <input
+        type="checkbox"
+        checked={allowDelete}
+        onchange={(e) => changeAllowDelete(e.currentTarget.checked)}
+      />
+      Allow deleting
+    </label>
     {#if privileged}
       <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
         Administrator access
@@ -696,6 +709,7 @@
         {fileManager}
         trashName={trash}
         {modKey}
+        canDelete={allowDelete}
         {deleteBlocked}
         onopen={openFolder}
         onreveal={showInFileManager}
@@ -763,7 +777,6 @@
   {#if confirmDelete}
     <DeleteDialog
       summary={confirmDelete.summary}
-      permanent={confirmDelete.permanent}
       trashName={trash}
       filtered={search !== null}
       {privileged}
@@ -826,6 +839,13 @@
     gap: 4px;
     margin-left: 12px;
     cursor: pointer;
+  }
+  .allow.on {
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--danger-bg);
+    color: var(--danger);
+    font-weight: 600;
   }
   .volume-note {
     margin: 0;

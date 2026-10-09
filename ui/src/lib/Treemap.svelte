@@ -52,8 +52,8 @@
     anchor: number | null;
     /** A click or key changed the selection; `null` clears it. */
     onpick: (pick: Pick | null) => void;
-    /** Delete, or Shift+Delete for `permanent`. */
-    ondelete?: (permanent: boolean) => void;
+    /** The Delete key. */
+    ondelete?: () => void;
     /** Double-click or Enter on a folder (or merged small items). */
     onopen: (node: number) => void;
     /** Backspace: go to the parent folder. */
@@ -534,7 +534,7 @@
     } else if (e.key === " " && toggles(e) && selection && !selection.other) {
       onpick({ focus: selection, nodes: [selection.node], mode: "toggle", keepAnchor: false });
     } else if (e.key === "Delete") {
-      ondelete?.(e.shiftKey);
+      ondelete?.();
     } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
       menuFromKeyboard();
     } else {
@@ -576,7 +576,7 @@
   bind:this={container}
   tabindex="0"
   role="application"
-  aria-label="Treemap. Arrow keys move the selection, Ctrl+click or Shift+click selects several items, Enter opens a folder, Backspace goes up, Delete moves the selection to the trash, Shift+F10 shows actions, Escape clears the selection."
+  aria-label="Treemap. Arrow keys move the selection, Ctrl+click or Shift+click selects several items, Enter opens a folder, Backspace goes up, Delete moves the selection to the trash once deleting is allowed, Shift+F10 shows actions, Escape clears the selection."
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}

@@ -21,8 +21,8 @@
     /** Where Shift ranges start. */
     anchor: number | null;
     onpick: (pick: Pick) => void;
-    /** Delete, or Shift+Delete for `permanent`. */
-    ondelete: (permanent: boolean) => void;
+    /** The Delete key. */
+    ondelete: () => void;
     onopen: (node: number) => void;
     onclose: () => void;
   }
@@ -80,7 +80,7 @@
 
   function onKey(e: KeyboardEvent) {
     if (e.key !== "Delete") return;
-    ondelete(e.shiftKey);
+    ondelete();
     e.preventDefault();
   }
 </script>

@@ -19,12 +19,14 @@
     trashName: string;
     /** "Ctrl", or "⌘" on macOS. */
     modKey: string;
+    /** Deleting is turned on for this run of the app. */
+    canDelete: boolean;
     /** Why deleting isn't available now, if it isn't. */
     deleteBlocked: string | null;
     onopen: (node: number) => void;
     onreveal: (node: number) => void;
     oncopy: (node: number) => void;
-    ondelete: (permanent: boolean) => void;
+    ondelete: () => void;
   }
 
   let {
@@ -36,6 +38,7 @@
     fileManager,
     trashName,
     modKey,
+    canDelete,
     deleteBlocked,
     onopen,
     onreveal,
@@ -53,20 +56,13 @@
 </script>
 
 {#snippet deleteActions()}
-  <div class="actions delete">
-    <button type="button" disabled={!!deleteBlocked} title={deleteBlocked} onclick={() => ondelete(false)}>
-      Move to {trashName}
-    </button>
-    <button
-      type="button"
-      class="danger"
-      disabled={!!deleteBlocked}
-      title={deleteBlocked}
-      onclick={() => ondelete(true)}
-    >
-      Delete permanently…
-    </button>
-  </div>
+  {#if canDelete}
+    <div class="actions delete">
+      <button type="button" class="danger" disabled={!!deleteBlocked} title={deleteBlocked} onclick={ondelete}>
+        Move to {trashName}…
+      </button>
+    </div>
+  {/if}
 {/snippet}
 
 <section class="details" aria-label="Selected item" aria-live="polite">

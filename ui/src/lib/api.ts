@@ -17,7 +17,7 @@ import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
-export const EXPECTED_PROTOCOL_VERSION = 3;
+export const EXPECTED_PROTOCOL_VERSION = 4;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
@@ -87,9 +87,15 @@ export function selectionSummary(request: SelectionRequest): Promise<SelectionSu
   return invoke<SelectionSummary>("selection_summary", { request });
 }
 
+/** Turns deleting on or off for this run of the app. It always starts off. */
+export function setDeleteAllowed(allowed: boolean): Promise<boolean> {
+  return invoke<boolean>("set_delete_allowed", { allowed });
+}
+
 /**
- * Deletes items (folders with their contents) and removes them from the
- * scan; a status update with a new revision follows. Rejects while scanning.
+ * Moves items (folders with their contents) to the Recycle Bin or Trash and
+ * removes them from the scan; a status update with a new revision follows.
+ * Rejects unless deleting is turned on, and while scanning.
  */
 export function deleteItems(request: DeleteRequest): Promise<DeleteReport> {
   return invoke<DeleteReport>("delete_items", { request });

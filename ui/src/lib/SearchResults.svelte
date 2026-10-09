@@ -22,8 +22,8 @@
     /** Where Shift ranges start. */
     anchor: number | null;
     onpick: (pick: Pick) => void;
-    /** Delete, or Shift+Delete for `permanent`. */
-    ondelete: (permanent: boolean) => void;
+    /** The Delete key. */
+    ondelete: () => void;
     /** Open the containing folder in the map and select the file. */
     onshow: (row: SearchRow) => void;
     onmenu: (row: SearchRow, x: number, y: number) => void;
@@ -191,7 +191,7 @@
       action();
       e.preventDefault();
     } else if (e.key === "Delete") {
-      ondelete(e.shiftKey);
+      ondelete();
       e.preventDefault();
     } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
       const row = rows.get(active);
