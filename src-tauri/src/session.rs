@@ -1,15 +1,17 @@
 //! One scan and the view state derived from it, plus conversions from the
 //! scanner's types to the protocol's.
 
+use crate::delete::{self, Outcome};
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
+use sb_core::selection;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -21,14 +23,19 @@ const SEARCH_STEP: usize = 200_000;
 /// Largest page of search results returned at once.
 const MAX_PAGE: u32 = 500;
 
-// Lock order: `search` before the tree, and `order` last.
+type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
+
+// Lock order: `deleting` first, `search` before the tree, and `order` last.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
+    on_status: StatusSink,
     order: Mutex<OrderCache>,
     search: Mutex<Option<ActiveSearch>>,
     /// Number of the most recently requested search.
     latest_search: AtomicU32,
+    /// Held while deleting, so deletes run one at a time.
+    deleting: Mutex<()>,
 }
 
 struct ActiveSearch {
@@ -41,22 +48,27 @@ struct ActiveSearch {
 }
 
 impl Session {
-    pub fn start(root: PathBuf, on_status: impl Fn(proto::ScanStatus) + Send + 'static) -> Self {
+    pub fn start(
+        root: PathBuf,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
+        let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
+        let sink = Arc::clone(&on_status);
         let scan = Scan::start(
             root.clone(),
             NativeFs::new(),
             native::scan_config(&root),
-            move |p| {
-                on_status(status(&display, p));
-            },
+            move |p| sink(status(&display, p)),
         );
         Self {
             root,
             scan,
+            on_status,
             order: Mutex::new(OrderCache::default()),
             search: Mutex::new(None),
             latest_search: AtomicU32::new(0),
+            deleting: Mutex::new(()),
         }
     }
 
@@ -364,6 +376,109 @@ impl Session {
         })
     }
 
+    /// What a set of selected items amounts to.
+    pub fn selection(&self, nodes: &[u32]) -> Result<proto::SelectionSummary, String> {
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let r = selection::resolve(&tree, nodes);
+        Ok(proto::SelectionSummary {
+            generation: self.generation(),
+            items: r.items.len() as u32,
+            folders: r.folders as u32,
+            files: r.files,
+            logical: r.logical,
+            allocated: r.allocated,
+            unknown_allocation_files: r.unknown,
+            missing: r.missing as u32,
+            samples: r
+                .items
+                .iter()
+                .take(proto::SELECTION_SAMPLES)
+                .map(|&n| proto::SelectedItem {
+                    node: n.index() as u32,
+                    name: node_name(&tree, n),
+                    path: display_path(&tree.path(n)),
+                    folder: tree.is_dir(n),
+                    logical: tree.logical(n),
+                    allocated: if tree.is_dir(n) {
+                        Some(tree.allocated(n))
+                    } else {
+                        tree.file_allocated(n).get()
+                    },
+                    files: u64::from(tree.file_count(n)),
+                })
+                .collect(),
+        })
+    }
+
+    /// Deletes the selected items from disk and removes those now gone from
+    /// the scan, which is published as a new revision. Refused while the
+    /// scan runs, since the scanner may still be adding to them.
+    pub fn delete(
+        &self,
+        nodes: &[u32],
+        mode: proto::DeleteMode,
+    ) -> Result<proto::DeleteReport, String> {
+        let _one_at_a_time = self
+            .deleting
+            .lock()
+            .map_err(|_| "deleting is unavailable")?;
+        if !self.scan.progress().state.is_finished() {
+            return Err("Items can be deleted once the scan finishes or is cancelled.".into());
+        }
+        let targets: Vec<(NodeId, PathBuf, bool)> = {
+            let tree = self.scan.tree();
+            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            selection::resolve(&tree, nodes)
+                .items
+                .into_iter()
+                .map(|n| (n, tree.path(n), tree.is_dir(n)))
+                .collect()
+        };
+        let mut gone = Vec::new();
+        let mut already_gone = 0;
+        let mut failed = Vec::new();
+        for (n, path, folder) in targets {
+            match delete::delete(&path, folder, mode) {
+                Outcome::Deleted => gone.push(n),
+                Outcome::AlreadyGone => {
+                    already_gone += 1;
+                    gone.push(n);
+                }
+                Outcome::Failed(message) => failed.push(proto::DeleteFailure {
+                    node: n.index() as u32,
+                    path: display_path(&path),
+                    message,
+                }),
+            }
+        }
+        let mut report = proto::DeleteReport {
+            generation: self.generation(),
+            mode,
+            deleted: Vec::new(),
+            already_gone,
+            failed,
+            files: 0,
+            logical: 0,
+            allocated: 0,
+        };
+        if gone.is_empty() {
+            return Ok(report);
+        }
+        let edited = self.scan.edit_finished(|tree| {
+            for &n in &gone {
+                report.files += u64::from(tree.file_count(n));
+                report.logical += tree.logical(n);
+                report.allocated += tree.allocated(n);
+                tree.remove(n);
+            }
+        });
+        let ((), progress) = edited.ok_or("scan data is unavailable")?;
+        report.deleted = gone.iter().map(|n| n.index() as u32).collect();
+        (self.on_status)(status(&display_path(&self.root), &progress));
+        Ok(report)
+    }
+
     /// The native path of a node, for file manager actions.
     pub fn path(&self, id: u32) -> Result<PathBuf, String> {
         let tree = self.scan.tree();
@@ -395,10 +510,12 @@ fn metric(m: proto::Metric) -> layout::Metric {
 
 fn node(tree: &Tree, id: u32) -> Result<NodeId, String> {
     let n = NodeId::from_index(id);
-    if tree.contains(n) {
-        Ok(n)
-    } else {
+    if !tree.contains(n) {
         Err(format!("unknown node {id}"))
+    } else if tree.is_removed(n) {
+        Err("It was deleted.".into())
+    } else {
+        Ok(n)
     }
 }
 
@@ -473,5 +590,101 @@ fn omission_reason(reason: OmissionReason) -> proto::OmissionReason {
         OmissionReason::Disconnected => proto::OmissionReason::Disconnected,
         OmissionReason::Unavailable => proto::OmissionReason::Unavailable,
         OmissionReason::Other => proto::OmissionReason::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> TempDir {
+        let dir = std::env::temp_dir().join(format!("sb-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("old").join("logs")).unwrap();
+        std::fs::write(dir.join("old").join("logs").join("a.log"), vec![0; 5000]).unwrap();
+        std::fs::write(dir.join("old").join("b.log"), vec![0; 3000]).unwrap();
+        std::fs::write(dir.join("keep.txt"), vec![0; 100]).unwrap();
+        TempDir(dir)
+    }
+
+    fn finished(statuses: &Mutex<Vec<proto::ScanStatus>>) -> bool {
+        statuses
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|s| s.phase != proto::ScanPhase::Scanning)
+    }
+
+    fn child(tree: &Tree, parent: NodeId, name: &str) -> NodeId {
+        tree.children(parent)
+            .find(|&c| tree.name(c) == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn deletes_selected_items_and_publishes_the_change() {
+        let tmp = fixture();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (old, a, keep) = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let old = child(&tree, NodeId::ROOT, "old");
+            let logs = child(&tree, old, "logs");
+            (
+                old,
+                child(&tree, logs, "a.log"),
+                child(&tree, NodeId::ROOT, "keep.txt"),
+            )
+        };
+        let id = |n: NodeId| n.index() as u32;
+        let search = session.search_set("log").unwrap().unwrap();
+        assert_eq!(search.files, 2);
+
+        let summary = session.selection(&[id(a), id(old), 0]).unwrap();
+        assert_eq!((summary.items, summary.folders, summary.files), (1, 1, 2));
+        assert_eq!(summary.logical, 8000);
+        assert_eq!(summary.missing, 1, "the scan root is never an item");
+
+        let before = session.scan.progress().revision;
+        let report = session
+            .delete(&[id(a), id(old)], proto::DeleteMode::Permanent)
+            .unwrap();
+        assert_eq!(report.deleted, [id(old)]);
+        assert!(report.failed.is_empty());
+        assert_eq!((report.files, report.logical), (2, 8000));
+        assert!(!tmp.0.join("old").exists());
+        assert!(tmp.0.join("keep.txt").exists());
+
+        let last = statuses.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.revision, before + 1);
+        assert_eq!((last.files, last.dirs, last.logical), (1, 0, 100));
+        assert!(session.details(id(old)).is_err());
+        assert!(session.details(id(keep)).is_ok());
+        let summary = session.search_summary(search.search).unwrap();
+        assert_eq!(summary.files, 0);
+
+        // Already gone: removed from the scan without an error.
+        std::fs::remove_file(tmp.0.join("keep.txt")).unwrap();
+        let report = session
+            .delete(&[id(keep)], proto::DeleteMode::Permanent)
+            .unwrap();
+        assert_eq!((report.deleted.len(), report.already_gone), (1, 1));
+        assert_eq!(session.status().files, 0);
     }
 }

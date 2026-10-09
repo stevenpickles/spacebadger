@@ -8,9 +8,9 @@ mod delete;
 mod session;
 
 use sb_protocol::{
-    AppInfo, LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted,
-    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary, SmallItemsPage, SmallItemsRequest,
-    VolumeInfo,
+    AppInfo, DeleteReport, DeleteRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
+    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
+    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -173,6 +173,29 @@ async fn volume_info(
         .map_err(|e| e.to_string())
 }
 
+/// What a set of selected items amounts to, for the details panel and the
+/// delete confirmation.
+#[tauri::command]
+async fn selection_summary(
+    state: State<'_, AppState>,
+    request: SelectionRequest,
+) -> Result<SelectionSummary, String> {
+    state.session(request.generation)?.selection(&request.nodes)
+}
+
+/// Deletes selected items (folders with their contents) and removes them
+/// from the scan. Runs on a blocking thread: large folders take a while.
+#[tauri::command]
+async fn delete_items(
+    state: State<'_, AppState>,
+    request: DeleteRequest,
+) -> Result<DeleteReport, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.delete(&request.nodes, request.mode))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Shows a scanned file or folder selected in the system file manager
 /// (Explorer, Finder, or the desktop's file manager).
 #[tauri::command]
@@ -225,7 +248,9 @@ pub fn run() {
             search_summary,
             search_results,
             small_items,
-            volume_info
+            volume_info,
+            selection_summary,
+            delete_items
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");
