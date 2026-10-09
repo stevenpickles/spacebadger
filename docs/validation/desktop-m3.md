@@ -40,6 +40,27 @@ Driven through Windows UI Automation and captured with `PrintWindow`:
 
 Synthetic mouse and keyboard input is blocked in the automation session, so these were not exercised automatically: click selection, double-click zoom, breadcrumbs, and keyboard navigation. They need a manual pass.
 
+The user ran that manual pass on Windows, from an elevated prompt, after merge; all worked.
+
+## Follow-up: context menu and reveal (2026-10-09)
+
+Branch `feature/5/context-menu`. Right-click (or the Menu key, or Shift+F10) on the map shows Open in map, Up one level, Show in Explorer/Finder/file manager, and Copy path; the details panel has the same reveal and copy buttons.
+
+- **Reveal** uses `tauri-plugin-opener` 2.7.0's `reveal_item_in_dir`, called from Rust with the node's native path. Its source meets the plan's rules: `SHOpenFolderAndSelectItems` on Windows, `NSWorkspace activateFileViewerSelectingURLs` on macOS, `org.freedesktop.FileManager1.ShowItems` on Linux with the OpenURI portal's `OpenDirectory` as fallback. No shell is involved. The path is checked first; a missing item gets "… no longer exists. Refresh to update the map."
+- **Driven on Windows** by posting mouse and key messages to the webview's render window (this works where `SendInput` doesn't), checked with screenshots and the Shell's open-window list:
+
+| Check | Result |
+|---|---|
+| Right-click a file | File selected; menu shows Show in Explorer, Copy path |
+| Show in Explorer on `` a&b; echo pwned $(whoami) %PATH% `x`.txt `` | Explorer opened at the folder with that file selected; nothing ran |
+| Show in Explorer on `ünïcödé 文件夹\日本語 ファイル.dat` | Explorer opened with the file selected |
+| Copy path on the Unicode file | Clipboard holds the exact path |
+| Right-click a folder header, Enter | Menu adds "Open in map"; Enter opened the folder |
+| Menu key in a subfolder, Enter | "Up one level" first; Enter went up and reselected the folder |
+| Reveal a file deleted after the scan | Banner: "… plain.bin no longer exists. Refresh to update the map." |
+
+Not exercised: Shift+F10 (posted messages can't carry the Shift state), and reveal on Linux and macOS.
+
 ## Known gaps
 
 - "Other small items" can be selected, and its folder opened, but its members are only listed by filename search in milestone 4.
