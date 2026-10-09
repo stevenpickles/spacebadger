@@ -3,4 +3,9 @@
 /**
  * Static information about the running backend.
  */
-export type AppInfo = { protocolVersion: number, appVersion: string, os: string, arch: string, };
+export type AppInfo = { protocolVersion: number, appVersion: string, os: string, arch: string, 
+/**
+ * Scans bypass permission checks because the app was started as
+ * administrator or root. The app never elevates itself.
+ */
+privilegedAccess: boolean, };

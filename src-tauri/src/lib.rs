@@ -53,6 +53,7 @@ fn app_info() -> AppInfo {
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        privileged_access: sb_scan::native::privileged_access(),
     }
 }
 

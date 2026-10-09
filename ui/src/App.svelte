@@ -36,6 +36,7 @@
   let layout = $state.raw<DecodedLayout | null>(null);
   let showOmissions = $state(false);
   let problem = $state<string | null>(null);
+  let privileged = $state(false);
 
   const scanning = $derived(status?.phase.kind === "scanning");
   const elapsedMs = $derived(
@@ -44,6 +45,7 @@
 
   appInfo().then(
     (info) => {
+      privileged = info.privilegedAccess;
       if (info.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
         problem = `The backend speaks protocol ${info.protocolVersion}, but this interface expects ${EXPECTED_PROTOCOL_VERSION}.`;
       }
@@ -173,6 +175,11 @@
       <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
       <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
     </div>
+    {#if privileged}
+      <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
+        Administrator access
+      </span>
+    {/if}
   </div>
 
   {#if problem}
@@ -263,6 +270,13 @@
     align-items: center;
     gap: 4px;
     cursor: pointer;
+  }
+  .badge {
+    margin-left: auto;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--warn-bg);
+    font-size: 12px;
   }
   .crumbs {
     padding: 4px 8px;

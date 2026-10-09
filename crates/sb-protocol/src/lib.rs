@@ -28,6 +28,9 @@ pub struct AppInfo {
     pub app_version: String,
     pub os: String,
     pub arch: String,
+    /// Scans bypass permission checks because the app was started as
+    /// administrator or root. The app never elevates itself.
+    pub privileged_access: bool,
 }
 
 /// Which size gives treemap area.
@@ -205,6 +208,7 @@ mod tests {
             app_version: "0.1.0".into(),
             os: "windows".into(),
             arch: "x86_64".into(),
+            privileged_access: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["protocolVersion"], PROTOCOL_VERSION);
