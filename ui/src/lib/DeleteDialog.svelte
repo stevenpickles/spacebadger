@@ -1,12 +1,13 @@
 <script lang="ts">
-  // Confirms a delete, saying exactly what it covers. Moving to the trash
-  // starts on the confirm button; deleting permanently starts on Cancel.
+  // Confirms moving items to the Recycle Bin or Trash, saying exactly what
+  // it covers. The confirm button stays disabled until the word "delete" is
+  // typed and a short countdown has run, so a reflexive Enter or click can't
+  // go through.
   import { describeItems, formatBytes, plural } from "./format";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
 
   interface Props {
     summary: SelectionSummary;
-    permanent: boolean;
     /** "Recycle Bin" or "Trash". */
     trashName: string;
     /** A filename filter is active, so folders hold more than is drawn. */
@@ -19,32 +20,54 @@
     oncancel: () => void;
   }
 
-  let { summary, permanent, trashName, filtered, privileged, busy, onconfirm, oncancel }: Props =
-    $props();
+  let { summary, trashName, filtered, privileged, busy, onconfirm, oncancel }: Props = $props();
 
+  /** What has to be typed. */
+  const WORD = "delete";
+  /** Seconds before the confirm button can be used. */
+  const WAIT = 3;
+
+  let typed = $state("");
+  let left = $state(WAIT);
+  let input: HTMLInputElement;
   let cancelButton: HTMLButtonElement;
   let confirmButton: HTMLButtonElement;
   const returnFocus = document.activeElement as HTMLElement | null;
 
+  const ready = $derived(typed.trim().toLowerCase() === WORD && left === 0 && !busy);
+
   const what = $derived(
     summary.items === 1 && summary.samples[0] ? `“${summary.samples[0].name}”` : plural(summary.items, "item"),
   );
-  const title = $derived(permanent ? `Permanently delete ${what}?` : `Move ${what} to the ${trashName}?`);
-
   const contents = $derived(describeItems(summary.items, summary.folders, summary.files));
 
   $effect(() => {
-    (permanent ? cancelButton : confirmButton).focus();
-    return () => returnFocus?.focus();
+    input.focus();
+    const timer = setInterval(() => {
+      left = Math.max(0, left - 1);
+      if (left === 0) clearInterval(timer);
+    }, 1000);
+    return () => {
+      clearInterval(timer);
+      returnFocus?.focus();
+    };
   });
+
+  function confirm() {
+    if (ready) onconfirm();
+  }
 
   function onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       if (!busy) oncancel();
+    } else if (e.key === "Enter" && e.target === input) {
+      confirm();
     } else if (e.key === "Tab") {
       // Keep focus inside the dialog.
-      const next = document.activeElement === cancelButton ? confirmButton : cancelButton;
-      next.focus();
+      const order: HTMLElement[] = [input, cancelButton, confirmButton].filter((el) => !el.disabled);
+      const at = order.indexOf(document.activeElement as HTMLElement);
+      const next = order[(at + (e.shiftKey ? order.length - 1 : 1)) % order.length];
+      next?.focus();
     } else {
       // Keys mustn't reach the map or lists behind the dialog.
       e.stopPropagation();
@@ -65,7 +88,7 @@
     tabindex="-1"
     onkeydown={onKey}
   >
-    <h2 id="delete-title">{title}</h2>
+    <h2 id="delete-title">Move {what} to the {trashName}?</h2>
     <p id="delete-what">
       {contents}, {formatBytes(summary.allocated)} allocated ({formatBytes(summary.logical)} logical).
     </p>
@@ -80,34 +103,34 @@
         <li class="muted">and {plural(summary.items - summary.samples.length, "more item")}</li>
       {/if}
     </ul>
-    {#if permanent}
-      <p class="warning">This can't be undone. Nothing is kept in the {trashName}.</p>
-    {:else}
-      <p class="muted">
-        The space is freed when the {trashName} is emptied.
-        {#if trashName === "Recycle Bin"}
-          If an item can't go to the Recycle Bin, Windows asks before deleting it permanently.
-        {/if}
+    {#if summary.folders > 0}
+      <p class="warning">
+        Folders go with everything in them{filtered ? ", including files the filter hides" : ""}.
       </p>
     {/if}
-    {#if filtered && summary.folders > 0}
-      <p class="warning">Folders are deleted with everything in them, including files the filter hides.</p>
-    {/if}
+    <p class="muted">
+      Items that can't go to the {trashName} (on network or removable drives, or too large for it) are left where
+      they are; nothing is deleted permanently. The space is freed when the {trashName} is emptied.
+    </p>
     {#if privileged}
-      <p class="muted">SpaceBadger has administrator rights, so protected files can be deleted too.</p>
+      <p class="warning">SpaceBadger has administrator rights, so protected files can be moved too.</p>
     {/if}
-    <div class="buttons">
-      {#if busy}<span class="muted" role="status">Deleting…</span>{/if}
-      <button type="button" bind:this={cancelButton} disabled={busy} onclick={oncancel}>Cancel</button>
-      <button
-        type="button"
-        class="confirm"
-        class:danger={permanent}
-        bind:this={confirmButton}
+    <label class="type">
+      Type <strong>{WORD}</strong> to confirm
+      <input
+        type="text"
+        bind:this={input}
+        bind:value={typed}
         disabled={busy}
-        onclick={onconfirm}
-      >
-        {permanent ? "Delete permanently" : `Move to ${trashName}`}
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </label>
+    <div class="buttons">
+      {#if busy}<span class="muted" role="status">Moving…</span>{/if}
+      <button type="button" bind:this={cancelButton} disabled={busy} onclick={oncancel}>Cancel</button>
+      <button type="button" class="confirm" bind:this={confirmButton} disabled={!ready} onclick={confirm}>
+        {left > 0 ? `Move to ${trashName} (${left})` : `Move to ${trashName}`}
       </button>
     </div>
   </div>
@@ -177,6 +200,21 @@
     color: var(--danger);
     font-weight: 600;
   }
+  .type {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .type input {
+    flex: 1;
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    user-select: text;
+  }
   .buttons {
     display: flex;
     justify-content: flex-end;
@@ -188,12 +226,8 @@
     margin-right: auto;
   }
   .confirm {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--bg);
-  }
-  .confirm.danger {
     background: var(--danger);
     border-color: var(--danger);
+    color: var(--bg);
   }
 </style>
