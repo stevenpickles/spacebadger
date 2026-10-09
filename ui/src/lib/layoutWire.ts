@@ -12,11 +12,24 @@ export const RF_INCOMPLETE = 1 << 3;
 export const RF_CLOUD = 1 << 4;
 export const RF_HARDLINKED = 1 << 5;
 
+/** Mirrors sb_core::filetype::FileType, in value order. */
+export const FILE_TYPES = [
+  "Other",
+  "Video",
+  "Audio",
+  "Images",
+  "Documents",
+  "Archives",
+  "Disk images",
+  "Programs",
+  "Code",
+] as const;
+
 export const LAYOUT_TRUNCATED = 1 << 0;
 export const LAYOUT_FINAL = 1 << 1;
 
 const MAGIC = 0x314c4253; // "SBL1" read as little-endian u32
-const FORMAT_VERSION = 1;
+const FORMAT_VERSION = 2;
 const RECT_LEN = 40;
 
 /** Rectangles as parallel typed arrays, parent before child. */
@@ -38,6 +51,8 @@ export interface DecodedLayout {
   depth: Uint8Array;
   kind: Uint8Array;
   rflags: Uint8Array;
+  /** File type for files (see FILE_TYPES), else 0. */
+  ftype: Uint8Array;
   labels: Map<number, string>;
 }
 
@@ -67,6 +82,7 @@ export function decodeLayout(buffer: ArrayBuffer): DecodedLayout {
     depth: new Uint8Array(count),
     kind: new Uint8Array(count),
     rflags: new Uint8Array(count),
+    ftype: new Uint8Array(count),
     labels: new Map(),
   };
   let o = headerLen;
@@ -81,6 +97,7 @@ export function decodeLayout(buffer: ArrayBuffer): DecodedLayout {
     out.depth[i] = v.getUint8(o + 32);
     out.kind[i] = v.getUint8(o + 33);
     out.rflags[i] = v.getUint8(o + 34);
+    out.ftype[i] = v.getUint8(o + 35);
   }
   const text = new TextDecoder();
   const bytes = new Uint8Array(buffer);

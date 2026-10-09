@@ -25,13 +25,14 @@
 //!  32  u8   depth (1 = child of the view)
 //!  33  u8   kind (0 file, 1 folder, 2 other small items)
 //!  34  u8   flags (see sb_core::layout::rect_flags)
-//!  35  u8   reserved, then u32 reserved
+//!  35  u8   file type for files (see sb_core::filetype), else 0
+//!  36  u32  reserved
 //! labels, for rectangles large enough to show text
 //!   u32 rectangle index, u16 byte length, UTF-8 bytes
 //! ```
 
 pub const LAYOUT_MAGIC: [u8; 4] = *b"SBL1";
-pub const LAYOUT_FORMAT_VERSION: u16 = 1;
+pub const LAYOUT_FORMAT_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 56;
 pub const RECT_LEN: usize = 40;
 
@@ -62,6 +63,8 @@ pub struct Rect {
     pub depth: u8,
     pub kind: u8,
     pub flags: u8,
+    /// `sb_core::filetype::FileType` for files, else 0.
+    pub file_type: u8,
 }
 
 /// Encodes a layout. `labels` pairs a rectangle index with its text.
@@ -91,7 +94,7 @@ pub fn encode(header: &Header, rects: &[Rect], labels: &[(u32, &str)]) -> Vec<u8
         out.extend_from_slice(&r.node.to_le_bytes());
         out.extend_from_slice(&r.count.to_le_bytes());
         out.extend_from_slice(&r.weight.to_le_bytes());
-        out.extend_from_slice(&[r.depth, r.kind, r.flags, 0]);
+        out.extend_from_slice(&[r.depth, r.kind, r.flags, r.file_type]);
         out.extend_from_slice(&0u32.to_le_bytes());
     }
     for &(index, text) in labels {
@@ -136,6 +139,7 @@ mod tests {
             depth: 1,
             kind: 1,
             flags: 3,
+            file_type: 4,
         };
         let bytes = encode(&header, &[rect], &[(0, "naïve.txt")]);
         assert_eq!(&bytes[0..4], b"SBL1");
@@ -153,7 +157,7 @@ mod tests {
         assert_eq!(f32::from_le_bytes(r[0..4].try_into().unwrap()), 1.5);
         assert_eq!(r[16], 9);
         assert_eq!(u64::from_le_bytes(r[24..32].try_into().unwrap()), 1000);
-        assert_eq!(&r[32..35], &[1, 1, 3]);
+        assert_eq!(&r[32..36], &[1, 1, 3, 4]);
         let l = &bytes[HEADER_LEN + RECT_LEN..];
         assert_eq!(l[0], 0);
         let len = u16::from_le_bytes([l[4], l[5]]) as usize;
