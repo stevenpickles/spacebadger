@@ -493,7 +493,11 @@ mod tests {
         assert_eq!(t.allocated(NodeId::ROOT), 8192);
         assert_eq!(
             t.changed_files(),
-            [alias.index() as u32, alias.index() as u32, owner.index() as u32]
+            [
+                alias.index() as u32,
+                alias.index() as u32,
+                owner.index() as u32
+            ]
         );
     }
 
