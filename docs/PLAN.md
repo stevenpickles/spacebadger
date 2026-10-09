@@ -39,7 +39,7 @@ Derived from [`spacebadger-implementation-brief.md`](../spacebadger-implementati
   - Windows: `SHOpenFolderAndSelectItems`.
   - macOS: `NSWorkspace activateFileViewerSelectingURLs`.
   - Linux: `org.freedesktop.FileManager1.ShowItems` over D-Bus, falling back to opening the parent folder with structured arguments, never through a shell.
-  - Check first whether `tauri-plugin-opener`'s `revealItemInDir` meets these rules.
+  - `tauri-plugin-opener` 2.7.0's `reveal_item_in_dir` does all three (Linux falls back to the OpenURI portal's `OpenDirectory`), so it is used from Rust.
 
 ## Milestones
 
@@ -73,3 +73,4 @@ Derived from [`spacebadger-implementation-brief.md`](../spacebadger-implementati
 - 2026-10-08: Scanner core built (milestone 2). The default 8 workers scan ~110–190k files/s warm on NVMe; full `C:\` (2.95M files) peaks at 420 MiB. macOS adapter is portable `readdir`/`lstat` until a Mac is available. Evidence: [`docs/validation/scanner-m2.md`](validation/scanner-m2.md).
 - 2026-10-08: Space not attributable to files (67 GiB on the benchmark `C:\`) is shown as a separate "unattributed" block at whole-volume roots after a completed scan, kept distinct from file area. Elevated scans measure protected folders and NTFS metadata into it; alternate streams are opt-in. The app never elevates itself.
 - 2026-10-08: Streaming desktop slice built (milestone 3). Layout runs in Rust per view and returns a binary rect list; the interface pulls at most one layout at a time. Root layouts of a 1.57M-node tree take 4–6 ms. Network roots use 3 workers; an already-elevated Windows process enables `SeBackupPrivilege`. Evidence: [`docs/validation/desktop-m3.md`](validation/desktop-m3.md).
+- 2026-10-09: Context menu and "Show in file manager" moved ahead of the rest of milestone 4 at the user's request. Reveal uses `tauri-plugin-opener` 2.7.0 from Rust; no JavaScript permission is granted. Evidence: [`docs/validation/desktop-m3.md`](validation/desktop-m3.md#follow-up-context-menu-and-reveal-2026-10-09).
