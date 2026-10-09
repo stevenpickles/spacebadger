@@ -42,7 +42,7 @@
         <dd>{formatBytes(other.weight)} <span class="muted">({exactBytes(other.weight)})</span></dd>
       </dl>
     {/if}
-    <p class="muted">These items are too small to draw at this size.</p>
+    <p class="muted">They are too small to draw at this size, so they are listed below.</p>
     <div class="actions">
       {#if selection.node !== view}
         <button type="button" onclick={() => onopen(selection.node)}>Open folder in map</button>

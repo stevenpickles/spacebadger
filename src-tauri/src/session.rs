@@ -283,6 +283,48 @@ impl Session {
         })
     }
 
+    /// A page of the items merged into a small-items region.
+    pub fn small_items(
+        &self,
+        req: &proto::SmallItemsRequest,
+    ) -> Result<proto::SmallItemsPage, String> {
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let folder = node(&tree, req.folder)?;
+        let filter = match req.search {
+            Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
+            None => None,
+        };
+        let (items, empty) = layout::small_children(
+            &tree,
+            folder,
+            metric(req.metric),
+            filter,
+            req.count as usize,
+        );
+        let start = (req.offset as usize).min(items.len());
+        let end = start
+            .saturating_add(req.limit.min(MAX_PAGE) as usize)
+            .min(items.len());
+        Ok(proto::SmallItemsPage {
+            generation: self.generation(),
+            folder: req.folder,
+            offset: start as u32,
+            total: items.len() as u32,
+            items: items[start..end]
+                .iter()
+                .map(|&(n, weight)| proto::SmallItem {
+                    node: n.index() as u32,
+                    name: tree.name(n).to_string_lossy().into_owned(),
+                    folder: tree.is_dir(n),
+                    weight,
+                })
+                .collect(),
+            empty: empty as u32,
+        })
+    }
+
     /// Capacity of the volume holding the root, read now (free space changes).
     pub fn volume(&self) -> Option<proto::VolumeInfo> {
         native::volume_info(&self.root).map(|v| proto::VolumeInfo {

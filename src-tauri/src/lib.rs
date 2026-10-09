@@ -8,7 +8,8 @@ mod session;
 
 use sb_protocol::{
     AppInfo, LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted,
-    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary, VolumeInfo,
+    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary, SmallItemsPage, SmallItemsRequest,
+    VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -150,6 +151,15 @@ async fn search_results(
     state.session(request.generation)?.search_results(&request)
 }
 
+/// The files and folders merged into an "other small items" region.
+#[tauri::command]
+async fn small_items(
+    state: State<'_, AppState>,
+    request: SmallItemsRequest,
+) -> Result<SmallItemsPage, String> {
+    state.session(request.generation)?.small_items(&request)
+}
+
 /// Capacity and free space of the scanned volume; `None` where unavailable.
 #[tauri::command]
 async fn volume_info(
@@ -213,6 +223,7 @@ pub fn run() {
             search_set,
             search_summary,
             search_results,
+            small_items,
             volume_info
         ])
         .run(tauri::generate_context!())

@@ -272,6 +272,34 @@ pub fn layout(
     out
 }
 
+/// Children of `dir` in an "other small items" region of `count` items,
+/// largest first: the `count` smallest children with a weight, since the
+/// layout merges every child below its area threshold. Also returns how many
+/// children have no weight (they're never drawn).
+pub fn small_children(
+    tree: &Tree,
+    dir: NodeId,
+    metric: Metric,
+    filter: Option<&Search>,
+    count: usize,
+) -> (Vec<(NodeId, u64)>, usize) {
+    let mut weighted = Vec::new();
+    let mut empty = 0;
+    for c in tree.children(dir) {
+        // With a filter, only children that contain matches belong here.
+        if filter.is_some_and(|s| s.totals(c).files == 0) {
+            continue;
+        }
+        match metric.weight_in(tree, filter, c) {
+            0 => empty += 1,
+            w => weighted.push((c, w)),
+        }
+    }
+    weighted.sort_unstable_by_key(|&(id, w)| (Reverse(w), id.index()));
+    let start = weighted.len().saturating_sub(count);
+    (weighted.split_off(start), empty)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Area {
     x: f32,
@@ -713,6 +741,31 @@ mod tests {
         // a large change reorders even while scanning.
         t.update_file(a, sizes(1000));
         assert_eq!(order(&t, &mut cache, true), [a, b]);
+    }
+
+    #[test]
+    fn small_children_are_the_merged_ones_largest_first() {
+        let mut t = Tree::new("/r");
+        file(&mut t, NodeId::ROOT, "big", 1_000_000);
+        let a = file(&mut t, NodeId::ROOT, "a", 3);
+        let b = file(&mut t, NodeId::ROOT, "b", 7);
+        file(&mut t, NodeId::ROOT, "empty", 0);
+        let l = run(&t, NodeId::ROOT, &LayoutParams::new(100.0, 100.0));
+        let other = l
+            .rects
+            .iter()
+            .find(|r| r.kind == RectKind::OtherSmall)
+            .expect("small items merged");
+        let (items, empty) = small_children(
+            &t,
+            NodeId::ROOT,
+            Metric::Allocated,
+            None,
+            other.count as usize,
+        );
+        assert_eq!(items, [(b, 7), (a, 3)]);
+        assert_eq!(items.iter().map(|i| i.1).sum::<u64>(), other.weight);
+        assert_eq!(empty, 1);
     }
 
     #[test]
