@@ -1,8 +1,10 @@
 //! File-type categories for the "file type" color mode, by extension.
 //!
-//! Only the name is used; contents are never read. Extensions are compared
-//! case-insensitively. A name with no extension, or one not listed here, is
-//! [`FileType::Other`]. The numeric values are sent in the layout wire
+//! Only the name and length are used; contents are never read. Extensions
+//! are compared case-insensitively. A name with no extension, or one not
+//! listed here, is [`FileType::Other`]. `.ts` is ambiguous: TypeScript
+//! sources are small, MPEG transport streams large, so it counts as video
+//! from [`TS_VIDEO_MIN`] bytes. The numeric values are sent in the layout wire
 //! format and mirrored in `ui/src/lib/layoutWire.ts`.
 
 use std::ffi::OsStr;
@@ -83,11 +85,15 @@ const TABLE: &[(FileType, &[&str])] = &[
     ),
 ];
 
+/// `.ts` files at least this long are treated as video.
+pub const TS_VIDEO_MIN: u64 = 1 << 20;
+
 /// Longest extension in [`TABLE`].
 const MAX_EXT: usize = 8;
 
 impl FileType {
-    pub fn of(name: &OsStr) -> Self {
+    /// The type of a file with this name and logical length.
+    pub fn of(name: &OsStr, len: u64) -> Self {
         let bytes = name.as_encoded_bytes();
         let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else {
             return Self::Other;
@@ -101,6 +107,9 @@ impl FileType {
         let lower = &mut lower[..ext.len()];
         lower.copy_from_slice(ext);
         lower.make_ascii_lowercase();
+        if lower == b"ts" && len >= TS_VIDEO_MIN {
+            return Self::Video;
+        }
         TABLE
             .iter()
             .find(|(_, exts)| exts.iter().any(|e| e.as_bytes() == lower))
@@ -113,7 +122,7 @@ mod tests {
     use super::*;
 
     fn of(name: &str) -> FileType {
-        FileType::of(OsStr::new(name))
+        FileType::of(OsStr::new(name), 100)
     }
 
     #[test]
@@ -126,6 +135,14 @@ mod tests {
         assert_eq!(of("chrome.dll"), FileType::Program);
         assert_eq!(of("main.rs"), FileType::Code);
         assert_eq!(of("photo.HEIC"), FileType::Image);
+    }
+
+    #[test]
+    fn large_ts_files_are_video_and_small_ones_code() {
+        assert_eq!(of("app.ts"), FileType::Code);
+        let lesson = OsStr::new("01 Intro.TS");
+        assert_eq!(FileType::of(lesson, TS_VIDEO_MIN), FileType::Video);
+        assert_eq!(FileType::of(lesson, TS_VIDEO_MIN - 1), FileType::Code);
     }
 
     #[test]

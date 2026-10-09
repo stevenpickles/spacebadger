@@ -142,7 +142,7 @@ impl Session {
                 kind: r.kind as u8,
                 flags: r.flags,
                 file_type: if r.kind == RectKind::File {
-                    FileType::of(tree.name(r.node)) as u8
+                    FileType::of(tree.name(r.node), tree.logical(r.node)) as u8
                 } else {
                     0
                 },
