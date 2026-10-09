@@ -51,6 +51,13 @@ Derived from [`spacebadger-implementation-brief.md`](../spacebadger-implementati
 2. **Scanner core** — scoped traversal, stable identities, both metrics, omission aggregation by reason, batching, cancellation. Tested with fixture trees and a fake-filesystem adapter, no window needed.
 3. **Streaming desktop slice** — root picker, live provisional treemap, select/zoom, breadcrumbs, cancel with retained partial results.
 4. **Usability** — filename filter and results list, details panel, reveal, refresh, color modes, empty and error states, optional volume overview strip.
+   - **Unattributed space block.** At a whole-volume root, in allocated mode, with no filename filter, and only after a completed scan: one block sized as volume used (capacity − free) minus scanned allocation. It's labelled as a non-file region and opens a breakdown of likely contributors (permission-denied folders with counts and samples, filesystem metadata, shadow copies, alternate data streams, other overhead). During a scan or after cancel, the gap includes unscanned files, so the block isn't shown.
+   - **Elevated scans (scanner side, early milestone 3).** Never auto-elevate. When the process already runs elevated:
+     - Windows: enable `SeBackupPrivilege` and open directories with `FILE_FLAG_BACKUP_SEMANTICS` so protected folders (`System Volume Information`, `Config.Msi`, other users' recycle bins) list normally, which also surfaces shadow-copy storage.
+     - Windows: query NTFS metadata sizes (`FSCTL_GET_NTFS_VOLUME_DATA` for MFT valid length, plus the change journal) and show them as items in a "Filesystem metadata" block.
+     - Alternate data streams stay opt-in ("measure alternate streams"), because per-file stream queries are ~6.5× slower (milestone 1). Raw MFT reading is a separate later decision.
+     - Linux/macOS: running as root removes most permission-denied omissions; filesystem overhead (e.g. ext4 reserved blocks) stays in the residual block.
+   - Whatever remains after measured contributors is shown as "other filesystem overhead", never distributed into folders.
 5. **Scale and packaging** — `sb-bench` with 1M and 5M synthetic plus real fixtures, memory/IPC/layout tuning, native packages, README, validation report.
 
 ## Open questions
@@ -64,3 +71,4 @@ Derived from [`spacebadger-implementation-brief.md`](../spacebadger-implementati
 - 2026-10-08: Windows scanner reads allocated size from directory enumeration (`FileIdExtdDirectoryInfo`) and detects hard-link aliases by directory file ID instead of opening every file; alternate data streams are not counted. Evidence: [`docs/validation/windows-m1.md`](validation/windows-m1.md).
 - 2026-10-08: OneDrive online-only files: enumeration and attribute-only opens don't hydrate; detect cloud state from attributes because reparse tags are disguised by default. Linux mount boundaries need `STATX_ATTR_MOUNT_ROOT`/mount ID, because bind mounts share `st_dev`. Evidence: [`docs/validation/linux-m1.md`](validation/linux-m1.md).
 - 2026-10-08: Scanner core built (milestone 2). The default 8 workers scan ~110–190k files/s warm on NVMe; full `C:\` (2.95M files) peaks at 420 MiB. macOS adapter is portable `readdir`/`lstat` until a Mac is available. Evidence: [`docs/validation/scanner-m2.md`](validation/scanner-m2.md).
+- 2026-10-08: Space not attributable to files (67 GiB on the benchmark `C:\`) is shown as a separate "unattributed" block at whole-volume roots after a completed scan, kept distinct from file area. Elevated scans measure protected folders and NTFS metadata into it; alternate streams are opt-in. The app never elevates itself.
