@@ -139,6 +139,7 @@ impl Session {
                 } else {
                     0
                 },
+                parent: r.parent(&tree).index() as u32,
             });
         }
         let labels: Vec<(u32, &str)> = names.iter().map(|(i, s)| (*i, s.as_ref())).collect();

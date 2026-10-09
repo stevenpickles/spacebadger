@@ -29,7 +29,7 @@ export const LAYOUT_TRUNCATED = 1 << 0;
 export const LAYOUT_FINAL = 1 << 1;
 
 const MAGIC = 0x314c4253; // "SBL1" read as little-endian u32
-const FORMAT_VERSION = 2;
+const FORMAT_VERSION = 3;
 const RECT_LEN = 40;
 
 /** Rectangles as parallel typed arrays, parent before child. */
@@ -53,6 +53,9 @@ export interface DecodedLayout {
   rflags: Uint8Array;
   /** File type for files (see FILE_TYPES), else 0. */
   ftype: Uint8Array;
+  /** The folder whose contents each rectangle is part of. Siblings are
+   * consecutive, largest first. */
+  parent: Uint32Array;
   labels: Map<number, string>;
 }
 
@@ -83,6 +86,7 @@ export function decodeLayout(buffer: ArrayBuffer): DecodedLayout {
     kind: new Uint8Array(count),
     rflags: new Uint8Array(count),
     ftype: new Uint8Array(count),
+    parent: new Uint32Array(count),
     labels: new Map(),
   };
   let o = headerLen;
@@ -98,6 +102,7 @@ export function decodeLayout(buffer: ArrayBuffer): DecodedLayout {
     out.kind[i] = v.getUint8(o + 33);
     out.rflags[i] = v.getUint8(o + 34);
     out.ftype[i] = v.getUint8(o + 35);
+    out.parent[i] = v.getUint32(o + 36, true);
   }
   const text = new TextDecoder();
   const bytes = new Uint8Array(buffer);

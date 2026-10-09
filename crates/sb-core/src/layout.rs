@@ -115,6 +115,17 @@ pub struct LayoutRect {
     pub count: u32,
 }
 
+impl LayoutRect {
+    /// The folder whose contents this rectangle is part of. Siblings are
+    /// placed consecutively, largest first.
+    pub fn parent(&self, tree: &Tree) -> NodeId {
+        match self.kind {
+            RectKind::OtherSmall => self.node,
+            _ => tree.parent(self.node).unwrap_or(NodeId::ROOT),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
     pub rects: Vec<LayoutRect>,
