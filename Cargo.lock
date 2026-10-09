@@ -3267,6 +3267,8 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "trash",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -22,6 +22,18 @@ serde_json.workspace = true
 tauri = { workspace = true, features = [] }
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
+
+# Windows recycles through the shell directly, so it can refuse anything the
+# shell would delete permanently; elsewhere the trash crate is used.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+windows-core = "=0.62.2"
+
+[target.'cfg(not(windows))'.dependencies]
 trash.workspace = true
 
 [lints]
