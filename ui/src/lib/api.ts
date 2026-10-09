@@ -42,6 +42,18 @@ export function nodeDetails(generation: number, node: number): Promise<NodeDetai
   return invoke<NodeDetails>("node_details", { generation, node });
 }
 
+/** Shows the item selected in Explorer, Finder, or the desktop's file manager. */
+export function reveal(generation: number, node: number): Promise<void> {
+  return invoke("reveal", { generation, node });
+}
+
+/** What the system file manager is called, for menu labels. */
+export function fileManagerName(os: string): string {
+  if (os === "windows") return "Explorer";
+  if (os === "macos") return "Finder";
+  return "file manager";
+}
+
 export function onScanStatus(handler: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>(SCAN_STATUS_EVENT, (event) => handler(event.payload));
 }
