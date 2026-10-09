@@ -149,6 +149,22 @@ fn print_summary(
 ) {
     let secs = p.elapsed.as_secs_f64().max(1e-9);
     println!("root:         {}", root.display());
+    if let Some(v) = sb_scan::native::volume_info(root) {
+        println!(
+            "volume:       {} capacity, {} free, {}{}{}",
+            gib(v.capacity),
+            gib(v.free),
+            v.filesystem.as_deref().unwrap_or("unknown filesystem"),
+            if v.is_root {
+                ", root is the volume top"
+            } else {
+                ""
+            },
+            v.metadata
+                .map(|m| format!(", metadata {}", gib(m)))
+                .unwrap_or_default()
+        );
+    }
     println!("state:        {:?}", p.state);
     println!("workers:      {workers}");
     println!("elapsed:      {:.2}s", secs);
