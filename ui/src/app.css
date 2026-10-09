@@ -2,6 +2,15 @@
   color-scheme: light dark;
   --bg: #f6f6f4;
   --fg: #1f2430;
+  --panel: #ececea;
+  --line: #d3d3cf;
+  --muted: #5d6270;
+  --hover: rgb(0 0 0 / 0.07);
+  --accent: #2563c9;
+  --link: #1f56b3;
+  --danger: #b3261e;
+  --danger-bg: #f9dedc;
+  --warn-bg: #fbefc9;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 14px;
 }
@@ -10,6 +19,15 @@
   :root {
     --bg: #1b1e25;
     --fg: #e6e6e3;
+    --panel: #23272f;
+    --line: #363b45;
+    --muted: #a3a8b3;
+    --hover: rgb(255 255 255 / 0.08);
+    --accent: #7aa7ff;
+    --link: #8db4ff;
+    --danger: #ffb4ab;
+    --danger-bg: #5c1f1b;
+    --warn-bg: #4d3d0f;
   }
 }
 
@@ -17,10 +35,40 @@ html,
 body {
   margin: 0;
   height: 100%;
+  overflow: hidden;
   background: var(--bg);
   color: var(--fg);
+  user-select: none;
 }
 
-main {
-  padding: 24px;
+button {
+  font: inherit;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  button.primary {
+    color: #10131a;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
