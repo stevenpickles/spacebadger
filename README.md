@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestone 4 features complete; milestone 5 (scale and packaging) is next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–4 and 6 (selection and delete) are complete; milestone 5 has its scale work done, and packaging is next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash, or delete them permanently. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Layout
 
@@ -41,6 +41,10 @@ cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
 
 In the map: click selects, double-click (or Enter) opens a folder, Backspace goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
+
+Selecting several items works as in a file manager, in the map, the result list, and the small-items list: Ctrl+click (⌘-click on macOS) adds or removes an item, Shift+click selects the range from the last item clicked (in the map, among items in the same folder, largest first), and Ctrl+A selects everything drawn in the viewed folder. The details panel totals the selection.
+
+Delete moves the selection to the Recycle Bin (Trash on macOS and Linux); Shift+Delete deletes it permanently. Both ask first, listing what will go; folders go with everything in them, including files a filter hides. Deleting is available once the scan finishes or is cancelled. Deleted items leave the map at once without a rescan; items that couldn't be deleted stay selected, with the reason shown.
 
 The filter box matches file names only (not folders or paths), ignoring case, as a literal substring: `.pdf` finds every PDF, and `*` has no special meaning. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
 
