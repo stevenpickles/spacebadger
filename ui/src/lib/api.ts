@@ -9,6 +9,8 @@ import type { ScanStatus } from "./protocol/ScanStatus";
 import type { SearchPage } from "./protocol/SearchPage";
 import type { SearchResultsRequest } from "./protocol/SearchResultsRequest";
 import type { SearchSummary } from "./protocol/SearchSummary";
+import type { SmallItemsPage } from "./protocol/SmallItemsPage";
+import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
 export const EXPECTED_PROTOCOL_VERSION = 2;
@@ -60,6 +62,10 @@ export function searchSummary(generation: number, search: number): Promise<Searc
 
 export function searchResults(request: SearchResultsRequest): Promise<SearchPage> {
   return invoke<SearchPage>("search_results", { request });
+}
+
+export function smallItems(request: SmallItemsRequest): Promise<SmallItemsPage> {
+  return invoke<SmallItemsPage>("small_items", { request });
 }
 
 /** Capacity of the scanned volume; `null` where unavailable. */
