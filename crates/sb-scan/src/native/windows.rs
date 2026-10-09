@@ -35,9 +35,12 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetVolumePathNameW, OPEN_EXISTING,
+    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo, GetDiskFreeSpaceExW,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    OPEN_EXISTING,
 };
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
@@ -399,6 +402,114 @@ pub fn is_remote(path: &Path) -> bool {
     }
     const DRIVE_REMOTE: u32 = 4;
     unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) == DRIVE_REMOTE }
+}
+
+/// Capacity and free space of the volume holding `path`, whether `path` is
+/// its top folder, and the NTFS master file table's size when the volume
+/// can be queried (usually only when elevated).
+pub fn volume_info(path: &Path) -> Option<super::VolumeInfo> {
+    let path = wide(path);
+    let mut volume = vec![0u16; path.len() + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.ok()?;
+    let volume_len = volume.iter().position(|&c| c == 0)?;
+    let (mut capacity, mut free) = (0u64, 0u64);
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(volume.as_ptr()),
+            None,
+            Some(&mut capacity),
+            Some(&mut free),
+        )
+    }
+    .ok()?;
+    let mut fs_name = [0u16; 64];
+    let filesystem = unsafe {
+        GetVolumeInformationW(
+            PCWSTR(volume.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_name),
+        )
+    }
+    .ok()
+    .map(|()| {
+        let len = fs_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(fs_name.len());
+        String::from_utf16_lossy(&fs_name[..len])
+    });
+    let metadata = if filesystem.as_deref() == Some("NTFS") {
+        ntfs_mft_bytes(&volume[..volume_len])
+    } else {
+        None
+    };
+    let trim = |s: &[u16]| -> Vec<u16> {
+        let mut s = s.to_vec();
+        while s.last().is_some_and(|&c| c == 0 || c == u16::from(b'\\')) {
+            s.pop();
+        }
+        s.iter()
+            .map(|&c| {
+                if c < 128 {
+                    u16::from((c as u8).to_ascii_lowercase())
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    Some(super::VolumeInfo {
+        is_root: trim(&path) == trim(&volume[..volume_len]),
+        capacity,
+        free,
+        filesystem,
+        metadata,
+    })
+}
+
+/// Valid length of the NTFS master file table, read from the volume device.
+/// Opening a volume needs administrator rights, so this is usually `None`
+/// for ordinary processes.
+fn ntfs_mft_bytes(volume: &[u16]) -> Option<u64> {
+    // "\\?\C:\" names the root folder; "\\?\C:" names the volume device.
+    let mut device: Vec<u16> = volume.to_vec();
+    if device.last() == Some(&u16::from(b'\\')) {
+        device.pop();
+    }
+    device.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(device.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: CreateFileW returned a valid handle that we now own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let mut data = NTFS_VOLUME_DATA_BUFFER::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            raw(&handle),
+            FSCTL_GET_NTFS_VOLUME_DATA,
+            None,
+            0,
+            Some((&raw mut data).cast::<c_void>()),
+            size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .ok()?;
+    u64::try_from(data.MftValidDataLength).ok()
 }
 
 #[cfg(test)]

@@ -35,6 +35,36 @@ pub fn is_remote(root: &Path) -> bool {
     }
 }
 
+/// Capacity of the volume that holds a scan root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// The root is the volume's top folder (a drive or mount point), so the
+    /// scan covers the whole volume.
+    pub is_root: bool,
+    pub capacity: u64,
+    /// Free bytes on the volume, including any reserved for administrators.
+    pub free: u64,
+    /// Filesystem name, such as "NTFS", where the OS reports one.
+    pub filesystem: Option<String>,
+    /// Bytes the filesystem uses for its own structures that could be
+    /// measured (on NTFS, the master file table when elevated).
+    pub metadata: Option<u64>,
+}
+
+/// The volume holding `root`; `None` where it can't be read or on platforms
+/// not yet supported (macOS).
+pub fn volume_info(root: &Path) -> Option<VolumeInfo> {
+    #[cfg(windows)]
+    return windows::volume_info(root);
+    #[cfg(target_os = "linux")]
+    return linux::volume_info(root);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 /// Scan settings suited to `root`: fewer workers for network shares.
 pub fn scan_config(root: &Path) -> ScanConfig {
     let mut config = ScanConfig::default();
