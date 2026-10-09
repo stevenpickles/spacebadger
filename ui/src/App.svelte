@@ -14,6 +14,8 @@
     searchSummary,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
+  import type { ColorMode } from "./lib/colors";
+  import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Details from "./lib/Details.svelte";
   import { plural } from "./lib/format";
@@ -39,6 +41,7 @@
   let view = $state(ROOT);
   let selection = $state<Selection | null>(null);
   let metric = $state<Metric>("allocated");
+  let colors = $state<ColorMode>(savedColors());
   let viewDetails = $state.raw<NodeDetails | null>(null);
   let selectedDetails = $state.raw<NodeDetails | null>(null);
   let layout = $state.raw<DecodedLayout | null>(null);
@@ -69,6 +72,23 @@
     },
     (e: unknown) => (problem = `Backend unavailable: ${String(e)}`),
   );
+
+  // The color mode is a per-viewer preference; storage may be unavailable.
+  function savedColors(): ColorMode {
+    try {
+      return localStorage.getItem("colors") === "type" ? "type" : "depth";
+    } catch {
+      return "depth";
+    }
+  }
+
+  $effect(() => {
+    try {
+      localStorage.setItem("colors", colors);
+    } catch {
+      // Not remembered; the default applies next time.
+    }
+  });
 
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
@@ -331,6 +351,10 @@
       <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
       <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
     </div>
+    <div class="metric" role="radiogroup" aria-label="Colors">
+      <label><input type="radio" bind:group={colors} value="depth" /> Depth colors</label>
+      <label><input type="radio" bind:group={colors} value="type" /> File type colors</label>
+    </div>
     <div class="filter">
       <input
         type="search"
@@ -374,36 +398,42 @@
   </div>
 
   <div class="body">
-    <main class="map">
-      {#if generation === null}
-        <div class="placeholder">
-          <p>Choose a folder or drive to see what's using its space.</p>
-          <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
-        </div>
-      {:else}
-        <Treemap
-          {generation}
-          {view}
-          {metric}
-          search={search?.search ?? null}
-          revision={status?.revision ?? 0}
-          {selection}
-          onselect={(s) => (selection = s)}
-          onopen={openFolder}
-          onup={goUp}
-          onlayout={(l) => (layout = l)}
-          onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r) })}
-        />
-        {#if empty}
-          <div class="placeholder overlay">
-            <p>{empty.text}</p>
-            {#if empty.toRoot}
-              <button type="button" onclick={() => openFolder(ROOT)}>Go to the scan root</button>
-            {/if}
+    <div class="mapcol">
+      <main class="map">
+        {#if generation === null}
+          <div class="placeholder">
+            <p>Choose a folder or drive to see what's using its space.</p>
+            <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
           </div>
+        {:else}
+          <Treemap
+            {generation}
+            {view}
+            {metric}
+            {colors}
+            search={search?.search ?? null}
+            revision={status?.revision ?? 0}
+            {selection}
+            onselect={(s) => (selection = s)}
+            onopen={openFolder}
+            onup={goUp}
+            onlayout={(l) => (layout = l)}
+            onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r) })}
+          />
+          {#if empty}
+            <div class="placeholder overlay">
+              <p>{empty.text}</p>
+              {#if empty.toRoot}
+                <button type="button" onclick={() => openFolder(ROOT)}>Go to the scan root</button>
+              {/if}
+            </div>
+          {/if}
         {/if}
+      </main>
+      {#if colors === "type" && generation !== null}
+        <Legend />
       {/if}
-    </main>
+    </div>
     <aside>
       <Details
         {selection}
@@ -463,6 +493,7 @@
   }
   .toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 8px 12px;
@@ -517,7 +548,14 @@
     grid-template-columns: 1fr 300px;
     min-height: 0;
   }
+  .mapcol {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
   .map {
+    flex: 1;
     position: relative;
     min-width: 0;
     min-height: 0;
