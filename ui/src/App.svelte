@@ -190,8 +190,8 @@
   {/if}
   {#if status?.phase.kind === "cancelled"}
     <div class="banner warn" role="status">
-      Partial result: the scan was cancelled. Folders that weren't scanned are outlined and their
-      sizes are incomplete.
+      Partial result: the scan was cancelled before every folder was read, so sizes shown are lower
+      bounds. Select a folder to see whether it was scanned.
     </div>
   {:else if status?.phase.kind === "failed"}
     <div class="banner error" role="alert">{status.phase.message}</div>
