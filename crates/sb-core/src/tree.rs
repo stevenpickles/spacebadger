@@ -107,6 +107,9 @@ pub struct Tree {
     /// Hard-link alias → owning node.
     alias_owner: HashMap<u32, u32>,
     dir_count: u64,
+    /// Files whose sizes changed after they were added, in order. Lets
+    /// overlays such as search catch up without rescanning the tree.
+    changes: Vec<u32>,
 }
 
 impl Tree {
@@ -128,6 +131,7 @@ impl Tree {
             files: Vec::new(),
             alias_owner: HashMap::new(),
             dir_count: 0,
+            changes: Vec::new(),
         };
         tree.push(NONE, OsStr::new(""), flags::DIRECTORY)
             .expect("empty tree has capacity for its root");
@@ -238,6 +242,7 @@ impl Tree {
         self.logical[i] = new_logical;
         self.allocated[i] = new_allocated;
         self.unknown[i] = new_unknown;
+        self.changes.push(node.0);
         self.for_each_ancestor(node, |t, a| {
             t.logical[a] = t.logical[a].wrapping_add(d_logical);
             t.allocated[a] = t.allocated[a].wrapping_add(d_allocated);
@@ -255,6 +260,7 @@ impl Tree {
         }
         self.flags[i] |= flags::HARDLINK_ALIAS | flags::HARDLINKED;
         self.alias_owner.insert(alias.0, owner.0);
+        self.changes.push(alias.0);
         let allocated = std::mem::take(&mut self.allocated[i]);
         self.for_each_ancestor(alias, |t, a| t.allocated[a] -= allocated);
     }
@@ -364,6 +370,12 @@ impl Tree {
         self.alias_owner.get(&alias.0).map(|&o| NodeId(o))
     }
 
+    /// Files whose sizes changed after being added, oldest first. Entries
+    /// may repeat; new entries are only ever appended.
+    pub fn changed_files(&self) -> &[u32] {
+        &self.changes
+    }
+
     pub fn alias_count(&self) -> usize {
         self.alias_owner.len()
     }
@@ -371,7 +383,10 @@ impl Tree {
     /// Approximate heap bytes held by the tree.
     pub fn memory_bytes(&self) -> usize {
         let per_node = 4 * 4 + 2 + 2 + 8 * 2 + 4 * 2;
-        self.parent.capacity() * per_node + self.names.capacity() + self.alias_owner.capacity() * 16
+        self.parent.capacity() * per_node
+            + self.names.capacity()
+            + self.alias_owner.capacity() * 16
+            + self.changes.capacity() * 4
     }
 }
 
@@ -476,6 +491,10 @@ mod tests {
         assert_eq!(t.logical(NodeId::ROOT), 400);
         t.update_file(owner, sizes(300, 8192));
         assert_eq!(t.allocated(NodeId::ROOT), 8192);
+        assert_eq!(
+            t.changed_files(),
+            [alias.index() as u32, alias.index() as u32, owner.index() as u32]
+        );
     }
 
     #[test]
