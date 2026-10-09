@@ -2,51 +2,57 @@
 
 Date: 2026-10-09. Branch `feature/11/select-delete`. Windows 11 Pro 10.0.26200, NTFS, release build, not elevated.
 
-The interface was driven by posting mouse and key messages to the webview window. Posted mouse messages carry Ctrl and Shift in `wParam`, so Ctrl+click and Shift+click were exercised for real; posted key messages can't carry modifiers, so Ctrl+A, Ctrl+Space, and Shift+Delete were not (Delete was).
+The interface was driven by posting mouse and key messages to the webview window. Posted mouse messages carry Ctrl and Shift in `wParam`, so Ctrl+click and Shift+click were exercised for real; posted key messages can't carry modifiers, so Ctrl+A and Ctrl+Space were not (Delete was).
 
-## Map
+## Protections
 
-Fixture folder: `big1.bin` 40 MiB, `big2.bin` 30 MiB, `big3.bin` 20 MiB, `mid.bin` 10 MiB (read-only), `folderA` (15 + 5 MiB), `folderB` (8 MiB).
+Deleting is deliberately hard to do:
 
-| Action | Result |
+1. **Off until allowed.** An "Allow deleting" switch in the toolbar starts off on every launch and is never saved. While it's off, no menu or panel offers a delete, the Delete key only explains how to turn it on, and the backend refuses `delete_items` regardless of what the interface sends.
+2. **Typed confirmation.** The dialog lists what will go (count, sizes, the largest items; folders with their contents, including files a filter hides). Its button stays disabled until `delete` is typed and a 3-second countdown has run.
+3. **Never permanent.** There is no permanent delete. On Windows, the app drives the shell itself and aborts any item the shell would delete instead of recycling (network and removable drives, items too large for the Recycle Bin, recycling turned off). On macOS and Linux the `trash` crate always keeps a copy in the Trash (on Linux it copies across filesystems before removing the original).
+4. **Re-checked per item.** Each item must still be the kind the scan saw and not a link or junction, and counts as deleted only once it's gone from its place.
+5. **Not while scanning.**
+
+## Results
+
+| Check | Result |
 |---|---|
-| Click `big1`, Ctrl+click `big3` | Both tinted; details panel: "2 items selected", 60.0 MiB |
-| Click `big1`, Shift+click `mid` | The five items between them in size order: `big1`, `big2`, `big3`, `folderA`, `mid` (120 MiB); `folderB` not included |
-| Ctrl+click `folderA` | Removed from the selection: 4 files, 100 MiB |
-| Delete key | Dialog "Move 4 items to the Recycle Bin?", listing all four, focus on the confirm button |
-| Enter | All four in the Recycle Bin (checked through the shell's Recycle Bin folder, with their original location), including the read-only file. Map and status bar: 3 files, 2 folders, 28.0 MiB. Notice "Moved 4 items (100 MiB) to the Recycle Bin" |
-| Right-click `b1.bin` → Delete permanently… | Dialog with the warning "This can't be undone", focus on Cancel |
-| Enter | Cancelled; the file is still on disk |
-| Select `folderA` → details → Delete permanently… → confirm | Folder and contents gone from disk and not in the Recycle Bin; status bar 1 file, 1 folder, 8.00 MiB |
-| Another process opens `b1.bin` without sharing; Move to Recycle Bin | Not deleted. Banner: "Couldn't delete 1 item: …b1.bin: Couldn't move it to the Recycle Bin: the move was cancelled or blocked. It may be in use." No Windows dialog appeared; the file stayed selected |
-| Right-click during a `C:\` scan | Both delete entries disabled in the menu and in the details panel |
+| Fresh launch | "Allow deleting" unchecked |
+| Delete key with it off | Notice: "Turn on “Allow deleting” in the toolbar to move items to the Recycle Bin." Nothing opened |
+| Right-click with it off | Menu has only Show in Explorer and Copy path |
+| Turn it on, Delete, type `delete` within the countdown, press Enter | Button still disabled ("Move to Recycle Bin (2)"); nothing happened |
+| Wait for the countdown, press Enter | `one.bin` in the Recycle Bin; map and status bar updated; notice "Moved “one.bin” (28.6 MiB) to the Recycle Bin" |
+| Scan the same folder as `\\localhost\C$\…` (no Recycle Bin on network paths) and confirm a delete of `two.bin` | Refused: "It can't go to the Recycle Bin here (…), and SpaceBadger never deletes permanently." The file is still on disk and stays selected |
+| Unit test against `\\localhost\C$` | The shell reported it would delete without recycling; the delete was aborted and the file survived |
 
-## Result list
+Earlier in this milestone, before the protections:
 
-Fixture: 400 `.log` files from 3.13 MiB down to 8 KiB, filter `log`.
-
-| Action | Result |
+| Check | Result |
 |---|---|
-| Click the first row, scroll to row 273 with the mouse wheel, Shift+click row 276 | 277 items selected (rows 0–276), 567 MiB, including rows that hadn't been loaded |
-| Details → Delete permanently… → confirm | 277 files gone from disk; 123 matches remain; status bar 124 files |
+| Click, Ctrl+click in the map | Both items tinted; details panel totals them |
+| Click `big1`, Shift+click `mid` | The five items between them in size order, same folder only |
+| Ctrl+click a selected folder | Removed from the selection |
+| Recycle 4 files, one read-only | All four in the Recycle Bin with their original location |
+| A file held open without sharing by another process | Not moved; banner "the move was cancelled or blocked. It may be in use."; no Windows dialog; the file stayed selected |
+| Result list: click row 0, scroll, Shift+click row 276 | 277 rows selected, including rows not yet loaded |
+| Right-click during a `C:\` scan | Delete actions disabled |
 
 ## Automated tests
 
-- `sb-core`: removing a folder takes its sizes off every ancestor and unlinks it; removing the owner of a hard link hands its allocation to a remaining alias; removed files leave search matches and totals; a selection resolves to its outermost items with totals.
-- `sb-scan`: a finished scan can be edited as a new revision, and edits are refused while scanning.
-- Desktop app: permanent deletion of files and folders (including a read-only file inside a folder), items that have become a different kind are left alone, a folder holding a junction (Windows) or symlink (Unix) loses the link but not its target, and an end-to-end session test (scan, summarize, delete, status update, search totals, already-gone items).
-- Linux (Docker, `rust:1.97` with the webview packages): `cargo clippy --workspace --all-targets` clean and `cargo test --workspace` passing, including the symlink test and the session test.
+- `sb-core`: removing a folder takes its sizes off every ancestor and unlinks it; removing a hard-link owner hands its allocation to a remaining alias; removed files leave search matches and totals; a selection resolves to its outermost items with totals.
+- `sb-scan`: a finished scan can be edited as a new revision; edits are refused while scanning.
+- Desktop app: an item counts as deleted only once it's gone; items that became a different kind, symlinks (Unix), and junctions (Windows) are left alone; Windows refuses a delete the shell wouldn't recycle (network path); the shell path conversion; an end-to-end session test (scan, summarize, delete, status update, search totals, already-gone items) with a stand-in for the trash. Moving a real file to the Recycle Bin is an ignored test, run by hand: `cargo test -p spacebadger recycles_a_local_file -- --ignored` (passed).
 
 ## Not covered
 
-- The Trash on macOS and Linux: the code builds and the permanent-delete tests run on Linux, but nothing was moved to a Linux or macOS trash.
-- Windows' prompt for items that can't go to the Recycle Bin (too large, or on a volume without one, such as most network shares). The shell is asked to warn before deleting permanently; this was not triggered.
-- Ctrl+A, Ctrl+Space, and Shift+Delete (see above). Shift+Delete calls the same handler as the Delete key with `permanent` set.
+- Moving items to the Trash on macOS and Linux.
+- The Windows refusal for an item too large for the Recycle Bin, or with recycling turned off; only the network-path case was exercised. All three reach the same check.
+- Ctrl+A and Ctrl+Space (see above).
 - Elevated deletes of protected files.
 
 ## Known limitations
 
-- Deleting waits for the scan to finish or be cancelled: the scanner may still be adding items to a folder being deleted.
-- Recycled items still use space until the Recycle Bin or Trash is emptied. They leave the map at once, but on a whole-drive scan the volume overview then counts them as "not attributed" until the next scan.
-- A large delete shows "Deleting…" until it ends; there's no progress count and it can't be cancelled.
+- Recycled items still use space until the Recycle Bin or Trash is emptied. They leave the map at once, but on a whole-drive scan the volume overview counts them as "not attributed" until the next scan.
+- A large delete shows "Moving…" until it ends; there's no progress count and it can't be cancelled.
 - Deleting one name of a hard-linked file frees nothing while another name remains; the map moves the allocation to the remaining name.
