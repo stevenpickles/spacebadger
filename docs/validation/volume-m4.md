@@ -26,7 +26,7 @@ Debug build, non-elevated, `C:\` (1.82 TiB NTFS), checked with screenshots:
 
 | Check | Result |
 |---|---|
-| Scan of `C:\Users\Steven\Downloads` (scan example) | Not the volume top; overview checkbox disabled |
+| `C:\Users\Steven\Downloads` in the scan example | Reported as not the volume top |
 | Scan of `C:\` | Overview offered |
 | During the scan, 20 s in | Files found 921 GiB, "Not scanned yet" 583 GiB (hatched), Free 358 GiB |
 | After completion (2.96M files) | Files found 1.41 TiB (77.4%), not attributed 63.1 GiB (3.4%), free 357 GiB (19.2%) |
@@ -34,7 +34,7 @@ Debug build, non-elevated, `C:\` (1.82 TiB NTFS), checked with screenshots:
 | Master file table size, non-elevated | Not readable, as expected |
 | Malformed root (`C:"`) | Scan fails with a clear banner; overview checkbox stays disabled |
 
-The 63.1 GiB gap matches the ~67 GiB found in milestone 2 within the change in files since then.
+The 63.1 GiB gap is close to the ~67 GiB found in milestone 2.
 
 ## Not yet verified
 
