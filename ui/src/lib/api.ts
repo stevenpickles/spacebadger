@@ -13,7 +13,7 @@ import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
-export const EXPECTED_PROTOCOL_VERSION = 2;
+export const EXPECTED_PROTOCOL_VERSION = 3;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";

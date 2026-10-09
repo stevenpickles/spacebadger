@@ -14,7 +14,7 @@ use ts_rs::TS;
 pub mod wire;
 
 /// Incremented whenever a command or event shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
@@ -331,6 +331,117 @@ pub struct VolumeInfo {
     /// table, when elevated).
     #[ts(type = "number | null")]
     pub metadata: Option<u64>,
+}
+
+/// Asks what an action on a set of selected items would touch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SelectionRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub nodes: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SelectedItem {
+    pub node: u32,
+    pub name: String,
+    pub path: String,
+    pub folder: bool,
+    #[ts(type = "number")]
+    pub logical: u64,
+    /// Known allocated bytes. For a file, `None` means unknown.
+    #[ts(type = "number | null")]
+    pub allocated: Option<u64>,
+    /// Files at or under this item.
+    #[ts(type = "number")]
+    pub files: u64,
+}
+
+/// The items a selection stands for: entries inside another selected folder
+/// are counted once, with that folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SelectionSummary {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Selected items not inside another selected folder.
+    pub items: u32,
+    pub folders: u32,
+    /// Files in the items, counting each folder's contents.
+    #[ts(type = "number")]
+    pub files: u64,
+    #[ts(type = "number")]
+    pub logical: u64,
+    #[ts(type = "number")]
+    pub allocated: u64,
+    #[ts(type = "number")]
+    pub unknown_allocation_files: u64,
+    /// Entries left out because they're no longer in the scan.
+    pub missing: u32,
+    /// The largest items, at most [`SELECTION_SAMPLES`].
+    pub samples: Vec<SelectedItem>,
+}
+
+/// Most items listed in a [`SelectionSummary`].
+pub const SELECTION_SAMPLES: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DeleteMode {
+    /// Move to the Recycle Bin (Windows) or Trash (macOS, Linux).
+    Recycle,
+    /// Delete without keeping a copy.
+    Permanent,
+}
+
+/// Deletes selected files and folders (folders with everything in them).
+/// Refused while the scan is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DeleteRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub nodes: Vec<u32>,
+    pub mode: DeleteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DeleteFailure {
+    pub node: u32,
+    pub path: String,
+    pub message: String,
+}
+
+/// What a delete did. Deleted items are removed from the scan, which moves
+/// to a new revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DeleteReport {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub mode: DeleteMode,
+    /// Items now gone from disk and from the scan.
+    pub deleted: Vec<u32>,
+    /// Of those, items that were already gone before the delete.
+    pub already_gone: u32,
+    pub failed: Vec<DeleteFailure>,
+    /// Totals of the deleted items, as scanned.
+    #[ts(type = "number")]
+    pub files: u64,
+    #[ts(type = "number")]
+    pub logical: u64,
+    #[ts(type = "number")]
+    pub allocated: u64,
 }
 
 #[cfg(test)]
