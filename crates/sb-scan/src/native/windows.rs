@@ -8,6 +8,9 @@
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
 //!   placeholder reparse tags for ordinary processes.
+//! - When the process is already elevated, `SeBackupPrivilege` is enabled so
+//!   directories opened with `FILE_FLAG_BACKUP_SEMANTICS` bypass ACL checks
+//!   (protected folders become listable). Elevation is never requested.
 //! - Per-file opens use `FILE_READ_ATTRIBUTES` with `OPEN_REPARSE_POINT` and
 //!   `OPEN_NO_RECALL`, which the probes showed don't hydrate placeholders.
 
@@ -18,16 +21,24 @@ use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE};
+use windows::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
+};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
+    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING,
+    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetVolumePathNameW, OPEN_EXISTING,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
 mod attr {
@@ -175,7 +186,10 @@ pub struct WindowsFs {
 }
 
 impl WindowsFs {
+    /// Also enables backup access when the process is already elevated;
+    /// see [`enable_backup_privilege`].
     pub fn new() -> Self {
+        enable_backup_privilege();
         Self::default()
     }
 
@@ -336,6 +350,55 @@ impl FsAdapter for WindowsFs {
             allocated: Some(standard.AllocationSize as u64),
         })
     }
+}
+
+/// Enables `SeBackupPrivilege` when this process already holds it (it was
+/// started elevated), so protected folders list like ordinary ones. Never
+/// requests elevation. Returns whether the privilege is enabled.
+pub fn enable_backup_privilege() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| try_enable_backup_privilege().unwrap_or(false))
+}
+
+fn try_enable_backup_privilege() -> windows::core::Result<bool> {
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    }?;
+    // SAFETY: OpenProcessToken returned a valid handle that we now own.
+    let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut luid = LUID::default();
+    unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_BACKUP_NAME, &mut luid) }?;
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    unsafe { AdjustTokenPrivileges(raw(&token), false, Some(&privileges), 0, None, None) }?;
+    // The call succeeds without enabling anything when the token lacks the
+    // privilege; only the last error says so.
+    Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
+}
+
+/// Whether `path` is on a network share (UNC path or mapped network drive).
+pub fn is_remote(path: &Path) -> bool {
+    let path = wide(path);
+    let unc: Vec<u16> = r"\?\UNC\".encode_utf16().collect();
+    if path.starts_with(&unc) {
+        return true;
+    }
+    let mut volume = vec![0u16; path.len() + 1];
+    if unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.is_err() {
+        return false;
+    }
+    const DRIVE_REMOTE: u32 = 4;
+    unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) == DRIVE_REMOTE }
 }
 
 #[cfg(test)]

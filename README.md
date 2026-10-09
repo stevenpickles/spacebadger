@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestone 0 (project baseline). The app opens a window, but there's no scanning yet.
+Status: milestone 3 (streaming desktop slice). Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Filename search, reveal in file manager, and color modes come in milestone 4.
 
 ## Layout
 
@@ -36,6 +36,10 @@ cargo test --workspace       # core tests (also regenerates ui/src/lib/protocol/
 npm run check                # type-check the interface
 npx tauri build              # release build + native installers
 ```
+
+The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
+
+In the map: click selects, double-click (or Enter) opens a folder, Backspace goes up, arrow keys move the selection, and Escape clears it. Double-clicking a file does nothing; files are never opened.
 
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.
 

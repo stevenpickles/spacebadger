@@ -211,6 +211,28 @@ impl FsAdapter for LinuxFs {
     }
 }
 
+/// Whether `path` is on a network or FUSE filesystem, by `statfs` magic.
+pub fn is_remote(path: &Path) -> bool {
+    const REMOTE: [u32; 10] = [
+        0x6969,      // NFS
+        0x517B,      // SMB
+        0xFF53_4D42, // CIFS
+        0xFE53_4D42, // SMB2
+        0x0102_1997, // 9P
+        0x00C3_6400, // Ceph
+        0x5346_414F, // AFS
+        0x7375_7245, // Coda
+        0x6573_5546, // FUSE (sshfs and others)
+        0x0BD0_0BD0, // Lustre
+    ];
+    rustix::fs::statfs(path).is_ok_and(|s| REMOTE.contains(&(s.f_type as u32)))
+}
+
+/// Whether the process runs as root, which bypasses permission checks.
+pub fn is_privileged() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

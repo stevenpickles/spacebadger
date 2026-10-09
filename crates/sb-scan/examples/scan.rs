@@ -3,7 +3,11 @@
 //! ```text
 //! cargo run --release -p sb-scan --example scan -- <root> [--workers N] [--cancel-after-ms N]
 //! ```
+//!
+//! After a full scan it also times treemap layouts of the root at 1920×1080:
+//! a first (sorting) layout and a repeat that reuses the sibling order.
 
+use sb_core::layout::{self, LayoutParams, Metric, OrderCache};
 use sb_core::tree::NodeId;
 use sb_scan::{NativeFs, Scan, ScanConfig};
 use std::path::PathBuf;
@@ -78,6 +82,25 @@ fn main() {
         tree.len(),
         tree.memory_bytes() >> 20
     );
+    let params = LayoutParams::new(1920.0, 1080.0);
+    let mut cache = OrderCache::default();
+    for (label, stable) in [("first layout", false), ("repeat layout", true)] {
+        let t = Instant::now();
+        let l = layout::layout(
+            &tree,
+            NodeId::ROOT,
+            Metric::Allocated,
+            &params,
+            &mut cache,
+            stable,
+        );
+        println!(
+            "{label}: {:?}, {} rects{}",
+            t.elapsed(),
+            l.rects.len(),
+            if l.truncated { " (budget reached)" } else { "" }
+        );
+    }
     let mut top: Vec<NodeId> = tree.children(NodeId::ROOT).collect();
     top.sort_by_key(|&n| std::cmp::Reverse(tree.allocated(n)));
     println!("largest entries at the root (allocated / logical):");
