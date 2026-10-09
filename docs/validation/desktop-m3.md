@@ -63,7 +63,7 @@ Not exercised: Shift+F10 (posted messages can't carry the Shift state), and reve
 
 ## Known gaps
 
-- "Other small items" can be selected, and its folder opened, but its members are only listed by filename search in milestone 4.
+- "Other small items" can be selected, and its folder opened. Its members are listed since milestone 4 ([`small-items-m4.md`](small-items-m4.md)).
 - Folders that weren't scanned after a cancel hold no bytes, so they have no area. Their state shows in the details panel.
 - Network shares: worker count is reduced, but no share has been measured yet (open question 2).
 - macOS: remote detection always reports local, and privileged detection isn't implemented.
