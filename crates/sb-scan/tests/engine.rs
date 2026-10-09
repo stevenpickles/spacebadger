@@ -289,3 +289,33 @@ fn progress_events_are_coalesced() {
         "the first change and the final state, none per directory"
     );
 }
+
+#[test]
+fn finished_scans_can_be_edited_as_a_new_revision() {
+    let fs = FakeFs::new();
+    fs.file("keep/a.bin", 10, 4096)
+        .file("gone/b.bin", 20, 8192)
+        .file("gone/sub/c.bin", 30, 4096);
+    let gate = fs.gate_dir("keep");
+    let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+    assert!(s.edit_finished(|_| ()).is_none(), "no edits while scanning");
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !s.progress().state.is_finished() {
+        assert!(Instant::now() < deadline, "scan never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let before = s.progress();
+    let (removed, after) = s
+        .edit_finished(|tree| {
+            let gone = find(tree, "gone");
+            tree.remove(gone)
+        })
+        .expect("finished scans can be edited");
+    assert!(removed);
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.state, ScanState::Complete);
+    assert_eq!((after.files, after.dirs), (1, 1));
+    assert_eq!((after.logical, after.allocated), (10, 4096));
+    assert_eq!(s.progress().revision, after.revision);
+}
