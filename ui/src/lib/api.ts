@@ -7,7 +7,7 @@ import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
 import type { ScanStatus } from "./protocol/ScanStatus";
 
-export const EXPECTED_PROTOCOL_VERSION = 1;
+export const EXPECTED_PROTOCOL_VERSION = 2;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";

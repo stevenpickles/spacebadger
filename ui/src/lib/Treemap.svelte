@@ -84,7 +84,7 @@
         const request = nextRequest++;
         try {
           const reply = decodeLayout(
-            await requestLayout({ ...want, request, width, height }),
+            await requestLayout({ ...want, request, width, height, search: null }),
           );
           // Drop replies for a view, metric, or scan that is no longer shown.
           if (
