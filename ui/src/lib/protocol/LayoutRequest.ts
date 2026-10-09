@@ -13,4 +13,8 @@ request: number, view: number, metric: Metric,
 /**
  * CSS pixels.
  */
-width: number, height: number, };
+width: number, height: number, 
+/**
+ * Draw only files matching this search (see [`SearchSummary::search`]).
+ */
+search: number | null, };

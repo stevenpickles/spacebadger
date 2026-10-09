@@ -4,10 +4,12 @@
 //! cargo run --release -p sb-scan --example scan -- <root> [--workers N] [--cancel-after-ms N]
 //! ```
 //!
-//! After a full scan it also times treemap layouts of the root at 1920×1080:
-//! a first (sorting) layout and a repeat that reuses the sibling order.
+//! After a full scan it also times treemap layouts of the root at 1920×1080
+//! (a first, sorting layout and a repeat that reuses the sibling order), and
+//! filename searches with a filtered layout for a few sample queries.
 
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache};
+use sb_core::search::{Matcher, Search};
 use sb_core::tree::NodeId;
 use sb_scan::{NativeFs, Scan, ScanConfig};
 use std::path::PathBuf;
@@ -90,6 +92,7 @@ fn main() {
             &tree,
             NodeId::ROOT,
             Metric::Allocated,
+            None,
             &params,
             &mut cache,
             stable,
@@ -99,6 +102,29 @@ fn main() {
             t.elapsed(),
             l.rects.len(),
             if l.truncated { " (budget reached)" } else { "" }
+        );
+    }
+    // A selective query, a broad one, and one that matches nothing.
+    for query in [".dll", "e", "no file has this name"] {
+        let t = Instant::now();
+        let mut search = Search::new(Matcher::new(query).unwrap());
+        search.catch_up(&tree, usize::MAX);
+        let searched = t.elapsed();
+        let t = Instant::now();
+        let l = layout::layout(
+            &tree,
+            NodeId::ROOT,
+            Metric::Allocated,
+            Some(&search),
+            &params,
+            &mut OrderCache::default(),
+            false,
+        );
+        println!(
+            "search {query:?}: {} matches in {searched:?}; filtered layout {:?}, {} rects",
+            search.matches().len(),
+            t.elapsed(),
+            l.rects.len()
         );
     }
     let mut top: Vec<NodeId> = tree.children(NodeId::ROOT).collect();

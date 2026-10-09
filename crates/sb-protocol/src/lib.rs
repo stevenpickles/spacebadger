@@ -14,7 +14,7 @@ use ts_rs::TS;
 pub mod wire;
 
 /// Incremented whenever a command or event shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
@@ -145,6 +145,8 @@ pub struct LayoutRequest {
     /// CSS pixels.
     pub width: f32,
     pub height: f32,
+    /// Draw only files matching this search (see [`SearchSummary::search`]).
+    pub search: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -197,6 +199,75 @@ pub struct NodeDetails {
     pub ancestors: Vec<Crumb>,
 }
 
+/// Totals for the files matching a filename search, across the whole scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchSummary {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Identifies this query within the scan; newer queries get larger
+    /// numbers. Layout and result requests name it.
+    pub search: u32,
+    pub query: String,
+    #[ts(type = "number")]
+    pub files: u64,
+    #[ts(type = "number")]
+    pub logical: u64,
+    /// Known, owned allocation of matching files.
+    #[ts(type = "number")]
+    pub allocated: u64,
+    #[ts(type = "number")]
+    pub unknown_allocation_files: u64,
+}
+
+/// Asks for a page of matching files, largest first by `metric`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchResultsRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub search: u32,
+    pub metric: Metric,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchRow {
+    pub node: u32,
+    pub name: String,
+    /// The containing folder.
+    pub parent: u32,
+    /// The containing folder's path relative to the scan root; empty at the
+    /// root.
+    pub folder: String,
+    #[ts(type = "number")]
+    pub logical: u64,
+    /// `None` when unknown. Hard-link aliases report 0 (see `alias`).
+    #[ts(type = "number | null")]
+    pub allocated: Option<u64>,
+    /// Another name of a hard-linked file whose allocation is counted at its
+    /// first name.
+    pub alias: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SearchPage {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub search: u32,
+    pub offset: u32,
+    /// Matching files in all.
+    pub total: u32,
+    pub rows: Vec<SearchRow>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +301,7 @@ mod tests {
     fn layout_request_reads_camel_case() {
         let req: LayoutRequest = serde_json::from_value(serde_json::json!({
             "generation": 3, "request": 9, "view": 0, "metric": "logical",
-            "width": 640.5, "height": 480
+            "width": 640.5, "height": 480, "search": null
         }))
         .unwrap();
         assert_eq!(req.metric, Metric::Logical);

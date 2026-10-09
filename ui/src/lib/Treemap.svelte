@@ -22,6 +22,8 @@
     generation: number;
     view: number;
     metric: Metric;
+    /** Active filename search; only matching files are drawn. */
+    search: number | null;
     /** Scan revision; a change triggers a new layout. */
     revision: number;
     selection: Selection | null;
@@ -39,6 +41,7 @@
     generation,
     view,
     metric,
+    search,
     revision,
     selection,
     onselect,
@@ -66,7 +69,7 @@
 
   $effect(() => {
     // Dependencies that change the layout.
-    void [generation, view, metric, revision, width, height];
+    void [generation, view, metric, search, revision, width, height];
     fetchLayout();
   });
 
@@ -80,17 +83,18 @@
       do {
         again = false;
         if (width < 1 || height < 1) break;
-        const want = { generation, view, metric };
+        const want = { generation, view, metric, search };
         const request = nextRequest++;
         try {
           const reply = decodeLayout(
             await requestLayout({ ...want, request, width, height }),
           );
-          // Drop replies for a view, metric, or scan that is no longer shown.
+          // Drop replies for a view, metric, search, or scan no longer shown.
           if (
             want.generation === generation &&
             want.view === view &&
             want.metric === metric &&
+            want.search === search &&
             reply.generation === generation
           ) {
             layout = reply;
@@ -98,7 +102,7 @@
             onlayout?.(reply);
           }
         } catch (e) {
-          if (want.generation === generation) error = String(e);
+          if (want.generation === generation && want.search === search) error = String(e);
         }
       } while (again);
     } finally {

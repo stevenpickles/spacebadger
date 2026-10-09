@@ -8,7 +8,7 @@ mod session;
 
 use sb_protocol::{
     AppInfo, LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted,
-    ScanStatus,
+    ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -118,6 +118,38 @@ async fn node_details(
     state.session(generation)?.details(node)
 }
 
+/// Filters by file name; an empty query clears the filter and returns `None`.
+/// Large trees take a moment, so this runs on a blocking thread; a newer
+/// call makes an older one return an error.
+#[tauri::command]
+async fn search_set(
+    state: State<'_, AppState>,
+    generation: u64,
+    query: String,
+) -> Result<Option<SearchSummary>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.search_set(&query))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn search_summary(
+    state: State<'_, AppState>,
+    generation: u64,
+    search: u32,
+) -> Result<SearchSummary, String> {
+    state.session(generation)?.search_summary(search)
+}
+
+#[tauri::command]
+async fn search_results(
+    state: State<'_, AppState>,
+    request: SearchResultsRequest,
+) -> Result<SearchPage, String> {
+    state.session(request.generation)?.search_results(&request)
+}
+
 /// Shows a scanned file or folder selected in the system file manager
 /// (Explorer, Finder, or the desktop's file manager).
 #[tauri::command]
@@ -165,7 +197,10 @@ pub fn run() {
             scan_status,
             layout,
             node_details,
-            reveal
+            reveal,
+            search_set,
+            search_summary,
+            search_results
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");

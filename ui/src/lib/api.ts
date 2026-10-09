@@ -6,8 +6,11 @@ import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
 import type { ScanStatus } from "./protocol/ScanStatus";
+import type { SearchPage } from "./protocol/SearchPage";
+import type { SearchResultsRequest } from "./protocol/SearchResultsRequest";
+import type { SearchSummary } from "./protocol/SearchSummary";
 
-export const EXPECTED_PROTOCOL_VERSION = 1;
+export const EXPECTED_PROTOCOL_VERSION = 2;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
@@ -40,6 +43,22 @@ export function requestLayout(request: LayoutRequest): Promise<ArrayBuffer> {
 
 export function nodeDetails(generation: number, node: number): Promise<NodeDetails> {
   return invoke<NodeDetails>("node_details", { generation, node });
+}
+
+/**
+ * Filters by file name; `null` when the query is empty (filter cleared).
+ * Rejects if a newer search replaced this one before it finished.
+ */
+export function searchSet(generation: number, query: string): Promise<SearchSummary | null> {
+  return invoke<SearchSummary | null>("search_set", { generation, query });
+}
+
+export function searchSummary(generation: number, search: number): Promise<SearchSummary> {
+  return invoke<SearchSummary>("search_summary", { generation, search });
+}
+
+export function searchResults(request: SearchResultsRequest): Promise<SearchPage> {
+  return invoke<SearchPage>("search_results", { request });
 }
 
 /** Shows the item selected in Explorer, Finder, or the desktop's file manager. */

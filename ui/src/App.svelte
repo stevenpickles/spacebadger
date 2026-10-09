@@ -10,6 +10,8 @@
     scanRefresh,
     scanStatus,
     reveal,
+    searchSet,
+    searchSummary,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
@@ -21,6 +23,9 @@
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
+  import type { SearchRow } from "./lib/protocol/SearchRow";
+  import type { SearchSummary } from "./lib/protocol/SearchSummary";
+  import SearchResults from "./lib/SearchResults.svelte";
   import type { MenuRequest, Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
@@ -41,7 +46,12 @@
   let problem = $state<string | null>(null);
   let privileged = $state(false);
   let fileManager = $state(fileManagerName(""));
-  let menu = $state.raw<MenuRequest | null>(null);
+  let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  /** What's typed in the filter box. */
+  let query = $state("");
+  /** The search the map and results show; `null` when unfiltered. */
+  let search = $state.raw<SearchSummary | null>(null);
+  let searching = $state(false);
   let notice = $state<string | null>(null);
 
   const scanning = $derived(status?.phase.kind === "scanning");
@@ -71,6 +81,9 @@
     selectedDetails = null;
     layout = null;
     menu = null;
+    search = null;
+    // Keep the filter across Refresh and new roots.
+    if (query) applySearch(query);
   }
 
   function receive(s: ScanStatus) {
@@ -105,6 +118,75 @@
 
   function cancel() {
     if (generation !== null) scanCancel(generation).catch((e: unknown) => (problem = String(e)));
+  }
+
+  // ---- filename search ------------------------------------------------
+
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Counts requests so only the newest reply is used. */
+  let searchSeq = 0;
+
+  function onQueryInput() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applySearch(query), 250);
+  }
+
+  function clearQuery() {
+    query = "";
+    clearTimeout(searchTimer);
+    applySearch("");
+  }
+
+  async function applySearch(text: string) {
+    const gen = generation;
+    if (gen === null) return;
+    const seq = ++searchSeq;
+    searching = text !== "";
+    try {
+      const summary = await searchSet(gen, text);
+      if (seq !== searchSeq || gen !== generation) return;
+      search = summary;
+      menu = null;
+    } catch (e) {
+      // A newer search replaced this one; its reply will arrive instead.
+      if (seq === searchSeq && gen === generation) problem = `Search failed: ${String(e)}`;
+    } finally {
+      if (seq === searchSeq) searching = false;
+    }
+  }
+
+  const searchId = $derived(search?.search);
+
+  // Matching totals follow the scan.
+  $effect(() => {
+    const gen = generation;
+    const id = searchId;
+    void status?.revision;
+    if (gen === null || id === undefined) return;
+    searchSummary(gen, id).then(
+      (s) => {
+        if (gen === generation && search?.search === s.search) search = s;
+      },
+      () => {},
+    );
+  });
+
+  /** Opens a result's folder in the map with the file selected. */
+  function showInMap(row: SearchRow) {
+    view = row.parent;
+    selection = { node: row.node, other: false };
+  }
+
+  function resultItems(row: SearchRow): MenuItem[] {
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap(row) },
+      {
+        label: `Show in ${fileManager}`,
+        action: () => showInFileManager(row.node),
+        separator: true,
+      },
+      { label: "Copy path", action: () => copyPath(row.node) },
+    ];
   }
 
   // Breadcrumbs follow the view.
@@ -217,16 +299,26 @@
     return () => document.removeEventListener("contextmenu", suppress);
   });
 
-  const empty = $derived.by(() => {
+  const empty = $derived.by((): { text: string; toRoot?: boolean } | null => {
     if (!layout || layout.total > 0 || !status) return null;
     if (status.phase.kind === "failed") return null;
     const what = metric === "allocated" ? "allocated space" : "data";
-    if (scanning) return `Scanning… no measurable ${what} found here yet.`;
+    if (search) {
+      if (search.files === 0) {
+        const text = `No file names contain “${search.query}”`;
+        return { text: scanning ? `${text} yet.` : `${text}.`, toRoot: view !== ROOT };
+      }
+      if (view !== ROOT) {
+        return { text: `No matching files with measurable ${what} in this folder.`, toRoot: true };
+      }
+      return { text: `The matching files have no measurable ${what}. They're in the result list.` };
+    }
+    if (scanning) return { text: `Scanning… no measurable ${what} found here yet.` };
     let text = `Nothing here has measurable ${what}.`;
     if (metric === "allocated" && (viewDetails?.unknownAllocationFiles ?? 0) > 0) {
       text += ` ${plural(viewDetails!.unknownAllocationFiles, "file")} have unknown allocation; try Logical size.`;
     }
-    return text;
+    return { text };
   });
 </script>
 
@@ -238,6 +330,18 @@
     <div class="metric" role="radiogroup" aria-label="Size measure">
       <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
       <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
+    </div>
+    <div class="filter">
+      <input
+        type="search"
+        placeholder="Filter by file name"
+        aria-label="Filter by file name"
+        bind:value={query}
+        oninput={onQueryInput}
+        onkeydown={(e) => e.key === "Escape" && clearQuery()}
+        disabled={generation === null}
+      />
+      {#if searching}<span class="muted" role="status">Searching…</span>{/if}
     </div>
     {#if privileged}
       <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
@@ -281,16 +385,22 @@
           {generation}
           {view}
           {metric}
+          search={search?.search ?? null}
           revision={status?.revision ?? 0}
           {selection}
           onselect={(s) => (selection = s)}
           onopen={openFolder}
           onup={goUp}
           onlayout={(l) => (layout = l)}
-          onmenu={(r) => (menu = r)}
+          onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r) })}
         />
         {#if empty}
-          <div class="placeholder overlay"><p>{empty}</p></div>
+          <div class="placeholder overlay">
+            <p>{empty.text}</p>
+            {#if empty.toRoot}
+              <button type="button" onclick={() => openFolder(ROOT)}>Go to the scan root</button>
+            {/if}
+          </div>
         {/if}
       {/if}
     </main>
@@ -308,6 +418,20 @@
       {#if showOmissions && status}
         <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
       {/if}
+      {#if search && generation !== null}
+        <SearchResults
+          {generation}
+          summary={search}
+          {metric}
+          revision={status?.revision ?? 0}
+          {scanning}
+          scanned={metric === "allocated" ? (status?.allocated ?? 0) : (status?.logical ?? 0)}
+          selected={selection && !selection.other ? selection.node : null}
+          onselect={(node) => (selection = { node, other: false })}
+          onshow={showInMap}
+          onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row) })}
+        />
+      {/if}
     </aside>
   </div>
 
@@ -324,7 +448,7 @@
       x={menu.x}
       y={menu.y}
       label="Actions"
-      items={menuItems(menu)}
+      items={menu.items}
       onclose={() => (menu = null)}
     />
   {/if}
@@ -356,6 +480,25 @@
     gap: 4px;
     cursor: pointer;
   }
+  .filter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 12px;
+  }
+  .filter input {
+    width: 220px;
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .muted {
+    color: var(--muted);
+    font-size: 12px;
+  }
   .badge {
     margin-left: auto;
     padding: 2px 8px;
@@ -381,6 +524,9 @@
     padding: 0;
   }
   aside {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     border-left: 1px solid var(--line);
     background: var(--panel);
     overflow-y: auto;
@@ -401,6 +547,9 @@
     position: absolute;
     inset: 0;
     pointer-events: none;
+  }
+  .overlay button {
+    pointer-events: auto;
   }
   .banner {
     display: flex;
