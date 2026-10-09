@@ -90,6 +90,7 @@ fn main() {
             &tree,
             NodeId::ROOT,
             Metric::Allocated,
+            None,
             &params,
             &mut cache,
             stable,

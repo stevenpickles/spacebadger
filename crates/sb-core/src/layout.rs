@@ -8,11 +8,14 @@
 //!   rectangle with their true combined area; nothing is inflated.
 //! - Sibling order is kept stable between layouts while a scan runs and is
 //!   re-sorted only when sizes drift past [`REORDER_HYSTERESIS`].
+//! - With a filename [`Search`], areas come from matching files only, and
+//!   folders without matches are left out.
 //!
 //! Coordinates are in the caller's units (CSS pixels for the interface).
 //! Rectangles are emitted parent before child, so drawing in order paints
 //! nested content on top and hit testing in reverse finds the deepest one.
 
+use crate::search::Search;
 use crate::tree::{DirState, NodeId, Tree, flags};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -32,6 +35,14 @@ impl Metric {
         match self {
             Self::Allocated => tree.allocated(node),
             Self::Logical => tree.logical(node),
+        }
+    }
+
+    /// The weight of `node`, counting only matching files when filtered.
+    pub fn weight_in(self, tree: &Tree, filter: Option<&Search>, node: NodeId) -> u64 {
+        match filter {
+            Some(search) => search.weight(self, node),
+            None => self.weight(tree, node),
         }
     }
 }
@@ -213,18 +224,21 @@ impl Ord for Pending {
 
 /// Lays out the contents of `view` to fill `params.width` × `params.height`.
 ///
-/// `stable` keeps sibling order from earlier layouts (use while scanning);
-/// pass `false` for a final relayout that sorts every folder afresh.
+/// `filter` limits the map to files matching a search; it must be caught up
+/// with `tree`. `stable` keeps sibling order from earlier layouts (use while
+/// scanning); pass `false` for a final relayout that sorts every folder
+/// afresh. Use a separate `cache` per filter.
 pub fn layout(
     tree: &Tree,
     view: NodeId,
     metric: Metric,
+    filter: Option<&Search>,
     params: &LayoutParams,
     cache: &mut OrderCache,
     stable: bool,
 ) -> Layout {
     let mut out = Layout {
-        total: metric.weight(tree, view),
+        total: metric.weight_in(tree, filter, view),
         ..Layout::default()
     };
     if !tree.contains(view) || !tree.is_dir(view) || params.width <= 0.0 || params.height <= 0.0 {
@@ -233,6 +247,7 @@ pub fn layout(
     let mut ctx = Ctx {
         tree,
         metric,
+        filter,
         params,
         cache,
         stable,
@@ -268,6 +283,7 @@ struct Area {
 struct Ctx<'a> {
     tree: &'a Tree,
     metric: Metric,
+    filter: Option<&'a Search>,
     params: &'a LayoutParams,
     cache: &'a mut OrderCache,
     stable: bool,
@@ -302,13 +318,13 @@ impl Ctx<'_> {
     /// Squarifies `dir`'s children into `area`.
     fn fill(&mut self, dir: NodeId, area: Area, depth: u8) {
         let tree = self.tree;
-        let total = self.metric.weight(tree, dir);
+        let total = self.metric.weight_in(tree, self.filter, dir);
         if total == 0 {
             return;
         }
         let children: Vec<(NodeId, u64)> = tree
             .children(dir)
-            .map(|c| (c, self.metric.weight(tree, c)))
+            .map(|c| (c, self.metric.weight_in(tree, self.filter, c)))
             .filter(|&(_, w)| w > 0)
             .collect();
         let children = self.cache.arrange(dir, children, self.stable);
@@ -507,6 +523,7 @@ mod tests {
             tree,
             view,
             Metric::Allocated,
+            None,
             params,
             &mut OrderCache::default(),
             false,
@@ -651,6 +668,7 @@ mod tests {
             &t,
             NodeId::ROOT,
             Metric::Logical,
+            None,
             &LayoutParams::new(100.0, 100.0),
             &mut OrderCache::default(),
             false,
@@ -670,11 +688,19 @@ mod tests {
         let params = LayoutParams::new(100.0, 100.0);
         let mut cache = OrderCache::default();
         let order = |t: &Tree, cache: &mut OrderCache, stable| {
-            layout(t, NodeId::ROOT, Metric::Allocated, &params, cache, stable)
-                .rects
-                .iter()
-                .map(|r| r.node)
-                .collect::<Vec<_>>()
+            layout(
+                t,
+                NodeId::ROOT,
+                Metric::Allocated,
+                None,
+                &params,
+                cache,
+                stable,
+            )
+            .rects
+            .iter()
+            .map(|r| r.node)
+            .collect::<Vec<_>>()
         };
         assert_eq!(order(&t, &mut cache, true), [a, b]);
 
@@ -687,5 +713,32 @@ mod tests {
         // a large change reorders even while scanning.
         t.update_file(a, sizes(1000));
         assert_eq!(order(&t, &mut cache, true), [a, b]);
+    }
+
+    #[test]
+    fn filtered_layout_uses_matching_bytes_only() {
+        use crate::search::{Matcher, Search};
+        let mut t = Tree::new("/r");
+        let photos = dir(&mut t, NodeId::ROOT, "photos");
+        let music = dir(&mut t, NodeId::ROOT, "music");
+        let jpg = file(&mut t, photos, "a.jpg", 300);
+        file(&mut t, photos, "b.png", 5_000);
+        file(&mut t, music, "song.mp3", 10_000);
+        let mut s = Search::new(Matcher::new(".JPG").unwrap());
+        s.catch_up(&t, usize::MAX);
+
+        let l = layout(
+            &t,
+            NodeId::ROOT,
+            Metric::Allocated,
+            Some(&s),
+            &LayoutParams::new(100.0, 100.0),
+            &mut OrderCache::default(),
+            false,
+        );
+        assert_eq!(l.total, 300);
+        let nodes: Vec<_> = l.rects.iter().map(|r| r.node).collect();
+        assert_eq!(nodes, [photos, jpg], "music has no matches");
+        assert_eq!(l.rects[0].weight, 300, "folder weight counts matches only");
     }
 }

@@ -71,7 +71,7 @@ impl Session {
                 .order
                 .lock()
                 .map_err(|_| "layout state is unavailable")?;
-            layout::layout(&tree, view, metric, &params, &mut order, !finished)
+            layout::layout(&tree, view, metric, None, &params, &mut order, !finished)
         };
 
         let mut rects = Vec::with_capacity(result.rects.len());
