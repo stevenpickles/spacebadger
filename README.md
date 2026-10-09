@@ -35,6 +35,7 @@ npm run tauri dev            # run the app with hot reload
 cargo test --workspace       # core tests (also regenerates ui/src/lib/protocol/*.ts)
 npm run check                # type-check the interface
 npx tauri build              # release build + native installers
+cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 ```
 
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
@@ -42,6 +43,8 @@ The app also accepts a folder to scan on start: `spacebadger <folder>` (for exam
 In the map: click selects, double-click (or Enter) opens a folder, Backspace goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
 
 The filter box matches file names only (not folders or paths), ignoring case, as a literal substring: `.pdf` finds every PDF, and `*` has no special meaning. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
+
+Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.
 
