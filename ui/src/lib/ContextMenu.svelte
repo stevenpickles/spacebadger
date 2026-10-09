@@ -6,6 +6,11 @@
     action: () => void;
     /** Draw a separator above this item. */
     separator?: boolean;
+    /** Shown but not available; `title` says why. */
+    disabled?: boolean;
+    title?: string;
+    /** Destructive: drawn in the danger color. */
+    danger?: boolean;
   }
 </script>
 
@@ -31,7 +36,7 @@
   const returnFocus = document.activeElement as HTMLElement | null;
 
   function buttons(): HTMLButtonElement[] {
-    return [...menu.querySelectorAll<HTMLButtonElement>("button")];
+    return [...menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
   }
 
   function close() {
@@ -101,6 +106,9 @@
       role="menuitem"
       tabindex="-1"
       aria-keyshortcuts={item.hint}
+      class:danger={item.danger}
+      disabled={item.disabled}
+      title={item.title}
       onclick={() => activate(item)}
     >
       <span>{item.label}</span>
@@ -142,6 +150,12 @@
   }
   button:focus-visible {
     box-shadow: inset 0 0 0 2px var(--accent);
+  }
+  button.danger {
+    color: var(--danger);
+  }
+  button:disabled {
+    background: none;
   }
   kbd {
     color: var(--muted);
