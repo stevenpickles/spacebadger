@@ -268,6 +268,50 @@ pub struct SearchPage {
     pub rows: Vec<SearchRow>,
 }
 
+/// Asks for the items merged into an "other small items" region: the
+/// region's folder and item count, as drawn with this metric and search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SmallItemsRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub count: u32,
+    pub metric: Metric,
+    pub search: Option<u32>,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SmallItem {
+    pub node: u32,
+    pub name: String,
+    pub folder: bool,
+    /// Size in the requested metric (matching bytes when filtered).
+    #[ts(type = "number")]
+    pub weight: u64,
+}
+
+/// Items of a small-items region, largest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SmallItemsPage {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub offset: u32,
+    pub total: u32,
+    pub items: Vec<SmallItem>,
+    /// Other children of the folder with no size in this metric, which the
+    /// map never draws.
+    pub empty: u32,
+}
+
 /// Capacity of the volume holding the scan root, for the volume overview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
