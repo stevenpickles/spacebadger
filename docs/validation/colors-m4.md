@@ -5,8 +5,8 @@ Date: 2026-10-09. Branch `feature/7/color-modes`.
 ## What exists
 
 - **Depth colors** (default): each nesting level gets its own hue; folders are darker than files.
-- **File type colors:** files are colored by type and folders are neutral gray. A legend under the map names every color, so no type has to be guessed from color alone.
-  - Types come from the extension only (`sb-core::filetype`), case-insensitively: video, audio, images, documents, archives, disk images, programs, code, and other.
+- **File type colors:** files are colored by type and folders are indigo, a hue no type uses. A legend under the map names every color, so no type has to be guessed from color alone.
+  - Types come from the extension only (`sb-core::filetype`), case-insensitively: video, audio (including `.m4b` audiobooks), images, documents, archives, disk images, programs, code, and other.
   - `.ts` is shared by TypeScript and MPEG transport streams; files of 1 MiB or more count as video.
   - The type travels in the previously reserved byte of each rectangle in the layout wire format, which is now version 2.
   - Hovering a file in this mode adds its type to the tooltip.
