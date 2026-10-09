@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { neutralFolderColor, otherSmallColor, TYPE_LEGEND, typeColor } from "./colors";
+  import { typeModeFolderColor, otherSmallColor, TYPE_LEGEND, typeColor } from "./colors";
 
   let dark = $state(window.matchMedia("(prefers-color-scheme: dark)").matches);
 
@@ -15,7 +15,7 @@
   {#each TYPE_LEGEND as t (t.type)}
     <li><span class="swatch" style:background={typeColor(t.type, dark)}></span>{t.label}</li>
   {/each}
-  <li><span class="swatch" style:background={neutralFolderColor(dark)}></span>Folders</li>
+  <li><span class="swatch" style:background={typeModeFolderColor(dark)}></span>Folders</li>
   <li><span class="swatch" style:background={otherSmallColor(dark)}></span>Small items</li>
 </ul>
 

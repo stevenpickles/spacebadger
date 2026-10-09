@@ -5,7 +5,7 @@
   import { nodeDetails, requestLayout } from "./api";
   import {
     depthColor,
-    neutralFolderColor,
+    typeModeFolderColor,
     otherSmallColor,
     typeColor,
     type ColorMode,
@@ -144,7 +144,7 @@
     const kind = l.kind[i];
     if (kind === KIND_OTHER) return otherSmallColor(dark);
     if (colors === "type") {
-      return kind === KIND_FOLDER ? neutralFolderColor(dark) : typeColor(l.ftype[i]!, dark);
+      return kind === KIND_FOLDER ? typeModeFolderColor(dark) : typeColor(l.ftype[i]!, dark);
     }
     return depthColor(l.depth[i]!, kind === KIND_FOLDER, dark);
   }

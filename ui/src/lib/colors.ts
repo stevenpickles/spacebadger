@@ -1,5 +1,5 @@
 // Treemap colors. Depth mode tints each nesting level; file-type mode colors
-// files by FILE_TYPES and draws folders in neutral gray.
+// files by FILE_TYPES and draws folders in one indigo, a hue no type uses.
 
 import { FILE_TYPES } from "./layoutWire";
 
@@ -23,8 +23,8 @@ export function typeColor(type: number, dark: boolean): string {
   return dark ? `hsl(${hue} 45% 42%)` : `hsl(${hue} 65% 74%)`;
 }
 
-export function neutralFolderColor(dark: boolean): string {
-  return dark ? "hsl(220 8% 24%)" : "hsl(220 8% 58%)";
+export function typeModeFolderColor(dark: boolean): string {
+  return dark ? "hsl(245 25% 33%)" : "hsl(245 32% 68%)";
 }
 
 export function otherSmallColor(dark: boolean): string {
