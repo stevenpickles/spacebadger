@@ -1,14 +1,42 @@
 # Releasing
 
-A release is made by pushing a version tag to a commit on `main`. The [release workflow](../.github/workflows/release.yml) builds the portable downloads and publishes them as a GitHub release; nothing is installed or signed beyond what's described below.
+Releases are cut on a release branch taken from `dev`. The branch is merged into `main`, the merge commit is tagged, and the branch is merged back into `dev`. The [release workflow](../.github/workflows/release.yml) builds and tests the downloads on every push to the release branch, and publishes them as a GitHub release when the tag is pushed. Nothing is installed or signed beyond what's described below.
+
+The version is kept only in the workspace `Cargo.toml` (`[workspace.package] version`); the app, its window, and the Windows file properties take it from there. During development, `CHANGELOG.md` collects entries under `## [Unreleased]`.
 
 ## Steps
 
-1. On `dev`, set the new version in the workspace `Cargo.toml` (`[workspace.package] version`). It is the only place the version is kept: the app, its window, and the Windows file properties all take it from there.
-2. Run `cargo check --workspace` so `Cargo.lock` picks up the version.
-3. In `CHANGELOG.md`, move the entries under `## [Unreleased]` into a new `## [x.y.z] - YYYY-MM-DD` section. That section becomes the release notes; the release fails if it's missing.
-4. Merge `dev` into `main` through a pull request.
-5. Tag the merge commit on `main` and push the tag:
+Shown for 0.1.0; use the new version throughout.
+
+1. **Branch from `dev`:**
+
+   ```sh
+   git checkout dev && git pull
+   git checkout -b release/v0.1.0
+   ```
+
+2. **Set the version and changelog:**
+
+   ```sh
+   scripts/release/bump.sh 0.1.0
+   ```
+
+   This sets the version in `Cargo.toml` and `Cargo.lock`, and moves the Unreleased entries into a `## [0.1.0] - <today>` section, which becomes the release notes. Edit the section if needed, then commit and push:
+
+   ```sh
+   git commit -am "Prepare 0.1.0"
+   git push -u origin release/v0.1.0
+   ```
+
+3. **Test.** Every push to the branch runs CI and the release workflow without publishing:
+   - the branch name has to match the version, and the changelog section has to exist;
+   - the Windows, Linux, and macOS downloads are built and attached to the workflow run as artifacts (kept 90 days by default), so they can be tried before release.
+
+   Release-only fixes (changelog wording, packaging, last bug fixes) are committed on the release branch.
+
+4. **Merge into `main`.** Open a pull request from `release/v0.1.0` into `main` and merge it with a **merge commit**, not squash or rebase, so the same commits later merge cleanly into `dev`.
+
+5. **Tag the merge commit:**
 
    ```sh
    git checkout main && git pull
@@ -16,16 +44,13 @@ A release is made by pushing a version tag to a commit on `main`. The [release w
    git push origin v0.1.0
    ```
 
-The workflow then:
+   The workflow checks that the tag is `v` plus the `Cargo.toml` version and points at a commit on `main`, builds on Windows, Linux (Ubuntu 22.04), and macOS (Apple Silicon), packs each download with `LICENSE`, `README.md`, and `THIRD-PARTY-LICENSES.html`, and publishes the release with the changelog section as notes, plus `SHA256SUMS`.
 
-- checks that the tag is `v` plus the `Cargo.toml` version and points at a commit on `main`;
-- builds on Windows, Linux (Ubuntu 22.04), and macOS (Apple Silicon);
-- packs each download with `LICENSE`, `README.md`, and `THIRD-PARTY-LICENSES.html`;
-- publishes the release with the changelog section as notes, plus `SHA256SUMS`.
+   If a check fails, nothing is published. Delete the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on the release branch, merge it into `main` again, and re-tag.
 
-If a check fails, nothing is published. Delete the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on `main`, and tag again.
+6. **Merge back into `dev`.** Open a pull request from `release/v0.1.0` into `dev`, again with a merge commit, so the version, changelog, and any fixes made on the release branch reach `dev`. Then delete the release branch.
 
-Pull requests that change the release files (`release.yml`, `scripts/release/`, `packaging/`, `tauri.conf.json`) run the same builds without publishing, and keep the downloads as workflow artifacts.
+Pull requests from other branches that change the release files (`release.yml`, `scripts/release/`, `packaging/`, `tauri.conf.json`) also build the downloads without publishing.
 
 ## Downloads
 
