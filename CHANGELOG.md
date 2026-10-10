@@ -1,10 +1,8 @@
 # Changelog
 
-All notable changes to SpaceBadger are listed here. Versions follow [semantic versioning](https://semver.org/); each `## [x.y.z]` section becomes the notes of that GitHub release.
+All notable changes to SpaceBadger are listed here. Versions follow [semantic versioning](https://semver.org/); new entries go under `## [Unreleased]`, and `scripts/release/bump.sh` turns them into a version's section on its release branch. Each `## [x.y.z]` section becomes the notes of that GitHub release.
 
 ## [Unreleased]
-
-## [0.1.0] - 2026-10-10
 
 First release, as portable downloads for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Silicon.
 
