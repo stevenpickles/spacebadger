@@ -139,6 +139,10 @@ jobs:
 
       - name: Build
         shell: bash
+        env:
+          # rustc crashed with a stack overflow compiling tauri with release
+          # optimizations on Ubuntu 22.04; it suggests this size.
+          RUST_MIN_STACK: "16777216"
         run: |
           if [ "${{ matrix.platform }}" = windows ]; then
             npx tauri build --no-bundle
