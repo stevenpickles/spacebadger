@@ -1,0 +1,27 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES.html, shipped with every
+# release download. Only crates compiled into the app count: build and dev
+# dependencies are not distributed.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Our own crates are covered by LICENSE.
+private = { ignore = true }
