@@ -277,7 +277,7 @@
     </div>
     {#if total === 0}
       <p class="muted empty">
-        {scanning ? "No matching files found yet." : `No file names contain “${summary.query}”.`}
+        {scanning ? "No matching files found yet." : `No file names match “${summary.query}”.`}
       </p>
     {/if}
   </div>
