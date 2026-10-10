@@ -45,6 +45,12 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
+  const FILTER_HELP = [
+    "Matches file names, ignoring case. Separate patterns with ;",
+    "report: names containing “report”",
+    "*.jpg: names ending in .jpg (* is any text, ? one character)",
+    "!*.tmp: leave out names ending in .tmp",
+  ].join("\n");
 
   let generation = $state<number | null>(null);
   let status = $state.raw<ScanStatus | null>(null);
@@ -557,7 +563,7 @@
     const what = metric === "allocated" ? "allocated space" : "data";
     if (search) {
       if (search.files === 0) {
-        const text = `No file names contain “${search.query}”`;
+        const text = `No file names match “${search.query}”`;
         return { text: scanning ? `${text} yet.` : `${text}.`, toRoot: view !== ROOT };
       }
       if (view !== ROOT) {
@@ -598,8 +604,9 @@
     <div class="filter">
       <input
         type="search"
-        placeholder="Filter by file name"
+        placeholder="Filter: *.jpg; *.png; !*.tmp"
         aria-label="Filter by file name"
+        title={FILTER_HELP}
         bind:value={query}
         oninput={onQueryInput}
         onkeydown={(e) => e.key === "Escape" && clearQuery()}

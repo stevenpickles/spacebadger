@@ -1,8 +1,10 @@
 //! Filename search as an overlay on the scan tree.
 //!
-//! A query matches a file when its basename (including the extension)
-//! contains the query as a case-insensitive literal substring. Folder names
-//! and full paths are never matched, and file contents are never read.
+//! A query is a list of patterns separated by `;`, matched against a file's
+//! basename (including the extension), ignoring case. A pattern with `*` or
+//! `?` wildcards must match the whole name; one without matches any name
+//! containing it. A leading `!` excludes. Folder names and full paths are
+//! never matched, and file contents are never read.
 //!
 //! [`Search`] keeps its own totals for matching files and every folder above
 //! them, so the treemap can be drawn from matching bytes only. It catches up
@@ -18,24 +20,205 @@ use std::ffi::OsStr;
 
 const NONE: u32 = u32::MAX;
 
-/// Case-insensitive literal substring matcher for file names.
+/// Case-insensitive file name matcher for a query such as
+/// `*.jpg; *.png; !thumb*`.
+///
+/// A name matches when it matches any included pattern (or there are none)
+/// and no excluded one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     query: String,
-    /// Lowercased query.
-    needle: String,
+    include: Vec<Pattern>,
+    exclude: Vec<Pattern>,
+    /// Every pattern is ASCII, so ASCII names can be matched bytewise.
+    ascii: bool,
+    /// Some pattern has `?`, so non-ASCII names are needed as characters.
+    globs: bool,
+}
+
+/// One pattern of a query, lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pattern {
+    /// No wildcards: the name contains it.
+    Contains(String),
+    /// Only `*` wildcards, kept as the pieces between them: the name starts
+    /// with the first, ends with the last, and holds the rest in order.
+    Stars { text: String, pieces: Vec<String> },
+    /// `*` matches any run of characters and `?` one character; the whole
+    /// name must match.
+    Glob { text: String, chars: Vec<char> },
+}
+
+impl Pattern {
+    fn new(term: &str) -> Self {
+        let text = term.to_lowercase();
+        if text.contains('?') {
+            let chars = text.chars().collect();
+            Self::Glob { text, chars }
+        } else if text.contains('*') {
+            let pieces = text.split('*').map(str::to_owned).collect();
+            Self::Stars { text, pieces }
+        } else {
+            Self::Contains(text)
+        }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Self::Contains(text) | Self::Stars { text, .. } | Self::Glob { text, .. } => text,
+        }
+    }
+
+    /// Matches an ASCII name against an ASCII pattern without allocating.
+    fn matches_ascii(&self, name: &[u8]) -> bool {
+        match self {
+            Self::Contains(needle) => find_ascii(name, needle.as_bytes()).is_some(),
+            Self::Stars { pieces, .. } => stars(
+                pieces,
+                name,
+                |p| p.as_bytes(),
+                |a, b| a.eq_ignore_ascii_case(b),
+                find_ascii,
+            ),
+            Self::Glob { text, .. } => wildcard(text.as_bytes(), name, b'*', b'?', |p, n| {
+                p == n.to_ascii_lowercase()
+            }),
+        }
+    }
+
+    /// Matches a lowercased name, given also as characters when there are
+    /// `?` globs to match.
+    fn matches_lower(&self, name: &str, chars: &[char]) -> bool {
+        match self {
+            Self::Contains(needle) => name.contains(needle.as_str()),
+            Self::Stars { pieces, .. } => stars(
+                pieces,
+                name.as_bytes(),
+                |p| p.as_bytes(),
+                |a, b| a == b,
+                // Both sides are lowercased UTF-8, so equal bytes are
+                // equal characters.
+                find_exact,
+            ),
+            Self::Glob { chars: pattern, .. } => wildcard(pattern, chars, '*', '?', |p, n| p == n),
+        }
+    }
+}
+
+/// Where `needle` first occurs in `hay`.
+fn find_exact(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Where `needle` first occurs in `hay`, ignoring ASCII case.
+fn find_ascii(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Whether `name` matches star-separated `pieces` (at least two): it starts
+/// with the first, ends with the last, and holds the others in order,
+/// without overlaps. Taking each middle piece at its earliest place is
+/// always safe.
+fn stars(
+    pieces: &[String],
+    name: &[u8],
+    bytes: impl Fn(&String) -> &[u8],
+    eq: impl Fn(&[u8], &[u8]) -> bool,
+    find: impl Fn(&[u8], &[u8]) -> Option<usize>,
+) -> bool {
+    let (Some(first), Some(last)) = (pieces.first(), pieces.last()) else {
+        return false;
+    };
+    let (first, last) = (bytes(first), bytes(last));
+    if first.len() + last.len() > name.len()
+        || !eq(&name[..first.len()], first)
+        || !eq(&name[name.len() - last.len()..], last)
+    {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for piece in &pieces[1..pieces.len() - 1] {
+        let piece = bytes(piece);
+        match find(rest, piece) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Whether `name` matches `pattern`, where `star` matches any run of items
+/// and `one` any single item. Greedy, backtracking only to the last star,
+/// which is enough for this pattern language.
+fn wildcard<T: Copy + PartialEq>(
+    pattern: &[T],
+    name: &[T],
+    star: T,
+    one: T,
+    eq: impl Fn(T, T) -> bool,
+) -> bool {
+    let (mut p, mut n) = (0, 0);
+    // Pattern position after the last star, and the name position it
+    // currently stands for.
+    let mut back: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some(&c) if c == star => {
+                p += 1;
+                back = Some((p, n));
+            }
+            Some(&c) if c == one || eq(c, name[n]) => {
+                p += 1;
+                n += 1;
+            }
+            _ => match back {
+                Some((bp, bn)) => {
+                    p = bp;
+                    n = bn + 1;
+                    back = Some((bp, n));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == star)
 }
 
 impl Matcher {
-    /// `None` for an empty query. The query is used literally: no wildcards,
-    /// and surrounding spaces are kept because file names can contain them.
+    /// `None` when the query has no patterns. Patterns are separated by `;`
+    /// and trimmed; a leading `!` excludes.
     pub fn new(query: &str) -> Option<Self> {
-        if query.is_empty() {
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+        for term in query.split(';') {
+            let term = term.trim();
+            let (list, term) = match term.strip_prefix('!') {
+                Some(rest) => (&mut exclude, rest.trim_start()),
+                None => (&mut include, term),
+            };
+            if !term.is_empty() {
+                list.push(Pattern::new(term));
+            }
+        }
+        if include.is_empty() && exclude.is_empty() {
             return None;
         }
+        let all = || include.iter().chain(&exclude);
+        let ascii = all().all(|p| p.text().is_ascii());
+        let globs = all().any(|p| matches!(p, Pattern::Glob { .. }));
         Some(Self {
             query: query.to_owned(),
-            needle: query.to_lowercase(),
+            include,
+            exclude,
+            ascii,
+            globs,
         })
     }
 
@@ -45,15 +228,22 @@ impl Matcher {
 
     pub fn matches(&self, name: &OsStr) -> bool {
         let bytes = name.as_encoded_bytes();
-        let needle = self.needle.as_bytes();
-        // Fast path without allocating: ASCII names against an ASCII query.
-        if bytes.is_ascii() && needle.is_ascii() {
-            return needle.len() <= bytes.len()
-                && bytes
-                    .windows(needle.len())
-                    .any(|w| w.eq_ignore_ascii_case(needle));
+        // Fast path without allocating: ASCII names against ASCII patterns.
+        if self.ascii && bytes.is_ascii() {
+            return self.decide(|p| p.matches_ascii(bytes));
         }
-        name.to_string_lossy().to_lowercase().contains(&self.needle)
+        let lower = name.to_string_lossy().to_lowercase();
+        let chars: Vec<char> = if self.globs {
+            lower.chars().collect()
+        } else {
+            Vec::new()
+        };
+        self.decide(|p| p.matches_lower(&lower, &chars))
+    }
+
+    fn decide(&self, test: impl Fn(&Pattern) -> bool) -> bool {
+        (self.include.is_empty() || self.include.iter().any(&test))
+            && !self.exclude.iter().any(&test)
     }
 }
 
@@ -322,10 +512,103 @@ mod tests {
         assert!(m.matches("a.PDF".as_ref()), "extension is part of the name");
         let m = Matcher::new("ÄPFEL").unwrap();
         assert!(m.matches("äpfel und birnen".as_ref()));
-        let m = Matcher::new("*.txt").unwrap();
-        assert!(!m.matches("a.txt".as_ref()), "no wildcards");
-        assert!(m.matches("odd *.txt name".as_ref()));
+        let m = Matcher::new("annual report").unwrap();
+        assert!(
+            m.matches("2024 Annual Report.pdf".as_ref()),
+            "spaces inside are kept"
+        );
         assert!(Matcher::new("").is_none());
+    }
+
+    #[test]
+    fn wildcards_match_the_whole_name() {
+        let m = Matcher::new("*.txt").unwrap();
+        assert!(m.matches("a.TXT".as_ref()));
+        assert!(m.matches(".txt".as_ref()));
+        assert!(!m.matches("a.txt.bak".as_ref()));
+        let m = Matcher::new("IMG_????.jpg").unwrap();
+        assert!(m.matches("img_0042.JPG".as_ref()));
+        assert!(!m.matches("img_042.jpg".as_ref()));
+        assert!(!m.matches("img_00042.jpg".as_ref()));
+        let m = Matcher::new("*report*2024*").unwrap();
+        assert!(m.matches("Q3 report - final 2024.xlsx".as_ref()));
+        assert!(m.matches("report2024".as_ref()));
+        assert!(!m.matches("2024 report".as_ref()));
+        let m = Matcher::new("a*b*c").unwrap();
+        assert!(m.matches("aXbYbZc".as_ref()), "backtracks past an early b");
+        assert!(!m.matches("aXbYc_".as_ref()));
+        assert!(Matcher::new("*").unwrap().matches("".as_ref()));
+        assert!(Matcher::new("**").unwrap().matches("anything".as_ref()));
+        let m = Matcher::new("Ä?fel*").unwrap();
+        assert!(m.matches("äpfel.txt".as_ref()));
+        assert!(!m.matches("apfel.txt".as_ref()));
+        let m = Matcher::new("*.txt").unwrap();
+        assert!(
+            m.matches("grüße.txt".as_ref()),
+            "ASCII pattern, other names"
+        );
+    }
+
+    #[test]
+    fn star_only_patterns_agree_with_the_general_matcher() {
+        let patterns = [
+            "*", "**", "a*", "*a", "a*a", "ab*ba", "*b*", "a**b", "*a*b*a*", "ä*", "*ß*", "x*ä*y",
+        ];
+        let alphabet = ['a', 'b', 'A', 'ä', 'ß', 'x', 'y'];
+        let mut names = vec![String::new()];
+        for _ in 0..4 {
+            let longer: Vec<String> = names
+                .iter()
+                .flat_map(|n| alphabet.iter().map(move |c| format!("{n}{c}")))
+                .collect();
+            names.extend(longer);
+        }
+        for pattern in patterns {
+            let fast = Matcher::new(pattern).unwrap();
+            assert!(matches!(fast.include[0], Pattern::Stars { .. }));
+            let lower = pattern.to_lowercase();
+            let chars: Vec<char> = lower.chars().collect();
+            for name in &names {
+                let lowered: Vec<char> = name.to_lowercase().chars().collect();
+                let expected = wildcard(&chars, &lowered, '*', '?', |p, n| p == n);
+                assert_eq!(
+                    fast.matches(name.as_ref()),
+                    expected,
+                    "{pattern:?} on {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn several_patterns_and_exclusions() {
+        let m = Matcher::new(" *.jpg ; *.png;;heic ").unwrap();
+        assert!(m.matches("a.jpg".as_ref()));
+        assert!(m.matches("b.PNG".as_ref()));
+        assert!(
+            m.matches("c.heic".as_ref()),
+            "plain patterns still mean contains"
+        );
+        assert!(!m.matches("d.gif".as_ref()));
+        assert!(!m.matches("a.jpg.part".as_ref()));
+
+        let m = Matcher::new("*.log; !debug*").unwrap();
+        assert!(m.matches("app.log".as_ref()));
+        assert!(!m.matches("Debug-1.log".as_ref()));
+        assert!(!m.matches("debug.txt".as_ref()));
+
+        let m = Matcher::new("! *.tmp; !cache").unwrap();
+        assert!(
+            m.matches("notes.txt".as_ref()),
+            "only exclusions keep the rest"
+        );
+        assert!(!m.matches("x.TMP".as_ref()));
+        assert!(!m.matches("webcache.db".as_ref()));
+
+        for empty in ["", " ", " ; ;", "!", "! ;"] {
+            assert!(Matcher::new(empty).is_none(), "{empty:?}");
+        }
+        assert_eq!(Matcher::new("*.a; *.b").unwrap().query(), "*.a; *.b");
     }
 
     #[test]

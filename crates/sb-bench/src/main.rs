@@ -214,7 +214,13 @@ fn run(nodes: usize, seed: u64) {
         ms(small)
     );
 
-    for query in [".pdf", "e", "no file has this name"] {
+    for query in [
+        ".pdf",
+        "e",
+        "no file has this name",
+        "*.jpg; *.png; *.pdf",
+        "*e*; !*.tmp; !*.log",
+    ] {
         let (searched, s) = time(3, || {
             let mut s = Search::new(Matcher::new(query).expect("non-empty"));
             s.catch_up(&tree, usize::MAX);
