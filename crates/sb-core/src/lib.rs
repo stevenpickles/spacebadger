@@ -4,5 +4,6 @@
 pub mod filetype;
 pub mod layout;
 pub mod search;
+pub mod selection;
 pub mod size;
 pub mod tree;

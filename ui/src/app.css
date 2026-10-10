@@ -7,6 +7,8 @@
   --muted: #5d6270;
   --hover: rgb(0 0 0 / 0.07);
   --accent: #2563c9;
+  /* Background of selected rows. */
+  --selected: rgb(37 99 201 / 0.16);
   --link: #1f56b3;
   --danger: #b3261e;
   --danger-bg: #f9dedc;
@@ -26,6 +28,7 @@
     --muted: #a3a8b3;
     --hover: rgb(255 255 255 / 0.08);
     --accent: #7aa7ff;
+    --selected: rgb(122 167 255 / 0.2);
     --link: #8db4ff;
     --danger: #ffb4ab;
     --danger-bg: #5c1f1b;

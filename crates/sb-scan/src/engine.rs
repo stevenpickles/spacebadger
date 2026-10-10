@@ -195,6 +195,17 @@ impl Progress {
             omissions: Omissions::default(),
         }
     }
+
+    /// Copies the tree's totals.
+    fn count(&mut self, tree: &Tree) {
+        let root = NodeId::ROOT;
+        self.files = u64::from(tree.file_count(root));
+        self.dirs = tree.dir_count() - 1;
+        self.logical = tree.logical(root);
+        self.allocated = tree.allocated(root);
+        self.unknown_allocation_files = u64::from(tree.unknown_allocation_files(root));
+        self.hardlink_aliases = tree.alias_count() as u64;
+    }
 }
 
 struct Shared {
@@ -261,6 +272,23 @@ impl Scan {
 
     pub fn progress(&self) -> Progress {
         self.shared.progress.lock().unwrap().clone()
+    }
+
+    /// Applies `edit` to the tree of a finished scan, such as removing
+    /// deleted items, and records it as a new revision. Returns `None`
+    /// without calling `edit` while the scan is running, because the scanner
+    /// may still be adding to the parts being changed.
+    pub fn edit_finished<R>(&self, edit: impl FnOnce(&mut Tree) -> R) -> Option<(R, Progress)> {
+        if !self.shared.progress.lock().unwrap().state.is_finished() {
+            return None;
+        }
+        // Same lock order as the aggregator: tree, then progress.
+        let mut tree = self.tree.write().unwrap();
+        let result = edit(&mut tree);
+        let mut progress = self.shared.progress.lock().unwrap();
+        progress.revision += 1;
+        progress.count(&tree);
+        Some((result, progress.clone()))
     }
 
     /// Requests cancellation. Returns immediately; the scan reports
@@ -644,9 +672,9 @@ impl<A: FsAdapter> Aggregator<A> {
     fn publish(&mut self, state: ScanState) {
         let progress = {
             let tree = self.tree.read().unwrap();
-            let root = NodeId::ROOT;
+            let mut progress = Progress::new(self.shared.progress.lock().unwrap().generation);
+            progress.count(&tree);
             Progress {
-                generation: self.shared.progress.lock().unwrap().generation,
                 pending_dirs: if state.is_finished() {
                     0
                 } else {
@@ -654,14 +682,9 @@ impl<A: FsAdapter> Aggregator<A> {
                 },
                 state,
                 elapsed: self.started.elapsed(),
-                files: u64::from(tree.file_count(root)),
-                dirs: tree.dir_count() - 1,
-                logical: tree.logical(root),
-                allocated: tree.allocated(root),
-                unknown_allocation_files: u64::from(tree.unknown_allocation_files(root)),
-                hardlink_aliases: tree.alias_count() as u64,
                 revision: self.revision,
                 omissions: self.omissions.clone(),
+                ..progress
             }
         };
         *self.shared.progress.lock().unwrap() = progress.clone();

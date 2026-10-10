@@ -2,6 +2,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
+import type { DeleteReport } from "./protocol/DeleteReport";
+import type { DeleteRequest } from "./protocol/DeleteRequest";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -9,11 +11,13 @@ import type { ScanStatus } from "./protocol/ScanStatus";
 import type { SearchPage } from "./protocol/SearchPage";
 import type { SearchResultsRequest } from "./protocol/SearchResultsRequest";
 import type { SearchSummary } from "./protocol/SearchSummary";
+import type { SelectionRequest } from "./protocol/SelectionRequest";
+import type { SelectionSummary } from "./protocol/SelectionSummary";
 import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
-export const EXPECTED_PROTOCOL_VERSION = 2;
+export const EXPECTED_PROTOCOL_VERSION = 4;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
@@ -76,6 +80,30 @@ export function volumeInfo(generation: number): Promise<VolumeInfo | null> {
 /** Shows the item selected in Explorer, Finder, or the desktop's file manager. */
 export function reveal(generation: number, node: number): Promise<void> {
   return invoke("reveal", { generation, node });
+}
+
+/** What a set of selected items amounts to. */
+export function selectionSummary(request: SelectionRequest): Promise<SelectionSummary> {
+  return invoke<SelectionSummary>("selection_summary", { request });
+}
+
+/** Turns deleting on or off for this run of the app. It always starts off. */
+export function setDeleteAllowed(allowed: boolean): Promise<boolean> {
+  return invoke<boolean>("set_delete_allowed", { allowed });
+}
+
+/**
+ * Moves items (folders with their contents) to the Recycle Bin or Trash and
+ * removes them from the scan; a status update with a new revision follows.
+ * Rejects unless deleting is turned on, and while scanning.
+ */
+export function deleteItems(request: DeleteRequest): Promise<DeleteReport> {
+  return invoke<DeleteReport>("delete_items", { request });
+}
+
+/** Where deleted items go, for labels. */
+export function trashName(os: string): string {
+  return os === "windows" ? "Recycle Bin" : "Trash";
 }
 
 /** What the system file manager is called, for menu labels. */

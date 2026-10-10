@@ -7,6 +7,7 @@
   import type { Metric } from "./protocol/Metric";
   import type { SearchRow } from "./protocol/SearchRow";
   import type { SearchSummary } from "./protocol/SearchSummary";
+  import { clickPick, type Pick } from "./selection";
 
   interface Props {
     generation: number;
@@ -17,8 +18,12 @@
     scanning: boolean;
     /** Unfiltered size of the scan, for comparison. */
     scanned: number;
-    selected: number | null;
-    onselect: (node: number) => void;
+    selected: Set<number>;
+    /** Where Shift ranges start. */
+    anchor: number | null;
+    onpick: (pick: Pick) => void;
+    /** The Delete key. */
+    ondelete: () => void;
     /** Open the containing folder in the map and select the file. */
     onshow: (row: SearchRow) => void;
     onmenu: (row: SearchRow, x: number, y: number) => void;
@@ -32,7 +37,9 @@
     scanning,
     scanned,
     selected,
-    onselect,
+    anchor,
+    onpick,
+    ondelete,
     onshow,
     onmenu,
   }: Props = $props();
@@ -124,7 +131,45 @@
     if (top < list.scrollTop) list.scrollTop = top;
     else if (top + ROW > list.scrollTop + viewport) list.scrollTop = top + ROW - viewport;
     const row = rows.get(active);
-    if (row) onselect(row.node);
+    if (row) onpick(only(row.node));
+  }
+
+  function only(node: number): Pick {
+    return { focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false };
+  }
+
+  /** Matching files from row `from` to row `to`, loading rows not yet seen. */
+  async function rangeNodes(from: number, to: number): Promise<number[]> {
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    const want = { generation, search: summary.search, metric };
+    const found = new Map(rows);
+    for (let i = lo; i <= hi; i++) {
+      if (found.has(i)) continue;
+      const page = await searchResults({ ...want, offset: i, limit: Math.min(500, hi - i + 1) });
+      if (page.generation !== generation || page.search !== summary.search) return [];
+      page.rows.forEach((r, k) => found.set(page.offset + k, r));
+      if (page.rows.length === 0) break;
+    }
+    const nodes: number[] = [];
+    for (let i = lo; i <= hi; i++) {
+      const r = found.get(i);
+      if (r) nodes.push(r.node);
+    }
+    return nodes;
+  }
+
+  async function onRowClick(e: MouseEvent, index: number, row: SearchRow | undefined) {
+    active = index;
+    list.focus();
+    if (!row) return;
+    const focus = { node: row.node, other: false };
+    let range: number[] | null = null;
+    if (e.shiftKey && anchor !== null) {
+      const from = [...rows].find(([, r]) => r.node === anchor)?.[0];
+      if (from !== undefined) range = await rangeNodes(from, index);
+    }
+    onpick(clickPick(focus, e, range));
   }
 
   function onKey(e: KeyboardEvent) {
@@ -145,6 +190,9 @@
     if (action) {
       action();
       e.preventDefault();
+    } else if (e.key === "Delete") {
+      ondelete();
+      e.preventDefault();
     } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
       const row = rows.get(active);
       if (row) {
@@ -158,7 +206,9 @@
   function onContextMenu(e: MouseEvent, index: number, row: SearchRow) {
     e.preventDefault();
     active = index;
-    onselect(row.node);
+    const focus = { node: row.node, other: false };
+    // Keep a selection the click points into, so the menu acts on all of it.
+    onpick(selected.has(row.node) ? { focus, nodes: [], mode: "add", keepAnchor: true } : only(row.node));
     list.focus();
     onmenu(row, e.clientX, e.clientY);
   }
@@ -189,7 +239,8 @@
     bind:this={list}
     role="listbox"
     tabindex="0"
-    aria-label="Matching files, largest first. Enter shows the file in the map."
+    aria-multiselectable="true"
+    aria-label="Matching files, largest first. Ctrl+click or Shift+click selects several. Enter shows the file in the map."
     aria-activedescendant={total > 0 ? `result-${active}` : undefined}
     onscroll={() => (scrollTop = list.scrollTop)}
     onkeydown={onKey}
@@ -202,16 +253,12 @@
           id="result-{i}"
           class="row"
           class:active={i === active}
-          class:selected={row !== undefined && row.node === selected}
+          class:selected={row !== undefined && selected.has(row.node)}
           role="option"
-          aria-selected={row !== undefined && row.node === selected}
+          aria-selected={row !== undefined && selected.has(row.node)}
           tabindex="-1"
           style:top="{i * ROW}px"
-          onclick={() => {
-            active = i;
-            if (row) onselect(row.node);
-            list.focus();
-          }}
+          onclick={(e) => onRowClick(e, i, row)}
           ondblclick={() => row && onshow(row)}
           oncontextmenu={(e) => row && onContextMenu(e, i, row)}
           onkeydown={() => {}}
@@ -291,7 +338,7 @@
     background: var(--hover);
   }
   .row.selected {
-    background: var(--hover);
+    background: var(--selected);
     font-weight: 600;
   }
   .line {
