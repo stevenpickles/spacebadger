@@ -4,6 +4,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-10
+
 First release, as portable downloads for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Silicon.
 
 - Scans a folder or drive and draws it as a treemap while the scan runs, by allocated or logical size, with depth or file-type colors.
@@ -12,3 +14,4 @@ First release, as portable downloads for Windows x64, Linux x86_64 (AppImage), a
 - Filename filter with several `;`-separated patterns, `*`/`?` wildcards, and `!` exclusions, with a ranked result list.
 - Small-items lists, details panel, context menu, and "Show in file manager".
 - Select several items and move them to the Recycle Bin or Trash, guarded by an "Allow deleting" switch, a typed confirmation, and never deleting permanently.
+
