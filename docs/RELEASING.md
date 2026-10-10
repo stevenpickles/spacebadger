@@ -32,7 +32,7 @@ Pull requests that change the release files (`release.yml`, `scripts/release/`, 
 | File | Platform | How to run |
 |---|---|---|
 | `SpaceBadger-x.y.z-windows-x64.zip` | Windows 10 and 11, x64 | Extract and run `SpaceBadger.exe`. Uses the WebView2 runtime that comes with Windows. |
-| `SpaceBadger-x.y.z-linux-x86_64.AppImage` | Linux x86_64 with glibc 2.35 or newer | `chmod +x` and run. |
+| `SpaceBadger-x.y.z-linux-x86_64.AppImage` | Linux x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, and later) | `chmod +x` and run. Uses the system's graphics libraries (`libEGL`), which every desktop has. |
 | `SpaceBadger-x.y.z-macos-arm64.zip` | macOS 11 or newer, Apple Silicon | Extract and open `SpaceBadger.app`. |
 | `THIRD-PARTY-LICENSES.html` | | Licenses of the bundled Rust crates and npm packages. |
 | `SHA256SUMS` | | Checksums of the files above. |
