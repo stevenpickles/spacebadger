@@ -5,7 +5,11 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–4 and 6 (selection and delete) are complete; milestone 5 has its scale work done, and packaging is next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+
+## Download
+
+Portable builds for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Silicon are on the [releases page](https://github.com/stevenpickles/spacebadger/releases). Nothing is installed: extract and run. They aren't code-signed, so Windows and macOS warn on first launch; see [`docs/RELEASING.md`](docs/RELEASING.md#downloads) for how to open them and how releases are made.
 
 ## Layout
 
@@ -34,7 +38,7 @@ npm install                  # once
 npm run tauri dev            # run the app with hot reload
 cargo test --workspace       # core tests (also regenerates ui/src/lib/protocol/*.ts)
 npm run check                # type-check the interface
-npx tauri build              # release build + native installers
+npx tauri build              # release build (macOS app, Linux AppImage); add --no-bundle on Windows
 cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 ```
 
@@ -60,3 +64,7 @@ Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay:
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.
 
 After changing a type in `sb-protocol`, run `cargo test -p sb-protocol` and commit the regenerated bindings. CI fails if they are stale.
+
+## License
+
+MIT; see [`LICENSE`](LICENSE). Release downloads include the licenses of bundled third-party code in `THIRD-PARTY-LICENSES.html`.
