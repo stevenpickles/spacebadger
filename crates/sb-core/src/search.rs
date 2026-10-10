@@ -32,7 +32,7 @@ pub struct Matcher {
     exclude: Vec<Pattern>,
     /// Every pattern is ASCII, so ASCII names can be matched bytewise.
     ascii: bool,
-    /// Some pattern has wildcards.
+    /// Some pattern has `?`, so non-ASCII names are needed as characters.
     globs: bool,
 }
 
@@ -41,6 +41,9 @@ pub struct Matcher {
 enum Pattern {
     /// No wildcards: the name contains it.
     Contains(String),
+    /// Only `*` wildcards, kept as the pieces between them: the name starts
+    /// with the first, ends with the last, and holds the rest in order.
+    Stars { text: String, pieces: Vec<String> },
     /// `*` matches any run of characters and `?` one character; the whole
     /// name must match.
     Glob { text: String, chars: Vec<char> },
@@ -49,9 +52,12 @@ enum Pattern {
 impl Pattern {
     fn new(term: &str) -> Self {
         let text = term.to_lowercase();
-        if text.contains(['*', '?']) {
+        if text.contains('?') {
             let chars = text.chars().collect();
             Self::Glob { text, chars }
+        } else if text.contains('*') {
+            let pieces = text.split('*').map(str::to_owned).collect();
+            Self::Stars { text, pieces }
         } else {
             Self::Contains(text)
         }
@@ -59,20 +65,21 @@ impl Pattern {
 
     fn text(&self) -> &str {
         match self {
-            Self::Contains(text) | Self::Glob { text, .. } => text,
+            Self::Contains(text) | Self::Stars { text, .. } | Self::Glob { text, .. } => text,
         }
     }
 
     /// Matches an ASCII name against an ASCII pattern without allocating.
     fn matches_ascii(&self, name: &[u8]) -> bool {
         match self {
-            Self::Contains(needle) => {
-                let needle = needle.as_bytes();
-                needle.len() <= name.len()
-                    && name
-                        .windows(needle.len())
-                        .any(|w| w.eq_ignore_ascii_case(needle))
-            }
+            Self::Contains(needle) => find_ascii(name, needle.as_bytes()).is_some(),
+            Self::Stars { pieces, .. } => stars(
+                pieces,
+                name,
+                |p| p.as_bytes(),
+                |a, b| a.eq_ignore_ascii_case(b),
+                find_ascii,
+            ),
             Self::Glob { text, .. } => wildcard(text.as_bytes(), name, b'*', b'?', |p, n| {
                 p == n.to_ascii_lowercase()
             }),
@@ -80,13 +87,71 @@ impl Pattern {
     }
 
     /// Matches a lowercased name, given also as characters when there are
-    /// globs to match.
+    /// `?` globs to match.
     fn matches_lower(&self, name: &str, chars: &[char]) -> bool {
         match self {
             Self::Contains(needle) => name.contains(needle.as_str()),
+            Self::Stars { pieces, .. } => stars(
+                pieces,
+                name.as_bytes(),
+                |p| p.as_bytes(),
+                |a, b| a == b,
+                // Both sides are lowercased UTF-8, so equal bytes are
+                // equal characters.
+                find_exact,
+            ),
             Self::Glob { chars: pattern, .. } => wildcard(pattern, chars, '*', '?', |p, n| p == n),
         }
     }
+}
+
+/// Where `needle` first occurs in `hay`.
+fn find_exact(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Where `needle` first occurs in `hay`, ignoring ASCII case.
+fn find_ascii(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Whether `name` matches star-separated `pieces` (at least two): it starts
+/// with the first, ends with the last, and holds the others in order,
+/// without overlaps. Taking each middle piece at its earliest place is
+/// always safe.
+fn stars(
+    pieces: &[String],
+    name: &[u8],
+    bytes: impl Fn(&String) -> &[u8],
+    eq: impl Fn(&[u8], &[u8]) -> bool,
+    find: impl Fn(&[u8], &[u8]) -> Option<usize>,
+) -> bool {
+    let (Some(first), Some(last)) = (pieces.first(), pieces.last()) else {
+        return false;
+    };
+    let (first, last) = (bytes(first), bytes(last));
+    if first.len() + last.len() > name.len()
+        || !eq(&name[..first.len()], first)
+        || !eq(&name[name.len() - last.len()..], last)
+    {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for piece in &pieces[1..pieces.len() - 1] {
+        let piece = bytes(piece);
+        match find(rest, piece) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Whether `name` matches `pattern`, where `star` matches any run of items
@@ -482,6 +547,37 @@ mod tests {
             m.matches("grüße.txt".as_ref()),
             "ASCII pattern, other names"
         );
+    }
+
+    #[test]
+    fn star_only_patterns_agree_with_the_general_matcher() {
+        let patterns = [
+            "*", "**", "a*", "*a", "a*a", "ab*ba", "*b*", "a**b", "*a*b*a*", "ä*", "*ß*", "x*ä*y",
+        ];
+        let alphabet = ['a', 'b', 'A', 'ä', 'ß', 'x', 'y'];
+        let mut names = vec![String::new()];
+        for _ in 0..4 {
+            let longer: Vec<String> = names
+                .iter()
+                .flat_map(|n| alphabet.iter().map(move |c| format!("{n}{c}")))
+                .collect();
+            names.extend(longer);
+        }
+        for pattern in patterns {
+            let fast = Matcher::new(pattern).unwrap();
+            assert!(matches!(fast.include[0], Pattern::Stars { .. }));
+            let lower = pattern.to_lowercase();
+            let chars: Vec<char> = lower.chars().collect();
+            for name in &names {
+                let lowered: Vec<char> = name.to_lowercase().chars().collect();
+                let expected = wildcard(&chars, &lowered, '*', '?', |p, n| p == n);
+                assert_eq!(
+                    fast.matches(name.as_ref()),
+                    expected,
+                    "{pattern:?} on {name:?}"
+                );
+            }
+        }
     }
 
     #[test]
