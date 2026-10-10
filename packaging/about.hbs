@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SpaceBadger third-party licenses</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+  pre { white-space: pre-wrap; background: #f4f4f4; padding: 1em; border-radius: 4px; }
+  li { margin-bottom: 0.2em; }
+  @media (prefers-color-scheme: dark) { body { background: #1b1b1b; color: #ddd; } pre { background: #262626; } a { color: #8ab4f8; } }
+</style>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<p>SpaceBadger is MIT licensed. It includes the following open-source components, under these licenses. They are included unmodified; the source code of each is available from the linked repository or registry page.</p>
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+  <!-- web-overview -->
+</ul>
+<h2>Rust crates</h2>
+{{#each licenses}}
+<h3 id="{{id}}">{{name}}</h3>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+  <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+<!-- web-licenses -->
+</body>
+</html>
