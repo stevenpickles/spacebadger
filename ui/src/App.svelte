@@ -24,6 +24,7 @@
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
+  import Contents from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Announcer from "./lib/Announcer.svelte";
@@ -50,7 +51,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "results" | "small" | "omissions";
+  type PanelTab = "contents" | "results" | "small" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -680,6 +681,7 @@
 
   const tabs = $derived(
     [
+      generation !== null ? { id: "contents" as const, label: "Contents" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
@@ -696,6 +698,23 @@
   });
   $effect(() => {
     if (showOmissions) untrack(() => (tab = "omissions"));
+  });
+
+  let contents: ReturnType<typeof Contents> | undefined = $state();
+  /** A folder opened from the contents list: the new list takes the focus. */
+  let refocusContents = false;
+
+  $effect(() => {
+    if (contents && refocusContents) {
+      refocusContents = false;
+      contents.focus();
+    }
+  });
+
+  // An item selected in the map scrolls into view in the contents list.
+  $effect(() => {
+    const sel = selection;
+    if (sel && !sel.other) untrack(() => contents?.reveal(sel.node));
   });
 
   function onTabKey(e: KeyboardEvent) {
@@ -948,7 +967,7 @@
           ondelete={askDelete}
         />
       </div>
-      {#if activeTab}
+      {#if activeTab && tabs.length > 1}
         <div class="tabs" role="tablist" aria-label="Lists">
           {#each tabs as t (t.id)}
             <button
@@ -963,8 +982,37 @@
             >
           {/each}
         </div>
-        <div class="list" id="panel-list" role="tabpanel" aria-labelledby="tab-{activeTab}">
-          {#if activeTab === "omissions" && status}
+      {/if}
+      {#if activeTab}
+        <!-- With one list there are no tabs, so no tab panel either. -->
+        <div
+          class="list"
+          id="panel-list"
+          role={tabs.length > 1 ? "tabpanel" : undefined}
+          aria-labelledby={tabs.length > 1 ? `tab-${activeTab}` : undefined}
+        >
+          {#if activeTab === "contents" && generation !== null}
+            {#key view}
+              <Contents
+                bind:this={contents}
+                {generation}
+                folder={view}
+                folderName={viewDetails?.node === view ? viewDetails.name : ""}
+                folderSize={!search && viewDetails?.node === view ? viewDetails.logical : 0}
+                search={searchId ?? null}
+                revision={status?.revision ?? 0}
+                selected={pickedSet}
+                {anchor}
+                onpick={pick}
+                ondelete={askDelete}
+                onopen={(node) => {
+                  refocusContents = true;
+                  openFolder(node);
+                }}
+                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
+              />
+            {/key}
+          {:else if activeTab === "omissions" && status}
             <Omissions groups={status.omissions} autofocus onclose={() => (showOmissions = false)} />
           {:else if activeTab === "small" && smallOf && generation !== null}
             {#key smallOf.folder}
