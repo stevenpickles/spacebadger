@@ -187,12 +187,12 @@
   const sep = (folder: string) => (folder.includes("\\") ? "\\" : "/");
 
   /** A folder path as its start and its last two folders, so the middle can
-   * be cut: ["/home/me/", "proj/out"]. */
+   * be cut: ["/home/me", "/proj/out"]. */
   function splitFolder(folder: string): [string, string] {
     const s = sep(folder);
     const parts = folder.split(s);
     if (parts.length <= 3) return ["", folder];
-    return [parts.slice(0, -2).join(s) + s, parts.slice(-2).join(s)];
+    return [parts.slice(0, -2).join(s), s + parts.slice(-2).join(s)];
   }
 
   function fullPath(r: SearchRow): string {
@@ -324,9 +324,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* The tail gives way only once the start is down to its ellipsis. */
   .folder .tail {
-    flex: 0 1 auto;
-    max-width: 80%;
+    flex: 0 0 auto;
+    max-width: calc(100% - 2em);
     overflow: hidden;
     text-overflow: ellipsis;
   }
