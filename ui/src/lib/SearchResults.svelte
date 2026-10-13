@@ -186,6 +186,15 @@
 
   const sep = (folder: string) => (folder.includes("\\") ? "\\" : "/");
 
+  /** A folder path as its start and its last two folders, so the middle can
+   * be cut: ["/home/me/", "proj/out"]. */
+  function splitFolder(folder: string): [string, string] {
+    const s = sep(folder);
+    const parts = folder.split(s);
+    if (parts.length <= 3) return ["", folder];
+    return [parts.slice(0, -2).join(s) + s, parts.slice(-2).join(s)];
+  }
+
   function fullPath(r: SearchRow): string {
     return r.folder ? `${r.folder}${sep(r.folder)}${r.name}` : `${r.name} (in the scan root)`;
   }
@@ -203,8 +212,9 @@
       <span class="muted small">· largest first</span>
     </div>
     <p class="small">
-      {formatBytes(summary.logical)}{#if scanned > 0}
-        · {percent(summary.logical, scanned)} of {formatBytes(scanned)} scanned{/if}
+      {formatBytes(summary.logical)}{#if scanned > 0}{" · "}{percent(summary.logical, scanned)} of {formatBytes(
+          scanned,
+        )} scanned{/if}
     </p>
     {#if scanning}
       <p class="small note">Still scanning: more matches may appear.</p>
@@ -245,7 +255,10 @@
   >
     {#snippet main(r)}
       <span class="row-name name">{r.name}</span>
-      <span class="folder"><span dir="ltr">{r.folder || "Scan root"}</span></span>
+      {@const [head, tail] = splitFolder(r.folder)}
+      <span class="folder"
+        >{#if head}<span class="head">{head}</span>{/if}<span class="tail">{tail || "Scan root"}</span></span
+      >
     {/snippet}
     {#snippet size(r)}
       <span title={sizeTitle(r)}>{formatBytes(r.logical)}</span>
@@ -296,16 +309,26 @@
   .name {
     display: block;
   }
-  /* Long folder paths lose their start, keeping the distinctive end. */
+  /* Long folder paths lose their middle, keeping where they start and
+     the last two folders. */
   .folder {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    display: flex;
+    min-width: 0;
     white-space: nowrap;
-    direction: rtl;
-    text-align: left;
     font-size: var(--fs-xs);
     color: var(--muted);
+  }
+  .folder .head {
+    flex: 0 1 auto;
+    min-width: 2em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .folder .tail {
+    flex: 0 1 auto;
+    max-width: 80%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .failed {
     flex: none;
