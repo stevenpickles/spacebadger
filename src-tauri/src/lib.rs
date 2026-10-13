@@ -13,11 +13,11 @@ mod recycle_windows;
 mod session;
 
 use sb_protocol::{
-    AppInfo, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest, DuplicatesList,
-    DuplicatesRequest, DuplicatesStatus, FolderFilesPage, FolderFilesRequest, LayoutRequest,
-    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
-    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
-    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
+    AppInfo, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus, FolderFilesPage,
+    FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT,
+    ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary, SelectionRequest,
+    SelectionSummary, SmallItemsPage, SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -267,6 +267,22 @@ async fn duplicates_list(
         .map_err(|e| e.to_string())?
 }
 
+/// Whether deleting the given items would leave a group of duplicates with
+/// no copy. Looks at the files that would stay on disk, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_check(
+    state: State<'_, AppState>,
+    request: DuplicatesCheckRequest,
+) -> Result<DuplicatesCheck, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_check(request.job, &request.nodes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn duplicates_cancel(
     state: State<'_, AppState>,
@@ -420,6 +436,7 @@ pub fn run() {
             duplicates_start,
             duplicates_status,
             duplicates_list,
+            duplicates_check,
             duplicates_cancel,
             set_delete_allowed,
             restart_elevated,

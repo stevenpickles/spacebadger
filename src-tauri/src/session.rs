@@ -733,6 +733,18 @@ impl Session {
         Ok(job.list(&tree, revision))
     }
 
+    /// Whether deleting `nodes` would leave a group of duplicates with no copy.
+    pub fn duplicates_check(
+        &self,
+        job: u32,
+        nodes: &[u32],
+    ) -> Result<proto::DuplicatesCheck, String> {
+        let job = self.duplicates_job(job)?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        Ok(job.check(&tree, nodes))
+    }
+
     /// Stops reading; the groups found so far stay.
     pub fn duplicates_cancel(&self, job: u32) -> Result<(), String> {
         self.duplicates_job(job)?.cancel();
@@ -1251,6 +1263,35 @@ mod tests {
             ],
             "shortest path first"
         );
+
+        // Deleting every copy, or all but one that has gone meanwhile, is
+        // flagged; keeping one that's still there isn't.
+        let nodes: Vec<u32> = list.groups[0].files.iter().map(|f| f.node).collect();
+        let check = |picked: &[u32]| session.duplicates_check(done.job, picked).unwrap();
+        assert_eq!(
+            check(&nodes[1..]).all_selected + check(&nodes[1..]).kept_gone,
+            0
+        );
+        assert_eq!(check(&nodes).all_selected, 1);
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        assert_eq!(
+            check(&[old, nodes[0]]).all_selected,
+            1,
+            "a selected folder takes the copies in it"
+        );
+        let kept = tmp.0.join("copy.bin");
+        std::fs::write(&kept, b"changed").unwrap();
+        let risky = check(&nodes[1..]);
+        assert_eq!((risky.all_selected, risky.kept_gone), (0, 1));
+        assert_eq!(
+            risky.examples,
+            [display_path(&tmp.0.join("old").join("copy-2.bin"))]
+        );
+        std::fs::write(&kept, &copy).unwrap();
 
         // With a filter, only matching files count.
         let search = session.search_set("*.bin").unwrap().unwrap().search;

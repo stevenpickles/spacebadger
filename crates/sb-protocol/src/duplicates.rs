@@ -138,3 +138,33 @@ pub struct DuplicatesList {
     pub total: u32,
     pub groups: Vec<DuplicateGroup>,
 }
+
+/// Asks whether deleting `nodes` would leave a group of duplicates with no
+/// copy, before the delete is confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicatesCheckRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub job: u32,
+    pub nodes: Vec<u32>,
+}
+
+/// Groups of duplicates a delete would leave with no copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicatesCheck {
+    /// Groups whose every file would be deleted.
+    pub all_selected: u32,
+    /// Groups whose files that would stay are gone from disk or have
+    /// changed size since they were compared.
+    pub kept_gone: u32,
+    /// A file that would be deleted from some of those groups, at most
+    /// [`DUPLICATE_CHECK_EXAMPLES`].
+    pub examples: Vec<String>,
+}
+
+/// Most examples a [`DuplicatesCheck`] lists.
+pub const DUPLICATE_CHECK_EXAMPLES: usize = 5;

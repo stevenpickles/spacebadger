@@ -3,9 +3,12 @@
 //! what was found and reports it, leaving out files deleted since.
 
 use crate::session::display_path;
+use sb_core::selection;
 use sb_core::tree::{NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::{self, Contents, Counters, Event, Group, Plan, Skip};
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -211,6 +214,58 @@ impl Job {
             groups,
         }
     }
+}
+
+impl Job {
+    /// Groups that deleting `selected` (with everything in selected
+    /// folders) would leave with no copy: every file selected, or the ones
+    /// that would stay no longer on disk at the size compared. Reads each
+    /// staying file's metadata, so this runs off the interface thread.
+    pub fn check(&self, tree: &Tree, selected: &[u32]) -> proto::DuplicatesCheck {
+        let items: HashSet<NodeId> = selection::resolve(tree, selected)
+            .items
+            .into_iter()
+            .collect();
+        let picked = |n: NodeId| {
+            let mut cur = Some(n);
+            while let Some(c) = cur {
+                if items.contains(&c) {
+                    return true;
+                }
+                cur = tree.parent(c);
+            }
+            false
+        };
+        let mut check = proto::DuplicatesCheck {
+            all_selected: 0,
+            kept_gone: 0,
+            examples: Vec::new(),
+        };
+        let (groups, _) = self.current(tree);
+        for g in groups {
+            let (going, staying): (Vec<NodeId>, Vec<NodeId>) =
+                g.files.iter().partition(|&&n| picked(n));
+            let Some(&example) = going.first() else {
+                continue;
+            };
+            if staying.is_empty() {
+                check.all_selected += 1;
+            } else if !staying.iter().any(|&n| still_there(&tree.path(n), g.size)) {
+                check.kept_gone += 1;
+            } else {
+                continue;
+            }
+            if check.examples.len() < proto::DUPLICATE_CHECK_EXAMPLES {
+                check.examples.push(display_path(&tree.path(example)));
+            }
+        }
+        check
+    }
+}
+
+/// Whether a plain file of `size` bytes is still at `path`.
+fn still_there(path: &Path, size: u64) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == size)
 }
 
 /// What [`Job::current`] copies out besides the groups.
