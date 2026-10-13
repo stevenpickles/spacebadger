@@ -12,10 +12,11 @@ mod recycle_windows;
 mod session;
 
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
-    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
-    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
-    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
+    AppInfo, DeleteReport, DeleteRequest, EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress,
+    ExportReport, ExportRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails,
+    PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
+    SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
+    SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -32,6 +33,8 @@ struct AppState {
     /// Deleting was turned on in this run of the app. Never saved, so every
     /// start begins with it off.
     delete_allowed: AtomicBool,
+    /// The file last exported, which "Show in Explorer" can reveal.
+    last_export: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -297,6 +300,59 @@ async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Resul
         .map_err(|e| e.to_string())?
 }
 
+/// Asks where to save, then exports what's under a folder there as CSV or
+/// a report. Returns `None` if the save dialog was dismissed. Writing runs
+/// on a blocking thread and reports its progress as events.
+#[tauri::command]
+async fn export_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ExportRequest,
+) -> Result<Option<ExportReport>, String> {
+    let session = state.session(request.generation)?;
+    let (kind, extension) = match request.format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Report => ("Text", "txt"),
+    };
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Export")
+        .set_file_name(&request.file_name)
+        .add_filter(kind, &[extension])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let generation = request.generation;
+    let emitter = app.clone();
+    let target = path.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        session.export(&request, &target, |rows| {
+            let _ = emitter.emit(EXPORT_PROGRESS_EVENT, ExportProgress { generation, rows });
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.last_export.lock().unwrap() = Some(path);
+    Ok(Some(report))
+}
+
+/// Shows the file last exported selected in the system file manager.
+#[tauri::command]
+async fn reveal_export(state: State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .last_export
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("Nothing has been exported yet.")?;
+    tauri::async_runtime::spawn_blocking(move || reveal_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn reveal_path(path: &Path) -> Result<(), String> {
     let shown = session::display_path(path);
     // The item may have been moved or deleted since it was scanned.
@@ -355,6 +411,8 @@ pub fn run() {
             layout,
             node_details,
             reveal,
+            export_save,
+            reveal_export,
             search_set,
             search_summary,
             search_results,
