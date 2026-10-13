@@ -520,10 +520,12 @@
     );
   }
 
-  // Breadcrumbs follow the view.
+  // Breadcrumbs follow the view; its details also refresh as the scan
+  // updates sizes, since they're shown when nothing is selected.
   $effect(() => {
     const gen = generation;
     const node = view;
+    void status?.revision;
     if (gen === null) return;
     nodeDetails(gen, node).then(
       (d) => {
@@ -570,6 +572,22 @@
     nodeDetails(gen, parent).then(
       (p) => {
         if (gen === generation && selectedDetails === d) parentSize = p.logical;
+      },
+      () => {},
+    );
+  });
+
+  // The viewed folder's parent, for its share when nothing is selected.
+  let viewParentSize = $state<number | null>(null);
+  $effect(() => {
+    const gen = generation;
+    const d = viewDetails;
+    const parent = d?.ancestors.at(-2)?.node;
+    viewParentSize = null;
+    if (gen === null || !d || parent === undefined) return;
+    nodeDetails(gen, parent).then(
+      (p) => {
+        if (gen === generation && viewDetails === d) viewParentSize = p.logical;
       },
       () => {},
     );
@@ -1013,6 +1031,8 @@
           {fileManager}
           trashName={trash}
           {parentSize}
+          viewed={viewDetails?.node === view ? viewDetails : null}
+          viewedParentSize={viewParentSize}
           error={detailsError}
           onretry={() => detailsRetry++}
           updating={multiUpdating}

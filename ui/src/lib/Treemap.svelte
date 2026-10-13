@@ -386,17 +386,14 @@
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
     } else {
-      // The size, or a compact form of it ("310M") on narrow tiles.
-      const full = formatBytes(l.weight[i]!);
-      const compact = full.replace(/ (.)i?B$/, "$1").replace(/ B$/, "B");
-      const fullWidth = ctx.measureText(full).width;
-      const size = fullWidth <= room ? full : compact;
-      const sizeWidth = size === full ? fullWidth : ctx.measureText(compact).width;
+      // The size in full, or none where it doesn't fit.
+      const size = formatBytes(l.weight[i]!);
+      const sizeWidth = ctx.measureText(size).width;
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
         label(ctx, name!, x + 4, y + line1, room);
         if (sizeWidth <= room) ctx.fillText(size, x + 4, y + line2);
-      } else if (room >= fullWidth + 30) {
+      } else if (room >= sizeWidth + 30) {
         // One line: the size right-aligned, the name cut to fit before it.
         label(ctx, name!, x + 4, y + line1, room - sizeWidth - 6);
         ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);

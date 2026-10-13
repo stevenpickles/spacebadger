@@ -297,18 +297,33 @@ async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Resul
 fn reveal_path(path: &Path) -> Result<(), String> {
     let shown = session::display_path(path);
     // The item may have been moved or deleted since it was scanned.
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(format!(
                 "{shown} no longer exists. Refresh to update the map."
             ));
         }
         Err(e) => return Err(format!("Couldn't reach {shown}: {e}")),
+    };
+    // A folder opens in the file manager, so its contents show. Anything
+    // else is shown selected in its folder and never opened: opening a file
+    // would run it or open it in an app. That includes links and junctions
+    // (`is_dir` is false for them), which would be followed, and macOS
+    // packages such as apps, which are folders that Finder launches.
+    // Both use the platform API with the path as an argument, never a shell.
+    if meta.is_dir() && !may_be_package(path) {
+        return tauri_plugin_opener::open_path(path, None::<&str>)
+            .map_err(|e| format!("Couldn't open {shown} in the file manager: {e}"));
     }
-    // Uses the platform API with the path as an argument, never a shell.
     tauri_plugin_opener::reveal_item_in_dir(path)
         .map_err(|e| format!("Couldn't show {shown} in the file manager: {e}"))
+}
+
+/// On macOS, a folder with an extension (`Safari.app`, `Photos Library.photoslibrary`)
+/// may be a package that opening would launch, so it's shown selected instead.
+fn may_be_package(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path.extension().is_some()
 }
 
 pub fn run() {
