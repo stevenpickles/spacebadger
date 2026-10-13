@@ -4,19 +4,40 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
-- With a filter on, a folder's details (selected or in view) show what matches there: matching size and share, how many of its files match, and the whole folder's size.
-- Filter: `is:video`, `is:image`, `is:document`, and the other file-type categories match files by type, and `!is:` leaves a type out. The filter suggests keywords, types, folder names after `dir:`, and extensions after `*.` from the scan as you type.
-- Sizes read KB, MB, and GB, counted as the system's file manager counts them (1,024 bytes per KB on Windows, 1,000 on macOS and Linux). With nothing selected, the details describe the folder in view. Show in Explorer/Finder opens a folder instead of selecting it in its parent; files are still only shown selected.
-- Filter: a `dir:` prefix matches folder names, so `dir:cache` finds the files inside folders named like `cache`, and `!dir:node_modules` leaves those folders out. Combined with file patterns, folder patterns narrow where they apply.
-- Windows: Restart as administrator from the toolbar (or beside "Permission denied" under Not counted) reopens SpaceBadger elevated and scans the same folder again, after asking; declining leaves it as it was.
-- Interface pass: sizes are file sizes throughout (the Allocated/Logical switch is gone; the volume overview still compares on-disk usage).
-- Toolbar regrouped, with a filter syntax popover, a scan progress bar, and a keyboard and mouse shortcuts sheet (press `?`).
-- Breadcrumbs have an Up button and collapse deep paths. The side panel keeps the details on top at a fixed height and lists the contents of the folder in the map below, largest first, in step with the map's selection. Unchecking "Folders" lists only files, the largest from every level under the folder. Results, small items, and what wasn't counted join it as tabs when open; narrow windows stack the panel under the map.
-- Treemap labels keep the size visible and pick a readable color per tile; selection and hover are clearer; the tooltip stays near the pointer and shows the share of the parent folder; the legend is a foldable card in both color modes.
+## [0.2.0] - 2026-10-13
+
+A redesigned interface, a much more capable filter, and sizes in familiar units.
+
+### Filter
+- Folder patterns: `dir:cache` finds the files inside folders named like `cache`, at any depth, and `!dir:node_modules` leaves those folders out. Combined with file patterns, they narrow where those apply: `dir:node_modules; *.js` is JavaScript inside `node_modules`.
+- File types: `is:video`, `is:audio`, `is:image`, `is:document`, `is:archive`, `is:diskimage`, `is:program`, `is:code`, and `is:other`, the same categories as the file-type colors. `!is:` leaves a type out, and any unambiguous start works (`is:doc`).
+- Suggestions as you type: keywords, types, folder names after `dir:`, and extensions after `*.` from the scan, with counts and sizes. Press ↓ or Ctrl+Space to open them, Enter or Tab to use one.
+- With a filter on, a folder's details show what matches there: matching size and share, how many of its files match, and the whole folder's size.
+
+### Side panel
+- The details stay on top; below them, the contents of the folder in the map, largest first, in step with the map's selection. Uncheck "Folders" to list only files, the largest from every level under the folder.
+- With nothing selected, the details describe the folder in view.
+- Results, small items, and what wasn't counted join the contents as tabs when open. Narrow windows stack the panel under the map.
+
+### Sizes
+- Sizes read KB, MB, and GB, counted the way the system's file manager counts them: 1,024 bytes per KB on Windows, like Explorer, and 1,000 on macOS and Linux, like Finder and Files.
+- Sizes are file sizes throughout; the Allocated/Logical switch is gone. The volume overview still compares on-disk usage.
+
+### Map and navigation
+- The toolbar is regrouped, with a filter syntax popover, a scan progress bar, and a keyboard and mouse shortcuts sheet (press `?`).
+- Breadcrumbs have an Up button and collapse deep paths.
+- Treemap labels keep the size visible and pick a readable color per tile. Selection and hover are clearer, the tooltip stays near the pointer and shows the share of the parent folder, and the legend is a foldable card in both color modes.
 - Result and small-item lists share one keyboard-driven list with range selection, a context menu, and readable folder paths.
-- The delete dialog is a true modal that shows full paths and ends on a result screen listing anything that couldn't be moved. Details, menus, and omissions explain themselves in plain words, and failures to load show a Retry.
-- The window title shows the version: `SpaceBadger v0.1.0` for a release, `SpaceBadger v0.1.0+dev.<commit>` for a build between releases (`.dirty` when it has uncommitted changes).
+- Show in Explorer/Finder opens a folder instead of selecting it in its parent; files are still only shown selected.
+
+### Windows
+- Restart as administrator, from the toolbar or beside "Permission denied" under Not counted, reopens SpaceBadger elevated and scans the same folder again, after asking. Declining leaves it as it was.
+
+### Also
+- The delete dialog is a true modal that shows full paths and ends on a result screen listing anything that couldn't be moved.
+- Details, menus, and what wasn't counted explain themselves in plain words, and failures to load offer a Retry.
 - Screen readers hear scan phases, search totals, and the selected item once, instead of every counter update.
+- The window title shows the version, such as `SpaceBadger v0.2.0`; builds between releases add `+dev` and the commit.
 
 ## [0.1.0] - 2026-10-10
 
