@@ -6,7 +6,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 - Interface pass: sizes are file sizes throughout (the Allocated/Logical switch is gone; the volume overview still compares on-disk usage).
 - Toolbar regrouped, with a filter syntax popover, a scan progress bar, and a keyboard and mouse shortcuts sheet (press `?`).
-- Breadcrumbs have an Up button and collapse deep paths. The side panel keeps the details on top, with results, small items, and what wasn't counted as tabs below; narrow windows stack it under the map.
+- Breadcrumbs have an Up button and collapse deep paths. The side panel keeps the details on top at a fixed height and lists the contents of the folder in the map below, largest first, in step with the map's selection. Results, small items, and what wasn't counted join it as tabs when open; narrow windows stack the panel under the map.
 - Treemap labels keep the size visible and pick a readable color per tile; selection and hover are clearer; the tooltip stays near the pointer and shows the share of the parent folder; the legend is a foldable card in both color modes.
 - Result and small-item lists share one keyboard-driven list with range selection, a context menu, and readable folder paths.
 - The delete dialog is a true modal that shows full paths and ends on a result screen listing anything that couldn't be moved. Details, menus, and omissions explain themselves in plain words, and failures to load show a Retry.
