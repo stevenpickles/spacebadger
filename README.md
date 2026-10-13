@@ -46,7 +46,7 @@ The app also accepts a folder to scan on start: `spacebadger <folder>` (for exam
 
 Press `?` (or the ? button in the toolbar) for a list of shortcuts. In the map: click selects, double-click (or Enter) opens a folder, Backspace or the ↑ button beside the breadcrumbs goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
 
-The side panel shows the selected item's details on top and, below, the contents of the folder in the map, largest first. Selecting in either selects in both; Enter or double-click on a folder in the list opens it.
+The side panel shows the selected item's details on top and, below, the contents of the folder in the map, largest first. Selecting in either selects in both; Enter or double-click on a folder in the list opens it. Uncheck **Folders** to list only files, the largest anywhere under the folder, each with the subfolder it's in; Enter on one shows it in the map.
 
 Selecting several items works as in a file manager, in the map, the contents list, the result list, and the small-items list: Ctrl+click (⌘-click on macOS) adds or removes an item, Shift+click selects the range from the last item clicked (in the map, among items in the same folder, largest first), and Ctrl+A selects everything drawn in the viewed folder. The details panel totals the selection.
 
