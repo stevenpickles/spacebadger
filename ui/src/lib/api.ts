@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
+import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
 import type { DuplicatesList } from "./protocol/DuplicatesList";
 import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
 import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
@@ -169,6 +171,11 @@ export function duplicatesStatus(generation: number, job: number): Promise<Dupli
 /** The groups of duplicates found so far, most reclaimable space first. */
 export function duplicatesList(generation: number, job: number): Promise<DuplicatesList> {
   return invoke<DuplicatesList>("duplicates_list", { generation, job });
+}
+
+/** Whether deleting the items would leave a group of duplicates with no copy. */
+export function duplicatesCheck(request: DuplicatesCheckRequest): Promise<DuplicatesCheck> {
+  return invoke<DuplicatesCheck>("duplicates_check", { request });
 }
 
 /** Stops reading; the groups found so far stay. */

@@ -4,6 +4,7 @@
   // folded. Header rows stand for no item: picks on them are dropped, and
   // Enter or a click on the header folds the group. The list is fetched
   // again whenever the search finds more or items are deleted.
+  import { untrack } from "svelte";
   import { announce } from "./announce.svelte";
   import { duplicatesList, errorText } from "./api";
   import { exactBytes, formatBytes, formatCount, formatElapsed, KILO, percent, plural } from "./format";
@@ -34,6 +35,8 @@
     onsearch: (minSize: number) => void;
     oncancel: () => void;
     onclose: () => void;
+    /** Clears the selection, when the keyboard moves onto a group header. */
+    onclear: () => void;
   }
 
   let {
@@ -50,10 +53,10 @@
     onsearch,
     oncancel,
     onclose,
+    onclear,
   }: Props = $props();
 
   const SIZES = [
-    { value: 1, label: "Any size" },
     { value: KILO, label: "1 KB" },
     { value: KILO ** 2, label: "1 MB" },
     { value: 10 * KILO ** 2, label: "10 MB" },
@@ -73,10 +76,13 @@
   // request at a time, and once more if anything changed meanwhile.
   let fetching = false;
   let stale = false;
+  // Status updates are new objects; only these numbers say what changed.
+  const job = $derived(status.job);
+  const version = $derived(status.version);
   $effect(() => {
-    void [generation, status.job, status.version];
+    void [generation, job, version];
     stale = true;
-    if (!fetching) void fetchList();
+    if (!fetching) untrack(() => void fetchList());
   });
 
   async function fetchList() {
@@ -138,13 +144,17 @@
     folded = next;
   }
 
-  /** Passes picks on files on; a pick on a header changes nothing. */
+  /** Passes picks on files on. A header stands for no item: moving onto
+   * one clears the selection, so Delete never acts on a file out of
+   * sight, and a range keeps only the files in it. */
   function pick(p: Pick) {
     const nodes = p.nodes.filter((n) => n >= 0);
     if (p.focus.node >= 0) {
       onpick({ ...p, nodes });
-    } else if (nodes.length > 0 && p.keepAnchor) {
+    } else if (p.keepAnchor && nodes.length > 0) {
       onpick({ ...p, focus: { node: nodes[nodes.length - 1]!, other: false }, nodes });
+    } else if (p.mode === "replace") {
+      onclear();
     }
   }
 
@@ -161,7 +171,11 @@
     if (r.kind === "group") {
       return `${plural(r.group.files.length, "file")} of ${exactBytes(r.group.size)} with the same contents. Enter ${r.open ? "folds" : "unfolds"} the group.`;
     }
-    return r.first ? `${r.file.path} (shortest path in its group)` : r.file.path;
+    const notes = [
+      r.first ? "shortest path in its group" : "",
+      r.file.hardlinked ? "has other hard-link names, so deleting this one alone may free nothing" : "",
+    ].filter(Boolean);
+    return notes.length > 0 ? `${r.file.path} (${notes.join("; ")})` : r.file.path;
   }
 
   const sep = (path: string) => (path.includes("\\") ? "\\" : "/");
@@ -186,6 +200,9 @@
       s.inUse > 0 ? `${formatCount(s.inUse)} in use by another program` : "",
       s.denied > 0 ? `${formatCount(s.denied)} without permission to read` : "",
       s.changed > 0 ? `${formatCount(s.changed)} changed since the scan` : "",
+      s.special > 0
+        ? `${formatCount(s.special)} stored in a special way (deduplicated, tiered, or virtualized), which reading raw would get wrong`
+        : "",
       s.vanished > 0 ? `${formatCount(s.vanished)} gone since the scan` : "",
       s.unreadable > 0 ? `${formatCount(s.unreadable)} unreadable` : "",
     ].filter(Boolean);
@@ -204,7 +221,7 @@
       </button>
     </div>
     {#if status.query}
-      <p class="small muted">Only files matching <code>{status.query}</code></p>
+      <p class="small muted">Found among files matching <code>{status.query}</code></p>
     {/if}
     <p class="small summary">
       {#if status.groups > 0}
@@ -305,7 +322,8 @@
       {:else}
         {@const [head, tail] = splitFolder(r.file.path)}
         <span class="file">
-          <span class="row-name name">{nameOf(r.file.path)}{#if r.first}<span class="first">first</span>{/if}</span>
+          <span class="row-name name">{nameOf(r.file.path)}{#if r.first}<span class="first">first</span>{/if}{#if r.file.hardlinked}<span class="first">has other names</span
+            >{/if}</span>
           <span class="folder"
             >{#if head}<span class="head">{head}</span>{/if}<span class="tail">{tail}</span></span
           >
@@ -326,7 +344,7 @@
         {#if running}
           Groups appear here as they're confirmed, largest first.
         {:else if status.candidates === 0}
-          No two files here {minSize > 1 ? `of at least ${formatBytes(minSize)} ` : ""}have the same size, so none can be
+          No two files here of at least {formatBytes(minSize)} have the same size, so none can be
           duplicates.
         {:else}
           Files with the same size were found, but their contents differ.

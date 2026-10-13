@@ -4,6 +4,7 @@
     appInfo,
     deleteItems,
     duplicatesCancel,
+    duplicatesCheck,
     duplicatesStart,
     duplicatesStatus,
     errorText,
@@ -41,6 +42,7 @@
   import Omissions from "./lib/Omissions.svelte";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
+  import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
   import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
@@ -108,7 +110,12 @@
   let trash = $state(trashName(""));
   /** Deleting is turned on. Never saved: every start begins with it off. */
   let allowDelete = $state(false);
-  let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
+  let confirmDelete = $state.raw<{
+    nodes: number[];
+    summary: SelectionSummary;
+    /** Groups of duplicates the delete would leave with no copy. */
+    duplicates: DuplicatesCheck | null;
+  } | null>(null);
   let deleting = $state(false);
   /** What the last delete did, shown in the dialog until it's closed. */
   let deleteResult = $state.raw<DeleteResult | null>(null);
@@ -135,7 +142,7 @@
   /** The latest search for duplicate files in this scan, while its tab is open. */
   let dupes = $state.raw<DuplicatesStatus | null>(null);
   /** Smallest file size the duplicate search looks at. */
-  let dupesMinSize = $state(Number(saved("duplicates-min-size")) || KILO ** 2);
+  let dupesMinSize = $state(Math.max(KILO, Number(saved("duplicates-min-size")) || KILO ** 2));
 
   const scanning = $derived(status?.phase.kind === "scanning");
   /** Restarting with administrator rights is offered on Windows only. */
@@ -429,10 +436,14 @@
     return () => void unlisten.then((f) => f());
   });
 
+  /** The duplicate search shown, as a plain number so that status updates
+   * (new objects) don't rerun what depends on it. */
+  const dupesJob = $derived(dupes?.job);
+
   // Deleting items takes them out of the groups.
   $effect(() => {
     const gen = generation;
-    const job = dupes?.job;
+    const job = dupesJob;
     void status?.revision;
     if (gen === null || job === undefined) return;
     duplicatesStatus(gen, job).then(
@@ -559,8 +570,14 @@
       return;
     }
     try {
-      const summary = await selectionSummary({ generation: gen, nodes });
-      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary };
+      // Duplicates found may be deleted all at once, or the copy meant to
+      // stay may have gone meanwhile; the dialog says so.
+      const job = dupes?.job;
+      const [summary, duplicates] = await Promise.all([
+        selectionSummary({ generation: gen, nodes }),
+        job === undefined ? null : duplicatesCheck({ generation: gen, job, nodes }).catch(() => null),
+      ]);
+      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary, duplicates };
     } catch (e) {
       problem = `Couldn't prepare the delete: ${String(e)}`;
     }
@@ -1245,6 +1262,7 @@
               onsearch={(min) => dupes && findDuplicates(dupes.folder, min)}
               oncancel={stopDuplicates}
               onclose={closeDuplicates}
+              onclear={() => pick(null)}
             />
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
@@ -1290,6 +1308,7 @@
       trashName={trash}
       filtered={search !== null}
       {privileged}
+      duplicates={confirmDelete.duplicates}
       busy={deleting}
       result={deleteResult}
       onconfirm={confirmed}
