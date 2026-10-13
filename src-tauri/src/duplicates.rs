@@ -78,16 +78,21 @@ impl Job {
 
     /// Reads the planned files, recording groups as they're confirmed.
     /// Blocks until done or cancelled.
+    /// A reader that panics ends the search as if stopped, keeping what
+    /// was found, rather than leaving it running.
     pub fn run(&self, contents: &impl Contents) {
-        let complete = duplicates::run(
-            &self.plan,
-            contents,
-            duplicates::READERS,
-            &self.cancel,
-            &self.counters,
-            |event| self.record(event),
-        );
-        let mut found = self.found.lock().unwrap();
+        let complete = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            duplicates::run(
+                &self.plan,
+                contents,
+                duplicates::READERS,
+                &self.cancel,
+                &self.counters,
+                |event| self.record(event),
+            )
+        }))
+        .unwrap_or(false);
+        let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
         found.phase = if complete {
             proto::DuplicatesPhase::Complete
         } else {
