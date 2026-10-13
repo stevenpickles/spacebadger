@@ -1,13 +1,25 @@
-// Display formatting. Sizes use binary units (KiB, MiB, GiB) consistently.
+// Display formatting.
 
-const UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+/**
+ * Sizes read KB, MB, GB, as the system's file manager counts them: Windows
+ * Explorer takes 1 KB as 1,024 bytes, macOS Finder and Linux file managers
+ * as 1,000. So a size here matches the one shown next to it there.
+ */
+const KILO = /Windows/i.test(navigator.userAgent) ? 1024 : 1000;
+
+const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
 export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < KILO) return `${bytes} B`;
   let value = bytes;
   let unit = 0;
-  while (value >= 1024 && unit < UNITS.length - 1) {
-    value /= 1024;
+  while (value >= KILO && unit < UNITS.length - 1) {
+    value /= KILO;
+    unit++;
+  }
+  // 999.6 KB would round to "1000 KB"; it reads "1.00 MB" instead.
+  if (Math.round(value) >= KILO && unit < UNITS.length - 1) {
+    value /= KILO;
     unit++;
   }
   const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
@@ -52,6 +64,8 @@ export function percent(part: number, whole: number): string {
   if (whole <= 0) return "0%";
   const p = (part / whole) * 100;
   if (p > 0 && p < 0.1) return "<0.1%";
+  // Nearly all isn't all: 99.6% stays "99.6%", never rounding up to 100%.
+  if (p >= 99.5 && part < whole) return `${Math.min(99.9, Math.floor(p * 10) / 10)}%`;
   return `${p >= 10 ? Math.round(p) : p.toFixed(1)}%`;
 }
 
