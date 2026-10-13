@@ -20,8 +20,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Export
 - Export… in the toolbar and in a folder's right-click menu saves a folder's contents, or everything under it, as CSV or a text report. With a filter on, only matching files are exported, and folders with their matching totals.
-- CSV has full paths, names, sizes in bytes and as shown, file counts, file types, and each item's share. It opens correctly in Excel, non-English names included, and names that look like formulas stay text.
-- The text report lists totals, the 50 largest folders and files, the filter, and what wasn't counted.
+- CSV has full paths, names, sizes in bytes and as shown, file counts, file types, each item's share, and files' modified times in ISO 8601 local time. It opens correctly in Excel, non-English names included, and names that look like formulas stay text.
+- The text report lists totals, the 50 largest folders and files (with modified dates), the filter, and what wasn't counted.
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
 
 ## [0.2.0] - 2026-10-13
