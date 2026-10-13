@@ -11,7 +11,7 @@ Status: milestones 1–6 are complete; portable downloads (milestone 7) are set 
 
 Portable builds for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Silicon are on the [releases page](https://github.com/stevenpickles/spacebadger/releases). Nothing is installed: extract and run. They aren't code-signed, so Windows and macOS warn on first launch; see [`docs/RELEASING.md`](docs/RELEASING.md#downloads) for how to open them and how releases are made.
 
-On Windows, once the packages are accepted (submitted, awaiting review), either package manager installs the same portable app and adds a `spacebadger` command:
+On Windows, once the packages are accepted, either package manager installs the same portable app and adds a `spacebadger` command:
 
 ```sh
 winget install StevenPickles.SpaceBadger
