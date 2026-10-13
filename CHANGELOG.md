@@ -14,8 +14,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Duplicates
 - Find duplicates, in the toolbar or a folder's menu, finds files with the same contents in the folder in view, among the files the filter matches: `is:video` then Find duplicates finds duplicate videos. It's the only feature that reads file contents, and only when asked. Cloud files are never read, so nothing is downloaded, and two names of one hard-linked file don't count.
-- The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at (1 MB to start).
-- Select duplicates like any other items, or use "Select all but the first" to select every copy except the one with the shortest path in each group. Deleting still goes through the guarded delete, and deleted files leave their groups.
+- The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at, from 1 KB to 100 MB (1 MB to start).
+- Select duplicates like any other items, or use "Select all but the first" to select every copy except the one with the shortest path in each group. Deleting still goes through the guarded delete, which warns if a group would lose every copy, and deleted files leave their groups.
 
 ## [0.2.0] - 2026-10-13
 
