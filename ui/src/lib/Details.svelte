@@ -109,9 +109,12 @@
 {/snippet}
 
 {#snippet changeRow(d: NodeDetails, c: ItemChange | null)}
-  {@const said = c && c.node === d.node ? describeChange(c.kind, c.before, c.after, since) : null}
+  {@const said = c && c.node === d.node ? describeChange(c.kind, c.before, c.beforeBelow, c.after, since) : null}
   {#if said}
-    <dt>Change</dt>
+    <!-- With a filter on, sizes above are matching files; changes cover all. -->
+    <dt title={d.matching ? "Change in all files, not only those matching the filter" : undefined}>
+      {d.matching ? "Change (all files)" : "Change"}
+    </dt>
     <dd class="change {c?.kind}">
       {said.text}{#if said.was}<span class="muted">{` (${said.was})`}</span>{/if}
     </dd>

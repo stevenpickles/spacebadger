@@ -6,7 +6,7 @@
   // page, and a scan change (a delete) reloads the pages already shown.
   import { untrack } from "svelte";
   import { compareChanges, errorText } from "./api";
-  import { formatDelta } from "./compare";
+  import { formatChange } from "./compare";
   import { exactBytes, formatBytes, formatCount, plural } from "./format";
   import ItemList from "./ItemList.svelte";
   import type { ChangeRow } from "./protocol/ChangeRow";
@@ -31,6 +31,8 @@
     /** Where Shift ranges start. */
     anchor: number | null;
     onpick: (pick: Pick) => void;
+    /** Moving onto a removed item, which can't be selected: nothing is. */
+    onclear: () => void;
     /** The Delete key. */
     ondelete: () => void;
     /** Open a folder in the map. */
@@ -51,6 +53,7 @@
     selected,
     anchor,
     onpick,
+    onclear,
     ondelete,
     onopen,
     onshow,
@@ -125,9 +128,14 @@
     attempt++;
   }
 
-  /** Removed items can't be selected: they aren't in the scan. */
+  /** Removed items can't be selected: they aren't in the scan. Moving
+   * onto one clears the selection, so Delete can't act on an item out of
+   * sight. */
   function pick(p: Pick) {
-    if (p.focus.node < 0) return;
+    if (p.focus.node < 0) {
+      onclear();
+      return;
+    }
     onpick({ ...p, nodes: p.nodes.filter((n) => n >= 0) });
   }
 
@@ -149,14 +157,19 @@
     if (r.kind === "removed") return `${what}: removed since ${since}`;
     if (r.kind === "new") return `${what}: new since ${since}`;
     const hint = r.folder ? "Enter opens it" : "Enter shows it in the map";
-    return `${what}: ${formatBytes(r.before ?? 0)} on ${since}, ${formatBytes(r.after ?? 0)} now (${hint})`;
+    const then =
+      r.before === null && r.beforeBelow !== null
+        ? `under ${formatBytes(r.beforeBelow)}`
+        : formatBytes(r.before ?? 0);
+    return `${what}: ${then} on ${since}, ${formatBytes(r.after ?? 0)} now (${hint})`;
   }
 
   function sizeTitle(r: Row): string {
-    const before = r.before ?? 0;
+    const below = r.before === null ? r.beforeBelow : null;
+    const before = r.before ?? below ?? 0;
     const after = r.after ?? 0;
     const sign = after >= before ? "+" : "−";
-    return `${sign}${exactBytes(Math.abs(after - before))}`;
+    return `${below !== null ? "At least " : ""}${sign}${exactBytes(Math.abs(after - before))}`;
   }
 
   const left = $derived(total === null ? 0 : Math.min(PAGE, total - rows.length));
@@ -200,7 +213,7 @@
       </span>
     {/snippet}
     {#snippet size(r)}
-      <span class="delta {r.kind}" title={sizeTitle(r)}>{formatDelta(r.before ?? 0, r.after ?? 0)}</span>
+      <span class="delta {r.kind}" title={sizeTitle(r)}>{formatChange(r.before, r.beforeBelow, r.after)}</span>
     {/snippet}
     {#snippet empty()}
       <p class="muted">

@@ -20,9 +20,12 @@
     mode?: ColorMode;
     /** In change mode: when the earlier scan was, e.g. "Oct 1, 2:03 PM". */
     since?: string;
+    /** A name filter is on: tiles show matching files, but changes are
+     * of all files. */
+    filtered?: boolean;
   }
 
-  let { mode = "type", since = "" }: Props = $props();
+  let { mode = "type", since = "", filtered = false }: Props = $props();
 
   const dark = $derived(theme.dark);
   const listId = $props.id();
@@ -95,6 +98,9 @@
           <span class="swatch" style:background={changeColor(MARK_UNKNOWN, false, dark)}></span>Earlier size unknown
         </li>
         <li class="wide muted">Deeper colors: bigger change for its size</li>
+        {#if filtered}
+          <li class="wide muted">Colors show the change in all files, not only matching ones</li>
+        {/if}
       {:else}
         <li class="wide">
           <span class="depths" aria-hidden="true">
