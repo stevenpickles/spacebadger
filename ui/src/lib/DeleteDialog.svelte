@@ -16,6 +16,7 @@
   // typed and a short countdown has run, so a reflexive Enter or click can't
   // go through. When the move is done the dialog stays open to report what
   // moved and what couldn't.
+  import { untrack } from "svelte";
   import { describeItems, exactBytes, formatBytes, plural } from "./format";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
   import SampleList from "./SampleList.svelte";
@@ -94,7 +95,7 @@
 
   $effect(() => {
     dialog.showModal();
-    input?.focus();
+    untrack(() => input?.focus());
     const timer = setInterval(() => {
       left = Math.max(0, left - 1);
       if (left === 0) clearInterval(timer);
