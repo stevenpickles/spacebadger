@@ -55,10 +55,17 @@ impl AppState {
         // `spacebadger .` names the folder it was started in; snapshots are
         // kept by absolute path, so another folder's never match.
         let root = std::path::absolute(&root).unwrap_or(root);
+        // Rescanning the same folder goes on comparing with the same
+        // earlier scan, held in memory in case its file is pruned.
+        let carried = self
+            .current()
+            .filter(|s| s.root == root)
+            .and_then(|s| s.carry());
         let emitter = app.clone();
         let session = Arc::new(Session::start_with(
             root,
             self.snapshots.clone(),
+            carried,
             move |status| {
                 let _ = emitter.emit(SCAN_STATUS_EVENT, status);
             },

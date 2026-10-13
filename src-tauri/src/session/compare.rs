@@ -22,6 +22,22 @@ pub(super) struct Saver {
     /// The id of the snapshot saved for this scan, left out of the earlier
     /// scans it can be compared with.
     pub saved: Arc<Mutex<Option<String>>>,
+    /// A snapshot in use for comparing, which saving mustn't prune.
+    pub protect: Option<String>,
+}
+
+/// An earlier scan in use for comparing, handed from one scan of a root to
+/// the next, so a rescan keeps comparing with it even if its file is pruned.
+#[derive(Clone)]
+pub struct Carried {
+    info: proto::SnapshotInfo,
+    snapshot: Arc<Snapshot>,
+}
+
+impl Carried {
+    pub fn id(&self) -> &str {
+        &self.info.id
+    }
 }
 
 impl Saver {
@@ -39,6 +55,7 @@ impl Saver {
         let root = self.root.clone();
         let tree = Arc::clone(&self.tree);
         let saved = Arc::clone(&self.saved);
+        let protect = self.protect.clone();
         let spawned = std::thread::Builder::new()
             .name("sb-snapshot".into())
             .spawn(move || {
@@ -55,7 +72,7 @@ impl Saver {
                 };
                 drop(tree);
                 let captured = started.elapsed();
-                match store.save(&root, &snap) {
+                match store.save(&root, &snap, protect.as_deref()) {
                     Ok(id) => {
                         if cfg!(debug_assertions) {
                             eprintln!(
@@ -139,7 +156,11 @@ impl Session {
             .snapshots
             .as_ref()
             .ok_or("Earlier scans aren't saved.")?;
-        let snapshot = Arc::new(store.load(&self.root, id)?);
+        // The scan carried over from before a rescan is kept in memory.
+        let snapshot = match &self.carried {
+            Some(c) if c.info.id == id => Arc::clone(&c.snapshot),
+            _ => Arc::new(store.load(&self.root, id)?),
+        };
         let header = snapshot.header().clone();
         let (comparison, revision) = {
             let tree = self.scan.tree();
@@ -163,6 +184,15 @@ impl Session {
             snapshot: info,
             threshold: header.threshold,
         }))
+    }
+
+    /// The earlier scan being compared with, to carry over to a rescan.
+    pub fn carry(&self) -> Option<Carried> {
+        let compare = self.compare.lock().ok()?;
+        compare.as_ref().map(|a| Carried {
+            info: a.info.clone(),
+            snapshot: Arc::clone(&a.snapshot),
+        })
     }
 
     /// How `id` changed since the snapshot.
@@ -405,7 +435,12 @@ mod tests {
 
     /// Scans `root` to the end and waits for its snapshot.
     fn scan(root: &Path, store: &Arc<Store>) -> Session {
-        let session = Session::start_with(root.to_owned(), Some(Arc::clone(store)), |_| {});
+        scan_carrying(root, store, None)
+    }
+
+    fn scan_carrying(root: &Path, store: &Arc<Store>, carried: Option<Carried>) -> Session {
+        let session =
+            Session::start_with(root.to_owned(), Some(Arc::clone(store)), carried, |_| {});
         let deadline = Instant::now() + Duration::from_secs(20);
         while session.saved_snapshot.lock().unwrap().is_none() {
             assert!(Instant::now() < deadline, "no snapshot saved");
@@ -521,7 +556,28 @@ mod tests {
             "not the comparison that's on"
         );
 
+        // A rescan carries the earlier scan over, even once its file is gone.
+        let carried = second.carry().expect("comparing");
+        assert_eq!(carried.id(), id);
+        for (file_id, _) in store.list(&data) {
+            if file_id == id {
+                let dir = tmp.0.join("store");
+                for d in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let _ = std::fs::remove_file(d.path().join(format!("{id}.sbsnap")));
+                }
+            }
+        }
+        assert!(store.list(&data).iter().all(|(f, _)| *f != id));
+        let third = scan_carrying(&data, &store, Some(carried));
+        assert!(third.compare_set(Some(&id)).unwrap().is_some());
+        let log = find(&third, "logs/app.log");
+        assert_eq!(
+            third.compare_item(&id, log).unwrap().before,
+            Some(2 * MB as u64)
+        );
+
         second.compare_set(None).unwrap();
         assert!(second.compare_item(&id, log).is_err());
+        assert!(second.carry().is_none());
     }
 }

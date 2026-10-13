@@ -68,9 +68,10 @@ impl Store {
             .join(format!("{:016x}", fnv64(root_key(root).as_bytes())))
     }
 
-    /// Writes `snap` of `root` and prunes old snapshots; returns the new
-    /// snapshot's id.
-    pub fn save(&self, root: &Path, snap: &Snapshot) -> io::Result<String> {
+    /// Writes `snap` of `root` and prunes old snapshots, except `protect`
+    /// (one of `root`'s, in use for comparing); returns the new snapshot's
+    /// id.
+    pub fn save(&self, root: &Path, snap: &Snapshot, protect: Option<&str>) -> io::Result<String> {
         // Encoded first, so the folder exists as briefly as possible before
         // the file in it.
         let bytes = snap.encode();
@@ -105,7 +106,9 @@ impl Store {
             let _ = fs::remove_file(&temp);
             return Err(e);
         }
-        self.prune(&path);
+        let mut keep = vec![path];
+        keep.extend(protect.map(|p| dir.join(format!("{p}.{EXTENSION}"))));
+        self.prune(&keep);
         Ok(id)
     }
 
@@ -140,8 +143,8 @@ impl Store {
     }
 
     /// Applies the retention rules in the module notes. `keep` (the one
-    /// just written) always stays.
-    fn prune(&self, keep: &Path) {
+    /// just written, and one in use) always stays.
+    fn prune(&self, keep: &[PathBuf]) {
         let Ok(roots) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -174,7 +177,7 @@ impl Store {
                 } else {
                     0
                 };
-                if f.rank > 0 || first_of_day || f.path == keep {
+                if f.rank > 0 || first_of_day || keep.contains(&f.path) {
                     all.push(f);
                 } else {
                     let _ = fs::remove_file(&f.path);
@@ -193,7 +196,7 @@ impl Store {
             if total <= self.max_total {
                 break;
             }
-            if f.path != keep && fs::remove_file(&f.path).is_ok() {
+            if !keep.contains(&f.path) && fs::remove_file(&f.path).is_ok() {
                 total -= f.size;
             }
         }
@@ -335,10 +338,10 @@ mod tests {
         let store = Store::new(tmp.0.clone());
         let a = Path::new("/data/a");
         let b = Path::new("/data/b");
-        let first = store.save(a, &snap("/data/a", 1000, 1)).unwrap();
-        let second = store.save(a, &snap("/data/a", 2000, 2)).unwrap();
-        store.save(b, &snap("/data/b", 1500, 3)).unwrap();
-        let again = store.save(a, &snap("/data/a", 2000, 4)).unwrap();
+        let first = store.save(a, &snap("/data/a", 1000, 1), None).unwrap();
+        let second = store.save(a, &snap("/data/a", 2000, 2), None).unwrap();
+        store.save(b, &snap("/data/b", 1500, 3), None).unwrap();
+        let again = store.save(a, &snap("/data/a", 2000, 4), None).unwrap();
         assert_eq!(again, "2000-1", "same time, distinct file");
 
         let listed: Vec<_> = store
@@ -382,7 +385,7 @@ mod tests {
             2 * d + 5,
         ];
         for t in times {
-            store.save(a, &snap("/data/a", t, 1)).unwrap();
+            store.save(a, &snap("/data/a", t, 1), None).unwrap();
         }
         let kept = |s: &Store| -> Vec<u64> {
             let mut ids: Vec<u64> = s.list(a).into_iter().map(|(_, h)| h.created_ms).collect();
@@ -401,16 +404,16 @@ mod tests {
             .unwrap()
             .len();
         let tight = Store::with_limits(tmp.0.clone(), 3, size * 4 + size / 2);
-        tight.save(a, &snap("/data/a", 2 * d + 6, 1)).unwrap();
+        tight.save(a, &snap("/data/a", 2 * d + 6, 1), None).unwrap();
         assert_eq!(kept(&tight), [1000, 2 * d + 4, 2 * d + 5, 2 * d + 6]);
 
         let b = Path::new("/data/b");
-        tight.save(b, &snap("/data/b", 3 * d, 1)).unwrap();
+        tight.save(b, &snap("/data/b", 3 * d, 1), None).unwrap();
         assert_eq!(kept(&tight), [1000, 2 * d + 5, 2 * d + 6], "from any root");
         assert_eq!(tight.list(b).len(), 1);
 
         let tiny = Store::with_limits(tmp.0.clone(), 3, 1);
-        tiny.save(a, &snap("/data/a", 2 * d + 7, 1)).unwrap();
+        tiny.save(a, &snap("/data/a", 2 * d + 7, 1), None).unwrap();
         assert_eq!(
             kept(&tiny),
             [2 * d + 7],
@@ -420,14 +423,29 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_in_use_is_never_pruned() {
+        let tmp = temp("protect");
+        let store = Store::with_limits(tmp.0.clone(), 1, 1);
+        let a = Path::new("/data/a");
+        store.save(a, &snap("/data/a", 1000, 1), None).unwrap();
+        store.save(a, &snap("/data/a", 2000, 1), None).unwrap();
+        store
+            .save(a, &snap("/data/a", 3000, 1), Some("2000"))
+            .unwrap();
+        let mut ids: Vec<_> = store.list(a).into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, ["2000", "3000"], "over the total, but in use");
+    }
+
+    #[test]
     fn save_makes_the_folder_again_if_it_vanishes() {
         let tmp = temp("vanish");
         let store = Store::new(tmp.0.clone());
         let a = Path::new("/data/a");
-        store.save(a, &snap("/data/a", 1000, 1)).unwrap();
+        store.save(a, &snap("/data/a", 1000, 1), None).unwrap();
         // As if another save's prune removed the folder while empty.
         fs::remove_dir_all(store.root_dir(a)).unwrap();
-        store.save(a, &snap("/data/a", 2000, 1)).unwrap();
+        store.save(a, &snap("/data/a", 2000, 1), None).unwrap();
         assert_eq!(store.list(a).len(), 1);
     }
 
@@ -436,7 +454,7 @@ mod tests {
         let tmp = temp("damaged");
         let store = Store::new(tmp.0.clone());
         let a = Path::new("/data/a");
-        let id = store.save(a, &snap("/data/a", 1000, 1)).unwrap();
+        let id = store.save(a, &snap("/data/a", 1000, 1), None).unwrap();
         let path = store.root_dir(a).join(format!("{id}.sbsnap"));
         let bytes = fs::read(&path).unwrap();
         fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();

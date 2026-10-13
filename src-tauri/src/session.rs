@@ -55,6 +55,8 @@ pub struct Session {
     started_ms: u64,
     /// The comparison with an earlier scan, when on.
     compare: Mutex<Option<compare::Active>>,
+    /// The earlier scan carried over from the previous scan of this root.
+    carried: Option<compare::Carried>,
 }
 
 struct Names {
@@ -90,14 +92,17 @@ impl Session {
         root: PathBuf,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
-        Self::start_with(root, None, on_status)
+        Self::start_with(root, None, None, on_status)
     }
 
     /// Starts scanning; once the scan completes, a snapshot of it is saved
-    /// in `snapshots`, so later scans can be compared with it.
+    /// in `snapshots`, so later scans can be compared with it. `carried` is
+    /// the earlier scan a previous scan of this root was compared with, kept
+    /// so comparing can go on after the rescan (see [`Session::carry`]).
     pub fn start_with(
         root: PathBuf,
         snapshots: Option<Arc<Store>>,
+        carried: Option<compare::Carried>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
         let started_ms = compare::now_ms();
@@ -111,6 +116,7 @@ impl Session {
             root: root.clone(),
             tree: Arc::clone(&tree_cell),
             saved: Arc::clone(&saved_snapshot),
+            protect: carried.as_ref().map(|c| c.id().to_owned()),
         });
         let scan = Scan::start(
             root.clone(),
@@ -138,6 +144,7 @@ impl Session {
             saved_snapshot,
             started_ms,
             compare: Mutex::new(None),
+            carried,
         }
     }
 
