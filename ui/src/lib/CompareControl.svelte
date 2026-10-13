@@ -65,12 +65,13 @@
     aria-expanded={open}
     aria-controls={listId}
     disabled={busy}
+    aria-label={current ? `Comparing with the scan of ${currentWhen}` : undefined}
     title={current
-      ? `Comparing with the scan of ${currentWhen}. Choose another earlier scan`
+      ? `Comparing with the scan of ${currentWhen}. Click to choose another earlier scan`
       : "Compare this scan with an earlier scan of the same folder: what grew, shrank, or is new"}
     onclick={() => (open = !open)}
   >
-    {#if busy}Comparing…{:else if current}Since {formatDay(current.createdMs)}{:else}Compare…{/if}
+    {#if busy}Comparing…{:else if current}{formatDay(current.createdMs)}{:else}Compare…{/if}
   </button>
   {#if current}
     <button type="button" class="icon-button" aria-label="Stop comparing" title="Stop comparing" onclick={onstop}
