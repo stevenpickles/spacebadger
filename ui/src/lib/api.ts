@@ -2,6 +2,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
+import type { ChangeMarksRequest } from "./protocol/ChangeMarksRequest";
+import type { ChangesPage } from "./protocol/ChangesPage";
+import type { ChangesRequest } from "./protocol/ChangesRequest";
+import type { CompareSummary } from "./protocol/CompareSummary";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
 import type { ExportProgress } from "./protocol/ExportProgress";
@@ -9,6 +13,7 @@ import type { ExportReport } from "./protocol/ExportReport";
 import type { ExportRequest } from "./protocol/ExportRequest";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
+import type { ItemChange } from "./protocol/ItemChange";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -20,6 +25,7 @@ import type { SelectionRequest } from "./protocol/SelectionRequest";
 import type { SelectionSummary } from "./protocol/SelectionSummary";
 import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
+import type { SnapshotInfo } from "./protocol/SnapshotInfo";
 import type { SuggestRequest } from "./protocol/SuggestRequest";
 import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
@@ -169,4 +175,30 @@ export function errorText(e: unknown): string {
 /** Folder names or extensions in the scan, for the filter's completion. */
 export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
   return invoke<Suggestion[]>("filter_suggest", { request });
+}
+
+// ---- comparing with an earlier scan ------------------------------------
+
+/** Earlier scans of the current root to compare with, newest first. */
+export function compareSnapshots(generation: number): Promise<SnapshotInfo[]> {
+  return invoke<SnapshotInfo[]>("compare_snapshots", { generation });
+}
+
+/** Compares with an earlier scan; `null` turns comparing off. */
+export function compareSet(generation: number, snapshot: string | null): Promise<CompareSummary | null> {
+  return invoke<CompareSummary | null>("compare_set", { generation, snapshot });
+}
+
+export function compareItem(generation: number, snapshot: string, node: number): Promise<ItemChange> {
+  return invoke<ItemChange>("compare_item", { generation, snapshot, node });
+}
+
+/** One byte per node; see `sb_protocol::change_mark` and `changeColor`. */
+export function changeMarks(request: ChangeMarksRequest): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("change_marks", { request });
+}
+
+/** The biggest changes under a folder, including removed items. */
+export function compareChanges(request: ChangesRequest): Promise<ChangesPage> {
+  return invoke<ChangesPage>("compare_changes", { request });
 }

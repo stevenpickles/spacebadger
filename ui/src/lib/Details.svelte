@@ -1,7 +1,9 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
-  import { describeItems, exactBytes, formatBytes, percent, plural, shortcut } from "./format";
+  import { describeChange } from "./compare";
+  import { describeItems, exactBytes, formatBytes, formatDate, percent, plural, shortcut } from "./format";
   import type { FolderState } from "./protocol/FolderState";
+  import type { ItemChange } from "./protocol/ItemChange";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
   import SampleList from "./SampleList.svelte";
@@ -42,6 +44,11 @@
     /** Copy the paths of every selected item. */
     oncopypaths?: () => void;
     ondelete: () => void;
+    /** While comparing: how the selected item and the viewed folder
+     * changed since the earlier scan, and when that was. */
+    change?: ItemChange | null;
+    viewedChange?: ItemChange | null;
+    since?: string;
   }
 
   let {
@@ -65,6 +72,9 @@
     oncopy,
     oncopypaths,
     ondelete,
+    change = null,
+    viewedChange = null,
+    since = "",
   }: Props = $props();
 
   const ROOT = 0;
@@ -98,7 +108,20 @@
   </div>
 {/snippet}
 
-{#snippet item(d: NodeDetails, parent: number | null)}
+{#snippet changeRow(d: NodeDetails, c: ItemChange | null)}
+  {@const said = c && c.node === d.node ? describeChange(c.kind, c.before, c.beforeBelow, c.after, since) : null}
+  {#if said}
+    <!-- With a filter on, sizes above are matching files; changes cover all. -->
+    <dt title={d.matching ? "Change in all files, not only those matching the filter" : undefined}>
+      {d.matching ? "Change (all files)" : "Change"}
+    </dt>
+    <dd class="change {c?.kind}">
+      {said.text}{#if said.was}<span class="muted">{` (${said.was})`}</span>{/if}
+    </dd>
+  {/if}
+{/snippet}
+
+{#snippet item(d: NodeDetails, parent: number | null, c: ItemChange | null)}
   <h2>{d.name}</h2>
   <!-- The scan root's name is already its path. -->
   {#if d.path !== d.name}
@@ -127,8 +150,13 @@
         {/if}
       </dd>
     {/if}
+    {@render changeRow(d, c)}
     <dt>Type</dt>
     <dd>{d.folder ? "Folder" : "File"}</dd>
+    {#if !d.folder && d.modified !== null}
+      <dt>Modified</dt>
+      <dd>{formatDate(d.modified)}</dd>
+    {/if}
     {#if d.folder}
       {#if !d.matching}
         <dt>Files</dt>
@@ -190,7 +218,7 @@
     {@render deleteAction(`Move ${plural(multi.items, "item")} to the ${trashName}…`)}
   {:else if !selection && viewed}
     <p class="eyebrow">{viewed.matching ? "Viewing · filtered" : "Viewing"}</p>
-    {@render item(viewed, viewedParentSize)}
+    {@render item(viewed, viewedParentSize, viewedChange)}
     <p class="muted small hint">
       Click an item in the map for its details; {ctrl}+click or Shift+click selects several.
     </p>
@@ -232,7 +260,7 @@
       <button type="button" onclick={() => onreveal(selection.node)}>Show folder in {fileManager}</button>
     </div>
   {:else if details}
-    {@render item(details, parentSize)}
+    {@render item(details, parentSize, change)}
   {:else if error}
     <p class="error selectable">Couldn't load details: {error}</p>
     {#if onretry}
@@ -276,6 +304,15 @@
   }
   .note {
     font-size: var(--fs-sm);
+  }
+  .change.grown {
+    color: var(--change-grown);
+  }
+  .change.shrunk {
+    color: var(--change-shrunk);
+  }
+  .change.new {
+    color: var(--change-new);
   }
   .actions {
     display: flex;

@@ -583,6 +583,7 @@ impl<A: FsAdapter> Aggregator<A> {
         let mut remeasure = Vec::new();
         let tree_lock = Arc::clone(&self.tree);
         let mut tree = tree_lock.write().unwrap();
+        let mut unreadable = false;
         for entry in entries {
             let skipped = match entry.kind {
                 EntryKind::File | EntryKind::Directory => None,
@@ -592,6 +593,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 EntryKind::UnknownReparse => Some(OmissionReason::UnknownReparse),
                 EntryKind::Failed(kind) => Some(OmissionReason::from_error(kind)),
             };
+            unreadable |= matches!(entry.kind, EntryKind::Failed(_));
             if let Some(reason) = skipped {
                 self.omissions.add(reason, limit, || OmissionSample {
                     path: path.join(&entry.name),
@@ -609,25 +611,26 @@ impl<A: FsAdapter> Aggregator<A> {
                     allocated: entry.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
                 };
                 let extra = if entry.cloud { flags::CLOUD } else { 0 };
-                tree.add_file(dir, &entry.name, sizes, extra).map(|id| {
-                    if let Identity::MaybeShared { key } = entry.identity {
-                        match self.owners.entry(key) {
-                            MapEntry::Vacant(v) => {
-                                v.insert(id);
-                            }
-                            MapEntry::Occupied(o) => {
-                                let owner = *o.get();
-                                tree.mark_alias(id, owner);
-                                // Listings of other names can be stale (NTFS),
-                                // so re-measure both sides once.
-                                remeasure.push(id);
-                                if self.remeasured.insert(owner) {
-                                    remeasure.push(owner);
+                tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
+                    .map(|id| {
+                        if let Identity::MaybeShared { key } = entry.identity {
+                            match self.owners.entry(key) {
+                                MapEntry::Vacant(v) => {
+                                    v.insert(id);
+                                }
+                                MapEntry::Occupied(o) => {
+                                    let owner = *o.get();
+                                    tree.mark_alias(id, owner);
+                                    // Listings of other names can be stale (NTFS),
+                                    // so re-measure both sides once.
+                                    remeasure.push(id);
+                                    if self.remeasured.insert(owner) {
+                                        remeasure.push(owner);
+                                    }
                                 }
                             }
                         }
-                    }
-                })
+                    })
             };
             if added.is_err() {
                 self.stop = Some(ScanState::Failed(
@@ -639,6 +642,9 @@ impl<A: FsAdapter> Aggregator<A> {
             }
         }
         tree.set_dir_state(dir, DirState::Listed);
+        if unreadable {
+            tree.mark_unreadable_entries(dir);
+        }
         let remeasure: Vec<_> = remeasure.into_iter().map(|n| (n, tree.path(n))).collect();
         drop(tree);
         if self.stop.is_some() {

@@ -4,6 +4,20 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+### Filter
+- Size terms: `size:>500MB`, `size:>=1GB`, `size:<10KB`, `size:<=2GB`, and ranges like `size:10MB..1GB`. Units are B, KB, MB, GB, and TB, counted like the sizes on screen (1,024 bytes per KB on Windows, 1,000 on macOS and Linux).
+- Age terms: `older:1y` and `newer:30d` (with `h`, `d`, `w`, `mo`, or `y`), or a date: `older:2024-01-01`. Files whose modified time is unknown never match one.
+- Size and age terms narrow everything else in the filter, and every one must hold; on their own they match every file that passes. `!` turns one around. Suggestions offer them, with common values such as `>1GB` and `6mo`.
+
+### Details
+- Files show when they were last modified.
+
+### Compare with an earlier scan
+- Each completed scan is saved as a compact snapshot. Scan the same folder again later, and **Compare…** in the toolbar lists the earlier scans to compare with: what grew, what shrank, and what's new since.
+- Color by **Change**: grown items warm, shrunk ones cool, new ones purple, deeper the bigger the change.
+- The details show an item's change, such as "+1.20 GB since Oct 1, 2:03 PM (was 3.40 GB)", and a **Changes** tab lists the biggest changes under the folder in view, including removed items.
+- Files under 1 MiB are recorded without their size: one that grew past 1 MiB shows as grown by at least the difference, and otherwise no change is shown. Each folder keeps its newest 5 snapshots, the first of each earlier day, and its first, and at most 256 MiB in all.
+
 ### Export
 - Export… in the toolbar and in a folder's right-click menu saves a folder's contents, or everything under it, as CSV or a text report. With a filter on, only matching files are exported, and folders with their matching totals.
 - CSV has full paths, names, sizes in bytes and as shown, file counts, file types, and each item's share. It opens correctly in Excel, non-English names included, and names that look like formulas stay text.

@@ -497,7 +497,8 @@ mod tests {
             logical: bytes,
             allocated: Allocated::known(bytes),
         };
-        tree.add_file(parent, OsStr::new(name), sizes, 0).unwrap()
+        tree.add_file(parent, OsStr::new(name), sizes, None, 0)
+            .unwrap()
     }
 
     fn dir(tree: &mut Tree, parent: NodeId, name: &str) -> NodeId {

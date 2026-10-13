@@ -4,8 +4,9 @@
   // change; at most one request is in flight, and changes that arrive
   // meanwhile are folded into one follow-up request (natural backpressure).
   import { announce } from "./announce.svelte";
-  import { nodeDetails, requestLayout } from "./api";
+  import { changeMarks, nodeDetails, requestLayout } from "./api";
   import {
+    changeColor,
     depthColor,
     typeModeFolderColor,
     otherSmallColor,
@@ -13,6 +14,7 @@
     typeColor,
     type ColorMode,
   } from "./colors";
+  import { MARK_UNKNOWN } from "./compare";
   import { formatBytes, formatCount, percent, plural, shortcut } from "./format";
   import {
     decodeLayout,
@@ -44,6 +46,8 @@
     view: number;
     metric: Metric;
     colors: ColorMode;
+    /** The earlier scan the "change" colors compare with. */
+    compare?: string | null;
     /** Active filename search; only matching files are drawn. */
     search: number | null;
     /** Scan revision; a change triggers a new layout. */
@@ -72,6 +76,7 @@
     view,
     metric,
     colors,
+    compare = null,
     search,
     revision,
     selection,
@@ -148,6 +153,29 @@
       (shown.generation !== generation || shown.view !== view || shown.search !== search),
   );
 
+  /** Change marks for the drawn layout's rectangles, in change mode. */
+  let marks = $state.raw<{ layout: DecodedLayout; compare: string; bytes: Uint8Array } | null>(null);
+  const changeMode = $derived(colors === "change" && compare !== null);
+
+  async function fetchMarks(l: DecodedLayout, cmp: string): Promise<Uint8Array> {
+    const nodes = Array.from(l.node.subarray(0, l.count));
+    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }));
+  }
+
+  // Switching to change colors, or to another comparison, marks the map
+  // already drawn; new layouts come with their marks (see fetchLayout).
+  $effect(() => {
+    const l = layout;
+    const cmp = changeMode ? compare : null;
+    if (!l || cmp === null || (marks?.layout === l && marks.compare === cmp)) return;
+    fetchMarks(l, cmp).then(
+      (bytes) => {
+        if (layout === l && compare === cmp) marks = { layout: l, compare: cmp, bytes };
+      },
+      () => {},
+    );
+  });
+
   let nextRequest = 1;
   let inFlight = false;
   let again = false;
@@ -175,6 +203,11 @@
           const reply = decodeLayout(
             await requestLayout({ ...want, request, width, height }),
           );
+          // In change mode the marks arrive with the layout, so tiles never
+          // flash in neutral colors first.
+          const cmp = changeMode ? compare : null;
+          let replyMarks: Uint8Array | null = null;
+          if (cmp !== null) replyMarks = await fetchMarks(reply, cmp).catch(() => null);
           // Drop replies for a view, metric, search, or scan no longer shown.
           if (
             want.generation === generation &&
@@ -185,6 +218,7 @@
           ) {
             stats.layout.add(performance.now() - started);
             layout = reply;
+            if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
             shown = { generation: want.generation, view: want.view, search: want.search };
             error = null;
             onlayout?.(reply);
@@ -215,6 +249,10 @@
   function fillFor(l: DecodedLayout, i: number): string {
     const kind = l.kind[i];
     if (kind === KIND_OTHER) return otherSmallColor(dark);
+    if (colors === "change") {
+      const m = marks?.layout === l && marks.compare === compare ? marks.bytes[i]! : MARK_UNKNOWN;
+      return changeColor(m, kind === KIND_FOLDER, dark);
+    }
     if (colors === "type") {
       return kind === KIND_FOLDER ? typeModeFolderColor(dark) : typeColor(l.ftype[i]!, dark);
     }
@@ -425,7 +463,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, selected, hover, palette, colors, width, height];
+    void [layout, marks, selection, selected, hover, palette, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
