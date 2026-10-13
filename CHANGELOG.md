@@ -4,6 +4,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+- Filter: `is:video`, `is:image`, `is:document`, and the other file-type categories match files by type, and `!is:` leaves a type out. The filter suggests keywords, types, folder names after `dir:`, and extensions after `*.` from the scan as you type.
 - Filter: a `dir:` prefix matches folder names, so `dir:cache` finds the files inside folders named like `cache`, and `!dir:node_modules` leaves those folders out. Combined with file patterns, folder patterns narrow where they apply.
 - Windows: Restart as administrator from the toolbar (or beside "Permission denied" under Not counted) reopens SpaceBadger elevated and scans the same folder again, after asking; declining leaves it as it was.
 - Interface pass: sizes are file sizes throughout (the Allocated/Logical switch is gone; the volume overview still compares on-disk usage).
