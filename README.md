@@ -61,7 +61,7 @@ Deleting is guarded:
 
 Deleted items leave the map at once without a rescan; items that couldn't be moved stay selected, with the reason shown.
 
-The filter box matches file names only (not folders or paths), ignoring case. Separate patterns with `;`. A pattern with `*` (any text) or `?` (one character) must match the whole name, one without matches names containing it, and a leading `!` leaves names out: `*.jpg; *.png; !thumb*` finds JPEG and PNG files except thumbnails. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
+The filter box matches file names (not paths), ignoring case. Separate patterns with `;`. A pattern with `*` (any text) or `?` (one character) must match the whole name, one without matches names containing it, and a leading `!` leaves names out: `*.jpg; *.png; !thumb*` finds JPEG and PNG files except thumbnails. Start a pattern with `dir:` to match folder names instead: `dir:cache` finds every file inside a folder named like `cache`, at any depth; `dir:node_modules; *.js` finds JavaScript files inside `node_modules`; and `*.log; !dir:archive` finds logs except those inside `archive` folders. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
 
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 

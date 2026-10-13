@@ -4,6 +4,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+- Filter: a `dir:` prefix matches folder names, so `dir:cache` finds the files inside folders named like `cache`, and `!dir:node_modules` leaves those folders out. Combined with file patterns, folder patterns narrow where they apply.
 - Windows: Restart as administrator from the toolbar (or beside "Permission denied" under Not counted) reopens SpaceBadger elevated and scans the same folder again, after asking; declining leaves it as it was.
 - Interface pass: sizes are file sizes throughout (the Allocated/Logical switch is gone; the volume overview still compares on-disk usage).
 - Toolbar regrouped, with a filter syntax popover, a scan progress bar, and a keyboard and mouse shortcuts sheet (press `?`).
