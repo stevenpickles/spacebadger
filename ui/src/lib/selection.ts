@@ -103,3 +103,8 @@ export function listRange<T>(items: T[], from: number, to: number, node: (item: 
   const hi = Math.min(items.length - 1, Math.max(from, to));
   return items.slice(lo, hi + 1).map(node);
 }
+
+/** The pick that selects `node` alone, as a plain click does. */
+export function replacePick(node: number): Pick {
+  return { focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false };
+}
