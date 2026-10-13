@@ -3,6 +3,7 @@
   import {
     appInfo,
     deleteItems,
+    errorText,
     EXPECTED_PROTOCOL_VERSION,
     fileManagerName,
     nodeDetails,
@@ -23,7 +24,7 @@
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
-  import DeleteDialog from "./lib/DeleteDialog.svelte";
+  import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
@@ -90,9 +91,14 @@
   let allowDelete = $state(false);
   let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
   let deleting = $state(false);
+  /** What the last delete did, shown in the dialog until it's closed. */
+  let deleteResult = $state.raw<DeleteResult | null>(null);
+  let detailsError = $state<string | null>(null);
+  let detailsRetry = $state(0);
+  let multiUpdating = $state(false);
   /** Counts completed deletes, which change free space. */
   let deletions = $state(0);
-  let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  let menu = $state.raw<{ x: number; y: number; items: MenuItem[]; heading?: string } | null>(null);
   /** What's typed in the filter box. */
   let query = $state("");
   /** The search the map and results show; `null` when unfiltered. */
@@ -108,7 +114,6 @@
   const deleteBlocked = $derived(
     !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
   );
-  const modKey = $derived(os === "macos" ? "⌘" : "Ctrl");
   const elapsedMs = $derived(
     status ? status.elapsedMs + (scanning ? Math.max(0, now - statusAt) : 0) : 0,
   );
@@ -330,15 +335,36 @@
     void status?.revision;
     if (gen === null || nodes.length < 2) {
       multi = null;
+      multiUpdating = false;
       return;
     }
+    multiUpdating = true;
     selectionSummary({ generation: gen, nodes }).then(
       (s) => {
-        if (gen === generation && nodes === picked) multi = s;
+        if (gen !== generation || nodes !== picked) return;
+        multi = s;
+        multiUpdating = false;
       },
-      () => {},
+      (e: unknown) => {
+        if (gen !== generation || nodes !== picked) return;
+        multiUpdating = false;
+        problem = `Couldn't total the selection: ${errorText(e)}`;
+      },
     );
   });
+
+  async function copyPaths() {
+    const gen = generation;
+    const nodes = picked;
+    if (gen === null || nodes.length === 0) return;
+    try {
+      const all = await Promise.all(nodes.map((n) => nodeDetails(gen, n)));
+      await navigator.clipboard.writeText(all.map((d) => d.path).join("\n"));
+      flash(`${plural(nodes.length, "path")} copied`);
+    } catch (e) {
+      problem = `Couldn't copy the paths: ${errorText(e)}`;
+    }
+  }
 
   /** What delete applies to: the selected items, else the focused one. */
   function deleteTargets(): number[] {
@@ -346,23 +372,29 @@
     return selection && !selection.other ? [selection.node] : [];
   }
 
-  /** Menu entry to delete `node`, or the selection it belongs to; none
-   * until deleting is turned on. */
+  /** Menu entry to delete `node`, or the selection it belongs to; shown
+   * unavailable, with the reason, until deleting is turned on. */
   function deleteItemsFor(node: number): MenuItem[] {
-    if (!allowDelete) return [];
     const count = pickedSet.has(node) ? picked.length : 1;
     const what = count > 1 ? `${count} items ` : "";
+    const reason = !allowDelete ? "Turn on “Allow deleting” in the toolbar first." : deleteBlocked;
     return [
       {
-        label: `Move ${what}to ${trash}…`,
+        label: `Move ${what}to the ${trash}…`,
         hint: "Del",
         action: askDelete,
         separator: true,
         danger: true,
-        disabled: !!deleteBlocked,
-        title: deleteBlocked ?? undefined,
+        disabled: !!reason,
+        title: reason ?? undefined,
       },
     ];
+  }
+
+  /** What a menu acts on, named in its heading. */
+  function menuHeading(node: number, name: string | undefined): string | undefined {
+    if (pickedSet.has(node) && picked.length > 1) return `${picked.length} selected items`;
+    return name;
   }
 
   async function changeAllowDelete(on: boolean) {
@@ -401,16 +433,18 @@
     deleting = true;
     try {
       const report = await deleteItems({ generation: gen, nodes: c.nodes });
-      if (gen === generation) afterDelete(report, c.summary);
+      // The dialog stays open on its result screen until closed.
+      if (gen === generation) afterDelete(report);
+      else confirmDelete = null;
     } catch (e) {
-      problem = `Couldn't delete: ${String(e)}`;
+      confirmDelete = null;
+      problem = `Couldn't move to the ${trash}: ${errorText(e)}`;
     } finally {
       deleting = false;
-      confirmDelete = null;
     }
   }
 
-  function afterDelete(r: DeleteReport, asked: SelectionSummary) {
+  function afterDelete(r: DeleteReport) {
     deletions++;
     const gone = new Set(r.deleted);
     // Leave a folder that was deleted along with the items.
@@ -424,18 +458,18 @@
     } else {
       pick(null);
     }
-    const done = r.deleted.length;
-    if (done > 0) {
-      const only = asked.items === 1 ? asked.samples[0] : undefined;
-      const what = only ? `“${only.name}”` : plural(done, "item");
-      const size = formatBytes(r.allocated);
-      flash(`Moved ${what} (${size}) to the ${trash}`, 4000);
-    }
-    if (failed.length > 0) {
-      const lines = r.failed.slice(0, 3).map((f) => `${f.path}: ${f.message}`);
-      if (r.failed.length > 3) lines.push(`…and ${plural(r.failed.length - 3, "more item")}.`);
-      problem = [`Couldn't move ${plural(failed.length, "item")}:`, ...lines].join("\n");
-    }
+    const total = r.deleted.length + r.failed.length;
+    deleteResult = {
+      moved: r.deleted.length,
+      total,
+      size: r.logical,
+      failures: r.failed.map((f) => ({ path: f.path, message: f.message })),
+    };
+    announce(
+      r.failed.length > 0
+        ? `Moved ${r.deleted.length} of ${total} items to the ${trash}; ${plural(r.failed.length, "item")} couldn't be moved`
+        : `Moved ${plural(r.deleted.length, "item")} (${formatBytes(r.logical)}) to the ${trash}`,
+    );
   }
 
   // Breadcrumbs follow the view.
@@ -455,7 +489,8 @@
   $effect(() => {
     const gen = generation;
     const sel = selection;
-    void status?.revision;
+    void [status?.revision, detailsRetry];
+    detailsError = null;
     if (gen === null || !sel) {
       selectedDetails = null;
       return;
@@ -463,6 +498,30 @@
     nodeDetails(gen, sel.node).then(
       (d) => {
         if (gen === generation && selection?.node === sel.node) selectedDetails = d;
+      },
+      (e: unknown) => {
+        if (gen !== generation || selection?.node !== sel.node) return;
+        selectedDetails = null;
+        detailsError = errorText(e);
+      },
+    );
+  });
+
+  // The selected item's share of its folder.
+  let parentSize = $state<number | null>(null);
+  $effect(() => {
+    const gen = generation;
+    const d = selectedDetails;
+    const parent = d?.ancestors.at(-2)?.node;
+    parentSize = null;
+    if (gen === null || !d || parent === undefined || selection?.other) return;
+    if (parent === view && viewDetails?.node === view) {
+      parentSize = viewDetails.logical;
+      return;
+    }
+    nodeDetails(gen, parent).then(
+      (p) => {
+        if (gen === generation && selectedDetails === d) parentSize = p.logical;
       },
       () => {},
     );
@@ -563,6 +622,13 @@
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
     if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
+  }
+
+  function treemapHeading(r: MenuRequest): string | undefined {
+    const node = r.selection?.node ?? view;
+    const known = [selectedDetails, viewDetails].find((d) => d?.node === node);
+    if (r.kind === "other") return known ? `Small items in ${known.name}` : "Small items";
+    return menuHeading(node, known?.name);
   }
 
   // Release builds replace the webview's own menu (Back, Reload, Inspect)
@@ -823,7 +889,7 @@
           onopen={openFolder}
           onup={goUp}
           onlayout={(l) => (layout = l)}
-          onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r) })}
+          onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r), heading: treemapHeading(r) })}
         />
         {#if empty}
           <div class="placeholder overlay">
@@ -848,7 +914,11 @@
           {view}
           {fileManager}
           trashName={trash}
-          {modKey}
+          {parentSize}
+          error={detailsError}
+          onretry={() => detailsRetry++}
+          updating={multiUpdating}
+          oncopypaths={copyPaths}
           canDelete={allowDelete}
           {deleteBlocked}
           onopen={openFolder}
@@ -874,7 +944,7 @@
         </div>
         <div class="list" id="panel-list" role="tabpanel" aria-labelledby="tab-{activeTab}">
           {#if activeTab === "omissions" && status}
-            <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
+            <Omissions groups={status.omissions} autofocus onclose={() => (showOmissions = false)} />
           {:else if activeTab === "small" && smallOf && generation !== null}
             {#key smallOf.folder}
               <SmallItems
@@ -890,7 +960,7 @@
                 ondelete={askDelete}
                 onopen={openFolder}
                 onclose={() => (smallOf = null)}
-                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it) })}
+                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
               />
             {/key}
           {:else if activeTab === "results" && search && generation !== null}
@@ -905,7 +975,7 @@
               onpick={pick}
               ondelete={askDelete}
               onshow={showInMap}
-              onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row) })}
+              onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row), heading: menuHeading(row.node, row.name) })}
             />
           {/if}
         </div>
@@ -926,6 +996,7 @@
       x={menu.x}
       y={menu.y}
       label="Actions"
+      heading={menu.heading}
       items={menu.items}
       onclose={() => (menu = null)}
     />
@@ -937,8 +1008,13 @@
       filtered={search !== null}
       {privileged}
       busy={deleting}
+      result={deleteResult}
       onconfirm={confirmed}
       oncancel={() => (confirmDelete = null)}
+      onclose={() => {
+        confirmDelete = null;
+        deleteResult = null;
+      }}
     />
   {/if}
   {#if showShortcuts}
