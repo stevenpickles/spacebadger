@@ -148,7 +148,11 @@ impl Comparison {
 
         let mut matched = vec![UNKNOWN; tree.len()];
         let mut seen = vec![false; n];
-        matched[NodeId::ROOT.index()] = if snap.was_read(0) { 0 } else { UNKNOWN };
+        matched[NodeId::ROOT.index()] = if snap.was_read(0) && tree.fully_listed(NodeId::ROOT) {
+            0
+        } else {
+            UNKNOWN
+        };
         seen[0] = true;
         let mut pairs = vec![(NodeId::ROOT, 0u32)];
         let mut added = Vec::new();
@@ -240,10 +244,26 @@ impl Comparison {
                         );
                     }
                 } else if is_dir {
-                    if !snap.was_read(s) {
+                    // Read only in part, then or now: its own total isn't
+                    // comparable, but the children found can be.
+                    if !snap.was_read(s) || !tree.fully_listed(c) {
                         matched[c.index()] = UNKNOWN;
                     }
                     pairs.push((c, s));
+                }
+            }
+            // Some entries here couldn't be read now: an earlier child not
+            // found may be one of them, so it isn't called removed.
+            if !tree.fully_listed(dir) {
+                let range =
+                    child_start[entry as usize] as usize..child_start[entry as usize + 1] as usize;
+                accounted.extend(children[range].iter().filter(|&&k| !seen[k as usize]));
+                while let Some(e) = accounted.pop() {
+                    let e = e as usize;
+                    seen[e] = true;
+                    accounted.extend_from_slice(
+                        &children[child_start[e] as usize..child_start[e + 1] as usize],
+                    );
                 }
             }
         }
@@ -701,6 +721,52 @@ mod tests {
             cmp.changes_under(&now, &snap, media, false).is_empty(),
             "no new or removed items in a folder unread then"
         );
+    }
+
+    #[test]
+    fn entries_that_couldnt_be_read_are_neither_removed_nor_new() {
+        let snap = Snapshot::capture(&before(), 0, false);
+
+        // Now `old.mkv` couldn't be read, so it's missing from `media`.
+        let mut now = Tree::new("/data");
+        let media = now.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
+        now.add_file(media, "a.mkv".as_ref(), sizes(12 * MB), None, 0)
+            .unwrap();
+        let mut now = listed(now);
+        now.mark_unreadable_entries(media);
+        let cmp = Comparison::new(&now, &snap);
+        assert_eq!(
+            cmp.status(media),
+            Status::Unknown,
+            "its total isn't comparable"
+        );
+        let a = find(&now, "media/a.mkv");
+        assert_eq!(
+            cmp.change(&now, &snap, a).unwrap().delta(),
+            (2 * MB) as i128
+        );
+        let removed: Vec<_> = cmp
+            .changes_under(&now, &snap, NodeId::ROOT, true)
+            .iter()
+            .filter_map(|c| match c.item {
+                Item::Removed(e) => Some(snap.display_name(e)),
+                Item::Current(_) => None,
+            })
+            .collect();
+        assert!(!removed.contains(&"old.mkv".to_owned()), "{removed:?}");
+
+        // Then `media` had an unreadable entry: what's in it now isn't new.
+        let mut then = before();
+        let media_then = find(&then, "media");
+        then.mark_unreadable_entries(media_then);
+        let snap = Snapshot::capture(&then, 0, false);
+        let now = after();
+        let cmp = Comparison::new(&now, &snap);
+        assert_eq!(cmp.status(find(&now, "media/older.mkv")), Status::Unknown);
+        assert!(matches!(
+            cmp.status(find(&now, "media/a.mkv")),
+            Status::Was(_)
+        ));
     }
 
     #[test]

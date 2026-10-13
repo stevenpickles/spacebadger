@@ -39,7 +39,7 @@
 //! The header can be read on its own to list snapshots without decoding
 //! them. Readers ignore header bytes past the fields they know.
 
-use crate::tree::{DirState, NodeId, Tree};
+use crate::tree::{NodeId, Tree};
 use std::fmt;
 use std::io::Read;
 
@@ -615,9 +615,9 @@ fn upcase(c: char) -> char {
     }
 }
 
-/// A folder's kind bits: read once its listing succeeded.
+/// A folder's kind bits: read once it was listed with every entry read.
 fn dir_kind(tree: &Tree, dir: NodeId) -> u8 {
-    if tree.dir_state(dir) == DirState::Listed {
+    if tree.fully_listed(dir) {
         KIND_DIR | KIND_READ
     } else {
         KIND_DIR
@@ -628,7 +628,7 @@ fn dir_kind(tree: &Tree, dir: NodeId) -> u8 {
 mod tests {
     use super::*;
     use crate::size::Allocated;
-    use crate::tree::FileSizes;
+    use crate::tree::{DirState, FileSizes};
 
     fn sizes(logical: u64) -> FileSizes {
         FileSizes {
