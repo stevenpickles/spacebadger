@@ -281,18 +281,6 @@ pub fn is_privileged() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unescapes_mountinfo_paths() {
-        assert_eq!(unescape_octal(br"/mnt/with\040space"), b"/mnt/with space");
-        assert_eq!(unescape_octal(br"/plain"), b"/plain");
-        assert_eq!(unescape_octal(br"/tab\011x\134y"), b"/tab\tx\\y");
-    }
-}
-
 /// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
 /// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
 /// blocking; anything but a plain file of the scanned size is refused.
@@ -309,4 +297,16 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
         return Err(Skip::Changed);
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescapes_mountinfo_paths() {
+        assert_eq!(unescape_octal(br"/mnt/with\040space"), b"/mnt/with space");
+        assert_eq!(unescape_octal(br"/plain"), b"/plain");
+        assert_eq!(unescape_octal(br"/tab\011x\134y"), b"/tab\tx\\y");
+    }
 }
