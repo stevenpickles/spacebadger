@@ -136,6 +136,11 @@
     scrollTop = 0;
   }
 
+  /** Moves the keyboard focus to the list, e.g. after an inline question. */
+  export function focus() {
+    list?.focus();
+  }
+
   /** Starts a new range request, giving up any earlier one. */
   function newRange(): AbortSignal {
     ranging?.abort();
