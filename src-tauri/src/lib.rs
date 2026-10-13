@@ -10,9 +10,10 @@ mod recycle_windows;
 mod session;
 
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
-    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
-    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, VolumeInfo,
+    AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
+    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
+    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
+    SmallItemsRequest, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -158,6 +159,19 @@ async fn search_results(
     state.session(request.generation)?.search_results(&request)
 }
 
+/// The largest files anywhere under a folder. Ranking a large folder takes a
+/// moment, so this runs on a blocking thread.
+#[tauri::command]
+async fn folder_files(
+    state: State<'_, AppState>,
+    request: FolderFilesRequest,
+) -> Result<FolderFilesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.folder_files(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The files and folders merged into an "other small items" region.
 #[tauri::command]
 async fn small_items(
@@ -270,6 +284,7 @@ pub fn run() {
             search_summary,
             search_results,
             small_items,
+            folder_files,
             volume_info,
             selection_summary,
             set_delete_allowed,
