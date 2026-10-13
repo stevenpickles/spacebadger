@@ -15,6 +15,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/workflows/packages.yml
       - scripts/release/**
       - packaging/**
       - src-tauri/tauri.conf.json
