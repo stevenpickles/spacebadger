@@ -46,6 +46,9 @@ pub struct DuplicateSkips {
     pub vanished: u32,
     /// Changed since the scan (size, or no longer a plain file).
     pub changed: u32,
+    /// Stored behind a reparse point (deduplicated, tiered, virtualized),
+    /// so reading it raw wouldn't give its contents.
+    pub special: u32,
     /// Open in another program that doesn't share it.
     pub in_use: u32,
     pub denied: u32,
@@ -104,6 +107,9 @@ pub struct DuplicateFile {
     /// The containing folder.
     pub parent: u32,
     pub path: String,
+    /// It has other hard-link names, so deleting this one alone may free
+    /// nothing.
+    pub hardlinked: bool,
 }
 
 /// Files with the same contents.

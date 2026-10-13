@@ -4,4 +4,9 @@ export type DuplicateFile = { node: number,
 /**
  * The containing folder.
  */
-parent: number, path: string, };
+parent: number, path: string, 
+/**
+ * It has other hard-link names, so deleting this one alone may free
+ * nothing.
+ */
+hardlinked: boolean, };

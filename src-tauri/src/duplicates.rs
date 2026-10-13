@@ -3,7 +3,7 @@
 //! what was found and reports it, leaving out files deleted since.
 
 use crate::session::display_path;
-use sb_core::tree::{NodeId, Tree};
+use sb_core::tree::{NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::{self, Contents, Counters, Event, Group, Plan, Skip};
 use std::sync::Mutex;
@@ -106,6 +106,7 @@ impl Job {
                     Skip::Cloud => &mut s.cloud,
                     Skip::Vanished => &mut s.vanished,
                     Skip::Changed => &mut s.changed,
+                    Skip::Special => &mut s.special,
                     Skip::InUse => &mut s.in_use,
                     Skip::Denied => &mut s.denied,
                     Skip::Unreadable => &mut s.unreadable,
@@ -189,6 +190,7 @@ impl Job {
                         node: n.index() as u32,
                         parent: tree.parent(n).unwrap_or(NodeId::ROOT).index() as u32,
                         path: display_path(&tree.path(n)),
+                        hardlinked: tree.flags(n) & flags::HARDLINKED != 0,
                     })
                     .collect();
                 files.sort_by(|a, b| {

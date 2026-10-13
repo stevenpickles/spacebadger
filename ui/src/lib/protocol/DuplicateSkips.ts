@@ -17,6 +17,11 @@ vanished: number,
  */
 changed: number, 
 /**
+ * Stored behind a reparse point (deduplicated, tiered, virtualized),
+ * so reading it raw wouldn't give its contents.
+ */
+special: number, 
+/**
  * Open in another program that doesn't share it.
  */
 inUse: number, denied: number, 
