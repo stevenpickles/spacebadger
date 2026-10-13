@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Download
 
@@ -44,9 +44,13 @@ cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
 
-In the map: click selects, double-click (or Enter) opens a folder, Backspace goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
+On Windows, **Restart as administrator…** in the toolbar reopens SpaceBadger with administrator rights and scans the same folder again, so folders that need those rights are counted too. Windows asks for permission first; the running copy stays as it was if you decline.
 
-Selecting several items works as in a file manager, in the map, the result list, and the small-items list: Ctrl+click (⌘-click on macOS) adds or removes an item, Shift+click selects the range from the last item clicked (in the map, among items in the same folder, largest first), and Ctrl+A selects everything drawn in the viewed folder. The details panel totals the selection.
+Press `?` (or the ? button in the toolbar) for a list of shortcuts. In the map: click selects, double-click (or Enter) opens a folder, Backspace or the ↑ button beside the breadcrumbs goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Show in Explorer/Finder opens a folder in the file manager, and shows a file selected in its folder. Double-clicking a file does nothing; files are never opened.
+
+The side panel shows the selected item's details on top and, below, the contents of the folder in the map, largest first. Selecting in either selects in both; Enter or double-click on a folder in the list opens it. Uncheck **Folders** to list only files, the largest anywhere under the folder, each with the subfolder it's in; Enter on one shows it in the map.
+
+Selecting several items works as in a file manager, in the map, the contents list, the result list, and the small-items list: Ctrl+click (⌘-click on macOS) adds or removes an item, Shift+click selects the range from the last item clicked (in the map, among items in the same folder, largest first), and Ctrl+A selects everything drawn in the viewed folder. The details panel totals the selection.
 
 Deleting is guarded:
 
@@ -57,7 +61,9 @@ Deleting is guarded:
 
 Deleted items leave the map at once without a rescan; items that couldn't be moved stay selected, with the reason shown.
 
-The filter box matches file names only (not folders or paths), ignoring case. Separate patterns with `;`. A pattern with `*` (any text) or `?` (one character) must match the whole name, one without matches names containing it, and a leading `!` leaves names out: `*.jpg; *.png; !thumb*` finds JPEG and PNG files except thumbnails. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
+The filter box matches file names (not paths), ignoring case. Separate patterns with `;`. A pattern with `*` (any text) or `?` (one character) must match the whole name, one without matches names containing it, and a leading `!` leaves names out: `*.jpg; *.png; !thumb*` finds JPEG and PNG files except thumbnails. Start a pattern with `dir:` to match folder names instead: `dir:cache` finds every file inside a folder named like `cache`, at any depth; `dir:node_modules; *.js` finds JavaScript files inside `node_modules`; and `*.log; !dir:archive` finds logs except those inside `archive` folders. `is:` picks a file type, by the same categories as the file-type colors: `is:video`, `is:audio`, `is:image`, `is:document`, `is:archive`, `is:diskimage`, `is:program`, `is:code`, or `is:other` (any unambiguous start works, like `is:doc`). `is:video; dir:Downloads` finds videos in Downloads, and `!is:code` leaves code out.
+
+As you type, the filter suggests keywords, file types after `is:`, folder names from the scan after `dir:`, and extensions from the scan after `*.`, with their counts and sizes. Press ↓ or Ctrl+Space to open the suggestions, Enter or Tab to use one, and Escape to close them. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
 
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 

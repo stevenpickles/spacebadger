@@ -1,16 +1,19 @@
 <script lang="ts">
+  import PathText from "./PathText.svelte";
   // Canvas treemap. Pulls a layout from the backend whenever its inputs
   // change; at most one request is in flight, and changes that arrive
   // meanwhile are folded into one follow-up request (natural backpressure).
+  import { announce } from "./announce.svelte";
   import { nodeDetails, requestLayout } from "./api";
   import {
     depthColor,
     typeModeFolderColor,
     otherSmallColor,
+    isDarkFill,
     typeColor,
     type ColorMode,
   } from "./colors";
-  import { formatBytes, plural } from "./format";
+  import { formatBytes, formatCount, percent, plural, shortcut } from "./format";
   import {
     decodeLayout,
     FILE_TYPES,
@@ -23,6 +26,7 @@
     type DecodedLayout,
   } from "./layoutWire";
   import { Samples } from "./perf";
+  import { cssVar, theme } from "./theme.svelte";
   import type { Metric } from "./protocol/Metric";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import {
@@ -81,6 +85,7 @@
     onmenu,
   }: Props = $props();
 
+  const helpId = $props.id();
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
   let width = $state(0);
@@ -88,8 +93,27 @@
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
   let hover = $state<{ index: number; x: number; y: number } | null>(null);
-  let hoverDetails = $state.raw<NodeDetails | null>(null);
-  let dark = $state(window.matchMedia("(prefers-color-scheme: dark)").matches);
+  /** Details for the tooltip's item, fetched shortly after it changes. */
+  let tipDetails = $state.raw<NodeDetails | null>(null);
+  /** The tooltip follows the keyboard selection until the mouse moves. */
+  let keyTip = $state(false);
+  let tipWidth = $state(0);
+  let tipHeight = $state(0);
+  const dark = $derived(theme.dark);
+
+  /** Canvas colors from the app.css tokens, re-read when the theme changes. */
+  const palette = $derived.by(() => {
+    void theme.dark;
+    return {
+      gap: cssVar("--map-gap"),
+      textDark: cssVar("--map-text-dark"),
+      textLight: cssVar("--map-text-light"),
+      incomplete: cssVar("--incomplete"),
+      accent: cssVar("--accent"),
+      // Labels are --fs-xs (11px) at the default 14px root size and scale with it.
+      fontSize: Math.round((parseFloat(getComputedStyle(document.documentElement).fontSize) || 14) * (11 / 14)),
+    };
+  });
 
   // ---- diagnostics (toggle with ` while the map has focus) ---------------
 
@@ -114,6 +138,15 @@
   });
 
   // ---- layout requests -------------------------------------------------
+
+  /** What the drawn layout shows; differs from the props while a new one loads. */
+  let shown = $state<{ generation: number; view: number; search: number | null } | null>(null);
+  /** The map is dimmed while it shows another view or search than asked for.
+   * Scan revisions refresh in place without dimming. */
+  const stale = $derived(
+    shown !== null &&
+      (shown.generation !== generation || shown.view !== view || shown.search !== search),
+  );
 
   let nextRequest = 1;
   let inFlight = false;
@@ -152,6 +185,7 @@
           ) {
             stats.layout.add(performance.now() - started);
             layout = reply;
+            shown = { generation: want.generation, view: want.view, search: want.search };
             error = null;
             onlayout?.(reply);
           }
@@ -164,7 +198,7 @@
     }
   }
 
-  // ---- sizing and theme ------------------------------------------------
+  // ---- sizing ----------------------------------------------------------
 
   $effect(() => {
     const observer = new ResizeObserver(([entry]) => {
@@ -173,13 +207,7 @@
       height = Math.floor(entry.contentRect.height);
     });
     observer.observe(container);
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const onTheme = () => (dark = media.matches);
-    media.addEventListener("change", onTheme);
-    return () => {
-      observer.disconnect();
-      media.removeEventListener("change", onTheme);
-    };
+    return () => observer.disconnect();
   });
 
   // ---- drawing ---------------------------------------------------------
@@ -243,10 +271,10 @@
     const l = layout;
     if (!l) return;
 
-    ctx.font = "11px system-ui, -apple-system, 'Segoe UI', sans-serif";
+    const p = palette;
+    ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
     ctx.textBaseline = "alphabetic";
-    const text = dark ? "#eceae6" : "#1b1e25";
-    const gap = dark ? "#1b1e25" : "#f6f6f4";
+    const gap = p.gap;
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -261,70 +289,143 @@
       else ctx.fillRect(x, y, w, h);
 
       if (kind === KIND_FOLDER && l.rflags[i]! & RF_INCOMPLETE) {
-        ctx.strokeStyle = dark ? "#d9a441" : "#a86a00";
+        ctx.strokeStyle = p.incomplete;
+        ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
         ctx.setLineDash([]);
       }
-
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x, y, w, h);
-      ctx.clip();
-      ctx.fillStyle = text;
-      const name = l.labels.get(i);
-      const size = formatBytes(l.weight[i]!);
-      if (kind === KIND_FOLDER && l.rflags[i]! & RF_HEADER && name !== undefined) {
-        const sizeWidth = ctx.measureText(size).width;
-        if (w - 8 > sizeWidth + 40) {
-          label(ctx, name, x + 4, y + 12, w - 14 - sizeWidth);
-          ctx.fillText(size, x + w - 4 - sizeWidth, y + 12);
-        } else {
-          label(ctx, name, x + 4, y + 12, w - 8);
-        }
-      } else if (kind === KIND_FILE && name !== undefined) {
-        label(ctx, name, x + 4, y + 12, w - 8);
-        if (h >= 28) label(ctx, size, x + 4, y + 25, w - 8);
-      } else if (kind === KIND_OTHER && w >= 60 && h >= 14) {
-        label(ctx, `${plural(l.items[i]!, "small item")}`, x + 4, y + 12, w - 8);
-      }
-      ctx.restore();
     }
 
-    if (selected.size > 0) {
-      // Selected items are tinted, with everything drawn inside them.
-      ctx.fillStyle = dark ? "rgb(122 167 255 / 0.38)" : "rgb(37 99 201 / 0.3)";
-      ctx.strokeStyle = dark ? "#7aa7ff" : "#2563c9";
-      ctx.lineWidth = 2;
-      for (let i = 0; i < l.count; i++) {
-        if (l.kind[i] === KIND_OTHER || !selected.has(l.node[i]!)) continue;
-        ctx.fillRect(l.x[i]!, l.y[i]!, l.w[i]!, l.h[i]!);
-        if (l.w[i]! > 4 && l.h[i]! > 4) {
-          ctx.strokeRect(l.x[i]! + 1, l.y[i]! + 1, l.w[i]! - 2, l.h[i]! - 2);
-        }
+    // Selection: a light accent tint (labels stay readable) under an accent
+    // frame edged in dark and light, so it can't pass for a blue depth fill.
+    const ink = dark ? p.textLight : p.textDark;
+    const paper = dark ? p.textDark : p.textLight;
+    const tint = dark ? 0.24 : 0.18;
+    const si = selectedIndex(l, selection);
+    const pickedAt = (i: number) =>
+      l.kind[i] === KIND_OTHER ? i === si : selected.has(l.node[i]!);
+
+    for (let i = 0; i < l.count; i++) {
+      // Small-items regions are never in `selected`; they count as picked
+      // while they hold the focus.
+      if (!pickedAt(i)) continue;
+      const x = l.x[i]!;
+      const y = l.y[i]!;
+      const w = l.w[i]!;
+      const h = l.h[i]!;
+      ctx.globalAlpha = tint;
+      ctx.fillStyle = p.accent;
+      ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = 1;
+      if (w > 8 && h > 8) {
+        band(ctx, x, y, w, h, 0, 1, ink);
+        band(ctx, x, y, w, h, 1, 2, p.accent);
+        band(ctx, x, y, w, h, 3, 1, paper);
+      } else if (w > 2 && h > 2) {
+        band(ctx, x, y, w, h, 0, 1, p.accent);
       }
     }
 
+    // Hover: a slight lighten and a 2px line, quieter than the selection.
     const hi = hover ? hover.index : -1;
     if (hi >= 0 && hi < l.count) {
-      ctx.strokeStyle = dark ? "rgba(255,255,255,0.7)" : "rgba(0,0,0,0.55)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(l.x[hi]! + 0.5, l.y[hi]! + 0.5, l.w[hi]! - 1, l.h[hi]! - 1);
+      ctx.globalAlpha = dark ? 0.1 : 0.22;
+      ctx.fillStyle = p.textLight;
+      ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
+      ctx.globalAlpha = 0.7;
+      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, ink);
+      ctx.globalAlpha = 1;
     }
-    const si = selectedIndex(l, selection);
+
+    // The focused item: a heavy dark-and-light ring, keeping the accent
+    // inside it when the item is also picked.
     if (si >= 0) {
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = dark ? "#ffffff" : "#000000";
-      ctx.strokeRect(l.x[si]! + 1.5, l.y[si]! + 1.5, Math.max(0, l.w[si]! - 3), Math.max(0, l.h[si]! - 3));
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = dark ? "#000000" : "#ffffff";
-      ctx.strokeRect(l.x[si]! + 3.5, l.y[si]! + 3.5, Math.max(0, l.w[si]! - 7), Math.max(0, l.h[si]! - 7));
+      const x = l.x[si]!;
+      const y = l.y[si]!;
+      const w = l.w[si]!;
+      const h = l.h[si]!;
+      band(ctx, x, y, w, h, 0, 3, ink);
+      band(ctx, x, y, w, h, 3, 1, paper);
+      if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
     }
+
+    // Labels go last, so tints and frames never hide them.
+    // Labels go inside the frames of selected and focused tiles.
+    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+  }
+
+  function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
+    const p = palette;
+    const x = l.x[i]! + pad - 4;
+    const y = l.y[i]! + pad - 4;
+    const w = l.w[i]! - 2 * (pad - 4);
+    const h = l.h[i]! - 2 * (pad - 4);
+    const kind = l.kind[i]!;
+    // Baselines of the first and second label lines, from the tile top.
+    const line1 = p.fontSize + 1;
+    const line2 = line1 + p.fontSize + 2;
+    // Tiles shorter than this get no label at all.
+    if (h < Math.max(14, p.fontSize + 3) || w < 16) return;
+    const name = l.labels.get(i);
+    const header = kind === KIND_FOLDER && (l.rflags[i]! & RF_HEADER) !== 0;
+    if (kind !== KIND_OTHER && (name === undefined || (kind === KIND_FOLDER && !header))) return;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    // Dark or light text, whichever contrasts with this tile.
+    ctx.fillStyle = isDarkFill(fillFor(l, i)) ? p.textLight : p.textDark;
+    const room = w - 8;
+    if (kind === KIND_OTHER) {
+      // Shorter wordings as the region narrows.
+      const n = formatCount(l.items[i]!);
+      const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
+        (t) => ctx.measureText(t).width <= room,
+      );
+      if (text) ctx.fillText(text, x + 4, y + line1);
+    } else {
+      // The size in full, or none where it doesn't fit.
+      const size = formatBytes(l.weight[i]!);
+      const sizeWidth = ctx.measureText(size).width;
+      if (kind === KIND_FILE && h >= line2 + 3) {
+        // Tall enough for two lines: name, then size.
+        label(ctx, name!, x + 4, y + line1, room);
+        if (sizeWidth <= room) ctx.fillText(size, x + 4, y + line2);
+      } else if (room >= sizeWidth + 30) {
+        // One line: the size right-aligned, the name cut to fit before it.
+        label(ctx, name!, x + 4, y + line1, room - sizeWidth - 6);
+        ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
+      } else if (sizeWidth <= room) {
+        // The size matters most, so it wins when both don't fit.
+        ctx.fillText(size, x + 4, y + line1);
+      }
+    }
+    ctx.restore();
+  }
+
+  /** Strokes a band `width` px wide, `inset` px inside the rectangle. */
+  function band(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    inset: number,
+    width: number,
+    color: string,
+  ) {
+    const o = inset + width / 2;
+    if (w <= 2 * o || h <= 2 * o) return;
+    ctx.lineWidth = width;
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x + o, y + o, w - 2 * o, h - 2 * o);
   }
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, selected, hover, dark, colors, width, height];
+    void [layout, selection, selected, hover, palette, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -351,39 +452,17 @@
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
-  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
-
   function onMove(e: MouseEvent) {
     const l = layout;
     if (!l) return;
     const [x, y] = point(e);
     const index = hitTest(l, x, y);
-    const changed = !hover || hover.index !== index;
     hover = index >= 0 ? { index, x, y } : null;
-    if (changed) {
-      hoverDetails = null;
-      clearTimeout(hoverTimer);
-      if (index >= 0 && l.kind[index] !== KIND_OTHER) {
-        const node = l.node[index]!;
-        const gen = generation;
-        hoverTimer = setTimeout(() => {
-          nodeDetails(gen, node).then(
-            (d) => {
-              if (hover && layout?.node[hover.index] === d.node && d.generation === generation) {
-                hoverDetails = d;
-              }
-            },
-            () => {},
-          );
-        }, 120);
-      }
-    }
+    keyTip = false;
   }
 
   function onLeave() {
-    clearTimeout(hoverTimer);
     hover = null;
-    hoverDetails = null;
   }
 
   /** Replaces the selection with the item at rectangle `i`. */
@@ -466,6 +545,36 @@
     });
   }
 
+  /** Says what rectangle `i` is: "name, size, 12% of parent, folder". */
+  function announceAt(i: number) {
+    const l = layout;
+    if (!l) return;
+    const size = formatBytes(l.weight[i]!);
+    const share = shareOfParent(l, i);
+    const say = (name: string, kind: string) =>
+      announce([name, size, share, kind].filter(Boolean).join(", "));
+    const kind = l.kind[i];
+    if (kind === KIND_OTHER) {
+      say(plural(l.items[i]!, "small item"), "merged");
+      return;
+    }
+    const what = kind === KIND_FOLDER ? "folder" : "file";
+    const name = l.labels.get(i);
+    if (name !== undefined) {
+      say(name, what);
+      return;
+    }
+    // Small tiles carry no label; ask for the name.
+    const node = l.node[i]!;
+    const gen = generation;
+    nodeDetails(gen, node).then(
+      (d) => {
+        if (selection?.node === node && !selection.other && generation === gen) say(d.name, what);
+      },
+      () => {},
+    );
+  }
+
   /** Selects every file and folder drawn directly in the view. */
   function selectAll() {
     const l = layout;
@@ -522,12 +631,18 @@
     const move = moves[e.key];
     if (move && !e.altKey) {
       const i = neighbour(move[0], move[1]);
-      if (i >= 0) onpick(only(i));
+      if (i >= 0) {
+        onpick(only(i));
+        keyTip = true;
+        hover = null;
+        announceAt(i);
+      }
     } else if (e.key === "Enter") {
       open(selection);
     } else if (e.key === "Backspace" || (e.key === "ArrowUp" && e.altKey)) {
       onup();
     } else if (e.key === "Escape") {
+      keyTip = false;
       onpick(null);
     } else if (e.key.toLowerCase() === "a" && toggles(e)) {
       selectAll();
@@ -543,28 +658,119 @@
     e.preventDefault();
   }
 
+  /** Zoom-in over what double-click opens: folders and small items. */
+  const cursor = $derived.by(() => {
+    const l = layout;
+    if (!l || !hover || hover.index >= l.count) return "default";
+    const i = hover.index;
+    return l.kind[i] !== KIND_FILE && l.node[i] !== view ? "zoom-in" : "default";
+  });
+
+  // ---- tooltip ---------------------------------------------------------
+
+  /** The rectangle the tooltip describes: hovered, or keyboard-selected. */
+  const tipIndex = $derived.by(() => {
+    const l = layout;
+    if (!l) return -1;
+    if (hover) return hover.index < l.count ? hover.index : -1;
+    return keyTip ? selectedIndex(l, selection) : -1;
+  });
+
+  /** The node whose details the tooltip needs; -1 for none or small items. */
+  const tipNode = $derived(
+    tipIndex >= 0 && layout && layout.kind[tipIndex] !== KIND_OTHER ? layout.node[tipIndex]! : -1,
+  );
+
+  $effect(() => {
+    const node = tipNode;
+    const gen = generation;
+    tipDetails = null;
+    if (node < 0) return;
+    const timer = setTimeout(() => {
+      nodeDetails(gen, node).then(
+        (d) => {
+          if (d.node === tipNode && d.generation === generation) tipDetails = d;
+        },
+        () => {},
+      );
+    }, 120);
+    return () => clearTimeout(timer);
+  });
+
+  /** Size of the folder rectangle `i` is drawn in, or 0 if not drawn. */
+  function parentWeight(l: DecodedLayout, i: number): number {
+    const parent = l.parent[i]!;
+    if (parent === l.view) return l.total;
+    // Parents come before their children.
+    for (let j = i - 1; j >= 0; j--) {
+      if (l.node[j] === parent && l.kind[j] === KIND_FOLDER) return l.weight[j]!;
+    }
+    return 0;
+  }
+
+  /** "12% of parent" for rectangle `i`, or `null` when unknown. */
+  function shareOfParent(l: DecodedLayout, i: number): string | null {
+    const whole = parentWeight(l, i);
+    return whole > 0 ? `${percent(l.weight[i]!, whole)} of parent` : null;
+  }
+
+  /**
+   * What the tooltip shows. Every line it will have is there from the
+   * start; `null` marks one still waiting for details, drawn as a
+   * placeholder so the tooltip keeps its size when they arrive.
+   */
   const tooltip = $derived.by(() => {
     const l = layout;
-    if (!hover || !l || hover.index >= l.count) return null;
-    const i = hover.index;
+    const i = tipIndex;
+    if (!l || i < 0) return null;
+    const share = shareOfParent(l, i);
+    const size = [formatBytes(l.weight[i]!), share].filter(Boolean).join(" · ");
     if (l.kind[i] === KIND_OTHER) {
       return {
         title: plural(l.items[i]!, "small item"),
-        lines: [`${formatBytes(l.weight[i]!)} combined`, "Too small to draw individually"],
+        path: undefined,
+        lines: [`${size} combined`, "Too small to draw individually"],
       };
     }
-    const d = hoverDetails;
-    const name = d?.name ?? l.labels.get(i) ?? "";
-    const lines: string[] = [];
-    if (d) {
-      lines.push(d.path);
-      const allocated = d.allocated === null ? "unknown" : formatBytes(d.allocated);
-      lines.push(`Allocated ${allocated} · Logical ${formatBytes(d.logical)}`);
-    } else {
-      lines.push(formatBytes(l.weight[i]!));
+    const d = tipDetails;
+    const folder = l.kind[i] === KIND_FOLDER;
+    const lines: (string | null)[] = [size];
+    if (folder) lines.push(d ? plural(d.files, "file") : null);
+    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned yet");
+    if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
+    return { title: d?.name ?? l.labels.get(i) ?? "", path: d ? d.path : null, lines };
+  });
+
+  /**
+   * Where the tooltip may go: right of `right` or left of `left`, below
+   * `below` or above `above`, whichever fits inside the map.
+   */
+  const tipAnchor = $derived.by(() => {
+    const l = layout;
+    if (!l || tipIndex < 0) return null;
+    if (hover) {
+      return { right: hover.x + 12, left: hover.x - 12, below: hover.y + 12, above: hover.y - 12 };
     }
-    if (colors === "type" && l.kind[i] === KIND_FILE) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
-    return { title: name, lines };
+    // Keyboard: under small tiles, just inside the top of big ones.
+    const x = l.x[tipIndex]!;
+    const y = l.y[tipIndex]!;
+    return {
+      right: x + 8,
+      left: x + 8,
+      below: Math.min(y + l.h[tipIndex]! + 4, y + 24),
+      above: y - 4,
+    };
+  });
+
+  const tipPosition = $derived.by(() => {
+    const a = tipAnchor;
+    if (!a) return null;
+    const clamp = (v: number, max: number) => Math.max(4, Math.min(v, max - 4));
+    let left = a.right;
+    if (left + tipWidth > width - 4) left = a.left - tipWidth;
+    let top = a.below;
+    if (top + tipHeight > height - 4) top = a.above - tipHeight;
+    return { left: clamp(left, width - tipWidth), top: clamp(top, height - tipHeight) };
   });
 </script>
 
@@ -576,30 +782,51 @@
   bind:this={container}
   tabindex="0"
   role="application"
-  aria-label="Treemap. Arrow keys move the selection, Ctrl+click or Shift+click selects several items, Enter opens a folder, Backspace goes up, Delete moves the selection to the trash once deleting is allowed, Shift+F10 shows actions, Escape clears the selection."
+  aria-label="Treemap"
+  aria-describedby={helpId}
+  style:cursor
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}
   ondblclick={onDblClick}
   oncontextmenu={onContextMenu}
   onkeydown={onKey}
+  onblur={() => (keyTip = false)}
 >
-  <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px" aria-hidden="true"
+  <p id={helpId} class="sr-only">
+    Arrow keys move the selection. {shortcut("Ctrl")}+click or Shift+click selects several items,
+    and {shortcut("Ctrl+A")} selects everything in view. Enter opens a folder, Backspace goes up.
+    Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
+    actions. Escape clears the selection.
+  </p>
+  <canvas
+    bind:this={canvas}
+    class:stale
+    style:width="{width}px"
+    style:height="{height}px"
+    aria-hidden="true"
   ></canvas>
-  {#if tooltip && hover}
+  {#if tooltip && tipPosition}
     <div
       class="tooltip"
-      style:left="{Math.min(hover.x + 14, Math.max(0, width - 320))}px"
-      style:top="{hover.y + 18 > height - 60 ? hover.y - 64 : hover.y + 18}px"
+      aria-hidden="true"
+      bind:clientWidth={tipWidth}
+      bind:clientHeight={tipHeight}
+      style:left="{tipPosition.left}px"
+      style:top="{tipPosition.top}px"
+      style:visibility={tipHeight > 0 ? "visible" : "hidden"}
     >
-      <strong>{tooltip.title}</strong>
+      <strong class="title">{tooltip.title || "\u00a0"}</strong>
+      {#if tooltip.path !== undefined}
+        <div class="path selectable" class:pending={tooltip.path === null}>{#if tooltip.path}<PathText path={tooltip.path} />{/if}</div>
+      {/if}
       {#each tooltip.lines as line, i (i)}
-        <div>{line}</div>
+        <div class="line" class:pending={line === null}>{line ?? ""}</div>
       {/each}
     </div>
   {/if}
   {#if error}
-    <p class="error" role="alert">Couldn't draw the map: {error}</p>
+    <p class="error selectable" role="alert">Couldn't draw the map: {error}</p>
   {/if}
   {#if showPerf}
     <pre class="perf" aria-label="Timing diagnostics">{perfText}</pre>
@@ -621,19 +848,57 @@
   }
   canvas {
     display: block;
+    transition: opacity 0.15s;
+  }
+  canvas.stale {
+    opacity: 0.6;
   }
   .tooltip {
     position: absolute;
-    max-width: 300px;
+    /* A fixed width, so details arriving later never resize it. */
+    box-sizing: border-box;
+    width: 300px;
+    max-width: calc(100% - 8px);
     padding: 6px 8px;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--panel);
     color: var(--fg);
     border: 1px solid var(--line);
     box-shadow: 0 2px 8px rgb(0 0 0 / 0.25);
     pointer-events: none;
-    font-size: 12px;
+    font-size: var(--fs-sm);
+    line-height: 1.35;
+  }
+  .tooltip .title {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tooltip .line {
+    min-height: 1.35em;
+  }
+  /* Paths take up to two lines, reserved from the start. */
+  .tooltip .path {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    height: 2.7em;
+    overflow: hidden;
     overflow-wrap: anywhere;
+    color: var(--muted);
+  }
+  .tooltip .pending::before {
+    content: "";
+    display: inline-block;
+    width: 60%;
+    height: 0.75em;
+    border-radius: 2px;
+    background: var(--line);
+  }
+  .tooltip .line.pending::before {
+    width: 30%;
   }
   .perf {
     position: absolute;
@@ -647,11 +912,20 @@
     font-size: 11px;
     pointer-events: none;
   }
+  /* A solid chip, readable over any tile. */
   .error {
     position: absolute;
-    left: 8px;
-    bottom: 8px;
+    left: var(--space-2);
+    bottom: var(--space-2);
+    max-width: calc(100% - 2 * var(--space-2));
+    box-sizing: border-box;
     margin: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--danger);
+    border-radius: var(--radius);
+    background: var(--danger-bg);
     color: var(--danger);
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
   }
 </style>

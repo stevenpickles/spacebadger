@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { FolderFilesPage } from "./protocol/FolderFilesPage";
+import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -15,6 +17,8 @@ import type { SelectionRequest } from "./protocol/SelectionRequest";
 import type { SelectionSummary } from "./protocol/SelectionSummary";
 import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
+import type { SuggestRequest } from "./protocol/SuggestRequest";
+import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
 export const EXPECTED_PROTOCOL_VERSION = 4;
@@ -48,8 +52,9 @@ export function requestLayout(request: LayoutRequest): Promise<ArrayBuffer> {
   return invoke<ArrayBuffer>("layout", { request });
 }
 
-export function nodeDetails(generation: number, node: number): Promise<NodeDetails> {
-  return invoke<NodeDetails>("node_details", { generation, node });
+/** With `search`, the details also say what that filter matches there. */
+export function nodeDetails(generation: number, node: number, search?: number | null): Promise<NodeDetails> {
+  return invoke<NodeDetails>("node_details", { generation, node, search: search ?? null });
 }
 
 /**
@@ -72,6 +77,11 @@ export function smallItems(request: SmallItemsRequest): Promise<SmallItemsPage> 
   return invoke<SmallItemsPage>("small_items", { request });
 }
 
+/** The largest files anywhere under a folder. */
+export function folderFiles(request: FolderFilesRequest): Promise<FolderFilesPage> {
+  return invoke<FolderFilesPage>("folder_files", { request });
+}
+
 /** Capacity of the scanned volume; `null` where unavailable. */
 export function volumeInfo(generation: number): Promise<VolumeInfo | null> {
   return invoke<VolumeInfo | null>("volume_info", { generation });
@@ -90,6 +100,15 @@ export function selectionSummary(request: SelectionRequest): Promise<SelectionSu
 /** Turns deleting on or off for this run of the app. It always starts off. */
 export function setDeleteAllowed(allowed: boolean): Promise<boolean> {
   return invoke<boolean>("set_delete_allowed", { allowed });
+}
+
+/**
+ * Asks, then reopens SpaceBadger with administrator rights scanning the same
+ * folder; this window closes. Resolves `false` if the user said no. Windows
+ * only.
+ */
+export function restartElevated(): Promise<boolean> {
+  return invoke<boolean>("restart_elevated");
 }
 
 /**
@@ -115,4 +134,15 @@ export function fileManagerName(os: string): string {
 
 export function onScanStatus(handler: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>(SCAN_STATUS_EVENT, (event) => handler(event.payload));
+}
+
+/** A failure from a command or the system, as a sentence for messages. */
+export function errorText(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e);
+  return text.replace(/^Error:\s*/, "").trim() || "Unknown error";
+}
+
+/** Folder names or extensions in the scan, for the filter's completion. */
+export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
+  return invoke<Suggestion[]>("filter_suggest", { request });
 }

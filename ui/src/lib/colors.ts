@@ -1,5 +1,5 @@
 // Treemap colors. Depth mode tints each nesting level; file-type mode colors
-// files by FILE_TYPES and draws folders in one indigo, a hue no type uses.
+// files by FILE_TYPES and draws folders in one muted slate.
 
 import { FILE_TYPES } from "./layoutWire";
 
@@ -18,13 +18,15 @@ const TYPE_HUES: (number | null)[] = [null, 0, 280, 130, 212, 32, 330, 52, 180];
 
 export function typeColor(type: number, dark: boolean): string {
   const hue = TYPE_HUES[type] ?? null;
-  // Other is a warm off-white so it isn't mistaken for small items.
-  if (hue === null) return dark ? "hsl(40 10% 44%)" : "hsl(40 25% 90%)";
+  // Other is a mid beige: visible against the background, and warmer than
+  // the cool grey of small items.
+  if (hue === null) return dark ? "hsl(36 18% 46%)" : "hsl(36 24% 70%)";
   return dark ? `hsl(${hue} 45% 42%)` : `hsl(${hue} 65% 74%)`;
 }
 
+/** Folders are containers, so a quiet slate that leaves color to files. */
 export function typeModeFolderColor(dark: boolean): string {
-  return dark ? "hsl(245 25% 33%)" : "hsl(245 32% 68%)";
+  return dark ? "hsl(225 10% 24%)" : "hsl(225 9% 60%)";
 }
 
 export function otherSmallColor(dark: boolean): string {
@@ -34,3 +36,44 @@ export function otherSmallColor(dark: boolean): string {
 export const TYPE_LEGEND = FILE_TYPES.map((label, type) => ({ label, type })).filter(
   (t) => t.type !== 0,
 ).concat({ label: FILE_TYPES[0], type: 0 });
+
+const darkFills = new Map<string, boolean>();
+
+/**
+ * Whether light text reads better than dark text on `color`, one of the
+ * "hsl(h s% l%)" or "#rrggbb" fills above. Compares WCAG relative luminance
+ * with the point where black and white text have equal contrast.
+ */
+export function isDarkFill(color: string): boolean {
+  let dark = darkFills.get(color);
+  if (dark === undefined) {
+    const rgb = parseColor(color);
+    dark = rgb ? luminance(rgb) < 0.179 : false;
+    darkFills.set(color, dark);
+  }
+  return dark;
+}
+
+type Rgb = [number, number, number];
+
+/** Channels in 0..1, or `null` for a format the fills above don't use. */
+function parseColor(color: string): Rgb | null {
+  const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
+  if (hex) return [hex[1]!, hex[2]!, hex[3]!].map((c) => parseInt(c, 16) / 255) as Rgb;
+  const hsl = /^hsl\(([\d.]+)\s+([\d.]+)%\s+([\d.]+)%\)$/.exec(color);
+  if (!hsl) return null;
+  const h = Number(hsl[1]);
+  const s = Number(hsl[2]) / 100;
+  const l = Number(hsl[3]) / 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+function luminance([r, g, b]: Rgb): number {
+  const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}

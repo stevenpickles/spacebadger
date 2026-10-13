@@ -6,12 +6,14 @@ use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::selection;
+use sb_core::suggest::NameIndex;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -25,7 +27,8 @@ const MAX_PAGE: u32 = 500;
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` before the tree, and `order` last.
+// Lock order: `deleting` first, `search` before the tree, then
+// `folder_files`, and `order` last.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -36,6 +39,27 @@ pub struct Session {
     latest_search: AtomicU32,
     /// Held while deleting, so deletes run one at a time.
     deleting: Mutex<()>,
+    /// The files under the folder last asked for, ranked by size.
+    folder_files: Mutex<Option<FolderFiles>>,
+    /// Folder names and extensions for the filter's completion.
+    names: Mutex<Option<Names>>,
+}
+
+struct Names {
+    revision: u64,
+    built: Instant,
+    index: Arc<NameIndex>,
+}
+
+/// While scanning, the completion index is rebuilt at most this often.
+const NAMES_REFRESH: Duration = Duration::from_secs(5);
+
+struct FolderFiles {
+    /// What the ranking was made from: folder, scan revision, search and
+    /// its version, metric.
+    key: (u32, u64, Option<(u32, u64)>, layout::Metric),
+    ranked: Ranked,
+    empty: usize,
 }
 
 struct ActiveSearch {
@@ -69,7 +93,14 @@ impl Session {
             search: Mutex::new(None),
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
+            folder_files: Mutex::new(None),
+            names: Mutex::new(None),
         }
+    }
+
+    /// A delete is moving items right now.
+    pub fn is_deleting(&self) -> bool {
+        self.deleting.try_lock().is_err()
     }
 
     pub fn generation(&self) -> u64 {
@@ -179,7 +210,7 @@ impl Session {
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
         let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
         let superseded = || format!("search {id} was replaced by a newer one");
-        let Some(matcher) = Matcher::new(query) else {
+        let Some(matcher) = Matcher::parse(query)? else {
             let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
@@ -279,6 +310,113 @@ impl Session {
         })
     }
 
+    /// One page of the files anywhere under a folder, largest first.
+    pub fn folder_files(
+        &self,
+        req: &proto::FolderFilesRequest,
+    ) -> Result<proto::FolderFilesPage, String> {
+        let revision = self.scan.progress().revision;
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let folder = node(&tree, req.folder)?;
+        let filter = match req.search {
+            Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
+            None => None,
+        };
+        let metric = metric(req.metric);
+        let key = (
+            req.folder,
+            revision,
+            filter.map(|s| (req.search.unwrap_or(0), s.version())),
+            metric,
+        );
+        let mut cache = self
+            .folder_files
+            .lock()
+            .map_err(|_| "folder files are unavailable")?;
+        let cached = match &mut *cache {
+            Some(c) if c.key == key => c,
+            slot => {
+                let (files, empty) = layout::files_under(&tree, folder, metric, filter);
+                slot.insert(FolderFiles {
+                    key,
+                    ranked: Ranked::from_files(files, metric),
+                    empty,
+                })
+            }
+        };
+        let total = cached.ranked.len();
+        let start = (req.offset as usize).min(total);
+        let end = start
+            .saturating_add(req.limit.min(MAX_PAGE) as usize)
+            .min(total);
+        let base = tree.path(folder);
+        let files = cached.ranked.top(&tree, end)[start..]
+            .iter()
+            .map(|&f| {
+                let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
+                let path = tree.path(parent);
+                let sub = path.strip_prefix(&base).unwrap_or(&path);
+                proto::FolderFile {
+                    node: f.index() as u32,
+                    name: tree.name(f).to_string_lossy().into_owned(),
+                    parent: parent.index() as u32,
+                    subfolder: display_path(sub),
+                    weight: metric.weight_in(&tree, filter, f),
+                }
+            })
+            .collect();
+        Ok(proto::FolderFilesPage {
+            generation: self.generation(),
+            folder: req.folder,
+            offset: start as u32,
+            total: total as u32,
+            files,
+            empty: cached.empty as u32,
+        })
+    }
+
+    /// Folder names or extensions for the filter's completion, largest
+    /// first. The index is rebuilt when the scan has changed, but during a
+    /// scan at most every [`NAMES_REFRESH`].
+    pub fn suggest(&self, req: &proto::SuggestRequest) -> Result<Vec<proto::Suggestion>, String> {
+        let progress = self.scan.progress();
+        let scanning = matches!(progress.state, ScanState::Scanning);
+        let index = {
+            let mut names = self
+                .names
+                .lock()
+                .map_err(|_| "suggestions are unavailable")?;
+            let fresh = names.as_ref().is_some_and(|n| {
+                n.revision == progress.revision || (scanning && n.built.elapsed() < NAMES_REFRESH)
+            });
+            if !fresh {
+                let tree = self.scan.tree();
+                let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+                *names = Some(Names {
+                    revision: progress.revision,
+                    built: Instant::now(),
+                    index: Arc::new(NameIndex::build(&tree)),
+                });
+            }
+            Arc::clone(&names.as_ref().expect("just built").index)
+        };
+        let limit = req.limit.min(50) as usize;
+        let found = match req.kind {
+            proto::SuggestKind::Folder => index.folders(&req.typed, limit),
+            proto::SuggestKind::Extension => index.extensions(&req.typed, limit),
+        };
+        Ok(found
+            .into_iter()
+            .map(|e| proto::Suggestion {
+                name: e.name().to_owned(),
+                count: e.count,
+                logical: e.logical,
+            })
+            .collect())
+    }
+
     /// A page of the items merged into a small-items region.
     pub fn small_items(
         &self,
@@ -333,10 +471,23 @@ impl Session {
         })
     }
 
-    pub fn details(&self, id: u32) -> Result<proto::NodeDetails, String> {
+    /// Details of a node; with `search`, also what that filter matches
+    /// under it. A search that's no longer current gives no matching totals
+    /// rather than an error, since a newer one is on its way.
+    pub fn details(&self, id: u32, search: Option<u32>) -> Result<proto::NodeDetails, String> {
+        let mut active = self.search.lock().map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
         let n = node(&tree, id)?;
+        let matching = search
+            .and_then(|s| current_search(&mut active, s, &tree).ok())
+            .map(|a| {
+                let t = a.search.totals(n);
+                proto::Matching {
+                    files: u64::from(t.files),
+                    logical: t.logical,
+                }
+            });
         let node_flags = tree.flags(n);
         let is_dir = tree.is_dir(n);
         let allocated = if is_dir {
@@ -373,6 +524,7 @@ impl Session {
             hardlinked: node_flags & flags::HARDLINKED != 0,
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
+            matching,
         })
     }
 
@@ -611,7 +763,12 @@ mod tests {
     }
 
     fn fixture() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("sb-session-{}", std::process::id()));
+        fixture_named("delete")
+    }
+
+    /// Each test gets its own folder, since tests run in parallel.
+    fn fixture_named(name: &str) -> TempDir {
+        let dir = std::env::temp_dir().join(format!("sb-session-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("old").join("logs")).unwrap();
         std::fs::write(dir.join("old").join("logs").join("a.log"), vec![0; 5000]).unwrap();
@@ -644,6 +801,129 @@ mod tests {
         tree.children(parent)
             .find(|&c| tree.name(c) == name)
             .unwrap()
+    }
+
+    #[test]
+    fn suggests_folder_names_and_extensions_from_the_scan() {
+        let tmp = fixture_named("suggest");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ask = |kind, typed: &str| {
+            session
+                .suggest(&proto::SuggestRequest {
+                    generation: session.generation(),
+                    kind,
+                    typed: typed.to_owned(),
+                    limit: 10,
+                })
+                .unwrap()
+        };
+        let folders = ask(proto::SuggestKind::Folder, "LO");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(
+            (
+                folders[0].name.as_str(),
+                folders[0].count,
+                folders[0].logical
+            ),
+            ("logs", 1, 5000)
+        );
+        let exts = ask(proto::SuggestKind::Extension, "");
+        let exts: Vec<_> = exts.iter().map(|e| (e.name.as_str(), e.count)).collect();
+        assert_eq!(exts, [("log", 2), ("txt", 1)]);
+    }
+
+    #[test]
+    fn details_report_what_the_filter_matches() {
+        let tmp = fixture_named("matching");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        let search = session.search_set("*.log").unwrap().unwrap().search;
+
+        let root = session.details(0, Some(search)).unwrap();
+        assert_eq!(
+            root.matching,
+            Some(proto::Matching {
+                files: 2,
+                logical: 8000
+            })
+        );
+        assert_eq!(
+            (root.files, root.logical),
+            (3, 8100),
+            "the whole folder too"
+        );
+        let old = session.details(old, Some(search)).unwrap();
+        assert_eq!(
+            old.matching,
+            Some(proto::Matching {
+                files: 2,
+                logical: 8000
+            })
+        );
+
+        assert_eq!(session.details(0, None).unwrap().matching, None);
+        assert_eq!(
+            session.details(0, Some(search + 7)).unwrap().matching,
+            None,
+            "a search that isn't current gives no totals, not an error"
+        );
+    }
+
+    #[test]
+    fn lists_the_largest_files_under_a_folder() {
+        let tmp = fixture_named("files");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        let request = |folder: u32, offset: u32| proto::FolderFilesRequest {
+            generation: session.generation(),
+            folder,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset,
+            limit: 2,
+        };
+        let page = session.folder_files(&request(0, 0)).unwrap();
+        assert_eq!(page.total, 3);
+        let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.log", "b.log"], "largest first, from every level");
+        let sub = Path::new("old").join("logs");
+        assert_eq!(page.files[0].subfolder, display_path(&sub));
+        let rest = session.folder_files(&request(0, 2)).unwrap();
+        assert_eq!(rest.files[0].name, "keep.txt");
+        assert_eq!(rest.files[0].subfolder, "");
+
+        let page = session.folder_files(&request(old, 0)).unwrap();
+        assert_eq!(page.total, 2, "only files under the folder");
+        assert_eq!(page.files[0].subfolder, "logs");
     }
 
     #[test]
@@ -688,8 +968,8 @@ mod tests {
         let last = statuses.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.revision, before + 1);
         assert_eq!((last.files, last.dirs, last.logical), (1, 0, 100));
-        assert!(session.details(id(old)).is_err());
-        assert!(session.details(id(keep)).is_ok());
+        assert!(session.details(id(old), None).is_err());
+        assert!(session.details(id(keep), None).is_ok());
         let summary = session.search_summary(search.search).unwrap();
         assert_eq!(summary.files, 0);
 

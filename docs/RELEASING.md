@@ -2,7 +2,7 @@
 
 Releases are cut on a release branch taken from `dev`. The branch is merged into `main`, the merge commit is tagged, and the branch is merged back into `dev`. The [release workflow](../.github/workflows/release.yml) builds and tests the downloads on every push to the release branch, and publishes them as a GitHub release when the tag is pushed. Nothing is installed or signed beyond what's described below.
 
-The version is kept only in the workspace `Cargo.toml` (`[workspace.package] version`); the app, its window, and the Windows file properties take it from there. During development, `CHANGELOG.md` collects entries under `## [Unreleased]`.
+The version is kept only in the workspace `Cargo.toml` (`[workspace.package] version`); the app, its window, and the Windows file properties take it from there. The window title shows `v0.1.0` only for a build of the commit tagged `v0.1.0` with no uncommitted changes; any other build shows `v0.1.0+dev.<commit>` (plus `.dirty` with uncommitted changes), so a release branch reads as a development build until it is tagged. During development, `CHANGELOG.md` collects entries under `## [Unreleased]`.
 
 ## Steps
 

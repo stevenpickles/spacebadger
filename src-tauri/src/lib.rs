@@ -6,13 +6,16 @@
 
 mod delete;
 #[cfg(windows)]
+mod elevate_windows;
+#[cfg(windows)]
 mod recycle_windows;
 mod session;
 
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
-    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
-    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, VolumeInfo,
+    AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
+    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
+    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
+    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -21,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[derive(Default)]
 struct AppState {
@@ -117,13 +120,16 @@ async fn layout(state: State<'_, AppState>, request: LayoutRequest) -> Result<Re
     Ok(Response::new(session.layout(&request)?))
 }
 
+/// Details of a scanned item; with `search`, also what that filter matches
+/// at or under it.
 #[tauri::command]
 async fn node_details(
     state: State<'_, AppState>,
     generation: u64,
     node: u32,
+    search: Option<u32>,
 ) -> Result<NodeDetails, String> {
-    state.session(generation)?.details(node)
+    state.session(generation)?.details(node, search)
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.
@@ -158,6 +164,33 @@ async fn search_results(
     state.session(request.generation)?.search_results(&request)
 }
 
+/// The largest files anywhere under a folder. Ranking a large folder takes a
+/// moment, so this runs on a blocking thread.
+#[tauri::command]
+async fn folder_files(
+    state: State<'_, AppState>,
+    request: FolderFilesRequest,
+) -> Result<FolderFilesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.folder_files(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Folder names or extensions from the scan for the filter's completion.
+/// The first call after a change indexes the whole tree, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn filter_suggest(
+    state: State<'_, AppState>,
+    request: SuggestRequest,
+) -> Result<Vec<Suggestion>, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.suggest(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The files and folders merged into an "other small items" region.
 #[tauri::command]
 async fn small_items(
@@ -187,6 +220,47 @@ async fn selection_summary(
     request: SelectionRequest,
 ) -> Result<SelectionSummary, String> {
     state.session(request.generation)?.selection(&request.nodes)
+}
+
+/// Asks first, then starts SpaceBadger again with administrator rights,
+/// scanning the same folder, and closes this copy. Returns `false` if the
+/// user said no, here or at the Windows elevation prompt.
+#[tauri::command]
+async fn restart_elevated(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    if !cfg!(windows) {
+        return Err("Restarting as administrator is only available on Windows.".to_owned());
+    }
+    let session = state.current();
+    if session.as_ref().is_some_and(|s| s.is_deleting()) {
+        return Err("Wait for the move to the Recycle Bin to finish first.".to_owned());
+    }
+    let root = session.map(|s| s.root.clone());
+    let again = match &root {
+        Some(r) => format!(" and scan {} again", r.display()),
+        None => String::new(),
+    };
+    let ok = app
+        .dialog()
+        .message(format!(
+            "SpaceBadger will close and reopen with administrator rights{again}. \
+             Windows asks for permission first."
+        ))
+        .title("Restart as administrator?")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Restart".to_owned(),
+            "Cancel".to_owned(),
+        ))
+        .blocking_show();
+    if !ok {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    if !elevate_windows::relaunch_elevated(root.as_deref())? {
+        return Ok(false);
+    }
+    app.exit(0);
+    Ok(true)
 }
 
 /// Turns deleting on or off for this run of the app; returns the new state.
@@ -226,18 +300,33 @@ async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Resul
 fn reveal_path(path: &Path) -> Result<(), String> {
     let shown = session::display_path(path);
     // The item may have been moved or deleted since it was scanned.
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(format!(
                 "{shown} no longer exists. Refresh to update the map."
             ));
         }
         Err(e) => return Err(format!("Couldn't reach {shown}: {e}")),
+    };
+    // A folder opens in the file manager, so its contents show. Anything
+    // else is shown selected in its folder and never opened: opening a file
+    // would run it or open it in an app. That includes links and junctions
+    // (`is_dir` is false for them), which would be followed, and macOS
+    // packages such as apps, which are folders that Finder launches.
+    // Both use the platform API with the path as an argument, never a shell.
+    if meta.is_dir() && !may_be_package(path) {
+        return tauri_plugin_opener::open_path(path, None::<&str>)
+            .map_err(|e| format!("Couldn't open {shown} in the file manager: {e}"));
     }
-    // Uses the platform API with the path as an argument, never a shell.
     tauri_plugin_opener::reveal_item_in_dir(path)
         .map_err(|e| format!("Couldn't show {shown} in the file manager: {e}"))
+}
+
+/// On macOS, a folder with an extension (`Safari.app`, `Photos Library.photoslibrary`)
+/// may be a package that opening would launch, so it's shown selected instead.
+fn may_be_package(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path.extension().is_some()
 }
 
 pub fn run() {
@@ -250,6 +339,11 @@ pub fn run() {
                 state.start(app.handle(), PathBuf::from(root));
             }
             app.manage(state);
+            // "SpaceBadger v0.1.0" for a release; builds between releases
+            // carry "+dev" and the commit (see build.rs).
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_title(&format!("SpaceBadger {}", env!("SPACEBADGER_BUILD")))?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -265,9 +359,12 @@ pub fn run() {
             search_summary,
             search_results,
             small_items,
+            folder_files,
+            filter_suggest,
             volume_info,
             selection_summary,
             set_delete_allowed,
+            restart_elevated,
             delete_items
         ])
         .run(tauri::generate_context!())

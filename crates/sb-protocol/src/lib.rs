@@ -197,6 +197,20 @@ pub struct NodeDetails {
     pub alias_of: Option<String>,
     /// From the scan root down to and including this node.
     pub ancestors: Vec<Crumb>,
+    /// What a filter matches at or under this node, when the request named
+    /// the current search.
+    pub matching: Option<Matching>,
+}
+
+/// Files matching a filter at or under a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Matching {
+    #[ts(type = "number")]
+    pub files: u64,
+    #[ts(type = "number")]
+    pub logical: u64,
 }
 
 /// Totals for the files matching a filename search, across the whole scan.
@@ -310,6 +324,90 @@ pub struct SmallItemsPage {
     /// Other children of the folder with no size in this metric, which the
     /// map never draws.
     pub empty: u32,
+}
+
+/// Asks for a page of the files anywhere under a folder, largest first by
+/// `metric`; with a search, matching files only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFilesRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub metric: Metric,
+    pub search: Option<u32>,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFile {
+    pub node: u32,
+    pub name: String,
+    /// The containing folder.
+    pub parent: u32,
+    /// The subfolder holding the file, relative to the requested folder;
+    /// empty when the file is directly in it.
+    pub subfolder: String,
+    /// Size in the requested metric.
+    #[ts(type = "number")]
+    pub weight: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFilesPage {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub offset: u32,
+    /// Files with a size under the folder, in all.
+    pub total: u32,
+    pub files: Vec<FolderFile>,
+    /// Other files under the folder with no size in this metric.
+    pub empty: u32,
+}
+
+/// What the filter's completion is suggesting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SuggestKind {
+    /// Folder names, for `dir:`.
+    Folder,
+    /// File extensions, for `*.`.
+    Extension,
+}
+
+/// Asks for folder names or extensions in the scan that start with or
+/// contain `typed`, ignoring case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SuggestRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub kind: SuggestKind,
+    pub typed: String,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Suggestion {
+    /// A folder name, or an extension without its dot.
+    pub name: String,
+    /// Folders with this name, or files with this extension.
+    pub count: u32,
+    /// Logical bytes in them; a folder name counts nested folders of the
+    /// same name once.
+    #[ts(type = "number")]
+    pub logical: u64,
 }
 
 /// Capacity of the volume holding the scan root, for the volume overview.
