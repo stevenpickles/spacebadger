@@ -24,7 +24,8 @@
 //! running it as a formula.
 //!
 //! Names and paths that aren't valid Unicode are written with replacement
-//! characters.
+//! characters. Modified times are left empty where unknown, and where the
+//! tree only knows the time is before 1970 or after early 2106.
 
 use crate::filetype::FileType;
 use crate::layout::Metric;
@@ -44,6 +45,47 @@ pub const SYSTEM_KILO: u64 = if cfg!(windows) { 1024 } else { 1000 };
 pub const REPORT_TOP: usize = 50;
 
 const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+
+/// Writes a modified time, in seconds since the Unix epoch, for a file. The
+/// app passes local-time formats; these defaults use UTC, since this crate
+/// knows no time zones.
+pub type TimeFormat = fn(i64) -> String;
+
+/// A file's modified time when it's known exactly: the tree stores times
+/// before 1970 as 1 and after early 2106 as `u32::MAX`.
+fn known_modified(tree: &Tree, node: NodeId) -> Option<i64> {
+    tree.modified(node)
+        .filter(|&secs| secs != 1 && secs != u32::MAX)
+        .map(i64::from)
+}
+
+/// Year, month, day, hour, minute, and second of a time in UTC.
+fn utc_parts(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
+    // Days to a civil date, after Howard Hinnant's `civil_from_days`.
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day, rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+/// ISO 8601 in UTC, such as `2026-10-13T16:05:09Z`.
+pub fn iso_utc(secs: i64) -> String {
+    let (y, mo, d, h, mi, s) = utc_parts(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// A short date and time in UTC, such as `2026-10-13 16:05`.
+pub fn short_utc(secs: i64) -> String {
+    let (y, mo, d, h, mi, _) = utc_parts(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
 
 /// What a CSV export lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,20 +252,28 @@ impl Walk {
 pub struct Csv {
     walk: Walk,
     kilo: u64,
+    time: TimeFormat,
     rows: u64,
 }
 
 /// The CSV header row.
 pub const CSV_HEADER: &str =
-    "Path,Name,Type,Size (bytes),Size,Files,File type,Share of folder (%)\r\n";
+    "Path,Name,Type,Size (bytes),Size,Files,File type,Share of folder (%),Modified\r\n";
 
 impl Csv {
     pub fn new(folder: NodeId, scope: Scope, metric: Metric) -> Self {
         Self {
             walk: Walk::new(folder, metric, scope == Scope::Everything),
             kilo: SYSTEM_KILO,
+            time: iso_utc,
             rows: 0,
         }
+    }
+
+    /// Writes modified times with `time` instead of ISO 8601 in UTC.
+    pub fn with_time_format(mut self, time: TimeFormat) -> Self {
+        self.time = time;
+        self
     }
 
     /// Display sizes with this many bytes per KB instead of the system's.
@@ -254,7 +304,7 @@ impl Csv {
         // Taken under the same lock as the rows, since a scan may have grown
         // the folder since the last step.
         let whole = self.walk.metric.weight_in(tree, filter, self.walk.folder);
-        let (metric, kilo) = (self.walk.metric, self.kilo);
+        let (metric, kilo, time) = (self.walk.metric, self.kilo, self.time);
         let rows = &mut self.rows;
         self.walk.step(tree, filter, budget, |node| {
             let folder = tree.is_dir(node);
@@ -274,6 +324,10 @@ impl Csv {
             }
             out.push(',');
             out.push_str(&share(size, whole));
+            out.push(',');
+            if let Some(secs) = known_modified(tree, node) {
+                push_field(out, &time(secs));
+            }
             out.push_str("\r\n");
             *rows += 1;
         })
@@ -301,6 +355,7 @@ pub struct ReportInfo {
 pub struct Report {
     walk: Walk,
     kilo: u64,
+    time: TimeFormat,
     folders: u64,
     files: u64,
     /// The largest so far, smallest on top: (weight, earlier ID first).
@@ -323,6 +378,7 @@ impl Report {
         Self {
             walk: Walk::new(folder, metric, true),
             kilo: SYSTEM_KILO,
+            time: short_utc,
             folders: 0,
             files: 0,
             top_folders: BinaryHeap::new(),
@@ -333,6 +389,12 @@ impl Report {
     /// Display sizes with this many bytes per KB instead of the system's.
     pub fn with_kilo(mut self, kilo: u64) -> Self {
         self.kilo = kilo;
+        self
+    }
+
+    /// Writes files' modified times with `time` instead of in UTC.
+    pub fn with_time_format(mut self, time: TimeFormat) -> Self {
+        self.time = time;
         self
     }
 
@@ -413,14 +475,13 @@ impl Report {
             nodes.sort_unstable_by_key(|&n| (Reverse(metric.weight_in(tree, filter, n)), n));
             nodes
         };
-        let row = |n: NodeId, files: Option<u64>| {
+        // `third` is a folder's file count or a file's modified time, padded.
+        let row = |n: NodeId, third: String| {
             let size = metric.weight_in(tree, filter, n);
-            let files = files.map_or(String::new(), format_count);
             format!(
-                "{:>10}  {:>6}%  {:>10}  {}",
+                "{:>10}  {:>6}%  {third}  {}",
                 format_bytes(size, kilo),
                 share_short(size, whole),
-                files,
                 tree.path(n).to_string_lossy()
             )
         };
@@ -440,7 +501,8 @@ impl Report {
                 "Size", "Share", "Files"
             ));
             for &n in &folders {
-                line(&row(n, Some(files_in(tree, filter, n))));
+                let files = format_count(files_in(tree, filter, n));
+                line(&row(n, format!("{files:>10}")));
                 listed += 1;
             }
         }
@@ -455,9 +517,13 @@ impl Report {
         if files.is_empty() {
             line("  None.");
         } else {
-            line(&format!("{:>10}  {:>7}  {:>10}  Path", "Size", "Share", ""));
+            line(&format!(
+                "{:>10}  {:>7}  {:<16}  Path",
+                "Size", "Share", "Modified"
+            ));
             for &n in &files {
-                line(&row(n, None));
+                let modified = known_modified(tree, n).map_or(String::new(), self.time);
+                line(&row(n, format!("{modified:<16}")));
                 listed += 1;
             }
         }
@@ -491,13 +557,27 @@ mod tests {
     use crate::size::Allocated;
     use crate::tree::{DirState, FileSizes};
     use std::ffi::OsStr;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// 2023-11-14 22:13:20 UTC.
+    const WHEN: u64 = 1_700_000_000;
 
     fn file(tree: &mut Tree, parent: NodeId, name: &str, bytes: u64) -> NodeId {
+        file_at(tree, parent, name, bytes, None)
+    }
+
+    fn file_at(
+        tree: &mut Tree,
+        parent: NodeId,
+        name: &str,
+        bytes: u64,
+        modified: Option<SystemTime>,
+    ) -> NodeId {
         let sizes = FileSizes {
             logical: bytes,
             allocated: Allocated::known(bytes),
         };
-        tree.add_file(parent, OsStr::new(name), sizes, None, 0)
+        tree.add_file(parent, OsStr::new(name), sizes, modified, 0)
             .unwrap()
     }
 
@@ -509,16 +589,18 @@ mod tests {
 
     /// root/
     ///   docs/ (a.txt 300, deep/ (b.jpg 200))
-    ///   big.jpg 1000
-    ///   =cmd.txt 100
+    ///   big.jpg 1000, modified at [`WHEN`]
+    ///   =cmd.txt 100, modified before 1970
     fn sample() -> Tree {
         let mut t = Tree::new(std::path::Path::new("root"));
         let docs = dir(&mut t, NodeId::ROOT, "docs");
         file(&mut t, docs, "a.txt", 300);
         let deep = dir(&mut t, docs, "deep");
         file(&mut t, deep, "b.jpg", 200);
-        file(&mut t, NodeId::ROOT, "big.jpg", 1000);
-        file(&mut t, NodeId::ROOT, "=cmd.txt", 100);
+        let when = UNIX_EPOCH + Duration::from_secs(WHEN);
+        file_at(&mut t, NodeId::ROOT, "big.jpg", 1000, Some(when));
+        let early = UNIX_EPOCH - Duration::from_secs(60);
+        file_at(&mut t, NodeId::ROOT, "=cmd.txt", 100, Some(early));
         t
     }
 
@@ -590,7 +672,8 @@ mod tests {
                 "1000 B".into(),
                 "".into(),
                 "image".into(),
-                "62.50".into()
+                "62.50".into(),
+                "2023-11-14T22:13:20Z".into()
             ]
         );
         assert_eq!(
@@ -603,11 +686,13 @@ mod tests {
                 "500 B".into(),
                 "2".into(),
                 "".into(),
-                "31.25".into()
+                "31.25".into(),
+                "".into()
             ]
         );
         assert_eq!(rows[2][1], "'=cmd.txt", "formula guard on the name");
         assert_eq!(rows[2][6], "document");
+        assert_eq!(rows[2][8], "", "a time before 1970 is only known as early");
     }
 
     #[test]
@@ -737,7 +822,11 @@ mod tests {
         let b = text.find(&path(&["docs", "deep", "b.jpg"])).unwrap();
         assert!(big < b, "largest first");
         assert!(!text.contains("a.txt"), "non-matching files are left out");
-        assert!(text.contains(&format!("   83.3%              {}", path(&["big.jpg"]))));
+        assert!(text.contains(&format!(
+            "   83.3%  2023-11-14 22:13  {}",
+            path(&["big.jpg"])
+        )));
+        assert!(text.contains("Size    Share  Modified          Path\n"));
     }
 
     #[test]
@@ -758,6 +847,15 @@ mod tests {
         assert!(text.contains(&path(&["f69"])));
         assert!(!text.contains(&format!("{}\n", path(&["f19"]))));
         assert!(text.contains("Nothing was left out."));
+    }
+
+    #[test]
+    fn times_convert_to_utc_dates() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(WHEN as i64), "2023-11-14T22:13:20Z");
+        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z", "leap day");
+        assert_eq!(iso_utc(i64::from(u32::MAX) - 1), "2106-02-07T06:28:14Z");
+        assert_eq!(short_utc(WHEN as i64), "2023-11-14 22:13");
     }
 
     #[test]
