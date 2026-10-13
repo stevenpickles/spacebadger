@@ -8,7 +8,7 @@
 
   let { path }: Props = $props();
 
-  const parts = $derived(path.split(/(?<=[\/])/));
+  const parts = $derived(path.split(/(?<=[\\/])/));
 </script>
 
 <span class="path-text">{#each parts as part, i (i)}{part}<wbr />{/each}</span>
