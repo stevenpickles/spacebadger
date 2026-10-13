@@ -8,7 +8,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Each completed scan is saved as a compact snapshot. Scan the same folder again later, and **Compare…** in the toolbar lists the earlier scans to compare with: what grew, what shrank, and what's new since.
 - Color by **Change**: grown items warm, shrunk ones cool, new ones purple, deeper the bigger the change.
 - The details show an item's change, such as "+1.20 GB since Oct 1, 2:03 PM (was 3.40 GB)", and a **Changes** tab lists the biggest changes under the folder in view, including removed items.
-- Files under 1 MiB are recorded without their size, so their changes aren't shown. The newest 10 snapshots per folder are kept, and at most 256 MiB in all.
+- Files under 1 MiB are recorded without their size: one that grew past 1 MiB shows as grown by at least the difference, and otherwise no change is shown. Each folder keeps its newest 5 snapshots, the first of each earlier day, and its first, and at most 256 MiB in all.
 
 ## [0.2.0] - 2026-10-13
 
