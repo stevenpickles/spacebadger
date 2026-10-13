@@ -14,4 +14,8 @@ parent: number | null, name: string, folder: boolean,
  * The containing folder relative to the requested one ("" when
  * directly in it).
  */
-subfolder: string, kind: ChangeKind, before: number | null, after: number | null, };
+subfolder: string, kind: ChangeKind, before: number | null, 
+/**
+ * As in [`ItemChange::before_below`].
+ */
+beforeBelow: number | null, after: number | null, };

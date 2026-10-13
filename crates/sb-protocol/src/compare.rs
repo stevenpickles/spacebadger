@@ -47,7 +47,8 @@ pub enum ChangeKind {
     New,
     /// There before, gone now (only in lists of changes).
     Removed,
-    /// The earlier size isn't known: a file below the threshold then.
+    /// The earlier size isn't known: a file below the threshold then and
+    /// now, or inside a folder that couldn't be read then or now.
     Unknown,
 }
 
@@ -63,6 +64,11 @@ pub struct ItemChange {
     /// Logical bytes then, when known and present.
     #[ts(type = "number | null")]
     pub before: Option<u64>,
+    /// For a file that was below the snapshot's threshold then: that
+    /// threshold, which its earlier size was under. It counts as grown by
+    /// at least the difference.
+    #[ts(type = "number | null")]
+    pub before_below: Option<u64>,
     #[ts(type = "number")]
     pub after: u64,
 }
@@ -123,6 +129,9 @@ pub struct ChangeRow {
     pub kind: ChangeKind,
     #[ts(type = "number | null")]
     pub before: Option<u64>,
+    /// As in [`ItemChange::before_below`].
+    #[ts(type = "number | null")]
+    pub before_below: Option<u64>,
     #[ts(type = "number | null")]
     pub after: Option<u64>,
 }

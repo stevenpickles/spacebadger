@@ -52,6 +52,9 @@ impl AppState {
 
     /// Replaces the current scan; dropping the old session cancels it.
     fn start(&self, app: &AppHandle, root: PathBuf) -> ScanStarted {
+        // `spacebadger .` names the folder it was started in; snapshots are
+        // kept by absolute path, so another folder's never match.
+        let root = std::path::absolute(&root).unwrap_or(root);
         let emitter = app.clone();
         let session = Arc::new(Session::start_with(
             root,
@@ -258,7 +261,8 @@ async fn compare_set(
         .map_err(|e| e.to_string())?
 }
 
-/// How one item changed since the earlier scan.
+/// How one item changed since the earlier scan. After a delete the scan
+/// is matched again first, so this runs on a blocking thread.
 #[tauri::command]
 async fn compare_item(
     state: State<'_, AppState>,
@@ -266,17 +270,24 @@ async fn compare_item(
     snapshot: String,
     node: u32,
 ) -> Result<sb_protocol::ItemChange, String> {
-    state.session(generation)?.compare_item(&snapshot, node)
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_item(&snapshot, node))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-/// One byte per node of a drawn layout, for the "Change" colors.
+/// One byte per node of a drawn layout, for the "Change" colors. Runs on a
+/// blocking thread, like `compare_item`.
 #[tauri::command]
 async fn change_marks(
     state: State<'_, AppState>,
     request: sb_protocol::ChangeMarksRequest,
 ) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    Ok(Response::new(session.change_marks(&request)?))
+    let marks = tauri::async_runtime::spawn_blocking(move || session.change_marks(&request))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Response::new(marks))
 }
 
 /// The biggest changes under a folder since the earlier scan. The first
@@ -406,7 +417,7 @@ pub fn run() {
             let state = AppState {
                 snapshots: app
                     .path()
-                    .app_data_dir()
+                    .app_local_data_dir()
                     .ok()
                     .map(|dir| Arc::new(snapshots::Store::new(dir.join("snapshots")))),
                 ..AppState::default()

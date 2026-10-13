@@ -8,4 +8,10 @@ export type ItemChange = { generation: number, node: number, kind: ChangeKind,
 /**
  * Logical bytes then, when known and present.
  */
-before: number | null, after: number, };
+before: number | null, 
+/**
+ * For a file that was below the snapshot's threshold then: that
+ * threshold, which its earlier size was under. It counts as grown by
+ * at least the difference.
+ */
+beforeBelow: number | null, after: number, };

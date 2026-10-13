@@ -85,13 +85,20 @@ pub(super) fn now_ms() -> u64 {
 /// The comparison that's on.
 pub(super) struct Active {
     info: proto::SnapshotInfo,
-    threshold: u64,
-    snapshot: Snapshot,
-    /// Matched for this scan revision; rebuilt when the tree changes.
+    snapshot: Arc<Snapshot>,
+    /// Matched for scan revision `revision`; rebuilt when the tree changes.
     revision: u64,
-    comparison: Comparison,
-    /// The changes last listed: folder, files only, and the list.
-    changes: Option<(u32, bool, Vec<Change>)>,
+    comparison: Arc<Comparison>,
+    /// The changes last listed: folder, files only, revision, and the list.
+    changes: Option<(u32, bool, u64, Arc<Vec<Change>>)>,
+}
+
+/// What a request works with, taken from [`Active`] so the lock isn't held
+/// while it's used.
+struct Current {
+    snapshot: Arc<Snapshot>,
+    comparison: Arc<Comparison>,
+    revision: u64,
 }
 
 impl Session {
@@ -112,7 +119,8 @@ impl Session {
 
     /// Compares with snapshot `id`, or turns comparing off with `None`.
     /// Only a completed scan compares: a partial one would show everything
-    /// it didn't reach as removed.
+    /// it didn't reach as removed. Reading and matching take a while on a
+    /// large tree; other requests keep being answered meanwhile.
     pub fn compare_set(&self, id: Option<&str>) -> Result<Option<proto::CompareSummary>, String> {
         let Some(id) = id else {
             *self
@@ -121,9 +129,8 @@ impl Session {
                 .map_err(|_| "comparing is unavailable")? = None;
             return Ok(None);
         };
-        let progress = self.scan.progress();
         if !matches!(
-            progress.state,
+            self.scan.progress().state,
             ScanState::Complete | ScanState::CompleteWithOmissions
         ) {
             return Err("Comparing is available once the scan completes.".into());
@@ -132,46 +139,45 @@ impl Session {
             .snapshots
             .as_ref()
             .ok_or("Earlier scans aren't saved.")?;
-        let snapshot = store.load(&self.root, id)?;
+        let snapshot = Arc::new(store.load(&self.root, id)?);
         let header = snapshot.header().clone();
-        let mut compare = self
+        let (comparison, revision) = {
+            let tree = self.scan.tree();
+            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let revision = self.scan.progress().revision;
+            (Arc::new(Comparison::new(&tree, &snapshot)), revision)
+        };
+        let info = info(id.to_owned(), &header);
+        *self
             .compare
             .lock()
-            .map_err(|_| "comparing is unavailable")?;
-        let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        let comparison = Comparison::new(&tree, &snapshot);
-        let active = compare.insert(Active {
-            info: info(id.to_owned(), &header),
-            threshold: header.threshold,
+            .map_err(|_| "comparing is unavailable")? = Some(Active {
+            info: info.clone(),
             snapshot,
-            revision: progress.revision,
+            revision,
             comparison,
             changes: None,
         });
         Ok(Some(proto::CompareSummary {
             generation: self.generation(),
-            snapshot: active.info.clone(),
-            threshold: active.threshold,
+            snapshot: info,
+            threshold: header.threshold,
         }))
     }
 
     /// How `id` changed since the snapshot.
     pub fn compare_item(&self, snapshot: &str, id: u32) -> Result<proto::ItemChange, String> {
-        let mut compare = self
-            .compare
-            .lock()
-            .map_err(|_| "comparing is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        let active = self.current_comparison(&mut compare, snapshot, &tree)?;
+        let cur = self.current(snapshot, &tree)?;
         let n = node(&tree, id)?;
-        let change = active.comparison.change(&tree, &active.snapshot, n);
+        let change = cur.comparison.change(&tree, &cur.snapshot, n);
         Ok(proto::ItemChange {
             generation: self.generation(),
             node: id,
             kind: change.map_or(proto::ChangeKind::Unknown, |c| kind(&c)),
             before: change.and_then(|c| c.before),
+            before_below: change.and_then(|c| c.below),
             after: tree.logical(n),
         })
     }
@@ -180,13 +186,9 @@ impl Session {
     /// [`proto::change_mark`]).
     pub fn change_marks(&self, req: &proto::ChangeMarksRequest) -> Result<Vec<u8>, String> {
         use proto::change_mark as mark;
-        let mut compare = self
-            .compare
-            .lock()
-            .map_err(|_| "comparing is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        let active = self.current_comparison(&mut compare, &req.snapshot, &tree)?;
+        let cur = self.current(&req.snapshot, &tree)?;
         Ok(req
             .nodes
             .iter()
@@ -195,22 +197,20 @@ impl Session {
                 if !tree.contains(n) || tree.is_removed(n) {
                     return mark::UNKNOWN;
                 }
-                match active.comparison.change(&tree, &active.snapshot, n) {
-                    None => mark::UNKNOWN,
-                    Some(Change { before: None, .. }) => mark::NEW,
-                    Some(Change {
-                        before: Some(b),
-                        after: Some(a),
-                        ..
-                    }) if a != b => {
-                        let level = change_level(b, a);
-                        if a > b {
-                            mark::GROWN + level
-                        } else {
-                            mark::SHRUNK + level
-                        }
-                    }
-                    Some(_) => mark::UNCHANGED,
+                let Some(c) = cur.comparison.change(&tree, &cur.snapshot, n) else {
+                    return mark::UNKNOWN;
+                };
+                if c.is_new() {
+                    return mark::NEW;
+                }
+                let before = c.before.or(c.below).unwrap_or(0);
+                let after = c.after.unwrap_or(0);
+                if c.delta() == 0 {
+                    mark::UNCHANGED
+                } else if c.delta() > 0 {
+                    mark::GROWN + change_level(before, after)
+                } else {
+                    mark::SHRUNK + change_level(before, after)
                 }
             })
             .collect())
@@ -219,34 +219,53 @@ impl Session {
     /// A page of the biggest changes under a folder, at any depth,
     /// including items removed since.
     pub fn changes(&self, req: &proto::ChangesRequest) -> Result<proto::ChangesPage, String> {
-        let mut compare = self
-            .compare
-            .lock()
-            .map_err(|_| "comparing is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        let active = self.current_comparison(&mut compare, &req.snapshot, &tree)?;
+        let cur = self.current(&req.snapshot, &tree)?;
         let folder = node(&tree, req.folder)?;
-        let cached = matches!(&active.changes, Some((f, files, _)) if *f == req.folder && *files == req.files_only);
-        if !cached {
-            let list =
-                active
-                    .comparison
-                    .changes_under(&tree, &active.snapshot, folder, req.files_only);
-            active.changes = Some((req.folder, req.files_only, list));
-        }
-        let list = &active.changes.as_ref().expect("just listed").2;
+        let cached = {
+            let compare = self
+                .compare
+                .lock()
+                .map_err(|_| "comparing is unavailable")?;
+            compare
+                .as_ref()
+                .and_then(|a| a.changes.as_ref())
+                .filter(|(f, files, rev, _)| {
+                    *f == req.folder && *files == req.files_only && *rev == cur.revision
+                })
+                .map(|c| Arc::clone(&c.3))
+        };
+        let list = match cached {
+            Some(list) => list,
+            None => {
+                let list = Arc::new(cur.comparison.changes_under(
+                    &tree,
+                    &cur.snapshot,
+                    folder,
+                    req.files_only,
+                ));
+                let mut compare = self
+                    .compare
+                    .lock()
+                    .map_err(|_| "comparing is unavailable")?;
+                if let Some(a) = compare.as_mut().filter(|a| a.info.id == req.snapshot) {
+                    a.changes = Some((req.folder, req.files_only, cur.revision, Arc::clone(&list)));
+                }
+                list
+            }
+        };
         let total = list.len();
         let start = (req.offset as usize).min(total);
         let end = start
             .saturating_add(req.limit.min(MAX_PAGE) as usize)
             .min(total);
         let base = tree.path(folder);
-        let folder_entry = match active.comparison.status(folder) {
+        let folder_entry = match cur.comparison.status(folder) {
             sb_core::compare::Status::Was(e) => Some(e),
             _ => None,
         };
-        let snap = &active.snapshot;
+        let snap = &cur.snapshot;
         let rows = list[start..end]
             .iter()
             .map(|c| match c.item {
@@ -262,6 +281,7 @@ impl Session {
                         subfolder: display_path(sub),
                         kind: kind(c),
                         before: c.before,
+                        before_below: c.below,
                         after: c.after,
                     }
                 }
@@ -279,6 +299,7 @@ impl Session {
                         subfolder: display_path(Path::new(&sub)),
                         kind: proto::ChangeKind::Removed,
                         before: c.before,
+                        before_below: None,
                         after: None,
                     }
                 }
@@ -293,25 +314,47 @@ impl Session {
         })
     }
 
-    /// The comparison if it is with snapshot `id`, matched again if the
-    /// tree changed (items deleted) since.
-    fn current_comparison<'a>(
-        &self,
-        compare: &'a mut Option<Active>,
-        id: &str,
-        tree: &Tree,
-    ) -> Result<&'a mut Active, String> {
+    /// The comparison with snapshot `id`, matched against `tree` (read
+    /// locked by the caller). When the tree changed since (items deleted),
+    /// it's matched again without holding the comparison's lock, so other
+    /// requests aren't kept waiting, and swapped in.
+    fn current(&self, id: &str, tree: &Tree) -> Result<Current, String> {
+        let gone = || "That comparison is no longer on.".to_owned();
+        let revision = self.scan.progress().revision;
+        let snapshot = {
+            let compare = self
+                .compare
+                .lock()
+                .map_err(|_| "comparing is unavailable")?;
+            let active = compare
+                .as_ref()
+                .filter(|a| a.info.id == id)
+                .ok_or_else(gone)?;
+            if active.revision == revision {
+                return Ok(Current {
+                    snapshot: Arc::clone(&active.snapshot),
+                    comparison: Arc::clone(&active.comparison),
+                    revision,
+                });
+            }
+            Arc::clone(&active.snapshot)
+        };
+        let comparison = Arc::new(Comparison::new(tree, &snapshot));
+        let mut compare = self
+            .compare
+            .lock()
+            .map_err(|_| "comparing is unavailable")?;
         let active = compare
             .as_mut()
             .filter(|a| a.info.id == id)
-            .ok_or("That comparison is no longer on.")?;
-        let revision = self.scan.progress().revision;
-        if active.revision != revision {
-            active.comparison = Comparison::new(tree, &active.snapshot);
-            active.revision = revision;
-            active.changes = None;
-        }
-        Ok(active)
+            .ok_or_else(gone)?;
+        active.comparison = Arc::clone(&comparison);
+        active.revision = revision;
+        Ok(Current {
+            snapshot,
+            comparison,
+            revision,
+        })
     }
 }
 
@@ -325,11 +368,15 @@ fn info(id: String, h: &snapshot::SnapshotHeader) -> proto::SnapshotInfo {
 }
 
 fn kind(c: &Change) -> proto::ChangeKind {
-    match (c.before, c.after) {
-        (None, _) => proto::ChangeKind::New,
-        (_, None) => proto::ChangeKind::Removed,
-        (Some(b), Some(a)) if a > b => proto::ChangeKind::Grown,
-        (Some(b), Some(a)) if a < b => proto::ChangeKind::Shrunk,
+    if c.after.is_none() {
+        return proto::ChangeKind::Removed;
+    }
+    if c.is_new() {
+        return proto::ChangeKind::New;
+    }
+    match c.delta() {
+        d if d > 0 => proto::ChangeKind::Grown,
+        d if d < 0 => proto::ChangeKind::Shrunk,
         _ => proto::ChangeKind::Unchanged,
     }
 }
@@ -385,6 +432,7 @@ mod tests {
         std::fs::write(data.join("logs").join("app.log"), vec![0; 2 * MB]).unwrap();
         std::fs::write(data.join("old.bin"), vec![0; 3 * MB]).unwrap();
         std::fs::write(data.join("tiny.txt"), b"x").unwrap();
+        std::fs::write(data.join("grows.txt"), b"x").unwrap();
         let store = Arc::new(Store::new(tmp.0.join("store")));
 
         let first = scan(&data, &store);
@@ -397,10 +445,11 @@ mod tests {
         std::fs::write(data.join("logs").join("app.log"), vec![0; 5 * MB]).unwrap();
         std::fs::remove_file(data.join("old.bin")).unwrap();
         std::fs::write(data.join("new.iso"), vec![0; MB]).unwrap();
+        std::fs::write(data.join("grows.txt"), vec![0; 3 * MB]).unwrap();
         let second = scan(&data, &store);
         let earlier = second.snapshots();
         assert_eq!(earlier.len(), 1);
-        assert_eq!(earlier[0].logical, 5 * MB as u64 + 1);
+        assert_eq!(earlier[0].logical, 5 * MB as u64 + 2);
 
         let id = earlier[0].id.clone();
         let summary = second.compare_set(Some(&id)).unwrap().unwrap();
@@ -415,6 +464,12 @@ mod tests {
             second.compare_item(&id, tiny).unwrap().kind,
             proto::ChangeKind::Unknown
         );
+        // Small then, big now: grown by at least the difference.
+        let grows = second
+            .compare_item(&id, find(&second, "grows.txt"))
+            .unwrap();
+        assert_eq!(grows.kind, proto::ChangeKind::Grown);
+        assert_eq!((grows.before, grows.before_below), (None, Some(MB as u64)));
         let new = find(&second, "new.iso");
         let marks = second
             .change_marks(&proto::ChangeMarksRequest {
@@ -430,7 +485,7 @@ mod tests {
                 mark::GROWN + 4,
                 mark::NEW,
                 mark::UNKNOWN,
-                mark::GROWN + 1,
+                mark::GROWN + 3,
                 mark::UNKNOWN
             ]
         );
@@ -456,6 +511,7 @@ mod tests {
                 ("logs", proto::ChangeKind::Grown, true),
                 ("app.log", proto::ChangeKind::Grown, true),
                 ("old.bin", proto::ChangeKind::Removed, false),
+                ("grows.txt", proto::ChangeKind::Grown, true),
                 ("new.iso", proto::ChangeKind::New, true),
             ]
         );

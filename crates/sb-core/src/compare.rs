@@ -5,16 +5,20 @@
 //! earlier counterpart's children. A [`Comparison`] keeps the result as one
 //! number per current node, so asking about any node afterwards is a lookup.
 //!
-//! An item that isn't found was added since, unless it is a file that was
-//! below the snapshot's file threshold then: those are recorded only by
-//! name hash, so the comparison knows the file existed but not its size,
-//! and says nothing about it. A renamed item counts as removed under its old
-//! name and new under its new one.
+//! An item that isn't found was added since, with two exceptions. A file
+//! that was below the snapshot's file threshold then is recorded only by
+//! name hash, so its earlier size is known only to be under the threshold:
+//! once it is over, it counts as grown by at least the difference, and
+//! otherwise nothing is said about it. And a folder whose contents weren't
+//! read, then or now, can't say what was added or removed inside it, so it
+//! and everything under it is left unknown. A renamed item counts as
+//! removed under its old name and new under its new one.
 
 use crate::snapshot::{Snapshot, fold, name_hash};
-use crate::tree::{NodeId, Tree};
+use crate::tree::{DirState, NodeId, Tree};
 use std::cmp::Reverse;
 
+const SMALL: u32 = u32::MAX - 2;
 const NEW: u32 = u32::MAX - 1;
 const UNKNOWN: u32 = u32::MAX;
 
@@ -23,10 +27,12 @@ const UNKNOWN: u32 = u32::MAX;
 pub enum Status {
     /// The same item, as snapshot entry `n`.
     Was(u32),
+    /// A file that was there but below the snapshot's file threshold.
+    WasSmall,
     /// Not there before.
     New,
-    /// Its earlier size isn't known: a file that was below the threshold,
-    /// or a node the comparison doesn't cover.
+    /// Its earlier size isn't known: in a folder whose contents weren't
+    /// read, then or now, or a node the comparison doesn't cover.
     Unknown,
 }
 
@@ -42,16 +48,26 @@ pub enum Item {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Change {
     pub item: Item,
-    /// Logical bytes then; `None` if new.
+    /// Logical bytes then; `None` if new, or if only `below` is known.
     pub before: Option<u64>,
+    /// For a file that was below the threshold then: the threshold, which
+    /// its earlier size was under.
+    pub below: Option<u64>,
     /// Logical bytes now; `None` if removed.
     pub after: Option<u64>,
 }
 
 impl Change {
-    /// Bytes gained (positive) or lost.
+    /// Bytes gained (positive) or lost; for a file that was below the
+    /// threshold, the least it can have grown by.
     pub fn delta(&self) -> i128 {
-        i128::from(self.after.unwrap_or(0)) - i128::from(self.before.unwrap_or(0))
+        let before = self.before.or(self.below).unwrap_or(0);
+        i128::from(self.after.unwrap_or(0)) - i128::from(before)
+    }
+
+    /// Not there before (and not merely small).
+    pub fn is_new(&self) -> bool {
+        self.before.is_none() && self.below.is_none()
     }
 }
 
@@ -71,18 +87,22 @@ pub fn change_level(before: u64, after: u64) -> u8 {
 /// A scan matched against a snapshot.
 #[derive(Debug, Clone)]
 pub struct Comparison {
-    /// Per current node: its snapshot entry, [`NEW`], or [`UNKNOWN`].
+    /// Per current node: its snapshot entry, [`SMALL`], [`NEW`], or
+    /// [`UNKNOWN`].
     matched: Vec<u32>,
-    /// Per snapshot entry: whether a current node matched it.
+    /// Per snapshot entry: whether it's accounted for (a current node
+    /// matched it, or it's inside a folder that couldn't be read now), so
+    /// it isn't listed as removed.
     seen: Vec<bool>,
     /// Snapshot children by parent, as ranges of `children`.
     child_start: Vec<u32>,
     children: Vec<u32>,
+    threshold: u64,
 }
 
 impl Comparison {
     /// Matches every node of `tree` with `snap`, comparing names as the
-    /// snapshot was taken (ignoring case on Windows).
+    /// snapshot was taken (ignoring case on Windows and macOS).
     pub fn new(tree: &Tree, snap: &Snapshot) -> Self {
         let insensitive = snap.header().case_insensitive;
         let n = snap.len();
@@ -128,41 +148,104 @@ impl Comparison {
 
         let mut matched = vec![UNKNOWN; tree.len()];
         let mut seen = vec![false; n];
-        matched[NodeId::ROOT.index()] = 0;
+        matched[NodeId::ROOT.index()] = if snap.was_read(0) { 0 } else { UNKNOWN };
         seen[0] = true;
         let mut pairs = vec![(NodeId::ROOT, 0u32)];
         let mut added = Vec::new();
         let mut buf = Vec::new();
+        let mut kids_now: Vec<(NodeId, Vec<u8>)> = Vec::new();
+        let mut pending = Vec::new();
+        let mut accounted = Vec::new();
         while let Some((dir, entry)) = pairs.pop() {
             let range =
                 child_start[entry as usize] as usize..child_start[entry as usize + 1] as usize;
             let kids = &mut children[range];
-            kids.sort_unstable_by(|&a, &b| key(a).cmp(key(b)));
-            for c in tree.children(dir) {
-                let name = fold(tree.name(c).as_encoded_bytes(), insensitive, &mut buf);
-                let found = kids
-                    .binary_search_by(|&k| key(k).cmp(name))
-                    .ok()
-                    .map(|i| kids[i]);
-                let is_dir = tree.is_dir(c);
-                matched[c.index()] = match found {
-                    // Two current names folded to one earlier name: only
-                    // the first can be that item.
-                    Some(s) if seen[s as usize] => UNKNOWN,
-                    Some(s) if snap.is_dir(s) == is_dir => {
+            kids.sort_unstable_by(|&a, &b| key(a).cmp(key(b)).then(snap.name(a).cmp(snap.name(b))));
+            let read_then = snap.was_read(entry);
+            kids_now.clear();
+            kids_now.extend(tree.children(dir).map(|c| {
+                (
+                    c,
+                    fold(tree.name(c).as_encoded_bytes(), insensitive, &mut buf).to_vec(),
+                )
+            }));
+            // Exact names first, so `A` and `a` side by side (a
+            // case-sensitive folder) each find their own earlier self;
+            // then names that match only ignoring case, where that's
+            // unambiguous.
+            pending.clear();
+            for (i, (c, folded)) in kids_now.iter().enumerate() {
+                let from = kids.partition_point(|&k| key(k) < folded.as_slice());
+                let to = from + kids[from..].partition_point(|&k| key(k) == folded.as_slice());
+                let raw = tree.name(*c).as_encoded_bytes();
+                match kids[from..to]
+                    .iter()
+                    .find(|&&k| !seen[k as usize] && snap.name(k) == raw)
+                {
+                    Some(&s) => {
                         seen[s as usize] = true;
-                        if is_dir {
-                            pairs.push((c, s));
-                        }
+                        matched[c.index()] = s;
+                    }
+                    None => pending.push((i, from, to)),
+                }
+            }
+            for &(i, from, to) in &pending {
+                let (c, folded) = &kids_now[i];
+                let c = *c;
+                let found = match to - from {
+                    0 => None,
+                    1 if !seen[kids[from] as usize] => Some(kids[from]),
+                    // Taken by an exact match, or several to choose from.
+                    _ => {
+                        matched[c.index()] = UNKNOWN;
+                        continue;
+                    }
+                };
+                matched[c.index()] = match found {
+                    Some(s) => {
+                        seen[s as usize] = true;
                         s
                     }
-                    // A folder where a file was, or the reverse.
-                    Some(_) => NEW,
-                    None if !is_dir && snap.had_small_file(entry, name_hash(name)) => UNKNOWN,
+                    None if !read_then => UNKNOWN,
+                    None if !tree.is_dir(c) && snap.had_small_file(entry, name_hash(folded)) => {
+                        SMALL
+                    }
                     None => NEW,
                 };
-                if is_dir && matched[c.index()] == NEW {
-                    added.push(c);
+            }
+            // Now settle each match: a folder where a file was (or the
+            // reverse) is new, and folders unread then or now are unknown.
+            for &(c, _) in &kids_now {
+                let s = matched[c.index()];
+                if s >= SMALL {
+                    if s == NEW && tree.is_dir(c) {
+                        added.push(c);
+                    }
+                    continue;
+                }
+                let is_dir = tree.is_dir(c);
+                if snap.is_dir(s) != is_dir {
+                    seen[s as usize] = false;
+                    matched[c.index()] = NEW;
+                    if is_dir {
+                        added.push(c);
+                    }
+                } else if is_dir && tree.dir_state(c) != DirState::Listed {
+                    // Unread now: nothing under it can be called removed.
+                    matched[c.index()] = UNKNOWN;
+                    accounted.push(s);
+                    while let Some(e) = accounted.pop() {
+                        let e = e as usize;
+                        seen[e] = true;
+                        accounted.extend_from_slice(
+                            &children[child_start[e] as usize..child_start[e + 1] as usize],
+                        );
+                    }
+                } else if is_dir {
+                    if !snap.was_read(s) {
+                        matched[c.index()] = UNKNOWN;
+                    }
+                    pairs.push((c, s));
                 }
             }
         }
@@ -180,29 +263,35 @@ impl Comparison {
             seen,
             child_start,
             children,
+            threshold: snap.header().threshold,
         }
     }
 
     pub fn status(&self, node: NodeId) -> Status {
         match self.matched.get(node.index()).copied().unwrap_or(UNKNOWN) {
+            SMALL => Status::WasSmall,
             NEW => Status::New,
             UNKNOWN => Status::Unknown,
             entry => Status::Was(entry),
         }
     }
 
-    /// The change at `node`, or `None` if its earlier size isn't known.
-    /// Unchanged items give a change with equal sizes.
+    /// The change at `node`, or `None` if its earlier size isn't known (or
+    /// it was a small file and still is). Unchanged items give a change
+    /// with equal sizes.
     pub fn change(&self, tree: &Tree, snap: &Snapshot, node: NodeId) -> Option<Change> {
-        let before = match self.status(node) {
-            Status::Was(e) => Some(snap.logical(e)),
-            Status::New => None,
-            Status::Unknown => return None,
+        let after = tree.logical(node);
+        let (before, below) = match self.status(node) {
+            Status::Was(e) => (Some(snap.logical(e)), None),
+            Status::WasSmall if after > self.threshold => (None, Some(self.threshold)),
+            Status::New => (None, None),
+            Status::WasSmall | Status::Unknown => return None,
         };
         Some(Change {
             item: Item::Current(node),
             before,
-            after: Some(tree.logical(node)),
+            below,
+            after: Some(after),
         })
     }
 
@@ -211,10 +300,12 @@ impl Comparison {
         &self.children[self.child_start[e] as usize..self.child_start[e + 1] as usize]
     }
 
-    /// Every item under `folder`, at any depth, whose size changed: grown,
+    /// The items under `folder`, at any depth, whose size changed: grown,
     /// shrunk, new, or removed (from the snapshot), largest change first.
-    /// With `files_only`, folders are left out. Items of unknown earlier
-    /// size and empty new or removed items are left out.
+    /// A new or removed folder stands for everything in it. With
+    /// `files_only`, folders are left out and the files in new or removed
+    /// folders are listed instead. Items of unknown earlier size and empty
+    /// new or removed items are left out.
     pub fn changes_under(
         &self,
         tree: &Tree,
@@ -225,9 +316,11 @@ impl Comparison {
         let mut out = Vec::new();
         let mut stack: Vec<NodeId> = tree.children(folder).collect();
         while let Some(n) = stack.pop() {
-            let is_dir = tree.is_dir(n);
-            if is_dir {
-                stack.extend(tree.children(n));
+            if tree.is_dir(n) {
+                let new = self.status(n) == Status::New;
+                if !(new && !files_only) {
+                    stack.extend(tree.children(n));
+                }
                 if files_only {
                     continue;
                 }
@@ -242,15 +335,17 @@ impl Comparison {
             let mut stack = self.snapshot_children(entry).to_vec();
             while let Some(e) = stack.pop() {
                 let is_dir = snap.is_dir(e);
-                if is_dir {
+                let removed = !self.seen[e as usize];
+                if is_dir && (!removed || files_only) {
                     stack.extend_from_slice(self.snapshot_children(e));
                 }
-                if self.seen[e as usize] || (files_only && is_dir) || snap.logical(e) == 0 {
+                if !removed || (files_only && is_dir) || snap.logical(e) == 0 {
                     continue;
                 }
                 out.push(Change {
                     item: Item::Removed(e),
                     before: Some(snap.logical(e)),
+                    below: None,
                     after: None,
                 });
             }
@@ -262,12 +357,7 @@ impl Comparison {
                 Item::Current(n) => (false, n.index() as u32),
                 Item::Removed(e) => (true, e),
             };
-            (
-                Reverse(c.delta().unsigned_abs()),
-                c.before.is_none(),
-                removed,
-                id,
-            )
+            (Reverse(c.delta().unsigned_abs()), c.is_new(), removed, id)
         });
         out
     }
@@ -305,6 +395,17 @@ mod tests {
         }
     }
 
+    /// Marks every folder as read, as after a completed scan.
+    fn listed(mut t: Tree) -> Tree {
+        for i in 0..t.len() as u32 {
+            let n = NodeId::from_index(i);
+            if t.is_dir(n) {
+                t.set_dir_state(n, DirState::Listed);
+            }
+        }
+        t
+    }
+
     fn find(tree: &Tree, path: &str) -> NodeId {
         let mut n = NodeId::ROOT;
         for part in path.split('/') {
@@ -335,7 +436,7 @@ mod tests {
             .unwrap();
         t.add_file(NodeId::ROOT, "small.log".as_ref(), sizes(100), 0)
             .unwrap();
-        t
+        listed(t)
     }
 
     /// After: report.pdf unchanged, notes.txt grew to 5 MB, a.mkv grew to
@@ -359,7 +460,7 @@ mod tests {
             .unwrap();
         t.add_file(NodeId::ROOT, "fresh.txt".as_ref(), sizes(10), 0)
             .unwrap();
-        t
+        listed(t)
     }
 
     #[test]
@@ -387,10 +488,15 @@ mod tests {
             "a rename is new under the new name"
         );
         assert_eq!(cmp.status(find(&tree, "fresh.txt")), Status::New);
-        // Below the threshold before: existed, size unknown, say nothing.
+        // Below the threshold before and still: size unknown, say nothing.
         assert_eq!(c("small.log"), None);
-        assert_eq!(c("docs/notes.txt"), None, "grew past the threshold");
+        assert_eq!(cmp.status(find(&tree, "small.log")), Status::WasSmall);
+        // Past it now: grown by at least the difference.
+        let notes = c("docs/notes.txt").unwrap();
         const { assert!(1024 < FILE_THRESHOLD) };
+        assert_eq!((notes.before, notes.below), (None, Some(FILE_THRESHOLD)));
+        assert_eq!(notes.delta(), (4 * MB) as i128);
+        assert!(!notes.is_new());
 
         let changes = cmp.changes_under(&tree, &snap, NodeId::ROOT, false);
         let sizes: Vec<u128> = changes.iter().map(|c| c.delta().unsigned_abs()).collect();
@@ -407,16 +513,16 @@ mod tests {
             .collect();
         described.sort();
         let mb = |n: i128| n * MB as i128;
+        // A new or removed folder stands for what's in it.
         let expected: Vec<(String, i128)> = [
-            ("-cache.bin", mb(-2)),
             ("-old.mkv", mb(-4)),
             ("-tmp", mb(-2)),
             ("a.mkv", mb(2)),
-            ("b.iso", mb(8)),
             ("docs", mb(5) - 1024),
             ("fresh.txt", 10),
             ("media", mb(2)),
             ("new", mb(8)),
+            ("notes.txt", mb(4)),
             ("older.mkv", mb(4)),
         ]
         .into_iter()
@@ -429,7 +535,27 @@ mod tests {
             Item::Current(n) => !tree.is_dir(n),
             Item::Removed(e) => !snap.is_dir(e),
         }));
-        assert_eq!(files.len(), 6, "four files now, two gone");
+        let mut names: Vec<_> = files
+            .iter()
+            .map(|c| match c.item {
+                Item::Current(n) => tree.name(n).to_string_lossy().into_owned(),
+                Item::Removed(e) => format!("-{}", snap.display_name(e)),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "-cache.bin",
+                "-old.mkv",
+                "a.mkv",
+                "b.iso",
+                "fresh.txt",
+                "notes.txt",
+                "older.mkv"
+            ],
+            "the files in new and removed folders, not the folders"
+        );
 
         let media = find(&tree, "media");
         let under = cmp.changes_under(&tree, &snap, media, false);
@@ -456,6 +582,7 @@ mod tests {
         let d = t.add_dir(NodeId::ROOT, "Photos".as_ref()).unwrap();
         t.add_file(d, "IMG.JPG".as_ref(), sizes(2 * MB), 0).unwrap();
         t.add_file(d, "Small.txt".as_ref(), sizes(5), 0).unwrap();
+        let t = listed(t);
         let mut renamed = Tree::new("/data");
         let d = renamed.add_dir(NodeId::ROOT, "photos".as_ref()).unwrap();
         renamed
@@ -464,6 +591,7 @@ mod tests {
         renamed
             .add_file(d, "small.TXT".as_ref(), sizes(5), 0)
             .unwrap();
+        let renamed = listed(renamed);
 
         let insensitive = Snapshot::capture(&t, 0, true);
         let cmp = Comparison::new(&renamed, &insensitive);
@@ -475,7 +603,7 @@ mod tests {
         );
         assert_eq!(
             cmp.status(find(&renamed, "photos/small.TXT")),
-            Status::Unknown
+            Status::WasSmall
         );
         assert!(
             cmp.changes_under(&renamed, &insensitive, NodeId::ROOT, false)
@@ -493,7 +621,7 @@ mod tests {
             .iter()
             .filter(|c| c.after.is_none())
             .count();
-        assert_eq!(removed, 2, "Photos and IMG.JPG");
+        assert_eq!(removed, 1, "Photos, standing for IMG.JPG too");
     }
 
     #[test]
@@ -501,8 +629,10 @@ mod tests {
         let mut t = Tree::new("/data");
         t.add_file(NodeId::ROOT, "x".as_ref(), sizes(2 * MB), 0)
             .unwrap();
+        let t = listed(t);
         let mut now = Tree::new("/data");
         let x = now.add_dir(NodeId::ROOT, "x".as_ref()).unwrap();
+        let now = listed(now);
         let snap = Snapshot::capture(&t, 0, false);
         let cmp = Comparison::new(&now, &snap);
         assert_eq!(cmp.status(x), Status::New);
@@ -526,6 +656,94 @@ mod tests {
         let changes = cmp.changes_under(&tree, &snap, NodeId::ROOT, false);
         assert_eq!(changes[0].delta(), -(14 * MB as i128));
         assert_eq!(cmp.status(media), Status::Unknown);
+    }
+
+    #[test]
+    fn folders_unread_then_or_now_are_unknown() {
+        let snap = Snapshot::capture(&before(), 0, false);
+
+        // Now unread (say, permission denied): not emptied, nothing removed.
+        let mut now = Tree::new("/data");
+        let docs = now.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
+        let media = now.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
+        now.add_file(media, "a.mkv".as_ref(), sizes(10 * MB), 0)
+            .unwrap();
+        now.add_file(media, "old.mkv".as_ref(), sizes(4 * MB), 0)
+            .unwrap();
+        let mut now = listed(now);
+        now.set_dir_state(docs, DirState::Failed);
+        let cmp = Comparison::new(&now, &snap);
+        assert_eq!(cmp.status(docs), Status::Unknown);
+        assert_eq!(cmp.change(&now, &snap, docs), None);
+        let changes = cmp.changes_under(&now, &snap, NodeId::ROOT, true);
+        let removed: Vec<_> = changes
+            .iter()
+            .filter_map(|c| match c.item {
+                Item::Removed(e) => Some(snap.display_name(e)),
+                Item::Current(_) => None,
+            })
+            .collect();
+        assert_eq!(removed, ["cache.bin"], "nothing under docs is removed");
+
+        // Unread then: what's in it now isn't new.
+        let mut then = Tree::new("/data");
+        let media_then = then.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
+        let mut then = listed(then);
+        then.set_dir_state(media_then, DirState::Failed);
+        let snap = Snapshot::capture(&then, 0, false);
+        let now = after();
+        let cmp = Comparison::new(&now, &snap);
+        let media = find(&now, "media");
+        assert_eq!(cmp.status(media), Status::Unknown);
+        assert_eq!(cmp.status(find(&now, "media/older.mkv")), Status::Unknown);
+        assert!(
+            cmp.changes_under(&now, &snap, media, false).is_empty(),
+            "no new or removed items in a folder unread then"
+        );
+    }
+
+    #[test]
+    fn exact_names_win_over_names_equal_ignoring_case() {
+        // A case-sensitive folder on a case-insensitive system.
+        let mut t = Tree::new("/data");
+        t.add_file(NodeId::ROOT, "A".as_ref(), sizes(2 * MB), 0)
+            .unwrap();
+        t.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), 0)
+            .unwrap();
+        let t = listed(t);
+        let snap = Snapshot::capture(&t, 0, true);
+        let cmp = Comparison::new(&t, &snap);
+        assert!(
+            cmp.changes_under(&t, &snap, NodeId::ROOT, false).is_empty(),
+            "an identical tree has no changes"
+        );
+        for name in ["A", "a"] {
+            let c = cmp.change(&t, &snap, find(&t, name)).unwrap();
+            assert_eq!(c.delta(), 0, "{name}");
+        }
+
+        // Only `a` is left: it's found exactly, and `A` is removed.
+        let mut now = Tree::new("/data");
+        now.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), 0)
+            .unwrap();
+        let now = listed(now);
+        let cmp = Comparison::new(&now, &snap);
+        assert_eq!(cmp.change(&now, &snap, find(&now, "a")).unwrap().delta(), 0);
+        let changes = cmp.changes_under(&now, &snap, NodeId::ROOT, false);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].delta(), -((2 * MB) as i128));
+
+        // A different case only, and unambiguous: still the same file.
+        let mut now = Tree::new("/data");
+        now.add_file(NodeId::ROOT, "\u{e1}.txt".as_ref(), sizes(3 * MB), 0)
+            .unwrap();
+        let now = listed(now);
+        let mut then = Tree::new("/data");
+        then.add_file(NodeId::ROOT, "\u{c1}.TXT".as_ref(), sizes(2 * MB), 0)
+            .unwrap();
+        let then = listed(then);
+        let cmp = Comparison::new(&now, &Snapshot::capture(&then, 0, true));
+        assert_eq!(cmp.status(find(&now, "\u{e1}.txt")), Status::Was(1));
     }
 
     #[test]
