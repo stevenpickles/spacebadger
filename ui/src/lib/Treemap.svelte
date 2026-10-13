@@ -23,6 +23,7 @@
     type DecodedLayout,
   } from "./layoutWire";
   import { Samples } from "./perf";
+  import { cssVar, theme } from "./theme.svelte";
   import type { Metric } from "./protocol/Metric";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import {
@@ -89,7 +90,19 @@
   let error = $state<string | null>(null);
   let hover = $state<{ index: number; x: number; y: number } | null>(null);
   let hoverDetails = $state.raw<NodeDetails | null>(null);
-  let dark = $state(window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const dark = $derived(theme.dark);
+
+  /** Canvas colors from the app.css tokens, re-read when the theme changes. */
+  const palette = $derived.by(() => {
+    void theme.dark;
+    return {
+      gap: cssVar("--map-gap"),
+      textDark: cssVar("--map-text-dark"),
+      textLight: cssVar("--map-text-light"),
+      incomplete: cssVar("--incomplete"),
+      accent: cssVar("--accent"),
+    };
+  });
 
   // ---- diagnostics (toggle with ` while the map has focus) ---------------
 
@@ -164,7 +177,7 @@
     }
   }
 
-  // ---- sizing and theme ------------------------------------------------
+  // ---- sizing ----------------------------------------------------------
 
   $effect(() => {
     const observer = new ResizeObserver(([entry]) => {
@@ -173,13 +186,7 @@
       height = Math.floor(entry.contentRect.height);
     });
     observer.observe(container);
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const onTheme = () => (dark = media.matches);
-    media.addEventListener("change", onTheme);
-    return () => {
-      observer.disconnect();
-      media.removeEventListener("change", onTheme);
-    };
+    return () => observer.disconnect();
   });
 
   // ---- drawing ---------------------------------------------------------
@@ -245,8 +252,9 @@
 
     ctx.font = "11px system-ui, -apple-system, 'Segoe UI', sans-serif";
     ctx.textBaseline = "alphabetic";
-    const text = dark ? "#eceae6" : "#1b1e25";
-    const gap = dark ? "#1b1e25" : "#f6f6f4";
+    const p = palette;
+    const text = dark ? p.textLight : p.textDark;
+    const gap = p.gap;
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -261,7 +269,7 @@
       else ctx.fillRect(x, y, w, h);
 
       if (kind === KIND_FOLDER && l.rflags[i]! & RF_INCOMPLETE) {
-        ctx.strokeStyle = dark ? "#d9a441" : "#a86a00";
+        ctx.strokeStyle = p.incomplete;
         ctx.setLineDash([3, 3]);
         ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
         ctx.setLineDash([]);
@@ -293,12 +301,14 @@
 
     if (selected.size > 0) {
       // Selected items are tinted, with everything drawn inside them.
-      ctx.fillStyle = dark ? "rgb(122 167 255 / 0.38)" : "rgb(37 99 201 / 0.3)";
-      ctx.strokeStyle = dark ? "#7aa7ff" : "#2563c9";
+      ctx.fillStyle = p.accent;
+      ctx.strokeStyle = p.accent;
       ctx.lineWidth = 2;
       for (let i = 0; i < l.count; i++) {
         if (l.kind[i] === KIND_OTHER || !selected.has(l.node[i]!)) continue;
+        ctx.globalAlpha = dark ? 0.38 : 0.3;
         ctx.fillRect(l.x[i]!, l.y[i]!, l.w[i]!, l.h[i]!);
+        ctx.globalAlpha = 1;
         if (l.w[i]! > 4 && l.h[i]! > 4) {
           ctx.strokeRect(l.x[i]! + 1, l.y[i]! + 1, l.w[i]! - 2, l.h[i]! - 2);
         }
@@ -307,24 +317,26 @@
 
     const hi = hover ? hover.index : -1;
     if (hi >= 0 && hi < l.count) {
-      ctx.strokeStyle = dark ? "rgba(255,255,255,0.7)" : "rgba(0,0,0,0.55)";
+      ctx.strokeStyle = dark ? p.textLight : p.textDark;
+      ctx.globalAlpha = 0.6;
       ctx.lineWidth = 1;
       ctx.strokeRect(l.x[hi]! + 0.5, l.y[hi]! + 0.5, l.w[hi]! - 1, l.h[hi]! - 1);
+      ctx.globalAlpha = 1;
     }
     const si = selectedIndex(l, selection);
     if (si >= 0) {
       ctx.lineWidth = 3;
-      ctx.strokeStyle = dark ? "#ffffff" : "#000000";
+      ctx.strokeStyle = dark ? p.textLight : p.textDark;
       ctx.strokeRect(l.x[si]! + 1.5, l.y[si]! + 1.5, Math.max(0, l.w[si]! - 3), Math.max(0, l.h[si]! - 3));
       ctx.lineWidth = 1;
-      ctx.strokeStyle = dark ? "#000000" : "#ffffff";
+      ctx.strokeStyle = dark ? p.textDark : p.textLight;
       ctx.strokeRect(l.x[si]! + 3.5, l.y[si]! + 3.5, Math.max(0, l.w[si]! - 7), Math.max(0, l.h[si]! - 7));
     }
   }
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, selected, hover, dark, colors, width, height];
+    void [layout, selection, selected, hover, palette, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);

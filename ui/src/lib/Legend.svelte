@@ -1,14 +1,8 @@
 <script lang="ts">
   import { typeModeFolderColor, otherSmallColor, TYPE_LEGEND, typeColor } from "./colors";
+  import { theme } from "./theme.svelte";
 
-  let dark = $state(window.matchMedia("(prefers-color-scheme: dark)").matches);
-
-  $effect(() => {
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const onTheme = () => (dark = media.matches);
-    media.addEventListener("change", onTheme);
-    return () => media.removeEventListener("change", onTheme);
-  });
+  const dark = $derived(theme.dark);
 </script>
 
 <ul class="legend" aria-label="File type colors">
