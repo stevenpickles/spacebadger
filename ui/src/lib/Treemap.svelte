@@ -350,15 +350,16 @@
     }
 
     // Labels go last, so tints and frames never hide them.
-    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i);
+    // Labels go inside the frames of selected and focused tiles.
+    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
   }
 
-  function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number) {
+  function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
     const p = palette;
-    const x = l.x[i]!;
-    const y = l.y[i]!;
-    const w = l.w[i]!;
-    const h = l.h[i]!;
+    const x = l.x[i]! + pad - 4;
+    const y = l.y[i]! + pad - 4;
+    const w = l.w[i]! - 2 * (pad - 4);
+    const h = l.h[i]! - 2 * (pad - 4);
     const kind = l.kind[i]!;
     // Baselines of the first and second label lines, from the tile top.
     const line1 = p.fontSize + 1;
@@ -384,13 +385,17 @@
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
     } else {
-      const size = formatBytes(l.weight[i]!);
-      const sizeWidth = ctx.measureText(size).width;
+      // The size, or a compact form of it ("310M") on narrow tiles.
+      const full = formatBytes(l.weight[i]!);
+      const compact = full.replace(/ (.)i?B$/, "$1").replace(/ B$/, "B");
+      const fullWidth = ctx.measureText(full).width;
+      const size = fullWidth <= room ? full : compact;
+      const sizeWidth = size === full ? fullWidth : ctx.measureText(compact).width;
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
         label(ctx, name!, x + 4, y + line1, room);
         if (sizeWidth <= room) ctx.fillText(size, x + 4, y + line2);
-      } else if (room >= sizeWidth + 30) {
+      } else if (room >= fullWidth + 30) {
         // One line: the size right-aligned, the name cut to fit before it.
         label(ctx, name!, x + 4, y + line1, room - sizeWidth - 6);
         ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
