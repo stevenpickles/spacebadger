@@ -3,10 +3,14 @@
   import {
     appInfo,
     deleteItems,
+    duplicatesCancel,
+    duplicatesStart,
+    duplicatesStatus,
     errorText,
     EXPECTED_PROTOCOL_VERSION,
     fileManagerName,
     nodeDetails,
+    onDuplicatesStatus,
     onScanStatus,
     scanCancel,
     scanChoose,
@@ -28,13 +32,16 @@
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import Duplicates from "./lib/Duplicates.svelte";
   import FilterBox from "./lib/FilterBox.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
-  import { formatBytes, plural } from "./lib/format";
+  import { formatBytes, KILO, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
+  import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
+  import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
@@ -53,7 +60,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "contents" | "results" | "small" | "omissions";
+  type PanelTab = "contents" | "results" | "small" | "duplicates" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -120,6 +127,10 @@
   let elevating = $state(false);
   /** The list chosen below the details; the panel falls back to one that's open. */
   let tab = $state<PanelTab | null>(null);
+  /** The latest search for duplicate files in this scan, while its tab is open. */
+  let dupes = $state.raw<DuplicatesStatus | null>(null);
+  /** Smallest file size the duplicate search looks at. */
+  let dupesMinSize = $state(Number(saved("duplicates-min-size")) || KILO ** 2);
 
   const scanning = $derived(status?.phase.kind === "scanning");
   /** Restarting with administrator rights is offered on Windows only. */
@@ -199,6 +210,7 @@
     menu = null;
     search = null;
     volume = null;
+    dupes = null;
     // Keep the filter across Refresh and new roots.
     if (query) applySearch(query);
   }
@@ -346,10 +358,85 @@
     items.push(
       { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
       { label: "Copy path", action: () => copyPath(it.node) },
-      ...deleteItemsFor(it.node),
     );
+    if (it.folder) items.push(findDuplicatesItem(it.node));
+    items.push(...deleteItemsFor(it.node));
     return items;
   }
+
+  function duplicateMenu(f: DuplicateFile): MenuItem[] {
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap(f) },
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(f.node), separator: true },
+      { label: "Copy path", action: () => copyPath(f.node) },
+      ...deleteItemsFor(f.node),
+    ];
+  }
+
+  // ---- duplicate files ----------------------------------------------------
+
+  const duplicatesBlocked = "Duplicates can be found once the scan finishes or is cancelled.";
+
+  /** Looks for files with the same contents under `folder`, matching the
+   * filter if one is on. Only ever started by the user: it reads the files. */
+  async function findDuplicates(folder: number, minSize = dupesMinSize) {
+    const gen = generation;
+    if (gen === null) return;
+    if (scanning) {
+      flash(duplicatesBlocked);
+      return;
+    }
+    dupesMinSize = minSize;
+    remember("duplicates-min-size", String(minSize));
+    try {
+      const started = await duplicatesStart({ generation: gen, folder, search: searchId ?? null, minSize });
+      if (gen !== generation) return;
+      dupes = started;
+      tab = "duplicates";
+    } catch (e) {
+      problem = `Couldn't look for duplicates: ${errorText(e)}`;
+    }
+  }
+
+  function findDuplicatesItem(folder: number): MenuItem {
+    return {
+      label: "Find duplicates here",
+      action: () => findDuplicates(folder),
+      separator: true,
+      disabled: scanning,
+      title: scanning ? duplicatesBlocked : undefined,
+    };
+  }
+
+  function stopDuplicates() {
+    if (generation !== null && dupes) duplicatesCancel(generation, dupes.job).catch(() => {});
+  }
+
+  function closeDuplicates() {
+    if (dupes?.phase === "running") stopDuplicates();
+    dupes = null;
+  }
+
+  $effect(() => {
+    const unlisten = onDuplicatesStatus((s) => {
+      if (s.generation === generation && s.job === dupes?.job) dupes = s;
+    });
+    return () => void unlisten.then((f) => f());
+  });
+
+  // Deleting items takes them out of the groups.
+  $effect(() => {
+    const gen = generation;
+    const job = dupes?.job;
+    void status?.revision;
+    if (gen === null || job === undefined) return;
+    duplicatesStatus(gen, job).then(
+      (s) => {
+        if (gen === generation && s.job === dupes?.job) dupes = s;
+      },
+      () => {},
+    );
+  });
 
   // ---- selection and delete -------------------------------------------
 
@@ -692,6 +779,7 @@
       separator: true,
     });
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    if (kind === "folder") items.push(findDuplicatesItem(node));
     if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
   }
@@ -755,6 +843,7 @@
       generation !== null ? { id: "contents" as const, label: "Contents" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
+      dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
     ].filter((t) => t !== null),
   );
@@ -846,6 +935,14 @@
           title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
         >
         <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
+        <button
+          type="button"
+          disabled={scanning}
+          title={scanning
+            ? duplicatesBlocked
+            : "Look for files with the same contents in the folder in view, matching the filter if one is on. This reads the files; cloud files are skipped."}
+          onclick={() => findDuplicates(view)}>Find duplicates</button
+        >
       {/if}
     </div>
     {#if generation !== null}
@@ -1127,6 +1224,22 @@
                 onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
               />
             {/key}
+          {:else if activeTab === "duplicates" && dupes && generation !== null}
+            <Duplicates
+              {generation}
+              status={dupes}
+              minSize={dupesMinSize}
+              canSearch={!scanning}
+              selected={pickedSet}
+              {anchor}
+              onpick={pick}
+              ondelete={askDelete}
+              onshow={showInMap}
+              onmenu={(f, x, y) => (menu = { x, y, items: duplicateMenu(f), heading: menuHeading(f.node, f.path.split(/[\\/]/).pop()) })}
+              onsearch={(min) => dupes && findDuplicates(dupes.folder, min)}
+              oncancel={stopDuplicates}
+              onclose={closeDuplicates}
+            />
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
               {generation}
