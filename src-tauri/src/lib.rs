@@ -250,6 +250,11 @@ pub fn run() {
                 state.start(app.handle(), PathBuf::from(root));
             }
             app.manage(state);
+            // "SpaceBadger v0.1.0" for a release; builds between releases
+            // carry "+dev" and the commit (see build.rs).
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_title(&format!("SpaceBadger {}", env!("SPACEBADGER_BUILD")))?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
