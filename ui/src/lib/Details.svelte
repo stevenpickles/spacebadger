@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { describeItems, exactBytes, formatBytes, plural } from "./format";
+  import { describeItems, exactBytes, formatBytes, percent, plural, shortcut } from "./format";
   import type { FolderState } from "./protocol/FolderState";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
+  import SampleList from "./SampleList.svelte";
   import type { Selection } from "./selection";
 
   interface Props {
@@ -17,15 +18,24 @@
     fileManager: string;
     /** "Recycle Bin" or "Trash". */
     trashName: string;
-    /** "Ctrl", or "⌘" on macOS. */
-    modKey: string;
+    /** Unused; key names now come from `shortcut()`. */
+    modKey?: string;
     /** Deleting is turned on for this run of the app. */
     canDelete: boolean;
     /** Why deleting isn't available now, if it isn't. */
     deleteBlocked: string | null;
+    /** Size of the selected item's parent folder, for "n% of parent folder". */
+    parentSize?: number | null;
+    /** The multi-selection totals are being recounted; `multi` is stale. */
+    updating?: boolean;
+    /** Loading the selected item's details failed. */
+    error?: string | null;
+    onretry?: () => void;
     onopen: (node: number) => void;
     onreveal: (node: number) => void;
     oncopy: (node: number) => void;
+    /** Copy the paths of every selected item. */
+    oncopypaths?: () => void;
     ondelete: () => void;
   }
 
@@ -37,15 +47,20 @@
     view,
     fileManager,
     trashName,
-    modKey,
     canDelete,
     deleteBlocked,
+    parentSize = null,
+    updating = false,
+    error = null,
+    onretry,
     onopen,
     onreveal,
     oncopy,
+    oncopypaths,
     ondelete,
   }: Props = $props();
 
+  const ROOT = 0;
 
   const folderStates: Record<FolderState, string> = {
     pending: "Still being scanned",
@@ -53,59 +68,80 @@
     failed: "Couldn't be read; contents unknown",
     notScanned: "Not scanned (scan cancelled)",
   };
+
+  const ctrl = shortcut("Ctrl");
+
+  /** Exact size, plus size on disk when it's known. */
+  function sizeTitle(logical: number, allocated: number | null): string {
+    const lines = [exactBytes(logical)];
+    if (allocated !== null) lines.push(`On disk: ${formatBytes(allocated)} (${exactBytes(allocated)})`);
+    return lines.join("\n");
+  }
 </script>
 
-{#snippet deleteActions()}
-  {#if canDelete}
-    <div class="actions delete">
-      <button type="button" class="danger" disabled={!!deleteBlocked} title={deleteBlocked} onclick={ondelete}>
-        Move to {trashName}…
-      </button>
-    </div>
-  {/if}
+{#snippet deleteAction(label: string)}
+  <div class="delete">
+    {#if canDelete}
+      <button type="button" class="danger" disabled={!!deleteBlocked} onclick={ondelete}>{label}</button>
+      {#if deleteBlocked}<p class="muted small reason">{deleteBlocked}</p>{/if}
+    {:else}
+      <button type="button" class="danger" disabled>{label}</button>
+      <p class="muted small reason">Turn on “Allow deleting” in the toolbar to use this.</p>
+    {/if}
+  </div>
 {/snippet}
 
-<section class="details" aria-label="Selected item" aria-live="polite">
+<section class="details" aria-label="Selected item">
   {#if multi && multi.items > 1}
     <h2>{plural(multi.items, "item")} selected</h2>
-    <p class="path">{describeItems(multi.items, multi.folders, multi.files)}</p>
-    <dl>
-      <dt>Allocated</dt>
-      <dd>{formatBytes(multi.allocated)} <span class="muted">({exactBytes(multi.allocated)})</span></dd>
-      <dt>Logical</dt>
-      <dd>{formatBytes(multi.logical)} <span class="muted">({exactBytes(multi.logical)})</span></dd>
-      {#if multi.unknownAllocationFiles > 0}
-        <dt>Unknown</dt>
-        <dd>{plural(multi.unknownAllocationFiles, "file")} with unknown allocation</dd>
-      {/if}
-    </dl>
-    <ul class="samples">
-      {#each multi.samples as item (item.node)}
-        <li>
-          <span class="name" title={item.path}>{item.name}{item.folder ? "/" : ""}</span>
-          <span class="size">{item.allocated === null ? "unknown" : formatBytes(item.allocated)}</span>
-        </li>
-      {/each}
-      {#if multi.items > multi.samples.length}
-        <li class="muted">and {plural(multi.items - multi.samples.length, "more item")}</li>
-      {/if}
-    </ul>
-    <p class="muted hint">{modKey}+click adds or removes items; Shift+click selects a range. Escape clears.</p>
-    {@render deleteActions()}
+    {#if updating}
+      <p class="muted small">Updating…</p>
+    {:else}
+      <p class="path">{describeItems(multi.items, multi.folders, multi.files)}</p>
+      <dl>
+        <dt>Size</dt>
+        <dd title={sizeTitle(multi.logical, multi.allocated)}>{formatBytes(multi.logical)}</dd>
+      </dl>
+      <div class="samples">
+        <SampleList samples={multi.samples} total={multi.items} />
+      </div>
+    {/if}
+    <p class="muted small hint">
+      {ctrl}+click adds or removes items; Shift+click selects a range. Escape clears.
+    </p>
+    {#if oncopypaths}
+      <div class="actions">
+        <button type="button" onclick={oncopypaths}>Copy {multi.items.toLocaleString()} paths</button>
+      </div>
+    {/if}
+    {@render deleteAction(`Move ${plural(multi.items, "item")} to the ${trashName}…`)}
   {:else if !selection}
-    <p class="muted">Select an item in the map to see its details.</p>
+    <h2>Nothing selected</h2>
+    <ul class="muted small tips">
+      <li>Click an item in the map to select it.</li>
+      <li>Double-click a folder to open it.</li>
+      <li>{ctrl}+click or Shift+click to select several.</li>
+      <li>Right-click for more actions.</li>
+    </ul>
   {:else if selection.other}
-    <h2>{other ? plural(other.items, "small item") : "Small items"}</h2>
+    <h2>Small items</h2>
     {#if details}
-      <p class="path">in {details.path}</p>
+      <p class="path selectable">in {details.path}</p>
     {/if}
     {#if other}
       <dl>
-        <dt>Combined</dt>
-        <dd>{formatBytes(other.weight)} <span class="muted">({exactBytes(other.weight)})</span></dd>
+        <dt>Size</dt>
+        <dd title={exactBytes(other.weight)}>
+          {formatBytes(other.weight)}
+          {#if details && details.logical > 0}
+            <span class="muted">· {percent(other.weight, details.logical)} of the folder</span>
+          {/if}
+        </dd>
       </dl>
+      <p class="muted small">{plural(other.items, "item")} too small to draw one by one at this size.</p>
+    {:else}
+      <p class="muted small">Items too small to draw one by one at this size.</p>
     {/if}
-    <p class="muted">They are too small to draw at this size, so they are listed below.</p>
     <div class="actions">
       {#if selection.node !== view}
         <button type="button" onclick={() => onopen(selection.node)}>Open folder in map</button>
@@ -114,41 +150,31 @@
     </div>
   {:else if details}
     <h2>{details.name}</h2>
-    <p class="path">{details.path}</p>
+    <p class="path selectable">{details.path}</p>
     <dl>
-      <dt>Type</dt>
-      <dd>{details.folder ? "Folder" : "File"}</dd>
-      <dt>Allocated</dt>
-      <dd>
-        {#if details.allocated === null}
-          Unknown
-        {:else}
-          {formatBytes(details.allocated)}
-          <span class="muted">({exactBytes(details.allocated)})</span>
+      <dt>Size</dt>
+      <dd title={sizeTitle(details.logical, details.allocated)}>
+        {formatBytes(details.logical)}
+        {#if parentSize !== null && parentSize > 0}
+          <span class="muted">· {percent(details.logical, parentSize)} of parent folder</span>
         {/if}
       </dd>
-      <dt>Logical</dt>
-      <dd>
-        {formatBytes(details.logical)} <span class="muted">({exactBytes(details.logical)})</span>
-      </dd>
+      <dt>Type</dt>
+      <dd>{details.folder ? "Folder" : "File"}</dd>
       {#if details.folder}
         <dt>Files</dt>
         <dd>{details.files.toLocaleString()}</dd>
         <dt>Status</dt>
         <dd>{folderStates[details.folder]}</dd>
       {/if}
-      {#if details.folder && details.unknownAllocationFiles > 0}
-        <dt>Unknown</dt>
-        <dd>{plural(details.unknownAllocationFiles, "file")} with unknown allocation, not in the map</dd>
-      {/if}
     </dl>
     {#if details.cloud}
-      <p class="note">Cloud file: only bytes stored on this device count as allocated.</p>
+      <p class="note">Cloud file: only the part stored on this device takes up space.</p>
     {/if}
     {#if details.aliasOf}
-      <p class="note">Hard link: its allocation is counted at {details.aliasOf}.</p>
+      <p class="note">Hard link: its size is counted once, at {details.aliasOf}.</p>
     {:else if details.hardlinked}
-      <p class="note">Hard-linked: its allocation is counted here, once.</p>
+      <p class="note">Hard-linked: its size is counted here, once.</p>
     {/if}
     <div class="actions">
       {#if details.folder && details.node !== view}
@@ -157,8 +183,21 @@
       <button type="button" onclick={() => onreveal(details.node)}>Show in {fileManager}</button>
       <button type="button" onclick={() => oncopy(details.node)}>Copy path</button>
     </div>
-    {#if details.node !== 0 && details.node !== view}
-      {@render deleteActions()}
+    {#if details.node === ROOT}
+      <p class="muted small reason">This is the scanned folder itself, so it can't be moved to the {trashName} from here.</p>
+    {:else if details.node === view}
+      <p class="muted small reason">
+        This is the folder you're viewing. Go up a level to move it to the {trashName}.
+      </p>
+    {:else}
+      {@render deleteAction(`Move to the ${trashName}…`)}
+    {/if}
+  {:else if error}
+    <p class="error selectable">Couldn't load details: {error}</p>
+    {#if onretry}
+      <div class="actions">
+        <button type="button" onclick={onretry}>Retry</button>
+      </div>
     {/if}
   {:else}
     <p class="muted">Loading…</p>
@@ -167,23 +206,25 @@
 
 <style>
   .details {
-    padding: 12px;
+    padding: var(--space-3);
     overflow-wrap: anywhere;
   }
   h2 {
-    margin: 0 0 4px;
-    font-size: 15px;
+    margin: 0 0 var(--space-1);
+    font-size: 13px;
+    font-weight: 600;
+  }
+  p {
+    margin: 0 0 var(--space-2);
   }
   .path {
-    margin: 0 0 10px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--muted);
-    user-select: text;
   }
   dl {
     display: grid;
     grid-template-columns: auto 1fr;
-    gap: 4px 10px;
+    gap: var(--space-1) 10px;
     margin: 0 0 10px;
   }
   dt {
@@ -193,45 +234,27 @@
     margin: 0;
   }
   .note {
-    margin: 0 0 8px;
-    font-size: 12px;
-  }
-  .muted {
-    color: var(--muted);
+    font-size: var(--fs-sm);
   }
   .actions {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
   }
-  .actions.delete {
-    margin-top: 8px;
+  .delete {
+    margin-top: var(--space-2);
   }
-  .danger {
-    color: var(--danger);
+  .reason {
+    margin: var(--space-1) 0 0;
   }
   .samples {
-    margin: 0 0 8px;
-    padding: 0;
-    list-style: none;
-    font-size: 12px;
+    margin: 0 0 var(--space-2);
   }
-  .samples li {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
+  .tips {
+    margin: 0;
+    padding-left: 18px;
   }
-  .samples .name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .samples .size {
-    flex: none;
-    font-variant-numeric: tabular-nums;
-  }
-  .hint {
-    margin: 0 0 4px;
-    font-size: 12px;
+  .tips li + li {
+    margin-top: 2px;
   }
 </style>
