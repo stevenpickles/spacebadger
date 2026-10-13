@@ -133,11 +133,17 @@
         ask = null;
         signal.removeEventListener("abort", stop);
         resolve(yes);
-        list?.focus();
       };
       const stop = () => answer(false);
       signal.addEventListener("abort", stop);
-      ask = { count, answer };
+      // Answering with a button hands the focus back to the list.
+      ask = {
+        count,
+        answer: (yes) => {
+          answer(yes);
+          list?.focus();
+        },
+      };
     });
   }
 
