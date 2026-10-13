@@ -32,7 +32,7 @@
     /** Running as administrator or root. */
     privileged: boolean;
     /** Groups of duplicates the delete would leave with no copy. */
-    duplicates?: DuplicatesCheck | null;
+    duplicates?: DuplicatesCheck | "unknown" | null;
     /** The delete is running. */
     busy: boolean;
     /** Set once the delete has finished: the dialog then shows the outcome. */
@@ -86,13 +86,17 @@
   );
   const contents = $derived(describeItems(summary.items, summary.folders, summary.files));
 
-  const lostGroups = $derived(duplicates ? duplicates.allSelected + duplicates.keptGone : 0);
+  const checked = $derived(typeof duplicates === "object" ? duplicates : null);
+  const lostGroups = $derived(checked ? checked.allSelected + checked.keptGone : 0);
+  /** Some groups of duplicates weren't checked; say so. */
+  const unchecked = $derived(duplicates === "unknown" || (checked?.unchecked ?? 0) > 0);
 
   /** Every warning paragraph, for aria-describedby. */
   const describedBy = $derived(
     [
       `${id}-what`,
       lostGroups > 0 ? `${id}-duplicates` : "",
+      unchecked ? `${id}-unchecked` : "",
       summary.folders > 0 ? `${id}-folders` : "",
       `${id}-skip`,
       privileged ? `${id}-admin` : "",
@@ -208,21 +212,27 @@
     <div class="samples">
       <SampleList samples={summary.samples} total={summary.items} paths />
     </div>
-    {#if duplicates && lostGroups > 0}
+    {#if checked && lostGroups > 0}
       <div class="warning" id="{id}-duplicates">
         <p>
-          This deletes every copy in {plural(lostGroups, "group")} of duplicates{#if duplicates.keptGone > 0}{duplicates.allSelected >
+          This deletes every copy in {plural(lostGroups, "group")} of duplicates{#if checked.keptGone > 0}{checked.allSelected >
             0
-              ? `; in ${plural(duplicates.keptGone, "group")}, the copies left out`
+              ? `; in ${plural(checked.keptGone, "group")}, the copies left out`
               : ": the copies left out"} are gone or changed since they were compared{/if}. Nothing of
           {lostGroups === 1 ? "it" : "them"} would remain outside the {trashName}.
         </p>
         <ul class="small">
-          {#each duplicates.examples as path (path)}
+          {#each checked.examples as path (path)}
             <li class="selectable"><PathText {path} /></li>
           {/each}
         </ul>
       </div>
+    {/if}
+    {#if unchecked}
+      <p class="muted small" id="{id}-unchecked">
+        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time: make sure a copy of
+        each stays.
+      </p>
     {/if}
     {#if summary.folders > 0}
       <p class="warning" id="{id}-folders">

@@ -114,7 +114,7 @@
     nodes: number[];
     summary: SelectionSummary;
     /** Groups of duplicates the delete would leave with no copy. */
-    duplicates: DuplicatesCheck | null;
+    duplicates: DuplicatesCheck | "unknown" | null;
   } | null>(null);
   let deleting = $state(false);
   /** What the last delete did, shown in the dialog until it's closed. */
@@ -557,6 +557,18 @@
     }
   }
 
+  /** How long the delete dialog waits for the duplicates check, which
+   * looks at files on disk and can be slow on a network share. */
+  const DUPLICATES_CHECK_WAIT = 2000;
+
+  /** Whether deleting `nodes` loses every copy of some duplicates;
+   * "unknown" if that couldn't be told in time. */
+  function checkDuplicates(gen: number, job: number, nodes: number[]): Promise<DuplicatesCheck | "unknown" | null> {
+    const late = new Promise<"unknown">((resolve) => setTimeout(() => resolve("unknown"), DUPLICATES_CHECK_WAIT));
+    const check = duplicatesCheck({ generation: gen, job, nodes }).catch(() => "unknown" as const);
+    return Promise.race([check, late]);
+  }
+
   async function askDelete() {
     const gen = generation;
     const nodes = deleteTargets();
@@ -575,7 +587,7 @@
       const job = dupes?.job;
       const [summary, duplicates] = await Promise.all([
         selectionSummary({ generation: gen, nodes }),
-        job === undefined ? null : duplicatesCheck({ generation: gen, job, nodes }).catch(() => null),
+        job === undefined ? null : checkDuplicates(gen, job, nodes),
       ]);
       if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary, duplicates };
     } catch (e) {
