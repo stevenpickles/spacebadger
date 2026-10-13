@@ -6,12 +6,14 @@ use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::selection;
+use sb_core::suggest::NameIndex;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -39,7 +41,18 @@ pub struct Session {
     deleting: Mutex<()>,
     /// The files under the folder last asked for, ranked by size.
     folder_files: Mutex<Option<FolderFiles>>,
+    /// Folder names and extensions for the filter's completion.
+    names: Mutex<Option<Names>>,
 }
+
+struct Names {
+    revision: u64,
+    built: Instant,
+    index: Arc<NameIndex>,
+}
+
+/// While scanning, the completion index is rebuilt at most this often.
+const NAMES_REFRESH: Duration = Duration::from_secs(2);
 
 struct FolderFiles {
     /// What the ranking was made from: folder, scan revision, search and
@@ -81,6 +94,7 @@ impl Session {
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
             folder_files: Mutex::new(None),
+            names: Mutex::new(None),
         }
     }
 
@@ -196,7 +210,7 @@ impl Session {
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
         let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
         let superseded = || format!("search {id} was replaced by a newer one");
-        let Some(matcher) = Matcher::new(query) else {
+        let Some(matcher) = Matcher::parse(query)? else {
             let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
@@ -361,6 +375,46 @@ impl Session {
             files,
             empty: cached.empty as u32,
         })
+    }
+
+    /// Folder names or extensions for the filter's completion, largest
+    /// first. The index is rebuilt when the scan has changed, but during a
+    /// scan at most every [`NAMES_REFRESH`].
+    pub fn suggest(&self, req: &proto::SuggestRequest) -> Result<Vec<proto::Suggestion>, String> {
+        let progress = self.scan.progress();
+        let scanning = matches!(progress.state, ScanState::Scanning);
+        let index = {
+            let mut names = self
+                .names
+                .lock()
+                .map_err(|_| "suggestions are unavailable")?;
+            let fresh = names.as_ref().is_some_and(|n| {
+                n.revision == progress.revision || (scanning && n.built.elapsed() < NAMES_REFRESH)
+            });
+            if !fresh {
+                let tree = self.scan.tree();
+                let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+                *names = Some(Names {
+                    revision: progress.revision,
+                    built: Instant::now(),
+                    index: Arc::new(NameIndex::build(&tree)),
+                });
+            }
+            Arc::clone(&names.as_ref().expect("just built").index)
+        };
+        let limit = req.limit.min(50) as usize;
+        let found = match req.kind {
+            proto::SuggestKind::Folder => index.folders(&req.typed, limit),
+            proto::SuggestKind::Extension => index.extensions(&req.typed, limit),
+        };
+        Ok(found
+            .into_iter()
+            .map(|e| proto::Suggestion {
+                name: e.name.clone(),
+                count: e.count,
+                logical: e.logical,
+            })
+            .collect())
     }
 
     /// A page of the items merged into a small-items region.
@@ -733,6 +787,42 @@ mod tests {
         tree.children(parent)
             .find(|&c| tree.name(c) == name)
             .unwrap()
+    }
+
+    #[test]
+    fn suggests_folder_names_and_extensions_from_the_scan() {
+        let tmp = fixture_named("suggest");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ask = |kind, typed: &str| {
+            session
+                .suggest(&proto::SuggestRequest {
+                    generation: session.generation(),
+                    kind,
+                    typed: typed.to_owned(),
+                    limit: 10,
+                })
+                .unwrap()
+        };
+        let folders = ask(proto::SuggestKind::Folder, "LO");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(
+            (
+                folders[0].name.as_str(),
+                folders[0].count,
+                folders[0].logical
+            ),
+            ("logs", 1, 5000)
+        );
+        let exts = ask(proto::SuggestKind::Extension, "");
+        let exts: Vec<_> = exts.iter().map(|e| (e.name.as_str(), e.count)).collect();
+        assert_eq!(exts, [("log", 2), ("txt", 1)]);
     }
 
     #[test]
