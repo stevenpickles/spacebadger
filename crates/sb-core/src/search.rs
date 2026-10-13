@@ -236,12 +236,22 @@ impl Matcher {
     /// makes a folder pattern, `is:` names a file type, and `size:`,
     /// `older:`, and `newer:` restrict by size and age, counted from now.
     /// Fails on an unknown or ambiguous type or a malformed size or age.
+    ///
+    /// Dates such as `older:2024-01-01` start at midnight UTC here; the app
+    /// uses [`Matcher::parse_at`] to start them at local midnight instead.
     pub fn parse(query: &str) -> Result<Option<Self>, String> {
-        Self::parse_at(query, SystemTime::now())
+        Self::parse_at(query, SystemTime::now(), &utc_midnight)
     }
 
-    /// [`Matcher::parse`] with ages counted back from `now`.
-    pub fn parse_at(query: &str, now: SystemTime) -> Result<Option<Self>, String> {
+    /// [`Matcher::parse`] with ages counted back from `now`, and dates
+    /// starting at the moment `midnight(year, month, day)` gives, in seconds
+    /// since the Unix epoch. It's only asked about real dates; `None` makes
+    /// the date an error.
+    pub fn parse_at(
+        query: &str,
+        now: SystemTime,
+        midnight: &dyn Fn(i32, u32, u32) -> Option<i64>,
+    ) -> Result<Option<Self>, String> {
         let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let mut include = Vec::new();
         let mut exclude = Vec::new();
@@ -270,7 +280,7 @@ impl Matcher {
                         strip_prefix_ignore_case(term, prefix).map(|value| (value, older))
                     });
             if let Some((value, older)) = age {
-                if let Some(range) = age_range(value.trim(), older, now)? {
+                if let Some(range) = age_range(value.trim(), older, now, midnight)? {
                     ages.push(range.negated(excluded));
                 }
                 continue;
@@ -586,16 +596,30 @@ const DAY: u64 = 86_400;
 /// The range of modified times an `older:` or `newer:` value describes, in
 /// seconds since the Unix epoch, counted back from `now`: a duration such
 /// as `30d`, `6mo`, or `1y` (a month is 30 days, a year 365), or a date
-/// such as `2024-01-01`, taken as midnight UTC. Older is strictly before
-/// that moment; newer is at or after it. `None` while it's still being
-/// typed.
-fn age_range(value: &str, older: bool, now: u64) -> Result<Option<Range>, String> {
+/// such as `2024-01-01`, starting when `midnight` says. Older is strictly
+/// before that moment; newer is at or after it. `None` while it's still
+/// being typed, including a date such as `2024-06-`.
+///
+/// The tree keeps times before 1970 as 1 (see
+/// [`crate::tree::epoch_seconds`]), so moments before 1970 aren't told
+/// apart: `older:1960-01-01` matches every file from before 1970.
+fn age_range(
+    value: &str,
+    older: bool,
+    now: u64,
+    midnight: &dyn Fn(i32, u32, u32) -> Option<i64>,
+) -> Result<Option<Range>, String> {
     if value.is_empty() {
         return Ok(None);
     }
     let keyword = if older { "older" } else { "newer" };
     let moment = if let Some(day) = date(value) {
-        day.ok_or_else(|| format!("“{keyword}:{value}” isn't a real date."))?
+        let secs = day
+            .and_then(|(y, m, d)| midnight(y, m, d))
+            .ok_or_else(|| format!("“{keyword}:{value}” isn't a real date."))?;
+        u64::try_from(secs).unwrap_or(0)
+    } else if date_prefix(value) {
+        return Ok(None);
     } else {
         let (number, unit) = split_number(value);
         let unit_secs = match unit.to_ascii_lowercase().as_str() {
@@ -624,16 +648,17 @@ fn age_range(value: &str, older: bool, now: u64) -> Result<Option<Range>, String
         }
     };
     Ok(Some(if older {
-        Range::below(moment)
+        // Stored pre-1970 times (1) are older than any moment from 1970 on.
+        Range::below(moment.max(2))
     } else {
         Range::new(moment, u64::MAX)
     }))
 }
 
-/// Midnight UTC of a `YYYY-MM-DD` date, in seconds since the Unix epoch
-/// (0 for dates before 1970). `None` when `text` isn't shaped like a date;
-/// `Some(None)` when it is but the date doesn't exist.
-fn date(text: &str) -> Option<Option<u64>> {
+/// The year, month, and day of a `YYYY-MM-DD` date. `None` when `text`
+/// isn't shaped like a date; `Some(None)` when it is but the date doesn't
+/// exist.
+fn date(text: &str) -> Option<Option<(i32, u32, u32)>> {
     let mut parts = text.split('-');
     let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
     let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
@@ -642,7 +667,7 @@ fn date(text: &str) -> Option<Option<u64>> {
     if parts.next().is_some() || !digits(y, 4..=4) || !digits(m, 1..=2) || !digits(d, 1..=2) {
         return None;
     }
-    let (y, m, d): (i64, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let (y, m, d): (i32, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let days_in_month = match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -651,18 +676,36 @@ fn date(text: &str) -> Option<Option<u64>> {
         2 => 28,
         _ => return Some(None),
     };
-    if d == 0 || d > days_in_month {
-        return Some(None);
+    Some((1..=days_in_month).contains(&d).then_some((y, m, d)))
+}
+
+/// Whether `text` is the start of a `YYYY-MM-DD` date still being typed:
+/// `2024`, `2024-`, `2024-0`, `2024-06`, or `2024-06-`.
+fn date_prefix(text: &str) -> bool {
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    let parts: Vec<&str> = text.split('-').collect();
+    match parts[..] {
+        [y] => digits(y, 4..=4),
+        [y, m] => digits(y, 4..=4) && digits(m, 0..=2),
+        [y, m, ""] => digits(y, 4..=4) && digits(m, 1..=2),
+        _ => false,
     }
+}
+
+/// Midnight UTC of a date, in seconds since the Unix epoch (negative
+/// before 1970). The resolver [`Matcher::parse`] uses.
+pub fn utc_midnight(year: i32, month: u32, day: u32) -> Option<i64> {
     // Days since 1970-01-01, after Howard Hinnant's days_from_civil: years
     // start in March, so the leap day falls at the end of one.
-    let y = if m <= 2 { y - 1 } else { y };
+    let y = i64::from(year) - i64::from(month <= 2);
     let era = y.div_euclid(400);
     let year_of_era = y - era * 400;
-    let day_of_year = (153 * i64::from((m + 9) % 12) + 2) / 5 + i64::from(d) - 1;
+    let day_of_year = (153 * i64::from((month + 9) % 12) + 2) / 5 + i64::from(day) - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
-    Some(Some(u64::try_from(days).map_or(0, |days| days * DAY)))
+    Some(days * DAY as i64)
 }
 
 /// `text` without `prefix`, compared ignoring ASCII case.
@@ -1498,6 +1541,11 @@ mod tests {
             "size:10MB..",
             "older:",
             "!newer: ",
+            "older:2024",
+            "older:2024-",
+            "older:2024-0",
+            "newer:2024-06",
+            "newer:2024-06-",
         ] {
             assert!(Matcher::parse(typing).unwrap().is_none(), "{typing:?}");
         }
@@ -1508,7 +1556,7 @@ mod tests {
         let now = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
         let m = |q: &str, age_days: Option<u32>| {
             let modified = age_days.map(|d| 1_800_000_000 - d * 86_400);
-            Matcher::parse_at(q, now)
+            Matcher::parse_at(q, now, &utc_midnight)
                 .unwrap()
                 .unwrap()
                 .matches_file("a".as_ref(), 0, modified)
@@ -1538,15 +1586,48 @@ mod tests {
         let m = Matcher::new("newer:2024-06-30").unwrap();
         assert!(m.matches_file("a".as_ref(), 0, Some(1_719_705_600)));
         assert!(!m.matches_file("a".as_ref(), 0, Some(1_719_705_599)));
-        assert_eq!(date("1970-01-01"), Some(Some(0)));
-        assert_eq!(date("2000-03-01"), Some(Some(951_868_800)));
-        assert_eq!(date("2024-02-29"), Some(Some(1_709_164_800)));
-        assert_eq!(
-            date("1969-12-31"),
-            Some(Some(0)),
-            "before 1970 reads as 1970"
-        );
+        assert_eq!(date("2024-2-29"), Some(Some((2024, 2, 29))));
+        assert_eq!(date("2023-02-29"), Some(None));
         assert_eq!(date("30d"), None);
+        assert_eq!(utc_midnight(1970, 1, 1), Some(0));
+        assert_eq!(utc_midnight(2000, 3, 1), Some(951_868_800));
+        assert_eq!(utc_midnight(2024, 2, 29), Some(1_709_164_800));
+        assert_eq!(utc_midnight(1969, 12, 31), Some(-86_400));
+    }
+
+    #[test]
+    fn dates_start_when_the_resolver_says() {
+        // A resolver for a zone eight hours behind UTC.
+        let pacific = |y, m, d| utc_midnight(y, m, d).map(|s| s + 8 * 3_600);
+        let now = SystemTime::now();
+        let m = Matcher::parse_at("newer:2024-06-30", now, &pacific)
+            .unwrap()
+            .unwrap();
+        let utc_midnight_30th = 1_719_705_600;
+        assert!(!m.matches_file("a".as_ref(), 0, Some(utc_midnight_30th)));
+        assert!(m.matches_file("a".as_ref(), 0, Some(utc_midnight_30th + 8 * 3_600)));
+        let none = |_, _, _| None;
+        let err = Matcher::parse_at("older:2024-03-10", now, &none).unwrap_err();
+        assert!(err.contains("isn't a real date"), "{err}");
+    }
+
+    #[test]
+    fn times_before_1970_are_not_told_apart() {
+        // The tree stores any time before 1970 as 1.
+        let m = |q: &str, modified| {
+            Matcher::new(q)
+                .unwrap()
+                .matches_file("a".as_ref(), 0, Some(modified))
+        };
+        assert!(m("older:1970-01-02", 1));
+        assert!(
+            m("older:1960-01-01", 1),
+            "a date before 1970 still finds them"
+        );
+        assert!(!m("older:1960-01-01", 86_400));
+        assert!(m("older:200y", 1));
+        assert!(m("newer:1960-01-01", 1));
+        assert!(m("older:2200-01-01", u32::MAX), "nor after 2106");
     }
 
     #[test]
