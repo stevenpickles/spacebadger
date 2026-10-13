@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "sb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sb-core",
  "sb-protocol",
@@ -2869,11 +2869,11 @@ dependencies = [
 
 [[package]]
 name = "sb-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "sb-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "serde",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "sb-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "sb-scan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "sb-core",
@@ -3255,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "spacebadger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sb-core",
  "sb-protocol",
