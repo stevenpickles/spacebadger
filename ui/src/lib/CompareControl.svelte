@@ -67,19 +67,17 @@
     disabled={busy}
     aria-label={current ? `Comparing with the scan of ${currentWhen}` : undefined}
     title={current
-      ? `Comparing with the scan of ${currentWhen}. Click to choose another earlier scan`
+      ? `Comparing with the scan of ${currentWhen}. Click to choose another earlier scan or stop comparing`
       : "Compare this scan with an earlier scan of the same folder: what grew, shrank, or is new"}
     onclick={() => (open = !open)}
   >
     {#if busy}Comparing…{:else if current}{formatDay(current.createdMs)}{:else}Compare…{/if}
   </button>
-  {#if current}
-    <button type="button" class="icon-button" aria-label="Stop comparing" title="Stop comparing" onclick={onstop}
-      >✕</button
-    >
-  {/if}
   {#if open}
     <div class="popover" id={listId} role="group" aria-label="Earlier scans">
+      {#if current}
+        <button type="button" class="stop" onclick={() => ((open = false), onstop())}>Stop comparing</button>
+      {/if}
       <p class="muted small">Compare with an earlier scan of this folder:</p>
       <ul>
         {#each snapshots as s, i (s.id)}
@@ -93,9 +91,6 @@
           </li>
         {/each}
       </ul>
-      {#if current}
-        <button type="button" class="stop" onclick={() => ((open = false), onstop())}>Stop comparing</button>
-      {/if}
     </div>
   {/if}
 </div>
@@ -155,6 +150,6 @@
     font-weight: 600;
   }
   .stop {
-    margin-top: var(--space-2);
+    margin-bottom: var(--space-2);
   }
 </style>

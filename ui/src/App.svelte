@@ -1405,9 +1405,9 @@
      dangle at the row's start. */
   .filter {
     border-left: none;
-    flex: 1 1 200px;
+    flex: 1 1 150px;
     max-width: 420px;
-    min-width: 180px;
+    min-width: 150px;
   }
   .filter-help {
     position: relative;

@@ -99,7 +99,7 @@
         </li>
         <li class="wide muted">Deeper colors: bigger change for its size</li>
         {#if filtered}
-          <li class="wide muted">Colors show the change in all files, not only matching ones</li>
+          <li class="wide muted note">Colors show the change in all files, not only matching ones</li>
         {/if}
       {:else}
         <li class="wide">
@@ -156,6 +156,9 @@
     align-items: center;
     gap: 5px;
     white-space: nowrap;
+  }
+  li.note {
+    white-space: normal;
   }
   li.wide {
     grid-column: 1 / -1;
