@@ -255,7 +255,20 @@ impl Comparison {
                 });
             }
         }
-        out.sort_unstable_by_key(|c| (Reverse(c.delta().unsigned_abs()), c.before.is_none()));
+        // Equal changes: items that were there before, then new ones, then
+        // removed ones; each in scan order, so pages stay put.
+        out.sort_unstable_by_key(|c| {
+            let (removed, id) = match c.item {
+                Item::Current(n) => (false, n.index() as u32),
+                Item::Removed(e) => (true, e),
+            };
+            (
+                Reverse(c.delta().unsigned_abs()),
+                c.before.is_none(),
+                removed,
+                id,
+            )
+        });
         out
     }
 
