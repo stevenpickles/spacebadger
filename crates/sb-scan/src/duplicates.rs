@@ -51,6 +51,9 @@ pub enum Skip {
     Vanished,
     /// Changed since the scan: another size, or no longer a plain file.
     Changed,
+    /// Stored behind a reparse point (deduplicated, tiered, or
+    /// virtualized), so reading it raw wouldn't give its contents.
+    Special,
     /// Another program has it open and won't share it.
     InUse,
     /// No permission to read it.

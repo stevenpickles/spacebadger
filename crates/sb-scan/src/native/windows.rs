@@ -38,11 +38,11 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo,
-    FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo,
+    FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -70,6 +70,7 @@ mod tag {
     pub const LX_FIFO: u32 = 0x8000_0024;
     pub const LX_CHR: u32 = 0x8000_0025;
     pub const LX_BLK: u32 = 0x8000_0026;
+    pub const WOF: u32 = 0x8000_0017;
 
     /// `IO_REPARSE_TAG_CLOUD` and its `CLOUD_1`..`CLOUD_F` variants.
     pub fn is_cloud(tag: u32) -> bool {
@@ -179,10 +180,13 @@ fn io_error(err: &windows::core::Error) -> std::io::Error {
 
 /// Opens a file to read its contents for finding duplicates. A first open
 /// reads only attributes, which never recalls anything; a cloud file
-/// (placeholder, pinned, or offline), a link, or a file whose size changed
-/// since the scan is refused there. The open that reads is made with
-/// `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` and checked again, in case the
-/// file was replaced in between.
+/// (placeholder, pinned, or offline), a link, a file stored behind another
+/// reparse point (deduplicated, tiered, or virtualized, whose raw contents
+/// aren't the file's), or a file whose size changed since the scan is
+/// refused there. The open that reads is made with `OPEN_NO_RECALL` and
+/// (except for WOF-compressed files, which only read right through their
+/// filter) `OPEN_REPARSE_POINT`, must be the same file, and is checked
+/// again.
 pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     let skip = |e: windows::core::Error| Skip::of(&io_error(&e));
     let probe = open_with(
@@ -191,38 +195,62 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
     )
     .map_err(skip)?;
-    check_contents(&probe, len)?;
+    let compressed = check_contents(&probe, len)?;
+    let id = file_id(&probe)?;
     drop(probe);
-    let handle = open_with(
-        path,
-        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN,
-    )
-    .map_err(skip)?;
+    let mut flags = FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN;
+    if !compressed {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags).map_err(skip)?;
+    if file_id(&handle)? != id {
+        return Err(Skip::Changed);
+    }
     check_contents(&handle, len)?;
     Ok(std::fs::File::from(handle))
 }
 
-fn check_contents(handle: &OwnedHandle, len: u64) -> Result<(), Skip> {
-    let skip = |e: ScanError| match e.kind {
+/// Whether contents can be read from a handle with these attributes and
+/// reparse tag: `Ok(true)` for a WOF-compressed file, `Ok(false)` for a
+/// plain one.
+fn readable(attributes: u32, reparse_tag: u32) -> Result<bool, Skip> {
+    let reparse = attributes & attr::REPARSE_POINT != 0;
+    if attributes & attr::CLOUD != 0 || (reparse && tag::is_cloud(reparse_tag)) {
+        return Err(Skip::Cloud);
+    }
+    if classify(attributes, reparse_tag) != EntryKind::File {
+        return Err(Skip::Changed);
+    }
+    match reparse_tag {
+        _ if !reparse => Ok(false),
+        tag::WOF => Ok(true),
+        _ => Err(Skip::Special),
+    }
+}
+
+fn info_skip(e: ScanError) -> Skip {
+    match e.kind {
         ErrorKind::Vanished => Skip::Vanished,
         ErrorKind::PermissionDenied => Skip::Denied,
         _ => Skip::Unreadable,
-    };
-    let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo).map_err(skip)?;
-    let attributes = tag_info.FileAttributes;
-    let reparse = attributes & attr::REPARSE_POINT != 0;
-    if attributes & attr::CLOUD != 0 || (reparse && tag::is_cloud(tag_info.ReparseTag)) {
-        return Err(Skip::Cloud);
     }
-    if classify(attributes, tag_info.ReparseTag) != EntryKind::File {
-        return Err(Skip::Changed);
-    }
-    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(skip)?;
+}
+
+/// Checks a handle's file against the scan; see [`readable`].
+fn check_contents(handle: &OwnedHandle, len: u64) -> Result<bool, Skip> {
+    let tag_info =
+        info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo).map_err(info_skip)?;
+    let compressed = readable(tag_info.FileAttributes, tag_info.ReparseTag)?;
+    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(info_skip)?;
     if standard.EndOfFile as u64 != len {
         return Err(Skip::Changed);
     }
-    Ok(())
+    Ok(compressed)
+}
+
+fn file_id(handle: &OwnedHandle) -> Result<(u64, [u8; 16]), Skip> {
+    let id = info::<FILE_ID_INFO>(handle, FileIdInfo).map_err(info_skip)?;
+    Ok((id.VolumeSerialNumber, id.FileId.Identifier))
 }
 
 fn raw(handle: &OwnedHandle) -> HANDLE {
@@ -649,5 +677,31 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn reads_contents_only_of_plain_and_compressed_files() {
+        let rp = attr::REPARSE_POINT;
+        assert_eq!(readable(0x20, 0), Ok(false));
+        assert_eq!(readable(0x20 | rp, tag::WOF), Ok(true));
+        assert_eq!(
+            readable(0x20 | rp, 0x8000_0013),
+            Err(Skip::Special),
+            "dedup"
+        );
+        assert_eq!(readable(0x20 | rp, 0x8000_0012), Err(Skip::Special), "SIS");
+        assert_eq!(
+            readable(0x20 | rp, 0x9000_001C),
+            Err(Skip::Special),
+            "ProjFS"
+        );
+        assert_eq!(readable(0x20 | rp, 0x9000_301A), Err(Skip::Cloud));
+        assert_eq!(
+            readable(0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
+            Err(Skip::Cloud)
+        );
+        assert_eq!(readable(0x20 | attr::OFFLINE, 0), Err(Skip::Cloud));
+        assert_eq!(readable(rp, tag::SYMLINK), Err(Skip::Changed));
+        assert_eq!(readable(attr::DIRECTORY, 0), Err(Skip::Changed));
     }
 }
