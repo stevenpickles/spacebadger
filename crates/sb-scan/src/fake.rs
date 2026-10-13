@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -17,6 +18,7 @@ enum Node {
         allocated: Option<u64>,
         identity: Identity,
         cloud: bool,
+        modified: Option<SystemTime>,
     },
     Other(EntryKind),
 }
@@ -90,6 +92,7 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::Unique,
                 cloud: false,
+                modified: None,
             },
         )
     }
@@ -102,6 +105,7 @@ impl FakeFs {
                 allocated: None,
                 identity: Identity::Unique,
                 cloud: false,
+                modified: None,
             },
         )
     }
@@ -114,6 +118,7 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::Unique,
                 cloud: true,
+                modified: None,
             },
         )
     }
@@ -127,8 +132,19 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::MaybeShared { key },
                 cloud: false,
+                modified: None,
             },
         )
+    }
+
+    /// Sets the modified time of the file at `path`, added earlier.
+    pub fn set_modified(&self, path: &str, time: SystemTime) -> &Self {
+        if let Some(Node::File { modified, .. }) =
+            self.nodes.lock().unwrap().get_mut(&Self::abs(path))
+        {
+            *modified = Some(time);
+        }
+        self
     }
 
     pub fn other(&self, path: &str, kind: EntryKind) -> &Self {
@@ -213,12 +229,14 @@ impl FsAdapter for FakeFs {
                         allocated: Some(0),
                         identity: Identity::Unique,
                         cloud: false,
+                        modified: None,
                     },
                     Node::File {
                         logical,
                         allocated,
                         identity,
                         cloud,
+                        modified,
                     } => Entry {
                         name,
                         kind: EntryKind::File,
@@ -226,6 +244,7 @@ impl FsAdapter for FakeFs {
                         allocated: *allocated,
                         identity: *identity,
                         cloud: *cloud,
+                        modified: *modified,
                     },
                     Node::Other(kind) => Entry {
                         name,
@@ -234,6 +253,7 @@ impl FsAdapter for FakeFs {
                         allocated: Some(0),
                         identity: Identity::Unique,
                         cloud: false,
+                        modified: None,
                     },
                 }
             })

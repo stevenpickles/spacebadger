@@ -211,3 +211,27 @@ fn reports_volume_capacity_and_whether_the_root_is_the_volume_top() {
     assert!(volume.is_root, "{} is a volume's top folder", top.display());
     assert_eq!(volume.capacity, inside.capacity);
 }
+
+#[test]
+fn records_modified_times_from_the_listing() {
+    let tmp = TempDir::new("mtime");
+    write(&tmp.0.join("old.txt"), 3);
+    write(&tmp.0.join("sub/new.txt"), 3);
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(tmp.0.join("old.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let new = std::fs::metadata(tmp.0.join("sub/new.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let (_, tree) = scan(&tmp.0);
+    let tree = tree.read().unwrap();
+    assert_eq!(tree.modified(find(&tree, "old.txt")), Some(1_000_000_000));
+    let secs = new.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(tree.modified(find(&tree, "sub/new.txt")), Some(secs as u32));
+    assert_eq!(tree.modified(find(&tree, "sub")), None, "folders have none");
+}

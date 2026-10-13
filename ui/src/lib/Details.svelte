@@ -1,6 +1,6 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
-  import { describeItems, exactBytes, formatBytes, percent, plural, shortcut } from "./format";
+  import { describeItems, exactBytes, formatBytes, formatDate, percent, plural, shortcut } from "./format";
   import type { FolderState } from "./protocol/FolderState";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
@@ -129,6 +129,10 @@
     {/if}
     <dt>Type</dt>
     <dd>{d.folder ? "Folder" : "File"}</dd>
+    {#if !d.folder && d.modified !== null}
+      <dt>Modified</dt>
+      <dd>{formatDate(d.modified)}</dd>
+    {/if}
     {#if d.folder}
       {#if !d.matching}
         <dt>Files</dt>

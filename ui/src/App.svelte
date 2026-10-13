@@ -63,6 +63,11 @@
     ["*.js; !dir:node_modules", "JavaScript files, except inside node_modules"],
     ["is:video", "videos; also audio, image, document, archive, diskimage, program, code, other"],
     ["is:image; dir:Photos", "images inside Photos folders"],
+    ["size:>500MB", "files over 500 MB; also <, >=, <="],
+    ["size:10MB..1GB", "from 10 MB to 1 GB, both included"],
+    ["older:1y", "modified over a year ago; also h, d, w, mo"],
+    ["newer:2024-06-30", "modified on or after a date"],
+    ["*.iso; size:>1GB; older:1y", "disk images over 1 GB, untouched for a year"],
   ];
 
   let generation = $state<number | null>(null);
@@ -880,7 +885,8 @@
             <div class="popover" role="note">
               <p>
                 Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names, or
-                <code>is:</code> for a file type. Press ↓ for suggestions.
+                <code>is:</code> for a file type. <code>size:</code>, <code>older:</code>, and <code>newer:</code> narrow
+                the matches by size and modified date. Press ↓ for suggestions.
               </p>
               <dl>
                 {#each FILTER_HELP as [pattern, meaning] (pattern)}

@@ -111,6 +111,7 @@ impl FsAdapter for UnixFs {
                         allocated: None,
                         identity: Identity::Unavailable,
                         cloud: false,
+                        modified: None,
                     });
                     continue;
                 }
@@ -142,6 +143,7 @@ impl FsAdapter for UnixFs {
                     Identity::Unique
                 },
                 cloud: is_cloud(&meta),
+                modified: meta.modified().ok(),
             });
         }
         Ok(entries)
