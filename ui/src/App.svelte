@@ -304,13 +304,11 @@
     pick({ focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false });
   }
 
-  // A different scan or filter starts with nothing selected.
+  // A different scan or filter starts with nothing selected; the focused
+  // item may no longer be drawn.
   $effect(() => {
     void [generation, searchId];
-    untrack(() => {
-      picked = [];
-      anchor = null;
-    });
+    untrack(() => pick(null));
   });
 
   // Totals for several selected items follow the scan.
