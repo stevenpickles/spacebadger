@@ -113,6 +113,11 @@
   /** The first page of a new list scrolls to an item already selected. */
   let revealed = false;
 
+  /** Counts fresh starts of the list. Requests carry it, so going back to
+   * an earlier folder, filter, or mode fetches again, and replies to an
+   * earlier start are dropped. */
+  let epoch = $state(0);
+
   // A different folder, filter, mode, or scan starts at the top.
   let shown = "";
   $effect(() => {
@@ -124,21 +129,22 @@
     empty = 0;
     error = null;
     revealed = false;
+    epoch++;
     list?.reset();
   });
 
   // Fetch the pages covering the visible rows; refetch on every revision.
   let loaded = new Set<string>();
   $effect(() => {
-    const want = `${generation}/${folder}/${search}/${folders}`;
-    const tag = `${want}/${revision}/${attempt}`;
+    const mine = epoch;
+    const tag = `${mine}/${revision}/${attempt}`;
     for (let p = Math.floor(first / PAGE); p * PAGE < Math.max(last, 1); p++) {
       const key = `${tag}/${p}`;
       if (loaded.has(key)) continue;
       loaded.add(key);
       fetchPage(p * PAGE).then(
         (page) => {
-          if (want !== `${generation}/${folder}/${search}/${folders}`) return;
+          if (mine !== epoch) return;
           const next = new Map(rows);
           page.rows.forEach((r, i) => next.set(page.offset + i, r));
           // Rows past a shrunken end would linger otherwise.
@@ -156,7 +162,7 @@
         },
         (e: unknown) => {
           loaded.delete(key);
-          if (want === `${generation}/${folder}/${search}/${folders}`) error = errorText(e);
+          if (mine === epoch) error = errorText(e);
         },
       );
     }
