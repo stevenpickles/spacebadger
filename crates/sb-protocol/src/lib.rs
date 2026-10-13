@@ -358,6 +358,44 @@ pub struct FolderFilesPage {
     pub empty: u32,
 }
 
+/// What the filter's completion is suggesting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SuggestKind {
+    /// Folder names, for `dir:`.
+    Folder,
+    /// File extensions, for `*.`.
+    Extension,
+}
+
+/// Asks for folder names or extensions in the scan that start with or
+/// contain `typed`, ignoring case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SuggestRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub kind: SuggestKind,
+    pub typed: String,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Suggestion {
+    /// A folder name, or an extension without its dot.
+    pub name: String,
+    /// Folders with this name, or files with this extension.
+    pub count: u32,
+    /// Logical bytes in them; a folder name counts nested folders of the
+    /// same name once.
+    #[ts(type = "number")]
+    pub logical: u64,
+}
+
 /// Capacity of the volume holding the scan root, for the volume overview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

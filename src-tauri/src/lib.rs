@@ -15,7 +15,7 @@ use sb_protocol::{
     AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
     NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
     SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
-    SmallItemsRequest, VolumeInfo,
+    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -170,6 +170,20 @@ async fn folder_files(
 ) -> Result<FolderFilesPage, String> {
     let session = state.session(request.generation)?;
     tauri::async_runtime::spawn_blocking(move || session.folder_files(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Folder names or extensions from the scan for the filter's completion.
+/// The first call after a change indexes the whole tree, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn filter_suggest(
+    state: State<'_, AppState>,
+    request: SuggestRequest,
+) -> Result<Vec<Suggestion>, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.suggest(&request))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -343,6 +357,7 @@ pub fn run() {
             search_results,
             small_items,
             folder_files,
+            filter_suggest,
             volume_info,
             selection_summary,
             set_delete_allowed,

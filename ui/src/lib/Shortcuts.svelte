@@ -41,7 +41,9 @@
     {
       title: "Anywhere",
       keys: [
-        ["Escape in the filter", "Clear the filter"],
+        ["↓, Ctrl+Space", "Show filter suggestions"],
+        ["Enter, Tab", "Use a filter suggestion"],
+        ["Escape in the filter", "Close the suggestions, then clear the filter"],
         ["?", "Show this list"],
       ],
     },

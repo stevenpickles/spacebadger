@@ -17,6 +17,8 @@ import type { SelectionRequest } from "./protocol/SelectionRequest";
 import type { SelectionSummary } from "./protocol/SelectionSummary";
 import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
+import type { SuggestRequest } from "./protocol/SuggestRequest";
+import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 
 export const EXPECTED_PROTOCOL_VERSION = 4;
@@ -137,4 +139,9 @@ export function onScanStatus(handler: (status: ScanStatus) => void): Promise<Unl
 export function errorText(e: unknown): string {
   const text = e instanceof Error ? e.message : String(e);
   return text.replace(/^Error:\s*/, "").trim() || "Unknown error";
+}
+
+/** Folder names or extensions in the scan, for the filter's completion. */
+export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
+  return invoke<Suggestion[]>("filter_suggest", { request });
 }

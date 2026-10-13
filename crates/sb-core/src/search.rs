@@ -6,7 +6,9 @@
 //! containing it. A leading `!` excludes. A pattern starting with `dir:`
 //! matches folder names instead: a file then matches only inside a folder
 //! (at any depth below the scan root) that matches one, and `!dir:` leaves
-//! out files inside matching folders. Full paths are never matched, and file
+//! out files inside matching folders. `is:video` (or any [`FileType`]
+//! keyword) matches files of that type, like an included pattern, and
+//! `!is:` leaves a type out. Full paths are never matched, and file
 //! contents are never read.
 //!
 //! [`Search`] keeps its own totals for matching files and every folder above
@@ -17,6 +19,7 @@
 //! matches. Hard-link ownership is kept: an alias that matches contributes
 //! its logical length but no allocation, exactly as in the tree.
 
+use crate::filetype::FileType;
 use crate::layout::Metric;
 use crate::tree::{NodeId, Tree};
 use std::ffi::OsStr;
@@ -38,6 +41,8 @@ pub struct Matcher {
     /// `dir:` patterns, matched against folder names.
     dir_include: Vec<Pattern>,
     dir_exclude: Vec<Pattern>,
+    /// `is:` file types; an included type counts like an included pattern.
+    types: TypeSet,
     /// Every pattern is ASCII, so ASCII names can be matched bytewise.
     ascii: bool,
     /// Some pattern has `?`, so non-ASCII names are needed as characters.
@@ -200,20 +205,41 @@ fn wildcard<T: Copy + PartialEq>(
 }
 
 impl Matcher {
-    /// `None` when the query has no patterns. Patterns are separated by `;`
-    /// and trimmed; a leading `!` excludes, and a `dir:` prefix (any case)
-    /// makes a folder pattern.
+    /// `None` when the query has no patterns; an unknown `is:` type counts
+    /// as none. Use [`Matcher::parse`] to report it.
     pub fn new(query: &str) -> Option<Self> {
+        Self::parse(query).ok().flatten()
+    }
+
+    /// `Ok(None)` when the query has no patterns. Patterns are separated by
+    /// `;` and trimmed; a leading `!` excludes, a `dir:` prefix (any case)
+    /// makes a folder pattern, and `is:` names a file type. Fails on an
+    /// unknown or ambiguous type.
+    pub fn parse(query: &str) -> Result<Option<Self>, String> {
         let mut include = Vec::new();
         let mut exclude = Vec::new();
         let mut dir_include = Vec::new();
         let mut dir_exclude = Vec::new();
+        let mut types = TypeSet::default();
         for term in query.split(';') {
             let term = term.trim();
             let (excluded, term) = match term.strip_prefix('!') {
                 Some(rest) => (true, rest.trim_start()),
                 None => (false, term),
             };
+            if let Some(word) = strip_prefix_ignore_case(term, "is:") {
+                let word = word.trim();
+                // "is:" alone, still being typed, is no pattern yet.
+                if !word.is_empty() {
+                    let t = FileType::from_keyword(word)?;
+                    if excluded {
+                        types.exclude |= TypeSet::bit(t);
+                    } else {
+                        types.include |= TypeSet::bit(t);
+                    }
+                }
+                continue;
+            }
             let (folder, term) = match strip_prefix_ignore_case(term, "dir:") {
                 Some(rest) => (true, rest.trim_start()),
                 None => (false, term),
@@ -235,31 +261,46 @@ impl Matcher {
                 .chain(&dir_include)
                 .chain(&dir_exclude)
         };
-        // No patterns at all.
-        all().next()?;
+        if all().next().is_none() && types.is_empty() {
+            return Ok(None);
+        }
         let ascii = all().all(|p| p.text().is_ascii());
         let globs = all().any(|p| matches!(p, Pattern::Glob { .. }));
-        Some(Self {
+        Ok(Some(Self {
             query: query.to_owned(),
             include,
             exclude,
             dir_include,
             dir_exclude,
+            types,
             ascii,
             globs,
-        })
+        }))
     }
 
     pub fn query(&self) -> &str {
         &self.query
     }
 
-    /// Whether a file name passes the file patterns. The folder patterns
-    /// are applied by [`Search`], which knows where the file is.
+    /// Whether a file name passes the file patterns, taking its type from
+    /// the name alone. See [`Matcher::matches_file`].
     pub fn matches(&self, name: &OsStr) -> bool {
+        self.matches_file(name, 0)
+    }
+
+    /// Whether a file passes the file patterns and `is:` types; `len` only
+    /// settles `.ts` (see [`FileType::of`]). The folder patterns are applied
+    /// by [`Search`], which knows where the file is.
+    pub fn matches_file(&self, name: &OsStr, len: u64) -> bool {
+        let kind = || TypeSet::bit(FileType::of(name, len));
+        let any_include = !self.include.is_empty() || self.types.include != 0;
         self.with_name(name, |test| {
-            (self.include.is_empty() || self.include.iter().any(test))
-                && !self.exclude.iter().any(test)
+            let included = !any_include
+                || self.include.iter().any(test)
+                || (self.types.include != 0 && self.types.include & kind() != 0);
+            let excluded = self.exclude.iter().any(test)
+                || (self.types.exclude != 0 && self.types.exclude & kind() != 0);
+            included && !excluded
         })
     }
 
@@ -298,6 +339,23 @@ impl Matcher {
     /// Whether a file inside folders described by `scope` can match.
     fn in_scope(&self, scope: FolderMatch) -> bool {
         (self.dir_include.is_empty() || scope.included) && !scope.excluded
+    }
+}
+
+/// Included and excluded file types, one bit per [`FileType`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TypeSet {
+    include: u16,
+    exclude: u16,
+}
+
+impl TypeSet {
+    fn bit(t: FileType) -> u16 {
+        1 << (t as u8)
+    }
+
+    fn is_empty(self) -> bool {
+        self.include == 0 && self.exclude == 0
     }
 }
 
@@ -442,7 +500,9 @@ impl Search {
                 }
             } else if !tree.is_removed(node)
                 && self.matcher.in_scope(outer)
-                && self.matcher.matches(tree.name(node))
+                && self
+                    .matcher
+                    .matches_file(tree.name(node), tree.logical(node))
             {
                 self.add(tree, node);
             }
@@ -975,5 +1035,55 @@ mod tests {
             .unwrap();
         assert!(s.catch_up(&t, usize::MAX));
         assert_eq!(names(&s, &t), ["a.js"]);
+    }
+
+    #[test]
+    fn is_keywords_match_file_types() {
+        let mut t = Tree::new("/r");
+        let dl = t.add_dir(NodeId::ROOT, "Downloads".as_ref()).unwrap();
+        for (dir, name, len) in [
+            (dl, "film.mkv", 900),
+            (dl, "photo.JPG", 50),
+            (dl, "notes.pdf", 10),
+            (NodeId::ROOT, "clip.mp4", 700),
+            (NodeId::ROOT, "app.ts", 2),
+            (NodeId::ROOT, "stream.ts", 2 << 20),
+        ] {
+            t.add_file(dir, name.as_ref(), sizes(len, 4096), 0).unwrap();
+        }
+
+        let s = search("is:video", &t);
+        assert_eq!(
+            names(&s, &t),
+            ["clip.mp4", "film.mkv", "stream.ts"],
+            "a large .ts is video"
+        );
+        let s = search("IS:Image; is:document", &t);
+        assert_eq!(names(&s, &t), ["notes.pdf", "photo.JPG"]);
+        let s = search("is:video; dir:downloads", &t);
+        assert_eq!(names(&s, &t), ["film.mkv"]);
+        let s = search("*.pdf; is:image", &t);
+        assert_eq!(
+            names(&s, &t),
+            ["notes.pdf", "photo.JPG"],
+            "a type adds to name patterns"
+        );
+        let s = search("!is:video", &t);
+        assert_eq!(names(&s, &t), ["app.ts", "notes.pdf", "photo.JPG"]);
+        let s = search("is:vid", &t);
+        assert_eq!(s.matches().len(), 3, "an unambiguous start of a type works");
+
+        assert!(
+            Matcher::parse("is:").unwrap().is_none(),
+            "is: alone is no pattern yet"
+        );
+        let err = Matcher::parse("*.jpg; is:vidoe").unwrap_err();
+        assert!(
+            err.contains("isn't a file type") && err.contains("video"),
+            "{err}"
+        );
+        let err = Matcher::parse("is:d").unwrap_err();
+        assert!(err.contains("document or diskimage"), "{err}");
+        assert!(Matcher::new("is:vidoe").is_none());
     }
 }
