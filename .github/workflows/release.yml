@@ -222,3 +222,14 @@ jobs:
             --verify-tag \
             --title "SpaceBadger $VERSION" \
             --notes-file notes/release-notes.md
+
+  # winget and Chocolatey; each submits only when its secret is set.
+  packages:
+    name: Package managers
+    needs: [prepare, publish]
+    uses: ./.github/workflows/packages.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+    secrets:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}

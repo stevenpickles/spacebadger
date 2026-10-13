@@ -1,0 +1,114 @@
+name: Packages
+
+# Builds the winget manifests and the Chocolatey package for a published
+# release and submits them: a pull request to microsoft/winget-pkgs when the
+# WINGET_TOKEN secret is set, and a push to the Chocolatey community
+# repository when CHOCO_API_KEY is set. Without the secrets it only builds and
+# validates them and attaches them to the run, so they can be submitted by
+# hand.
+#
+# The release workflow calls this after publishing. (A release created with
+# the workflow's own token doesn't start other workflows, so `release:
+# published` would never fire.) Run it by hand for an existing release from
+# the Actions tab. See docs/RELEASING.md#package-managers.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Released version (x.y.z)
+        required: true
+        type: string
+    secrets:
+      WINGET_TOKEN:
+        required: false
+      CHOCO_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released version (x.y.z), already published on GitHub
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version }}
+  WINGETCREATE_VERSION: 1.12.13.0
+  WINGETCREATE_SHA256: 24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea
+
+jobs:
+  winget:
+    name: winget
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Manifests
+        id: manifests
+        shell: bash
+        run: echo "dir=$(scripts/release/winget.sh "$VERSION")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: winget-manifests
+          path: ${{ steps.manifests.outputs.dir }}
+          if-no-files-found: error
+
+      - name: Install wingetcreate
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP wingetcreate.exe
+          Invoke-WebRequest -OutFile $exe `
+            "https://github.com/microsoft/winget-create/releases/download/v$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          if ((Get-FileHash -Algorithm SHA256 $exe).Hash -ne $env:WINGETCREATE_SHA256) {
+            throw "wingetcreate.exe checksum mismatch"
+          }
+          "WINGETCREATE=$exe" >> $env:GITHUB_ENV
+
+      - name: Submit to winget-pkgs
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          MANIFESTS: ${{ steps.manifests.outputs.dir }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            "::notice::WINGET_TOKEN isn't set; skipping the winget-pkgs pull request. The manifests are attached to this run."
+            exit 0
+          }
+          & $env:WINGETCREATE submit --no-open --token $env:WINGET_TOKEN `
+            --prtitle "New version: StevenPickles.SpaceBadger version $env:VERSION" `
+            $env:MANIFESTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  chocolatey:
+    name: Chocolatey
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Package
+        shell: bash
+        run: |
+          nuspec=$(scripts/release/chocolatey.sh "$VERSION")
+          choco pack "$nuspec" --output-directory dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chocolatey-package
+          path: dist/spacebadger.${{ inputs.version }}.nupkg
+          if-no-files-found: error
+
+      - name: Push to the Chocolatey community repository
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if (-not $env:CHOCO_API_KEY) {
+            "::notice::CHOCO_API_KEY isn't set; skipping choco push. The package is attached to this run."
+            exit 0
+          }
+          choco push "dist/spacebadger.$env:VERSION.nupkg" `
+            --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
