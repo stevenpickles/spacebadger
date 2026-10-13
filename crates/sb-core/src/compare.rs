@@ -153,7 +153,7 @@ impl Comparison {
         let mut pairs = vec![(NodeId::ROOT, 0u32)];
         let mut added = Vec::new();
         let mut buf = Vec::new();
-        let mut kids_now: Vec<(NodeId, Vec<u8>)> = Vec::new();
+        let mut kids_now: Vec<NodeId> = Vec::new();
         let mut pending = Vec::new();
         let mut accounted = Vec::new();
         while let Some((dir, entry)) = pairs.pop() {
@@ -163,21 +163,17 @@ impl Comparison {
             kids.sort_unstable_by(|&a, &b| key(a).cmp(key(b)).then(snap.name(a).cmp(snap.name(b))));
             let read_then = snap.was_read(entry);
             kids_now.clear();
-            kids_now.extend(tree.children(dir).map(|c| {
-                (
-                    c,
-                    fold(tree.name(c).as_encoded_bytes(), insensitive, &mut buf).to_vec(),
-                )
-            }));
+            kids_now.extend(tree.children(dir));
             // Exact names first, so `A` and `a` side by side (a
             // case-sensitive folder) each find their own earlier self;
             // then names that match only ignoring case, where that's
             // unambiguous.
             pending.clear();
-            for (i, (c, folded)) in kids_now.iter().enumerate() {
-                let from = kids.partition_point(|&k| key(k) < folded.as_slice());
-                let to = from + kids[from..].partition_point(|&k| key(k) == folded.as_slice());
-                let raw = tree.name(*c).as_encoded_bytes();
+            for &c in &kids_now {
+                let raw = tree.name(c).as_encoded_bytes();
+                let folded = fold(raw, insensitive, &mut buf);
+                let from = kids.partition_point(|&k| key(k) < folded);
+                let to = from + kids[from..].partition_point(|&k| key(k) == folded);
                 match kids[from..to]
                     .iter()
                     .find(|&&k| !seen[k as usize] && snap.name(k) == raw)
@@ -186,12 +182,10 @@ impl Comparison {
                         seen[s as usize] = true;
                         matched[c.index()] = s;
                     }
-                    None => pending.push((i, from, to)),
+                    None => pending.push((c, from, to)),
                 }
             }
-            for &(i, from, to) in &pending {
-                let (c, folded) = &kids_now[i];
-                let c = *c;
+            for &(c, from, to) in &pending {
                 let found = match to - from {
                     0 => None,
                     1 if !seen[kids[from] as usize] => Some(kids[from]),
@@ -207,7 +201,11 @@ impl Comparison {
                         s
                     }
                     None if !read_then => UNKNOWN,
-                    None if !tree.is_dir(c) && snap.had_small_file(entry, name_hash(folded)) => {
+                    None if !tree.is_dir(c) && {
+                        let folded = fold(tree.name(c).as_encoded_bytes(), insensitive, &mut buf);
+                        snap.had_small_file(entry, name_hash(folded))
+                    } =>
+                    {
                         SMALL
                     }
                     None => NEW,
@@ -215,7 +213,7 @@ impl Comparison {
             }
             // Now settle each match: a folder where a file was (or the
             // reverse) is new, and folders unread then or now are unknown.
-            for &(c, _) in &kids_now {
+            for &c in &kids_now {
                 let s = matched[c.index()];
                 if s >= SMALL {
                     if s == NEW && tree.is_dir(c) {
