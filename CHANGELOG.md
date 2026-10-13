@@ -4,6 +4,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+### Packages
+- winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
+
 ## [0.2.0] - 2026-10-13
 
 A redesigned interface, a much more capable filter, and sizes in familiar units.
