@@ -13,9 +13,12 @@
     autofocus?: boolean;
     /** Shows a close button when given. */
     onclose?: () => void;
+    /** Offers to restart with administrator rights next to the reasons it
+     * would help with, when given. */
+    onelevate?: () => void;
   }
 
-  let { groups, autofocus = false, onclose }: Props = $props();
+  let { groups, autofocus = false, onclose, onelevate }: Props = $props();
 
   const id = $props.id();
 
@@ -106,6 +109,9 @@
   <div class="group">
     <div class="reason"><strong>{r.title}</strong> <span class="muted">{formatCount(g.count)}</span></div>
     <p class="small">{r.explain}{r.advice ? ` ${r.advice}` : ""}</p>
+    {#if g.reason === "permissionDenied" && onelevate}
+      <button type="button" class="elevate" onclick={onelevate}>Restart as administrator…</button>
+    {/if}
     {#if g.samples.length > 0}
       <details>
         <summary class="small">{g.count > 1 ? "Show paths" : "Show path"}</summary>
@@ -199,6 +205,10 @@
   }
   .group {
     margin-bottom: 10px;
+  }
+  .elevate {
+    margin-bottom: var(--space-2);
+    font-size: var(--fs-sm);
   }
   .reason {
     display: flex;

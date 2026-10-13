@@ -84,6 +84,11 @@ impl Session {
         }
     }
 
+    /// A delete is moving items right now.
+    pub fn is_deleting(&self) -> bool {
+        self.deleting.try_lock().is_err()
+    }
+
     pub fn generation(&self) -> u64 {
         self.scan.generation()
     }
