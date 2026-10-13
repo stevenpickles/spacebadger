@@ -6,6 +6,8 @@
 
 mod delete;
 #[cfg(windows)]
+mod elevate_windows;
+#[cfg(windows)]
 mod recycle_windows;
 mod session;
 
@@ -22,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[derive(Default)]
 struct AppState {
@@ -203,6 +205,47 @@ async fn selection_summary(
     state.session(request.generation)?.selection(&request.nodes)
 }
 
+/// Asks first, then starts SpaceBadger again with administrator rights,
+/// scanning the same folder, and closes this copy. Returns `false` if the
+/// user said no, here or at the Windows elevation prompt.
+#[tauri::command]
+async fn restart_elevated(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    if !cfg!(windows) {
+        return Err("Restarting as administrator is only available on Windows.".to_owned());
+    }
+    let session = state.current();
+    if session.as_ref().is_some_and(|s| s.is_deleting()) {
+        return Err("Wait for the move to the Recycle Bin to finish first.".to_owned());
+    }
+    let root = session.map(|s| s.root.clone());
+    let again = match &root {
+        Some(r) => format!(" and scan {} again", r.display()),
+        None => String::new(),
+    };
+    let ok = app
+        .dialog()
+        .message(format!(
+            "SpaceBadger will close and reopen with administrator rights{again}. \
+             Windows asks for permission first."
+        ))
+        .title("Restart as administrator?")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Restart".to_owned(),
+            "Cancel".to_owned(),
+        ))
+        .blocking_show();
+    if !ok {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    if !elevate_windows::relaunch_elevated(root.as_deref())? {
+        return Ok(false);
+    }
+    app.exit(0);
+    Ok(true)
+}
+
 /// Turns deleting on or off for this run of the app; returns the new state.
 #[tauri::command]
 fn set_delete_allowed(state: State<'_, AppState>, allowed: bool) -> bool {
@@ -288,6 +331,7 @@ pub fn run() {
             volume_info,
             selection_summary,
             set_delete_allowed,
+            restart_elevated,
             delete_items
         ])
         .run(tauri::generate_context!())

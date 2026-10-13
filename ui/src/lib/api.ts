@@ -100,6 +100,15 @@ export function setDeleteAllowed(allowed: boolean): Promise<boolean> {
 }
 
 /**
+ * Asks, then reopens SpaceBadger with administrator rights scanning the same
+ * folder; this window closes. Resolves `false` if the user said no. Windows
+ * only.
+ */
+export function restartElevated(): Promise<boolean> {
+  return invoke<boolean>("restart_elevated");
+}
+
+/**
  * Moves items (folders with their contents) to the Recycle Bin or Trash and
  * removes them from the scan; a status update with a new revision follows.
  * Rejects unless deleting is turned on, and while scanning.

@@ -44,6 +44,8 @@ cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
 
+On Windows, **Restart as administrator…** in the toolbar reopens SpaceBadger with administrator rights and scans the same folder again, so folders that need those rights are counted too. Windows asks for permission first; the running copy stays as it was if you decline.
+
 Press `?` (or the ? button in the toolbar) for a list of shortcuts. In the map: click selects, double-click (or Enter) opens a folder, Backspace or the ↑ button beside the breadcrumbs goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
 
 The side panel shows the selected item's details on top and, below, the contents of the folder in the map, largest first. Selecting in either selects in both; Enter or double-click on a folder in the list opens it. Uncheck **Folders** to list only files, the largest anywhere under the folder, each with the subfolder it's in; Enter on one shows it in the map.
