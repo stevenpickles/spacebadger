@@ -10,8 +10,10 @@
 //! files (the whole file when that's all there is), and what's left is
 //! confirmed by a hash of the whole content. Hashes are BLAKE3, so equal
 //! hashes mean equal contents in practice. Groups with the most space at
-//! stake are read first, by a small pool of readers: disks, spinning ones
-//! especially, read fastest a stream or two at a time.
+//! stake are read first, by a small pool of readers. Opening a file is
+//! slow (virus scanners look at each one first), so several are opened at
+//! once, but only a couple of large files are read whole at a time:
+//! spinning disks and network shares read fastest a stream or two at a time.
 
 use sb_core::layout::{self, Metric};
 use sb_core::search::Search;
@@ -20,6 +22,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 /// Bytes hashed from each end of a file to tell same-size files apart.
 pub const SAMPLE: u64 = 64 * 1024;
@@ -27,9 +31,15 @@ pub const SAMPLE: u64 = 64 * 1024;
 /// Bytes read per call when hashing whole files.
 const BUFFER: usize = 1 << 20;
 
-/// Files read at once. More only helps fast SSDs, and costs spinning disks
-/// and network shares a lot.
-pub const READERS: usize = 2;
+/// Files open at once.
+pub const READERS: usize = 6;
+
+/// Whole files larger than this are read at most [`STREAMS`] at a time.
+const LARGE: u64 = 8 << 20;
+
+/// Large files read whole at once. More only helps fast SSDs, and costs
+/// spinning disks and network shares a lot.
+const STREAMS: usize = 2;
 
 /// Why a candidate file wasn't read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -201,6 +211,7 @@ pub fn run<C: Contents>(
 ) -> bool {
     let next = AtomicUsize::new(0);
     let readers = readers.clamp(1, plan.groups.len().max(1));
+    let streams = Gate::new(STREAMS);
     std::thread::scope(|s| {
         for _ in 0..readers {
             s.spawn(|| {
@@ -208,6 +219,7 @@ pub fn run<C: Contents>(
                     contents,
                     cancel,
                     counters,
+                    streams: &streams,
                     buf: vec![0; BUFFER],
                 };
                 while let Some(group) = plan.groups.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -225,10 +237,55 @@ struct Cancelled;
 
 type Digest = [u8; 32];
 
+/// Lets at most `limit` threads through at once.
+struct Gate {
+    inside: Mutex<usize>,
+    left: Condvar,
+    limit: usize,
+}
+
+struct Pass<'a>(&'a Gate);
+
+impl Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            inside: Mutex::new(0),
+            left: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Waits for a place, giving up if `cancel` is set meanwhile.
+    fn enter(&self, cancel: &AtomicBool) -> Result<Pass<'_>, Cancelled> {
+        let mut inside = self.inside.lock().unwrap();
+        while *inside >= self.limit {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Cancelled);
+            }
+            inside = self
+                .left
+                .wait_timeout(inside, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+        *inside += 1;
+        Ok(Pass(self))
+    }
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        *self.0.inside.lock().unwrap() -= 1;
+        self.0.left.notify_one();
+    }
+}
+
 struct Reader<'a, C> {
     contents: &'a C,
     cancel: &'a AtomicBool,
     counters: &'a Counters,
+    /// Large files read whole pass through here.
+    streams: &'a Gate,
     buf: Vec<u8>,
 }
 
@@ -288,6 +345,11 @@ impl<C: Contents> Reader<'_, C> {
         size: u64,
         sample: bool,
     ) -> Result<Result<Digest, Skip>, Cancelled> {
+        let _stream = if !sample && size > LARGE {
+            Some(self.streams.enter(self.cancel)?)
+        } else {
+            None
+        };
         let mut file = match self.contents.open(&c.path, size) {
             Ok(file) => file,
             Err(why) => return Ok(Err(why)),
