@@ -22,6 +22,7 @@ use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
 const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
@@ -58,6 +59,19 @@ fn dev(stx: &Statx) -> u64 {
 
 fn mount_id(stx: &Statx) -> Option<u64> {
     (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+}
+
+/// The last write time, when statx filled it in (part of `BASIC_STATS`).
+fn modified(stx: &Statx) -> Option<SystemTime> {
+    if stx.stx_mask & StatxFlags::MTIME.bits() == 0 {
+        return None;
+    }
+    let t = &stx.stx_mtime;
+    let nanos = Duration::new(0, t.tv_nsec);
+    match u64::try_from(t.tv_sec) {
+        Ok(secs) => UNIX_EPOCH.checked_add(Duration::from_secs(secs) + nanos),
+        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(t.tv_sec.unsigned_abs()) - nanos),
+    }
 }
 
 fn kind_of(stx: &Statx) -> FileType {
@@ -153,6 +167,7 @@ impl FsAdapter for LinuxFs {
                         allocated: None,
                         identity: Identity::Unavailable,
                         cloud: false,
+                        modified: None,
                     });
                     continue;
                 }
@@ -192,6 +207,7 @@ impl FsAdapter for LinuxFs {
                     Identity::Unique
                 },
                 cloud: false,
+                modified: modified(&stx),
             });
         }
         Ok(entries)

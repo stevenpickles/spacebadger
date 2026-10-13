@@ -6,11 +6,13 @@
 //! milestone 2 measurements: about six files per folder on average with a
 //! long tail of very large folders, sizes spanning bytes to tens of GiB with
 //! a heavy tail, a mix of common extensions, and some non-ASCII names.
+//! Modified times spread over the ten years before a fixed date.
 
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree};
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// xorshift64* — small, fast, and reproducible across platforms.
 pub struct Rng(u64);
@@ -135,6 +137,18 @@ fn file_sizes(rng: &mut Rng) -> FileSizes {
     FileSizes { logical, allocated }
 }
 
+/// A modified time in the ten years before 2026-01-01, a few unknown.
+fn modified(rng: &mut Rng) -> Option<SystemTime> {
+    const END: u64 = 1_767_225_600;
+    const SPAN: u64 = 10 * 365 * 86_400;
+    if rng.below(1000) < 2 {
+        return None;
+    }
+    // Recent files are more common than old ones.
+    let age = (rng.unit() * rng.unit() * SPAN as f64) as u64;
+    Some(UNIX_EPOCH + Duration::from_secs(END - age))
+}
+
 /// Summary of a generated tree.
 pub struct Generated {
     pub tree: Tree,
@@ -146,6 +160,9 @@ pub struct Generated {
 /// Builds a tree with about `nodes` nodes.
 pub fn generate(nodes: usize, seed: u64) -> Generated {
     let mut rng = Rng::new(seed);
+    // Times come from their own stream, so the tree's shape, names, and
+    // sizes are the same as before times were recorded.
+    let mut times = Rng::new(seed ^ 0x7153);
     let mut tree = Tree::new("/synthetic");
     let mut queue = VecDeque::from([NodeId::ROOT]);
     let (mut files, mut folders, mut name_bytes) = (0u64, 1u64, 0u64);
@@ -171,7 +188,7 @@ pub fn generate(nodes: usize, seed: u64) -> Generated {
         for _ in 0..n_files {
             let n = name(&mut rng, false);
             name_bytes += n.len() as u64;
-            tree.add_file(dir, &n, file_sizes(&mut rng), 0)
+            tree.add_file(dir, &n, file_sizes(&mut rng), modified(&mut times), 0)
                 .expect("synthetic tree within capacity");
             files += 1;
         }

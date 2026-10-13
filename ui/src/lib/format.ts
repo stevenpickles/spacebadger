@@ -31,6 +31,12 @@ export function exactBytes(bytes: number): string {
   return `${bytes.toLocaleString()} ${bytes === 1 ? "byte" : "bytes"}`;
 }
 
+/** A time in seconds since the Unix epoch as a date and time in the user's
+ * locale, e.g. "Oct 13, 2026, 2:05 PM". */
+export function formatDate(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
 export function formatCount(n: number): string {
   return n.toLocaleString();
 }

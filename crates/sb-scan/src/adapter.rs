@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::time::SystemTime;
 
 /// What a directory entry is, as far as scanning is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,8 @@ pub struct Entry {
     pub identity: Identity,
     /// The entry belongs to a cloud provider (placeholder or synced file).
     pub cloud: bool,
+    /// Last write time, if the listing gave one. Recorded for files.
+    pub modified: Option<SystemTime>,
 }
 
 /// Authoritative sizes from a per-file query.

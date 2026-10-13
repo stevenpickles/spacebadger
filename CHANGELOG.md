@@ -4,6 +4,14 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+### Filter
+- Size terms: `size:>500MB`, `size:>=1GB`, `size:<10KB`, `size:<=2GB`, and ranges like `size:10MB..1GB`. Units are B, KB, MB, GB, and TB, counted like the sizes on screen (1,024 bytes per KB on Windows, 1,000 on macOS and Linux).
+- Age terms: `older:1y` and `newer:30d` (with `h`, `d`, `w`, `mo`, or `y`), or a date: `older:2024-01-01`. Files whose modified time is unknown never match one.
+- Size and age terms narrow everything else in the filter, and every one must hold; on their own they match every file that passes. `!` turns one around. Suggestions offer them, with common values such as `>1GB` and `6mo`.
+
+### Details
+- Files show when they were last modified.
+
 ### Duplicates
 - Find duplicates, in the toolbar or a folder's menu, finds files with the same contents in the folder in view, among the files the filter matches: `is:video` then Find duplicates finds duplicate videos. It's the only feature that reads file contents, and only when asked. Cloud files are never read, so nothing is downloaded, and two names of one hard-linked file don't count.
 - The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at (1 MB to start).

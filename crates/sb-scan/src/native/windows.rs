@@ -4,6 +4,7 @@
 //!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
 //!   reparse tags, and file IDs come from the listing without opening files.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
+//!   The modified time is the listing's `LastWriteTime`.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -26,6 +27,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
 };
@@ -252,6 +254,22 @@ struct Listed {
     attributes: u32,
     reparse_tag: u32,
     file_id: u128,
+    /// `LastWriteTime`: 100 ns intervals since 1601, 0 when not set.
+    last_write: i64,
+}
+
+/// Seconds from 1601-01-01, where `FILETIME` counts from, to the Unix epoch.
+const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
+
+/// A `FILETIME` as a time; `None` for 0, which means the filesystem has none.
+fn filetime(ticks: i64) -> Option<SystemTime> {
+    let ticks = u64::try_from(ticks).ok().filter(|&t| t != 0)?;
+    let since_1601 = Duration::new(ticks / 10_000_000, (ticks % 10_000_000) as u32 * 100);
+    let offset = Duration::from_secs(FILETIME_EPOCH_OFFSET);
+    match since_1601.checked_sub(offset) {
+        Some(after) => UNIX_EPOCH.checked_add(after),
+        None => UNIX_EPOCH.checked_sub(offset - since_1601),
+    }
 }
 
 /// Windows filesystem adapter. Create one per scan.
@@ -311,6 +329,7 @@ impl DirInfo for FILE_ID_EXTD_DIR_INFO {
             attributes: self.FileAttributes,
             reparse_tag: self.ReparsePointTag,
             file_id: u128::from_le_bytes(self.FileId.Identifier),
+            last_write: self.LastWriteTime,
         }
     }
 }
@@ -335,6 +354,7 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
             // For reparse points this class reports the tag in EaSize.
             reparse_tag: self.EaSize,
             file_id: self.FileId as u64 as u128,
+            last_write: self.LastWriteTime,
         }
     }
 }
@@ -413,6 +433,7 @@ impl FsAdapter for WindowsFs {
                 },
                 cloud: l.attributes & attr::CLOUD != 0
                     || (l.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(l.reparse_tag)),
+                modified: filetime(l.last_write),
                 name: l.name,
             })
             .collect())
@@ -588,6 +609,22 @@ fn ntfs_mft_bytes(volume: &[u16]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_filetimes() {
+        assert_eq!(filetime(0), None);
+        assert_eq!(filetime(-5), None);
+        let epoch = FILETIME_EPOCH_OFFSET as i64 * 10_000_000;
+        assert_eq!(filetime(epoch), Some(UNIX_EPOCH));
+        assert_eq!(
+            filetime(epoch + 15_000_000),
+            Some(UNIX_EPOCH + Duration::from_millis(1500))
+        );
+        assert_eq!(
+            filetime(epoch - 10_000_000),
+            UNIX_EPOCH.checked_sub(Duration::from_secs(1))
+        );
+    }
 
     #[test]
     fn classifies_reparse_tags_by_category() {

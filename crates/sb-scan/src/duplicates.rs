@@ -479,6 +479,7 @@ mod tests {
                         logical: len,
                         allocated: Allocated::known(len),
                     },
+                    None,
                     extra,
                 )
                 .unwrap();

@@ -3292,6 +3292,7 @@ dependencies = [
 name = "spacebadger"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "sb-core",
  "sb-protocol",
  "sb-scan",
