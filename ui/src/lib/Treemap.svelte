@@ -7,6 +7,7 @@
     depthColor,
     typeModeFolderColor,
     otherSmallColor,
+    isDarkFill,
     typeColor,
     type ColorMode,
   } from "./colors";
@@ -101,6 +102,8 @@
       textLight: cssVar("--map-text-light"),
       incomplete: cssVar("--incomplete"),
       accent: cssVar("--accent"),
+      // Labels are --fs-xs (11px) at the default 14px root size and scale with it.
+      fontSize: Math.round((parseFloat(getComputedStyle(document.documentElement).fontSize) || 14) * (11 / 14)),
     };
   });
 
@@ -250,11 +253,15 @@
     const l = layout;
     if (!l) return;
 
-    ctx.font = "11px system-ui, -apple-system, 'Segoe UI', sans-serif";
-    ctx.textBaseline = "alphabetic";
     const p = palette;
-    const text = dark ? p.textLight : p.textDark;
+    ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
+    ctx.textBaseline = "alphabetic";
     const gap = p.gap;
+    // Baselines of the first and second label lines, from the tile top.
+    const line1 = p.fontSize + 1;
+    const line2 = line1 + p.fontSize + 2;
+    // Tiles shorter than this get no label at all.
+    const minLabel = Math.max(14, p.fontSize + 3);
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -264,7 +271,8 @@
       const kind = l.kind[i]!;
       ctx.fillStyle = gap;
       ctx.fillRect(x, y, w, h);
-      ctx.fillStyle = fillFor(l, i);
+      const fill = fillFor(l, i);
+      ctx.fillStyle = fill;
       if (w > 2 && h > 2) ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
       else ctx.fillRect(x, y, w, h);
 
@@ -275,26 +283,28 @@
         ctx.setLineDash([]);
       }
 
+      if (h < minLabel || w < 16) continue;
       ctx.save();
       ctx.beginPath();
       ctx.rect(x, y, w, h);
       ctx.clip();
-      ctx.fillStyle = text;
+      // Dark or light text, whichever contrasts with this tile.
+      ctx.fillStyle = isDarkFill(fill) ? p.textLight : p.textDark;
       const name = l.labels.get(i);
       const size = formatBytes(l.weight[i]!);
       if (kind === KIND_FOLDER && l.rflags[i]! & RF_HEADER && name !== undefined) {
         const sizeWidth = ctx.measureText(size).width;
         if (w - 8 > sizeWidth + 40) {
-          label(ctx, name, x + 4, y + 12, w - 14 - sizeWidth);
-          ctx.fillText(size, x + w - 4 - sizeWidth, y + 12);
+          label(ctx, name, x + 4, y + line1, w - 14 - sizeWidth);
+          ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
         } else {
-          label(ctx, name, x + 4, y + 12, w - 8);
+          label(ctx, name, x + 4, y + line1, w - 8);
         }
       } else if (kind === KIND_FILE && name !== undefined) {
-        label(ctx, name, x + 4, y + 12, w - 8);
-        if (h >= 28) label(ctx, size, x + 4, y + 25, w - 8);
-      } else if (kind === KIND_OTHER && w >= 60 && h >= 14) {
-        label(ctx, `${plural(l.items[i]!, "small item")}`, x + 4, y + 12, w - 8);
+        label(ctx, name, x + 4, y + line1, w - 8);
+        if (h >= line2 + 3) label(ctx, size, x + 4, y + line2, w - 8);
+      } else if (kind === KIND_OTHER && w >= 60) {
+        label(ctx, `${plural(l.items[i]!, "small item")}`, x + 4, y + line1, w - 8);
       }
       ctx.restore();
     }

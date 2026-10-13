@@ -34,3 +34,44 @@ export function otherSmallColor(dark: boolean): string {
 export const TYPE_LEGEND = FILE_TYPES.map((label, type) => ({ label, type })).filter(
   (t) => t.type !== 0,
 ).concat({ label: FILE_TYPES[0], type: 0 });
+
+const darkFills = new Map<string, boolean>();
+
+/**
+ * Whether light text reads better than dark text on `color`, one of the
+ * "hsl(h s% l%)" or "#rrggbb" fills above. Compares WCAG relative luminance
+ * with the point where black and white text have equal contrast.
+ */
+export function isDarkFill(color: string): boolean {
+  let dark = darkFills.get(color);
+  if (dark === undefined) {
+    const rgb = parseColor(color);
+    dark = rgb ? luminance(rgb) < 0.179 : false;
+    darkFills.set(color, dark);
+  }
+  return dark;
+}
+
+type Rgb = [number, number, number];
+
+/** Channels in 0..1, or `null` for a format the fills above don't use. */
+function parseColor(color: string): Rgb | null {
+  const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
+  if (hex) return [hex[1]!, hex[2]!, hex[3]!].map((c) => parseInt(c, 16) / 255) as Rgb;
+  const hsl = /^hsl\(([\d.]+)\s+([\d.]+)%\s+([\d.]+)%\)$/.exec(color);
+  if (!hsl) return null;
+  const h = Number(hsl[1]);
+  const s = Number(hsl[2]) / 100;
+  const l = Number(hsl[3]) / 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+function luminance([r, g, b]: Rgb): number {
+  const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
