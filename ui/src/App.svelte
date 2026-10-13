@@ -874,6 +874,14 @@
       {:else if status}
         <span class="muted">{status.root}</span>
       {/if}
+      {#if search}
+        <span class="filtered">
+          Showing files matching <code>{search.query}</code>
+          <button type="button" class="icon-button" aria-label="Clear the filter" title="Clear the filter" onclick={clearQuery}
+            >✕</button
+          >
+        </span>
+      {/if}
     </div>
   {/if}
 
@@ -1213,6 +1221,17 @@
     padding: 2px 8px;
     min-height: 28px;
     border-bottom: 1px solid var(--line);
+  }
+  .filtered {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding: 0 2px 0 8px;
+    border-radius: 12px;
+    background: var(--selected);
+    font-size: var(--fs-sm);
   }
   .body {
     flex: 1;
