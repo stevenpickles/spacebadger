@@ -30,7 +30,7 @@ The interface was driven the same way as in milestone 6: screenshots with `Print
 | Type colors | Purple folders dominated; "Other" blended into the background | Muted folders; beige "Other" |
 | Right-click | (no heading) | Heading names the item; first item focused; Escape closes |
 | Side panel after a scan | Details hints, nothing below | Contents of the viewed folder, largest first; list stays in place when an item is selected |
-| Delete two dummy files | Toast plus banner | Full paths listed; ✓ when `delete` matches; "Moved 2 items (12.7 KiB)" result screen; map updated |
+| Delete two dummy files | Toast plus banner | Full paths listed; ✓ when `delete` matches; "Moved 2 items (12.7 KiB)" (sizes have since moved to KB/MB/GB) result screen; map updated |
 
 Type check (`npm run check`) and `npm run build` pass; no Rust changed.
 
