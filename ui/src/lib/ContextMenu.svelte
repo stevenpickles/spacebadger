@@ -60,6 +60,8 @@
 </script>
 
 <script lang="ts">
+  import { tick } from "svelte";
+
   // A small popup menu at a point in the window. Arrow keys move between
   // items, including unavailable ones (which say why), Enter activates, and
   // Escape, Tab, scrolling, or a click elsewhere closes it. Focus returns to
@@ -102,8 +104,11 @@
     left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4));
     top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4));
     placed = true;
-    const first = buttons().find((b) => b.getAttribute("aria-disabled") !== "true") ?? buttons()[0];
-    (first ?? menu).focus();
+    // Hidden elements can't take focus, so wait until it's shown.
+    tick().then(() => {
+      const first = buttons().find((b) => b.getAttribute("aria-disabled") !== "true") ?? buttons()[0];
+      (first ?? menu).focus();
+    });
 
     const onPointer = (e: PointerEvent) => {
       if (!menu.contains(e.target as Node)) close();
