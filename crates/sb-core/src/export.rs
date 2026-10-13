@@ -334,6 +334,11 @@ impl Report {
         self
     }
 
+    /// Folders and files examined so far.
+    pub fn examined(&self) -> u64 {
+        self.folders + self.files
+    }
+
     /// Examines up to `budget` nodes; returns `true` once done.
     pub fn step(&mut self, tree: &Tree, filter: Option<&Search>, budget: usize) -> bool {
         let metric = self.walk.metric;

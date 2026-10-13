@@ -1,6 +1,8 @@
 //! One scan and the view state derived from it, plus conversions from the
 //! scanner's types to the protocol's.
 
+mod export;
+
 use crate::delete::{self, Outcome};
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
