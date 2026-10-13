@@ -12,6 +12,10 @@
 //! They are only compared and shown (lossily), never turned back into
 //! paths, so a damaged file can't produce an invalid `OsStr`.
 //!
+//! A folder the scan couldn't read (permission denied) records that its
+//! contents aren't known, so a comparison doesn't take its missing children
+//! as removed or a later scan's children as new.
+//!
 //! # Format (version 1)
 //!
 //! All integers are little-endian; `varint` is unsigned LEB128.
@@ -25,7 +29,8 @@
 //!           root_len u32, root (UTF-8, as displayed)
 //! entries   one per entry, parents before their children:
 //!           varint parent distance (0 for the root, else index − parent),
-//!           u8 kind (0 file, 1 folder), varint name length, name bytes,
+//!           u8 kind (bit 0: folder; bit 1: the folder's contents were
+//!           read, so its children are all here), varint name length, name bytes,
 //!           varint logical size; folders add varint file count,
 //!           varint small-file count, and that many u32 name hashes
 //! checksum  u64      FNV-1a over every byte before it
@@ -34,7 +39,7 @@
 //! The header can be read on its own to list snapshots without decoding
 //! them. Readers ignore header bytes past the fields they know.
 
-use crate::tree::{NodeId, Tree};
+use crate::tree::{DirState, NodeId, Tree};
 use std::fmt;
 use std::io::Read;
 
@@ -46,8 +51,11 @@ pub const MAGIC: [u8; 8] = *b"SBSNAP\0\0";
 pub const VERSION: u32 = 1;
 
 /// Snapshots compare names ignoring case where the platform's file names
-/// do (Windows), and exactly elsewhere.
-pub const CASE_INSENSITIVE: bool = cfg!(windows);
+/// usually do (Windows, and macOS by default), and exactly elsewhere.
+pub const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
+const KIND_DIR: u8 = 1;
+const KIND_READ: u8 = 2;
 
 const FLAG_CASE_INSENSITIVE: u32 = 1;
 const MAX_HEADER: u32 = 64 * 1024;
@@ -104,7 +112,8 @@ pub struct SnapshotHeader {
 pub struct Snapshot {
     header: SnapshotHeader,
     parent: Vec<u32>,
-    dir: Vec<bool>,
+    /// [`KIND_DIR`] and [`KIND_READ`] bits.
+    kind: Vec<u8>,
     name_start: Vec<u32>,
     name_len: Vec<u16>,
     names: Vec<u8>,
@@ -132,7 +141,7 @@ impl Snapshot {
                 root: tree.root_path().display().to_string(),
             },
             parent: Vec::new(),
-            dir: Vec::new(),
+            kind: Vec::new(),
             name_start: Vec::new(),
             name_len: Vec::new(),
             names: Vec::new(),
@@ -142,7 +151,13 @@ impl Snapshot {
             small_len: Vec::new(),
             small: Vec::new(),
         };
-        snap.push(NONE, b"", true, tree.logical(root), tree.file_count(root));
+        snap.push(
+            NONE,
+            b"",
+            dir_kind(tree, root),
+            tree.logical(root),
+            tree.file_count(root),
+        );
         let mut stack = vec![(root, 0u32)];
         let mut hashes = Vec::new();
         let mut key = Vec::new();
@@ -151,10 +166,16 @@ impl Snapshot {
             for c in tree.children(node) {
                 let name = tree.name(c).as_encoded_bytes();
                 if tree.is_dir(c) {
-                    let id = snap.push(entry, name, true, tree.logical(c), tree.file_count(c));
+                    let id = snap.push(
+                        entry,
+                        name,
+                        dir_kind(tree, c),
+                        tree.logical(c),
+                        tree.file_count(c),
+                    );
                     stack.push((c, id));
                 } else if tree.logical(c) >= FILE_THRESHOLD {
-                    snap.push(entry, name, false, tree.logical(c), 1);
+                    snap.push(entry, name, 0, tree.logical(c), 1);
                 } else {
                     hashes.push(name_hash(fold(name, case_insensitive, &mut key)));
                 }
@@ -170,12 +191,12 @@ impl Snapshot {
         snap
     }
 
-    fn push(&mut self, parent: u32, name: &[u8], dir: bool, logical: u64, files: u32) -> u32 {
+    fn push(&mut self, parent: u32, name: &[u8], kind: u8, logical: u64, files: u32) -> u32 {
         let id = self.parent.len() as u32;
         // Tree names are at most u16::MAX bytes, so this never truncates.
         let len = name.len().min(usize::from(u16::MAX));
         self.parent.push(parent);
-        self.dir.push(dir);
+        self.kind.push(kind);
         self.name_start.push(self.names.len() as u32);
         self.name_len.push(len as u16);
         self.names.extend_from_slice(&name[..len]);
@@ -206,7 +227,13 @@ impl Snapshot {
     }
 
     pub fn is_dir(&self, entry: u32) -> bool {
-        self.dir[entry as usize]
+        self.kind[entry as usize] & KIND_DIR != 0
+    }
+
+    /// Whether folder `entry`'s contents were read, so every child of it
+    /// (above the threshold) is in the snapshot.
+    pub fn was_read(&self, entry: u32) -> bool {
+        self.kind[entry as usize] & KIND_READ != 0
     }
 
     /// The entry's native name bytes; empty for the root.
@@ -271,12 +298,12 @@ impl Snapshot {
                 i as u64 - u64::from(parent)
             };
             put_varint(&mut out, distance);
-            out.push(u8::from(self.dir[i]));
+            out.push(self.kind[i]);
             let name = self.name(i as u32);
             put_varint(&mut out, name.len() as u64);
             out.extend_from_slice(name);
             put_varint(&mut out, self.logical[i]);
-            if self.dir[i] {
+            if self.kind[i] & KIND_DIR != 0 {
                 put_varint(&mut out, u64::from(self.files[i]));
                 let start = self.small_start[i] as usize;
                 let small = &self.small[start..start + self.small_len[i] as usize];
@@ -314,7 +341,7 @@ impl Snapshot {
         let mut snap = Self {
             header,
             parent: Vec::with_capacity(cap),
-            dir: Vec::with_capacity(cap),
+            kind: Vec::with_capacity(cap),
             name_start: Vec::with_capacity(cap),
             name_len: Vec::with_capacity(cap),
             names: Vec::new(),
@@ -336,16 +363,16 @@ impl Snapshot {
                     return Err(SnapshotError::Corrupt("parent out of order"));
                 }
                 let p = i - distance as u32;
-                if !snap.dir[p as usize] {
+                if snap.kind[p as usize] & KIND_DIR == 0 {
                     return Err(SnapshotError::Corrupt("parent is a file"));
                 }
                 p
             };
-            let dir = match r.byte()? {
-                0 => false,
-                1 => true,
-                _ => return Err(SnapshotError::Corrupt("unknown entry kind")),
-            };
+            let kind = r.byte()?;
+            if kind & !(KIND_DIR | KIND_READ) != 0 || kind == KIND_READ {
+                return Err(SnapshotError::Corrupt("unknown entry kind"));
+            }
+            let dir = kind & KIND_DIR != 0;
             if i == 0 && !dir {
                 return Err(SnapshotError::Corrupt("root is a file"));
             }
@@ -356,7 +383,7 @@ impl Snapshot {
             let name = r.take(name_len as usize)?;
             let logical = r.varint()?;
             snap.parent.push(parent);
-            snap.dir.push(dir);
+            snap.kind.push(kind);
             snap.name_start.push(
                 u32::try_from(snap.names.len())
                     .map_err(|_| SnapshotError::Corrupt("names too long"))?,
@@ -553,8 +580,10 @@ pub fn name_hash(name: &[u8]) -> u32 {
 }
 
 /// `name` as compared: unchanged when case matters, else upper-cased char
-/// by char the way NTFS compares names (only one-to-one mappings, so `ß`
-/// stays `ß`). Uses `buf` only when the name changes.
+/// by char the way NTFS compares names: only characters in the Basic
+/// Multilingual Plane, and only one-to-one mappings (so `ß` stays `ß`).
+/// Bytes that aren't valid UTF-8, such as Windows names' unpaired
+/// surrogates, are kept as they are. Uses `buf` only when the name changes.
 pub fn fold<'a>(name: &'a [u8], case_insensitive: bool, buf: &'a mut Vec<u8>) -> &'a [u8] {
     if !case_insensitive || !name.iter().any(|b| b.is_ascii_lowercase() || *b >= 0x80) {
         return name;
@@ -564,19 +593,35 @@ pub fn fold<'a>(name: &'a [u8], case_insensitive: bool, buf: &'a mut Vec<u8>) ->
         buf.extend(name.iter().map(u8::to_ascii_uppercase));
         return buf;
     }
-    // Native names are WTF-8 on Windows; unpaired surrogates become
-    // replacement characters, which only matters for names no one types.
-    let text = String::from_utf8_lossy(name);
     let mut utf8 = [0u8; 4];
-    for c in text.chars() {
-        let mut upper = c.to_uppercase();
-        let one = match (upper.next(), upper.next()) {
-            (Some(u), None) => u,
-            _ => c,
-        };
-        buf.extend_from_slice(one.encode_utf8(&mut utf8).as_bytes());
+    for chunk in name.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            buf.extend_from_slice(upcase(c).encode_utf8(&mut utf8).as_bytes());
+        }
+        buf.extend_from_slice(chunk.invalid());
     }
     buf
+}
+
+/// `c` upper-cased when that maps one BMP character to another.
+fn upcase(c: char) -> char {
+    if u32::from(c) > 0xffff {
+        return c;
+    }
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) if u32::from(u) <= 0xffff => u,
+        _ => c,
+    }
+}
+
+/// A folder's kind bits: read once its listing succeeded.
+fn dir_kind(tree: &Tree, dir: NodeId) -> u8 {
+    if tree.dir_state(dir) == DirState::Listed {
+        KIND_DIR | KIND_READ
+    } else {
+        KIND_DIR
+    }
 }
 
 #[cfg(test)]
@@ -601,6 +646,10 @@ mod tests {
         t.add_file(a, "note.txt".as_ref(), sizes(10), 0).unwrap();
         t.add_file(b, "ü.bin".as_ref(), sizes(2 << 20), 0).unwrap();
         t.add_file(NodeId::ROOT, "x".as_ref(), sizes(1), 0).unwrap();
+        // `b` couldn't be read.
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+        t.set_dir_state(a, DirState::Listed);
+        t.set_dir_state(b, DirState::Failed);
         t
     }
 
@@ -625,6 +674,11 @@ mod tests {
         assert!(back.had_small_file(a, name_hash(b"note.txt")));
         assert!(!back.had_small_file(a, name_hash(b"big.iso")));
         assert!(back.had_small_file(0, name_hash(b"x")));
+        assert!(back.was_read(0) && back.was_read(a));
+        let b = (0..back.len() as u32)
+            .find(|&e| back.name(e) == b"b")
+            .unwrap();
+        assert!(back.is_dir(b) && !back.was_read(b));
     }
 
     #[test]
@@ -705,6 +759,19 @@ mod tests {
             "STRAßE".as_bytes()
         );
         assert_eq!(fold(b"ALREADY", true, &mut buf), b"ALREADY");
+        // Outside the BMP, NTFS doesn't fold: Deseret small long I.
+        assert_eq!(
+            fold("\u{10428}".as_bytes(), true, &mut buf),
+            "\u{10428}".as_bytes()
+        );
+        // Unpaired surrogates (WTF-8) stay distinct rather than becoming
+        // one replacement character.
+        let a = [b'x', 0xed, 0xa0, 0x80];
+        let b = [b'x', 0xed, 0xa0, 0x81];
+        let fa = fold(&a, true, &mut buf).to_vec();
+        let fb = fold(&b, true, &mut buf).to_vec();
+        assert_eq!(fa, [b'X', 0xed, 0xa0, 0x80]);
+        assert_ne!(fa, fb);
     }
 
     #[test]
