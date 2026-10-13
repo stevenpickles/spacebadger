@@ -7,7 +7,10 @@
 //! keeps a stack of node IDs across steps; IDs are never reused, and a node
 //! removed between steps is skipped. Nodes the scan adds meanwhile are
 //! included only if their folder hasn't been walked yet, so an export taken
-//! while scanning is, like the map, a partial picture.
+//! while scanning is, like the map, a partial picture. Sizes then are as of
+//! the step that wrote each row, a row's share is of the folder's size at
+//! that moment (so shares stay within 100%), and each folder's contents are
+//! ordered by size when that folder is reached.
 //!
 //! With a [`Search`], only matching files are listed, and folders only when
 //! they contain matches, with matching totals, as in the filtered map.
@@ -206,8 +209,6 @@ impl Walk {
 #[derive(Debug)]
 pub struct Csv {
     walk: Walk,
-    /// The folder's size when the export started, for each row's share.
-    whole: u64,
     kilo: u64,
     rows: u64,
 }
@@ -220,7 +221,6 @@ impl Csv {
     pub fn new(folder: NodeId, scope: Scope, metric: Metric) -> Self {
         Self {
             walk: Walk::new(folder, metric, scope == Scope::Everything),
-            whole: 0,
             kilo: SYSTEM_KILO,
             rows: 0,
         }
@@ -250,9 +250,11 @@ impl Csv {
         if !self.walk.started {
             out.push('\u{feff}');
             out.push_str(CSV_HEADER);
-            self.whole = self.walk.metric.weight_in(tree, filter, self.walk.folder);
         }
-        let (metric, whole, kilo) = (self.walk.metric, self.whole, self.kilo);
+        // Taken under the same lock as the rows, since a scan may have grown
+        // the folder since the last step.
+        let whole = self.walk.metric.weight_in(tree, filter, self.walk.folder);
+        let (metric, kilo) = (self.walk.metric, self.kilo);
         let rows = &mut self.rows;
         self.walk.step(tree, filter, budget, |node| {
             let folder = tree.is_dir(node);
@@ -677,6 +679,25 @@ mod tests {
         let names: Vec<String> = rows(&out).into_iter().map(|r| r[1].clone()).collect();
         assert_eq!(names, ["big.jpg", "'=cmd.txt"]);
         assert_eq!(csv.rows(), 2);
+    }
+
+    #[test]
+    fn shares_follow_a_growing_folder() {
+        let mut t = Tree::new(std::path::Path::new("root"));
+        file(&mut t, NodeId::ROOT, "a", 100);
+        file(&mut t, NodeId::ROOT, "b", 100);
+        let mut csv = Csv::new(NodeId::ROOT, Scope::Everything, Metric::Logical);
+        let mut out = String::new();
+        assert!(!csv.step(&t, None, 1, &mut out));
+        // The scan finds more before the next step.
+        file(&mut t, NodeId::ROOT, "c", 800);
+        while !csv.step(&t, None, 1, &mut out) {}
+        let shares: Vec<String> = rows(&out).into_iter().map(|r| r[7].clone()).collect();
+        assert_eq!(
+            shares,
+            ["50.00", "10.00"],
+            "c came after its folder was listed"
+        );
     }
 
     #[test]
