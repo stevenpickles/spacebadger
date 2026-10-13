@@ -31,7 +31,8 @@ const MAX_PAGE: u32 = 500;
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
 // Lock order: `deleting` first, `search` and `compare` before the tree,
-// then `folder_files`, and `order` last.
+// then `folder_files`, and `order` last. `rematching` is taken with the
+// tree read-locked, and `compare` briefly inside it.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -55,6 +56,9 @@ pub struct Session {
     started_ms: u64,
     /// The comparison with an earlier scan, when on.
     compare: Mutex<Option<compare::Active>>,
+    /// Held while the comparison is matched again after the scan changed,
+    /// so only one request does it.
+    rematching: Mutex<()>,
     /// The earlier scan carried over from the previous scan of this root.
     carried: Option<compare::Carried>,
 }
@@ -144,6 +148,7 @@ impl Session {
             saved_snapshot,
             started_ms,
             compare: Mutex::new(None),
+            rematching: Mutex::new(()),
             carried,
         }
     }

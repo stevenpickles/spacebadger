@@ -349,8 +349,19 @@ impl Session {
     /// it's matched again without holding the comparison's lock, so other
     /// requests aren't kept waiting, and swapped in.
     fn current(&self, id: &str, tree: &Tree) -> Result<Current, String> {
-        let gone = || "That comparison is no longer on.".to_owned();
         let revision = self.scan.progress().revision;
+        if let Some(current) = self.matched_for(id, revision)? {
+            return Ok(current);
+        }
+        // One request matches again; others asking meanwhile wait for it
+        // and use its result.
+        let _one = self
+            .rematching
+            .lock()
+            .map_err(|_| "comparing is unavailable")?;
+        if let Some(current) = self.matched_for(id, revision)? {
+            return Ok(current);
+        }
         let snapshot = {
             let compare = self
                 .compare
@@ -360,13 +371,6 @@ impl Session {
                 .as_ref()
                 .filter(|a| a.info.id == id)
                 .ok_or_else(gone)?;
-            if active.revision == revision {
-                return Ok(Current {
-                    snapshot: Arc::clone(&active.snapshot),
-                    comparison: Arc::clone(&active.comparison),
-                    revision,
-                });
-            }
             Arc::clone(&active.snapshot)
         };
         let comparison = Arc::new(Comparison::new(tree, &snapshot));
@@ -386,6 +390,27 @@ impl Session {
             revision,
         })
     }
+
+    /// The comparison with snapshot `id` if it's matched for `revision`.
+    fn matched_for(&self, id: &str, revision: u64) -> Result<Option<Current>, String> {
+        let compare = self
+            .compare
+            .lock()
+            .map_err(|_| "comparing is unavailable")?;
+        let active = compare
+            .as_ref()
+            .filter(|a| a.info.id == id)
+            .ok_or_else(gone)?;
+        Ok((active.revision == revision).then(|| Current {
+            snapshot: Arc::clone(&active.snapshot),
+            comparison: Arc::clone(&active.comparison),
+            revision,
+        }))
+    }
+}
+
+fn gone() -> String {
+    "That comparison is no longer on.".to_owned()
 }
 
 fn info(id: String, h: &snapshot::SnapshotHeader) -> proto::SnapshotInfo {
@@ -555,6 +580,24 @@ mod tests {
             second.compare_item("123", log).is_err(),
             "not the comparison that's on"
         );
+
+        // After a delete, the scan is matched again (once, by whichever
+        // request comes first).
+        let logs = find(&second, "logs");
+        second
+            .scan
+            .edit_finished(|t| t.remove(NodeId::from_index(log)))
+            .unwrap();
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| second.compare_item(&id, logs)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for c in results {
+            let c = c.unwrap();
+            assert_eq!((c.kind, c.after), (proto::ChangeKind::Shrunk, 0));
+        }
 
         // A rescan carries the earlier scan over, even once its file is gone.
         let carried = second.carry().expect("comparing");
