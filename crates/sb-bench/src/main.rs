@@ -231,6 +231,8 @@ fn run(nodes: usize, seed: u64) {
         "*e*; !*.tmp; !*.log",
         "dir:a",
         "*.pdf; !dir:e",
+        "size:>100MB",
+        "*.pdf; older:1y",
     ] {
         let (searched, s) = time(3, || {
             let mut s = Search::new(Matcher::new(query).expect("non-empty"));
