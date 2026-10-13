@@ -12,6 +12,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
+use crate::duplicates::Skip;
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -160,4 +161,31 @@ impl FsAdapter for UnixFs {
             allocated: Some(meta.blocks().saturating_mul(512)),
         })
     }
+}
+
+/// Opens a file to read its contents for finding duplicates. Without a
+/// portable `O_NOFOLLOW`, the path is checked to be a plain file before
+/// opening and the opened file checked to be that same file after, so a
+/// link is never read through. Dataless (cloud-only) files are refused, and
+/// this process never materializes them anyway (see `open_root`).
+pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    let before = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
+    if is_cloud(&before) {
+        return Err(Skip::Cloud);
+    }
+    if !before.is_file() || before.size() != len {
+        return Err(Skip::Changed);
+    }
+    let file = std::fs::File::open(path).map_err(|e| Skip::of(&e))?;
+    let meta = file.metadata().map_err(|e| Skip::of(&e))?;
+    if is_cloud(&meta) {
+        return Err(Skip::Cloud);
+    }
+    if !meta.is_file()
+        || (meta.dev(), meta.ino()) != (before.dev(), before.ino())
+        || meta.size() != len
+    {
+        return Err(Skip::Changed);
+    }
+    Ok(file)
 }

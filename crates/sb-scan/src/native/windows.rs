@@ -13,10 +13,13 @@
 //!   (protected folders become listable). Elevation is never requested.
 //! - Per-file opens use `FILE_READ_ATTRIBUTES` with `OPEN_REPARSE_POINT` and
 //!   `OPEN_NO_RECALL`, which the probes showed don't hydrate placeholders.
+//! - Finding duplicates reads contents only after such an open shows a plain
+//!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, classify_io,
 };
+use crate::duplicates::Skip;
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -32,12 +35,12 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO,
-    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo, GetDiskFreeSpaceExW,
-    GetDriveTypeW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
-    OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo,
+    FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandleEx,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -133,6 +136,19 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 fn open(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
+    open_with(
+        path,
+        access,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+    )
+    .map_err(scan_error)
+}
+
+fn open_with(
+    path: &Path,
+    access: u32,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> windows::core::Result<OwnedHandle> {
     let path = wide(path);
     let handle = unsafe {
         CreateFileW(
@@ -141,13 +157,70 @@ fn open(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+            flags,
             None,
         )
-    }
-    .map_err(scan_error)?;
+    }?;
     // SAFETY: CreateFileW returned a valid handle that we now own.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
+
+/// The OS error behind a failed call, so [`Skip::of`] can classify it.
+fn io_error(err: &windows::core::Error) -> std::io::Error {
+    let code = err.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::other(err.message())
+    }
+}
+
+/// Opens a file to read its contents for finding duplicates. A first open
+/// reads only attributes, which never recalls anything; a cloud file
+/// (placeholder, pinned, or offline), a link, or a file whose size changed
+/// since the scan is refused there. The open that reads is made with
+/// `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` and checked again, in case the
+/// file was replaced in between.
+pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    let skip = |e: windows::core::Error| Skip::of(&io_error(&e));
+    let probe = open_with(
+        path,
+        FILE_READ_ATTRIBUTES.0,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+    )
+    .map_err(skip)?;
+    check_contents(&probe, len)?;
+    drop(probe);
+    let handle = open_with(
+        path,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN,
+    )
+    .map_err(skip)?;
+    check_contents(&handle, len)?;
+    Ok(std::fs::File::from(handle))
+}
+
+fn check_contents(handle: &OwnedHandle, len: u64) -> Result<(), Skip> {
+    let skip = |e: ScanError| match e.kind {
+        ErrorKind::Vanished => Skip::Vanished,
+        ErrorKind::PermissionDenied => Skip::Denied,
+        _ => Skip::Unreadable,
+    };
+    let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo).map_err(skip)?;
+    let attributes = tag_info.FileAttributes;
+    let reparse = attributes & attr::REPARSE_POINT != 0;
+    if attributes & attr::CLOUD != 0 || (reparse && tag::is_cloud(tag_info.ReparseTag)) {
+        return Err(Skip::Cloud);
+    }
+    if classify(attributes, tag_info.ReparseTag) != EntryKind::File {
+        return Err(Skip::Changed);
+    }
+    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(skip)?;
+    if standard.EndOfFile as u64 != len {
+        return Err(Skip::Changed);
+    }
+    Ok(())
 }
 
 fn raw(handle: &OwnedHandle) -> HANDLE {

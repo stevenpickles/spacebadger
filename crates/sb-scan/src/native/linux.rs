@@ -12,6 +12,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
+use crate::duplicates::Skip;
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
@@ -290,4 +291,22 @@ mod tests {
         assert_eq!(unescape_octal(br"/plain"), b"/plain");
         assert_eq!(unescape_octal(br"/tab\011x\134y"), b"/tab\tx\\y");
     }
+}
+
+/// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
+/// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
+/// blocking; anything but a plain file of the scanned size is refused.
+pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| match e {
+        rustix::io::Errno::LOOP => Skip::Changed,
+        e => Skip::of(&e.into()),
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(file)
 }
