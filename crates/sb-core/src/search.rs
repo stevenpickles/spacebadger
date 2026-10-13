@@ -522,7 +522,7 @@ fn size_range(value: &str) -> Result<Option<Range>, String> {
         .find_map(|op| value.strip_prefix(op).map(|rest| (op, rest.trim())))
         .ok_or_else(|| {
             format!(
-                "“size:{value}” needs a comparison, like size:>{value} or size:<{value}, \
+                "“size:{value}” needs a comparison: size:>{value}, size:<{value}, \
                  or a range like size:10MB..1GB."
             )
         })?;
@@ -558,8 +558,7 @@ fn bytes(text: &str, value: &str) -> Result<u64, String> {
         // The conversion saturates, so an absurd size simply matches nothing.
         (Ok(n), Some(m)) if n.is_finite() && n >= 0.0 => Ok((n * m as f64).round() as u64),
         _ => Err(format!(
-            "“size:{value}” has a size SpaceBadger can't read. \
-             Use a number with B, KB, MB, GB, or TB, like 500MB or 1.5GB."
+            "“size:{value}” isn't a size: try size:>500MB or size:>1.5GB (B, KB, MB, GB, TB)."
         )),
     }
 }
@@ -608,8 +607,8 @@ fn age_range(value: &str, older: bool, now: u64) -> Result<Option<Range>, String
             }
             _ => {
                 return Err(format!(
-                    "“{keyword}:{value}” isn't an age. Use a number with h, d, w, mo, or y, \
-                     like {keyword}:30d or {keyword}:1y, or a date like {keyword}:2024-01-01."
+                    "“{keyword}:{value}” isn't an age: try {keyword}:30d, {keyword}:6mo, \
+                     {keyword}:1y, or {keyword}:2024-01-01."
                 ));
             }
         }
@@ -1447,9 +1446,9 @@ mod tests {
     fn malformed_sizes_and_ages_are_reported() {
         for (query, words) in [
             ("size:500MB", "needs a comparison"),
-            ("size:>abc", "can't read"),
-            ("size:>5PB", "can't read"),
-            ("size:>-1", "can't read"),
+            ("size:>abc", "isn't a size"),
+            ("size:>5PB", "isn't a size"),
+            ("size:>-1", "isn't a size"),
             ("size:1GB..10MB", "larger to smaller"),
             ("older:30", "isn't an age"),
             ("newer:soon", "isn't an age"),
