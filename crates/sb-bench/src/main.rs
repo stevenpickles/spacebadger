@@ -220,6 +220,8 @@ fn run(nodes: usize, seed: u64) {
         "no file has this name",
         "*.jpg; *.png; *.pdf",
         "*e*; !*.tmp; !*.log",
+        "dir:a",
+        "*.pdf; !dir:e",
     ] {
         let (searched, s) = time(3, || {
             let mut s = Search::new(Matcher::new(query).expect("non-empty"));
