@@ -2,6 +2,7 @@
 //! scanner's types to the protocol's.
 
 use crate::delete::{self, Outcome};
+use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
@@ -12,8 +13,10 @@ use sb_protocol as proto;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+mod compare;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -27,8 +30,8 @@ const MAX_PAGE: u32 = 500;
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` before the tree, then
-// `folder_files`, and `order` last.
+// Lock order: `deleting` first, `search` and `compare` before the tree,
+// then `folder_files`, and `order` last.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -43,6 +46,12 @@ pub struct Session {
     folder_files: Mutex<Option<FolderFiles>>,
     /// Folder names and extensions for the filter's completion.
     names: Mutex<Option<Names>>,
+    /// Where snapshots of completed scans are kept; `None` in tests.
+    snapshots: Option<Arc<Store>>,
+    /// The snapshot saved for this scan once it completed.
+    saved_snapshot: Arc<Mutex<Option<String>>>,
+    /// The comparison with an earlier scan, when on.
+    compare: Mutex<Option<compare::Active>>,
 }
 
 struct Names {
@@ -72,19 +81,45 @@ struct ActiveSearch {
 }
 
 impl Session {
+    /// Starts scanning without saving a snapshot at the end.
+    #[cfg(test)]
     pub fn start(
         root: PathBuf,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_with(root, None, on_status)
+    }
+
+    /// Starts scanning; once the scan completes, a snapshot of it is saved
+    /// in `snapshots`, so later scans can be compared with it.
+    pub fn start_with(
+        root: PathBuf,
+        snapshots: Option<Arc<Store>>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
         let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
+        let tree_cell = Arc::new(OnceLock::new());
+        let saved_snapshot = Arc::new(Mutex::new(None));
+        let saver = snapshots.as_ref().map(|store| compare::Saver {
+            store: Arc::clone(store),
+            root: root.clone(),
+            tree: Arc::clone(&tree_cell),
+            saved: Arc::clone(&saved_snapshot),
+        });
         let scan = Scan::start(
             root.clone(),
             NativeFs::new(),
             native::scan_config(&root),
-            move |p| sink(status(&display, p)),
+            move |p| {
+                sink(status(&display, p));
+                if let Some(saver) = &saver {
+                    saver.progress(&p.state);
+                }
+            },
         );
+        let _ = tree_cell.set(Arc::downgrade(&scan.tree()));
         Self {
             root,
             scan,
@@ -95,6 +130,9 @@ impl Session {
             deleting: Mutex::new(()),
             folder_files: Mutex::new(None),
             names: Mutex::new(None),
+            snapshots,
+            saved_snapshot,
+            compare: Mutex::new(None),
         }
     }
 
