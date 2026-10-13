@@ -266,7 +266,7 @@
     {#snippet empty()}
       <p class="muted">
         {scanning ? "No matching files found yet." : `No files match “${summary.query}”.`}
-        Patterns match file names; start one with dir: to match folder names.
+        Patterns match file names; dir: matches folder names and is: file types.
       </p>
     {/snippet}
   </ItemList>
