@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. Export a folder as CSV or a text report. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Download
 
@@ -15,7 +15,7 @@ Portable builds for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Sil
 
 | Path | Contents |
 |---|---|
-| `crates/sb-core` | Scan model, size accounting, aggregation, search, treemap layout |
+| `crates/sb-core` | Scan model, size accounting, aggregation, search, treemap layout, export |
 | `crates/sb-scan` | Filesystem traversal and per-OS metadata adapters |
 | `crates/sb-protocol` | Versioned IPC types; exports TypeScript bindings via `ts-rs` |
 | `crates/sb-probe` | Filesystem correctness-probe CLI |
@@ -64,6 +64,13 @@ Deleted items leave the map at once without a rescan; items that couldn't be mov
 The filter box matches file names (not paths), ignoring case. Separate patterns with `;`. A pattern with `*` (any text) or `?` (one character) must match the whole name, one without matches names containing it, and a leading `!` leaves names out: `*.jpg; *.png; !thumb*` finds JPEG and PNG files except thumbnails. Start a pattern with `dir:` to match folder names instead: `dir:cache` finds every file inside a folder named like `cache`, at any depth; `dir:node_modules; *.js` finds JavaScript files inside `node_modules`; and `*.log; !dir:archive` finds logs except those inside `archive` folders. `is:` picks a file type, by the same categories as the file-type colors: `is:video`, `is:audio`, `is:image`, `is:document`, `is:archive`, `is:diskimage`, `is:program`, `is:code`, or `is:other` (any unambiguous start works, like `is:doc`). `is:video; dir:Downloads` finds videos in Downloads, and `!is:code` leaves code out.
 
 As you type, the filter suggests keywords, file types after `is:`, folder names from the scan after `dir:`, and extensions from the scan after `*.`, with their counts and sizes. Press ↓ or Ctrl+Space to open the suggestions, Enter or Tab to use one, and Escape to close them. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
+
+**Export…** in the toolbar, or in a folder's right-click menu, saves what's in a folder as a file. Choose **This folder's contents** (its own files and folders) or **Everything under this folder** (every file and folder at any depth), and a format:
+
+- **CSV**, for spreadsheets: one row per item with its full path, name, `folder` or `file`, size in bytes, size as shown in the app, the number of files (for folders), the file type (the same categories as `is:` and the file-type colors), and its share of the exported folder in percent. Each folder comes before its contents, largest first. The file is UTF-8 with a byte order mark and CRLF line endings, quoted as in RFC 4180, so Excel and other spreadsheet apps read names with commas, quotes, line breaks, or non-English characters correctly. A name that starts with `=`, `+`, `-`, `@`, a tab, or a carriage return is written with a leading `'`, so a spreadsheet shows it as text instead of running it as a formula.
+- **Text report**: the folder, scan root, how the scan went, when it was exported, totals, the 50 largest folders and the 50 largest files under the folder, and what the scan didn't count.
+
+With a filter on, only matching files are exported, with the folders that contain them and the size and count of their matching files. You choose where to save in the system's save dialog; the suggested name is like `SpaceBadger-Downloads-2026-10-13.csv`. The file is written in the background, in steps, so the map and a running scan carry on; when it's done, **Show in Explorer** (Finder, file manager) shows the file. An export taken while scanning holds what had been scanned so far.
 
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 
