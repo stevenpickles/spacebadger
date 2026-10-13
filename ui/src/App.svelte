@@ -3,6 +3,7 @@
   import {
     appInfo,
     deleteItems,
+    errorText,
     EXPECTED_PROTOCOL_VERSION,
     fileManagerName,
     nodeDetails,
@@ -23,8 +24,10 @@
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
-  import DeleteDialog from "./lib/DeleteDialog.svelte";
+  import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import Announcer from "./lib/Announcer.svelte";
+  import { announce } from "./lib/announce.svelte";
   import { formatBytes, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
@@ -34,9 +37,11 @@
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
   import type { SearchRow } from "./lib/protocol/SearchRow";
+  import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
   import SearchResults from "./lib/SearchResults.svelte";
+  import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
   import { applyPick, type MenuRequest, type Pick, type Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
@@ -45,12 +50,13 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  const FILTER_HELP = [
-    "Matches file names, ignoring case. Separate patterns with ;",
-    "report: names containing “report”",
-    "*.jpg: names ending in .jpg (* is any text, ? one character)",
-    "!*.tmp: leave out names ending in .tmp",
-  ].join("\n");
+  type PanelTab = "results" | "small" | "omissions";
+  const FILTER_HELP: [string, string][] = [
+    ["report", "names containing “report”"],
+    ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
+    ["*.jpg; *.png", "either pattern (separate patterns with ;)"],
+    ["!*.tmp", "leave out names ending in .tmp"],
+  ];
 
   let generation = $state<number | null>(null);
   let status = $state.raw<ScanStatus | null>(null);
@@ -66,7 +72,9 @@
   let anchor = $state<number | null>(null);
   /** Totals when several items are selected. */
   let multi = $state.raw<SelectionSummary | null>(null);
-  let metric = $state<Metric>("allocated");
+  /** The map, lists, and totals measure file size; on-disk size appears
+   * only in the volume overview, which compares against disk usage. */
+  const metric: Metric = "logical";
   let colors = $state<ColorMode>(savedColors());
   let viewDetails = $state.raw<NodeDetails | null>(null);
   let selectedDetails = $state.raw<NodeDetails | null>(null);
@@ -83,21 +91,29 @@
   let allowDelete = $state(false);
   let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
   let deleting = $state(false);
+  /** What the last delete did, shown in the dialog until it's closed. */
+  let deleteResult = $state.raw<DeleteResult | null>(null);
+  let detailsError = $state<string | null>(null);
+  let detailsRetry = $state(0);
+  let multiUpdating = $state(false);
   /** Counts completed deletes, which change free space. */
   let deletions = $state(0);
-  let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  let menu = $state.raw<{ x: number; y: number; items: MenuItem[]; heading?: string } | null>(null);
   /** What's typed in the filter box. */
   let query = $state("");
   /** The search the map and results show; `null` when unfiltered. */
   let search = $state.raw<SearchSummary | null>(null);
   let searching = $state(false);
   let notice = $state<string | null>(null);
+  let showShortcuts = $state(false);
+  let showFilterHelp = $state(false);
+  /** The list chosen below the details; the panel falls back to one that's open. */
+  let tab = $state<PanelTab | null>(null);
 
   const scanning = $derived(status?.phase.kind === "scanning");
   const deleteBlocked = $derived(
     !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
   );
-  const modKey = $derived(os === "macos" ? "⌘" : "Ctrl");
   const elapsedMs = $derived(
     status ? status.elapsedMs + (scanning ? Math.max(0, now - statusAt) : 0) : 0,
   );
@@ -276,6 +292,17 @@
     ];
   }
 
+  function smallItemMenu(it: SmallItem): MenuItem[] {
+    const items: MenuItem[] = [];
+    if (it.folder) items.push({ label: "Open in map", hint: "Enter", action: () => openFolder(it.node) });
+    items.push(
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
+      { label: "Copy path", action: () => copyPath(it.node) },
+      ...deleteItemsFor(it.node),
+    );
+    return items;
+  }
+
   // ---- selection and delete -------------------------------------------
 
   function pick(p: Pick | null) {
@@ -294,13 +321,11 @@
     pick({ focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false });
   }
 
-  // A different scan or filter starts with nothing selected.
+  // A different scan or filter starts with nothing selected; the focused
+  // item may no longer be drawn.
   $effect(() => {
     void [generation, searchId];
-    untrack(() => {
-      picked = [];
-      anchor = null;
-    });
+    untrack(() => pick(null));
   });
 
   // Totals for several selected items follow the scan.
@@ -310,15 +335,36 @@
     void status?.revision;
     if (gen === null || nodes.length < 2) {
       multi = null;
+      multiUpdating = false;
       return;
     }
+    multiUpdating = true;
     selectionSummary({ generation: gen, nodes }).then(
       (s) => {
-        if (gen === generation && nodes === picked) multi = s;
+        if (gen !== generation || nodes !== picked) return;
+        multi = s;
+        multiUpdating = false;
       },
-      () => {},
+      (e: unknown) => {
+        if (gen !== generation || nodes !== picked) return;
+        multiUpdating = false;
+        problem = `Couldn't total the selection: ${errorText(e)}`;
+      },
     );
   });
+
+  async function copyPaths() {
+    const gen = generation;
+    const nodes = picked;
+    if (gen === null || nodes.length === 0) return;
+    try {
+      const all = await Promise.all(nodes.map((n) => nodeDetails(gen, n)));
+      await navigator.clipboard.writeText(all.map((d) => d.path).join("\n"));
+      flash(`${plural(nodes.length, "path")} copied`);
+    } catch (e) {
+      problem = `Couldn't copy the paths: ${errorText(e)}`;
+    }
+  }
 
   /** What delete applies to: the selected items, else the focused one. */
   function deleteTargets(): number[] {
@@ -326,23 +372,29 @@
     return selection && !selection.other ? [selection.node] : [];
   }
 
-  /** Menu entry to delete `node`, or the selection it belongs to; none
-   * until deleting is turned on. */
+  /** Menu entry to delete `node`, or the selection it belongs to; shown
+   * unavailable, with the reason, until deleting is turned on. */
   function deleteItemsFor(node: number): MenuItem[] {
-    if (!allowDelete) return [];
     const count = pickedSet.has(node) ? picked.length : 1;
     const what = count > 1 ? `${count} items ` : "";
+    const reason = !allowDelete ? "Turn on “Allow deleting” in the toolbar first." : deleteBlocked;
     return [
       {
-        label: `Move ${what}to ${trash}…`,
+        label: `Move ${what}to the ${trash}…`,
         hint: "Del",
         action: askDelete,
         separator: true,
         danger: true,
-        disabled: !!deleteBlocked,
-        title: deleteBlocked ?? undefined,
+        disabled: !!reason,
+        title: reason ?? undefined,
       },
     ];
+  }
+
+  /** What a menu acts on, named in its heading. */
+  function menuHeading(node: number, name: string | undefined): string | undefined {
+    if (pickedSet.has(node) && picked.length > 1) return `${picked.length} selected items`;
+    return name;
   }
 
   async function changeAllowDelete(on: boolean) {
@@ -381,16 +433,18 @@
     deleting = true;
     try {
       const report = await deleteItems({ generation: gen, nodes: c.nodes });
-      if (gen === generation) afterDelete(report, c.summary);
+      // The dialog stays open on its result screen until closed.
+      if (gen === generation) afterDelete(report);
+      else confirmDelete = null;
     } catch (e) {
-      problem = `Couldn't delete: ${String(e)}`;
+      confirmDelete = null;
+      problem = `Couldn't move to the ${trash}: ${errorText(e)}`;
     } finally {
       deleting = false;
-      confirmDelete = null;
     }
   }
 
-  function afterDelete(r: DeleteReport, asked: SelectionSummary) {
+  function afterDelete(r: DeleteReport) {
     deletions++;
     const gone = new Set(r.deleted);
     // Leave a folder that was deleted along with the items.
@@ -404,18 +458,18 @@
     } else {
       pick(null);
     }
-    const done = r.deleted.length;
-    if (done > 0) {
-      const only = asked.items === 1 ? asked.samples[0] : undefined;
-      const what = only ? `“${only.name}”` : plural(done, "item");
-      const size = formatBytes(r.allocated);
-      flash(`Moved ${what} (${size}) to the ${trash}`, 4000);
-    }
-    if (failed.length > 0) {
-      const lines = r.failed.slice(0, 3).map((f) => `${f.path}: ${f.message}`);
-      if (r.failed.length > 3) lines.push(`…and ${plural(r.failed.length - 3, "more item")}.`);
-      problem = [`Couldn't move ${plural(failed.length, "item")}:`, ...lines].join("\n");
-    }
+    const total = r.deleted.length + r.failed.length;
+    deleteResult = {
+      moved: r.deleted.length,
+      total,
+      size: r.logical,
+      failures: r.failed.map((f) => ({ path: f.path, message: f.message })),
+    };
+    announce(
+      r.failed.length > 0
+        ? `Moved ${r.deleted.length} of ${total} items to the ${trash}; ${plural(r.failed.length, "item")} couldn't be moved`
+        : `Moved ${plural(r.deleted.length, "item")} (${formatBytes(r.logical)}) to the ${trash}`,
+    );
   }
 
   // Breadcrumbs follow the view.
@@ -435,7 +489,8 @@
   $effect(() => {
     const gen = generation;
     const sel = selection;
-    void status?.revision;
+    void [status?.revision, detailsRetry];
+    detailsError = null;
     if (gen === null || !sel) {
       selectedDetails = null;
       return;
@@ -443,6 +498,30 @@
     nodeDetails(gen, sel.node).then(
       (d) => {
         if (gen === generation && selection?.node === sel.node) selectedDetails = d;
+      },
+      (e: unknown) => {
+        if (gen !== generation || selection?.node !== sel.node) return;
+        selectedDetails = null;
+        detailsError = errorText(e);
+      },
+    );
+  });
+
+  // The selected item's share of its folder.
+  let parentSize = $state<number | null>(null);
+  $effect(() => {
+    const gen = generation;
+    const d = selectedDetails;
+    const parent = d?.ancestors.at(-2)?.node;
+    parentSize = null;
+    if (gen === null || !d || parent === undefined || selection?.other) return;
+    if (parent === view && viewDetails?.node === view) {
+      parentSize = viewDetails.logical;
+      return;
+    }
+    nodeDetails(gen, parent).then(
+      (p) => {
+        if (gen === generation && selectedDetails === d) parentSize = p.logical;
       },
       () => {},
     );
@@ -474,7 +553,7 @@
   });
 
   $effect(() => {
-    void [generation, view, metric, searchId];
+    void [generation, view, searchId];
     smallOf = null;
   });
 
@@ -509,6 +588,7 @@
 
   function flash(text: string, ms = 1800) {
     notice = text;
+    announce(text);
     clearTimeout(noticeTimer);
     noticeTimer = setTimeout(() => (notice = null), ms);
   }
@@ -544,6 +624,28 @@
     return items;
   }
 
+  function treemapHeading(r: MenuRequest, name: string | undefined): string | undefined {
+    const node = r.selection?.node ?? view;
+    if (r.kind === "other") return name ? `Small items in ${name}` : "Small items";
+    return menuHeading(node, name);
+  }
+
+  function openTreemapMenu(r: MenuRequest) {
+    const node = r.selection?.node ?? view;
+    const known = [selectedDetails, viewDetails].find((d) => d?.node === node);
+    const opened = { x: r.x, y: r.y, items: menuItems(r), heading: treemapHeading(r, known?.name) };
+    menu = opened;
+    // An item right-clicked before it was selected: name it once known.
+    const gen = generation;
+    if (known || gen === null) return;
+    nodeDetails(gen, node).then(
+      (d) => {
+        if (menu === opened) menu = { ...opened, heading: treemapHeading(r, d.name) };
+      },
+      () => {},
+    );
+  }
+
   // Release builds replace the webview's own menu (Back, Reload, Inspect)
   // everywhere except where text can be copied or edited.
   $effect(() => {
@@ -560,206 +662,344 @@
   const empty = $derived.by((): { text: string; toRoot?: boolean } | null => {
     if (!layout || layout.total > 0 || !status) return null;
     if (status.phase.kind === "failed") return null;
-    const what = metric === "allocated" ? "allocated space" : "data";
     if (search) {
       if (search.files === 0) {
         const text = `No file names match “${search.query}”`;
         return { text: scanning ? `${text} yet.` : `${text}.`, toRoot: view !== ROOT };
       }
       if (view !== ROOT) {
-        return { text: `No matching files with measurable ${what} in this folder.`, toRoot: true };
+        return { text: "The matching files in this folder are all empty.", toRoot: true };
       }
-      return { text: `The matching files have no measurable ${what}. They're in the result list.` };
+      return { text: "The matching files are all empty. They're in the result list." };
     }
-    if (scanning) return { text: `Scanning… no measurable ${what} found here yet.` };
-    let text = `Nothing here has measurable ${what}.`;
-    if (metric === "allocated" && (viewDetails?.unknownAllocationFiles ?? 0) > 0) {
-      text += ` ${plural(viewDetails!.unknownAllocationFiles, "file")} have unknown allocation; try Logical size.`;
-    }
-    return { text };
+    if (scanning) return { text: "Scanning… no data found here yet." };
+    return { text: "Everything here is empty." };
   });
+
+  // ---- side panel lists -------------------------------------------------
+
+  const tabs = $derived(
+    [
+      search && generation !== null ? { id: "results" as const, label: "Results" } : null,
+      smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
+      showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
+    ].filter((t) => t !== null),
+  );
+  const activeTab = $derived(tabs.find((t) => t.id === tab)?.id ?? tabs[0]?.id ?? null);
+
+  // A list that opens comes to the front.
+  $effect(() => {
+    if (search) untrack(() => (tab = "results"));
+  });
+  $effect(() => {
+    if (smallOf?.folder !== undefined) untrack(() => (tab = "small"));
+  });
+  $effect(() => {
+    if (showOmissions) untrack(() => (tab = "omissions"));
+  });
+
+  function onTabKey(e: KeyboardEvent) {
+    const at = tabs.findIndex((t) => t.id === activeTab);
+    const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+    if (!step || at < 0) return;
+    e.preventDefault();
+    const next = tabs[(at + step + tabs.length) % tabs.length]!;
+    tab = next.id;
+    document.getElementById(`tab-${next.id}`)?.focus();
+  }
+
+  // ---- announcements and global keys -------------------------------------
+
+  // Phase changes are announced once; the status bar's counters never are.
+  let announcedPhase = "";
+  $effect(() => {
+    const s = status;
+    const key = s ? `${s.generation}:${s.phase.kind}` : "";
+    if (!s || key === announcedPhase) return;
+    announcedPhase = key;
+    if (s.phase.kind === "scanning") announce(`Scanning ${s.root}`);
+    else if (s.phase.kind === "failed") announce("Scan failed");
+    else if (s.phase.kind === "cancelled") announce("Scan cancelled; partial result");
+    else announce(`Scan complete: ${plural(s.files, "file")}, ${formatBytes(s.logical)}`);
+  });
+
+  function onWindowKey(e: KeyboardEvent) {
+    const t = e.target as HTMLElement;
+    if (e.key !== "?" || t.closest("input, textarea, dialog")) return;
+    e.preventDefault();
+    showShortcuts = true;
+  }
+
+  // Scan progress: a whole-volume scan can compare against used space.
+  const progress = $derived.by(() => {
+    if (!scanning || !status) return null;
+    if (!volume?.isRoot) return { value: null };
+    const used = volume.capacity - volume.free;
+    return used > 0 ? { value: Math.min(1, status.allocated / used) } : { value: null };
+  });
+
+  function closeFilterHelp(e: PointerEvent) {
+    if (!(e.target as HTMLElement).closest(".filter-help")) showFilterHelp = false;
+  }
 </script>
 
+<svelte:window onkeydown={onWindowKey} onpointerdown={showFilterHelp ? closeFilterHelp : undefined} />
+
 <div class="app">
-  <div class="toolbar" role="toolbar" aria-label="Scan controls">
-    <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
-    <button type="button" onclick={() => run(scanRefresh)} disabled={generation === null}>Refresh</button>
-    <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
-    <div class="metric" role="radiogroup" aria-label="Size measure">
-      <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
-      <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
+  <div class="toolbar">
+    <div class="group">
+      <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
+      {#if generation !== null}
+        <button
+          type="button"
+          onclick={() => run(scanRefresh)}
+          title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
+        >
+        <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
+      {/if}
     </div>
-    <label
-      class="check"
-      title={volume?.isRoot
-        ? "Show the volume's capacity, free space, and space not attributed to files"
-        : "Available when a whole drive or volume is scanned"}
-    >
-      <input type="checkbox" bind:checked={showVolume} disabled={!volume?.isRoot} /> Volume overview
-    </label>
-    <div class="metric" role="radiogroup" aria-label="Colors">
-      <label><input type="radio" bind:group={colors} value="depth" /> Depth colors</label>
-      <label><input type="radio" bind:group={colors} value="type" /> File type colors</label>
-    </div>
-    <div class="filter">
-      <input
-        type="search"
-        placeholder="Filter: *.jpg; *.png; !*.tmp"
-        aria-label="Filter by file name"
-        title={FILTER_HELP}
-        bind:value={query}
-        oninput={onQueryInput}
-        onkeydown={(e) => e.key === "Escape" && clearQuery()}
-        disabled={generation === null}
-      />
-      {#if searching}<span class="muted" role="status">Searching…</span>{/if}
-    </div>
-    <label
-      class="check allow"
-      class:on={allowDelete}
-      title="Lets you move items to the {trash}. Turns itself off when SpaceBadger closes."
-    >
-      <input
-        type="checkbox"
-        checked={allowDelete}
-        onchange={(e) => changeAllowDelete(e.currentTarget.checked)}
-      />
-      Allow deleting
-    </label>
-    {#if privileged}
-      <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
-        Administrator access
-      </span>
-    {/if}
-  </div>
-
-  {#if problem}
-    <div class="banner error" role="alert">
-      {problem}
-      <button type="button" onclick={() => (problem = null)} aria-label="Dismiss">✕</button>
-    </div>
-  {/if}
-  {#if status?.phase.kind === "cancelled"}
-    <div class="banner warn" role="status">
-      Partial result: the scan was cancelled before every folder was read, so sizes shown are lower
-      bounds. Select a folder to see whether it was scanned.
-    </div>
-  {:else if status?.phase.kind === "failed"}
-    <div class="banner error" role="alert">{status.phase.message}</div>
-  {/if}
-
-  {#if showVolume && volume?.isRoot && status}
-    {#if metric === "allocated" && !search}
-      <VolumeStrip {volume} {status} {os} onshowomissions={() => (showOmissions = true)} />
-    {:else}
-      <p class="volume-note">
-        The volume overview compares allocated space, so it's hidden with Logical size or a filter.
-      </p>
-    {/if}
-  {/if}
-
-  <div class="crumbs">
-    {#if viewDetails}
-      <Breadcrumbs crumbs={viewDetails.ancestors} onnavigate={openFolder} />
-    {:else if status}
-      <span>{status.root}</span>
-    {/if}
-  </div>
-
-  <div class="body">
-    <div class="mapcol">
-      <main class="map">
-        {#if generation === null}
-          <div class="placeholder">
-            <p>Choose a folder or drive to see what's using its space.</p>
-            <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
-          </div>
-        {:else}
-          <Treemap
-            {generation}
-            {view}
-            {metric}
-            {colors}
-            search={search?.search ?? null}
-            revision={status?.revision ?? 0}
-            {selection}
-            selected={pickedSet}
-            {anchor}
-            onpick={pick}
-            ondelete={askDelete}
-            onopen={openFolder}
-            onup={goUp}
-            onlayout={(l) => (layout = l)}
-            onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r) })}
-          />
-          {#if empty}
-            <div class="placeholder overlay">
-              <p>{empty.text}</p>
-              {#if empty.toRoot}
-                <button type="button" onclick={() => openFolder(ROOT)}>Go to the scan root</button>
-              {/if}
+    {#if generation !== null}
+      <fieldset class="group">
+        <legend>Color by</legend>
+        <label><input type="radio" bind:group={colors} value="depth" /> Depth</label>
+        <label><input type="radio" bind:group={colors} value="type" /> File type</label>
+      </fieldset>
+      {#if volume?.isRoot}
+        <label class="group check" title="Show the drive's capacity, free space, and used space no file accounts for">
+          <input type="checkbox" bind:checked={showVolume} /> Volume overview
+        </label>
+      {/if}
+      <div class="group filter">
+        <input
+          type="search"
+          placeholder="Filter files: *.jpg; *.png; !*.tmp"
+          aria-label="Filter by file name"
+          aria-describedby="filter-hint"
+          bind:value={query}
+          oninput={onQueryInput}
+          onkeydown={(e) => e.key === "Escape" && clearQuery()}
+        />
+        <span class="spinner" class:on={searching} aria-hidden="true"></span>
+        <span id="filter-hint" class="sr-only">Matches file names only. Escape clears.</span>
+        <div class="filter-help">
+          <button
+            type="button"
+            class="icon-button help"
+            aria-label="Filter syntax"
+            aria-expanded={showFilterHelp}
+            onclick={() => (showFilterHelp = !showFilterHelp)}>?</button
+          >
+          {#if showFilterHelp}
+            <div class="popover" role="note">
+              <p>Matches file names (not folders or paths), ignoring case.</p>
+              <dl>
+                {#each FILTER_HELP as [pattern, meaning] (pattern)}
+                  <dt><code>{pattern}</code></dt>
+                  <dd>{meaning}</dd>
+                {/each}
+              </dl>
             </div>
           {/if}
-        {/if}
-      </main>
-      {#if colors === "type" && generation !== null}
-        <Legend />
+        </div>
+      </div>
+    {/if}
+    <div class="end">
+      {#if privileged}
+        <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
+          Administrator
+        </span>
+      {/if}
+      <label
+        class="check allow"
+        class:on={allowDelete}
+        title="Lets you move items to the {trash}: select them, then press Delete or right-click. Turns itself off when SpaceBadger closes."
+      >
+        <input
+          type="checkbox"
+          checked={allowDelete}
+          onchange={(e) => changeAllowDelete(e.currentTarget.checked)}
+        />
+        Allow deleting
+      </label>
+      <button
+        type="button"
+        class="icon-button help"
+        aria-label="Keyboard and mouse shortcuts"
+        title="Keyboard and mouse shortcuts (?)"
+        onclick={() => (showShortcuts = true)}>?</button
+      >
+    </div>
+  </div>
+  <div class="progress" class:on={progress !== null} aria-hidden="true">
+    {#if progress}
+      {#if progress.value === null}
+        <span class="indeterminate"></span>
+      {:else}
+        <span style:width="{progress.value * 100}%"></span>
+      {/if}
+    {/if}
+  </div>
+
+  <div class="banners">
+    {#if problem}
+      <div class="banner error" role="alert">
+        <span class="selectable">{problem}</span>
+        <button type="button" class="icon-button" onclick={() => (problem = null)} aria-label="Dismiss">✕</button>
+      </div>
+    {/if}
+    {#if status?.phase.kind === "cancelled"}
+      <div class="banner warn">
+        <span>
+          Partial result: the scan was cancelled before every folder was read, so sizes are lower bounds.
+          Select a folder to see whether it was scanned.
+        </span>
+      </div>
+    {:else if status?.phase.kind === "failed"}
+      <div class="banner error" role="alert"><span class="selectable">{status.phase.message}</span></div>
+    {/if}
+  </div>
+
+  {#if showVolume && volume?.isRoot && status}
+    {#if !search}
+      <VolumeStrip {volume} {status} {os} onshowomissions={() => (showOmissions = true)} />
+    {:else}
+      <p class="volume-note">The volume overview is hidden while a filter is on.</p>
+    {/if}
+  {/if}
+
+  {#if generation !== null}
+    <div class="crumbs">
+      {#if viewDetails}
+        <Breadcrumbs crumbs={viewDetails.ancestors} onnavigate={openFolder} onup={goUp} />
+      {:else if status}
+        <span class="muted">{status.root}</span>
+      {/if}
+      {#if search}
+        <span class="filtered">
+          Showing files matching <code>{search.query}</code>
+          <button type="button" class="icon-button" aria-label="Clear the filter" title="Clear the filter" onclick={clearQuery}
+            >✕</button
+          >
+        </span>
       {/if}
     </div>
-    <aside>
-      <Details
-        {selection}
-        details={selectedDetails}
-        other={otherInfo}
-        {multi}
-        {view}
-        {fileManager}
-        trashName={trash}
-        {modKey}
-        canDelete={allowDelete}
-        {deleteBlocked}
-        onopen={openFolder}
-        onreveal={showInFileManager}
-        oncopy={copyPath}
-        ondelete={askDelete}
-      />
-      {#if showOmissions && status}
-        <Omissions groups={status.omissions} onclose={() => (showOmissions = false)} />
-      {/if}
-      {#if smallOf && generation !== null}
-        {#key smallOf.folder}
-          <SmallItems
-            {generation}
-            folder={smallOf.folder}
-            folderName={smallOf.name}
-            count={smallOf.count}
-            {metric}
-            search={searchId ?? null}
-            revision={status?.revision ?? 0}
-            selected={pickedSet}
-            {anchor}
-            onpick={pick}
-            ondelete={askDelete}
-            onopen={openFolder}
-            onclose={() => (smallOf = null)}
-          />
-        {/key}
-      {/if}
-      {#if search && generation !== null}
-        <SearchResults
+  {/if}
+
+  <div class="body">
+    <main class="map">
+      {#if generation === null}
+        <div class="placeholder">
+          <h1>See what's using your disk space</h1>
+          <p>Choose a folder or a whole drive. The map fills in while it scans: bigger boxes are bigger files.</p>
+          <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
+          <p class="small">
+            Press <kbd>?</kbd> for keyboard and mouse shortcuts.
+          </p>
+        </div>
+      {:else}
+        <Treemap
           {generation}
-          summary={search}
+          {view}
           {metric}
+          {colors}
+          search={search?.search ?? null}
           revision={status?.revision ?? 0}
-          {scanning}
-          scanned={metric === "allocated" ? (status?.allocated ?? 0) : (status?.logical ?? 0)}
+          {selection}
           selected={pickedSet}
           {anchor}
           onpick={pick}
           ondelete={askDelete}
-          onshow={showInMap}
-          onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row) })}
+          onopen={openFolder}
+          onup={goUp}
+          onlayout={(l) => (layout = l)}
+          onmenu={openTreemapMenu}
         />
+        {#if empty}
+          <div class="placeholder overlay">
+            <p>{empty.text}</p>
+            {#if empty.toRoot}
+              <button type="button" onclick={() => openFolder(ROOT)}>Go to the scan root</button>
+            {/if}
+          </div>
+        {/if}
+        <Legend mode={colors} />
+      {/if}
+    </main>
+    <aside>
+      <div class="details">
+        <Details
+          {selection}
+          details={selectedDetails}
+          other={otherInfo}
+          {multi}
+          {view}
+          {fileManager}
+          trashName={trash}
+          {parentSize}
+          error={detailsError}
+          onretry={() => detailsRetry++}
+          updating={multiUpdating}
+          oncopypaths={copyPaths}
+          canDelete={allowDelete}
+          {deleteBlocked}
+          onopen={openFolder}
+          onreveal={showInFileManager}
+          oncopy={copyPath}
+          ondelete={askDelete}
+        />
+      </div>
+      {#if activeTab}
+        <div class="tabs" role="tablist" aria-label="Lists">
+          {#each tabs as t (t.id)}
+            <button
+              type="button"
+              role="tab"
+              id="tab-{t.id}"
+              aria-selected={t.id === activeTab}
+              aria-controls="panel-list"
+              tabindex={t.id === activeTab ? 0 : -1}
+              onclick={() => (tab = t.id)}
+              onkeydown={onTabKey}>{t.label}</button
+            >
+          {/each}
+        </div>
+        <div class="list" id="panel-list" role="tabpanel" aria-labelledby="tab-{activeTab}">
+          {#if activeTab === "omissions" && status}
+            <Omissions groups={status.omissions} autofocus onclose={() => (showOmissions = false)} />
+          {:else if activeTab === "small" && smallOf && generation !== null}
+            {#key smallOf.folder}
+              <SmallItems
+                {generation}
+                folder={smallOf.folder}
+                folderName={smallOf.name}
+                count={smallOf.count}
+                search={searchId ?? null}
+                revision={status?.revision ?? 0}
+                selected={pickedSet}
+                {anchor}
+                onpick={pick}
+                ondelete={askDelete}
+                onopen={openFolder}
+                onclose={() => (smallOf = null)}
+                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
+              />
+            {/key}
+          {:else if activeTab === "results" && search && generation !== null}
+            <SearchResults
+              {generation}
+              summary={search}
+              revision={status?.revision ?? 0}
+              {scanning}
+              scanned={status?.logical ?? 0}
+              selected={pickedSet}
+              {anchor}
+              onpick={pick}
+              ondelete={askDelete}
+              onshow={showInMap}
+              onmenu={(row, x, y) => (menu = { x, y, items: resultItems(row), heading: menuHeading(row.node, row.name) })}
+            />
+          {/if}
+        </div>
       {/if}
     </aside>
   </div>
@@ -767,9 +1007,9 @@
   <StatusBar
     {status}
     {elapsedMs}
-    {metric}
     {showOmissions}
     ontoggleomissions={() => (showOmissions = !showOmissions)}
+    oncancel={cancel}
   />
 
   {#if menu}
@@ -777,6 +1017,7 @@
       x={menu.x}
       y={menu.y}
       label="Actions"
+      heading={menu.heading}
       items={menu.items}
       onclose={() => (menu = null)}
     />
@@ -788,11 +1029,20 @@
       filtered={search !== null}
       {privileged}
       busy={deleting}
+      result={deleteResult}
       onconfirm={confirmed}
       oncancel={() => (confirmDelete = null)}
+      onclose={() => {
+        confirmDelete = null;
+        deleteResult = null;
+      }}
     />
   {/if}
-  <div class="notice" role="status">{#if notice}<span>{notice}</span>{/if}</div>
+  {#if showShortcuts}
+    <Shortcuts trashName={trash} onclose={() => (showShortcuts = false)} />
+  {/if}
+  <div class="notice" aria-hidden="true">{#if notice}<span>{notice}</span>{/if}</div>
+  <Announcer />
 </div>
 
 <style>
@@ -805,88 +1055,194 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--line);
+    gap: var(--space-2) 0;
+    padding: var(--space-2) var(--space-3);
     background: var(--panel);
   }
-  .metric {
-    display: flex;
-    gap: 10px;
-    margin-left: 12px;
-  }
-  .metric label {
+  /* Control groups, divided by a rule. */
+  .group {
     display: flex;
     align-items: center;
-    gap: 4px;
-    cursor: pointer;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0 var(--space-3);
+    border: none;
+    border-left: 1px solid var(--line);
   }
-  .filter {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-left: 12px;
+  .group:first-child {
+    padding-left: 0;
+    border-left: none;
   }
-  .filter input {
-    width: 220px;
-    font: inherit;
-    padding: 4px 8px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: var(--bg);
-    color: var(--fg);
-  }
-  .muted {
+  fieldset.group legend {
+    float: left;
+    padding: 0;
     color: var(--muted);
-    font-size: 12px;
   }
+  .group label,
   .check {
     display: flex;
     align-items: center;
     gap: 4px;
-    margin-left: 12px;
     cursor: pointer;
   }
-  .allow.on {
+  /* The group that wraps to a second row first: a rule there would
+     dangle at the row's start. */
+  .filter {
+    border-left: none;
+    flex: 1 1 200px;
+    max-width: 420px;
+    min-width: 180px;
+  }
+  .filter input {
+    flex: 1;
+    min-width: 0;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    margin-left: -30px;
+    margin-right: 6px;
+    border: 2px solid var(--line);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .spinner.on {
+    visibility: visible;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .filter-help {
+    position: relative;
+  }
+  .popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    width: 320px;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    box-shadow: 0 6px 20px rgb(0 0 0 / 0.2);
+    font-size: var(--fs-sm);
+  }
+  .popover p {
+    margin: 0 0 var(--space-2);
+  }
+  .popover dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 10px;
+    margin: 0;
+  }
+  .popover dd {
+    margin: 0;
+  }
+  .end {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: auto;
+    padding-left: var(--space-3);
+  }
+  .allow {
     padding: 1px 6px;
-    border-radius: 4px;
+    border-radius: var(--radius);
+  }
+  .allow.on {
     background: var(--danger-bg);
     color: var(--danger);
     font-weight: 600;
+  }
+  .help {
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    font-weight: 600;
+  }
+  .badge {
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--warn-bg);
+    font-size: var(--fs-sm);
+  }
+  /* Thin bar under the toolbar while scanning. */
+  .progress {
+    position: relative;
+    height: 2px;
+    overflow: hidden;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .progress span {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--accent);
+    transition: width 0.3s;
+  }
+  .progress .indeterminate {
+    width: 30%;
+    animation: slide 1.4s ease-in-out infinite;
+  }
+  @keyframes slide {
+    from {
+      left: -30%;
+    }
+    to {
+      left: 100%;
+    }
+  }
+  .banners {
+    max-height: 30vh;
+    overflow-y: auto;
+  }
+  .banner {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+    white-space: pre-line;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--line);
   }
   .volume-note {
     margin: 0;
     padding: 4px 12px;
     border-bottom: 1px solid var(--line);
     color: var(--muted);
-    font-size: 12px;
-  }
-  .badge {
-    margin-left: auto;
-    padding: 2px 8px;
-    border-radius: 10px;
-    background: var(--warn-bg);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
   .crumbs {
-    padding: 4px 8px;
-    min-height: 24px;
+    display: flex;
+    align-items: center;
+    padding: 2px 8px;
+    min-height: 28px;
     border-bottom: 1px solid var(--line);
+  }
+  .filtered {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding: 0 2px 0 8px;
+    border-radius: 12px;
+    background: var(--selected);
+    font-size: var(--fs-sm);
   }
   .body {
     flex: 1;
     display: grid;
-    grid-template-columns: 1fr 300px;
-    min-height: 0;
-  }
-  .mapcol {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
+    grid-template-columns: minmax(0, 1fr) clamp(260px, 28%, 380px);
     min-height: 0;
   }
   .map {
-    flex: 1;
     position: relative;
     min-width: 0;
     min-height: 0;
@@ -898,7 +1254,59 @@
     min-height: 0;
     border-left: 1px solid var(--line);
     background: var(--panel);
+  }
+  .details {
+    flex: none;
+    max-height: 55%;
     overflow-y: auto;
+  }
+  .tabs {
+    display: flex;
+    flex: none;
+    gap: 2px;
+    padding: 0 var(--space-2);
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .tabs button {
+    padding: 6px 10px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: none;
+    color: var(--muted);
+  }
+  .tabs button[aria-selected="true"] {
+    border-bottom-color: var(--accent);
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .list {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  /* Narrow windows put the side panel under the map. */
+  @media (max-width: 800px) {
+    .body {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) minmax(0, 40%);
+    }
+    /* One scroll area: the details at full height, then the list. */
+    aside {
+      border-left: none;
+      border-top: 1px solid var(--line);
+      overflow-y: auto;
+    }
+    .details {
+      max-height: none;
+      overflow: visible;
+    }
+    .list {
+      flex: none;
+      height: 280px;
+    }
   }
   .placeholder {
     display: flex;
@@ -912,6 +1320,21 @@
     padding: 24px;
     box-sizing: border-box;
   }
+  .placeholder h1 {
+    margin: 0;
+    font-size: 20px;
+    color: var(--fg);
+  }
+  .placeholder p {
+    max-width: 420px;
+    margin: 0;
+  }
+  .placeholder kbd {
+    padding: 0 5px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font: inherit;
+  }
   .overlay {
     position: absolute;
     inset: 0;
@@ -920,23 +1343,9 @@
   .overlay button {
     pointer-events: auto;
   }
-  .banner {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    white-space: pre-line;
-    padding: 6px 12px;
-    border-bottom: 1px solid var(--line);
-  }
-  .banner button {
-    border: none;
-    background: none;
-    color: inherit;
-    cursor: pointer;
-  }
   .notice {
     position: fixed;
-    bottom: 40px;
+    bottom: 48px;
     left: 50%;
     transform: translateX(-50%);
     pointer-events: none;
@@ -944,15 +1353,16 @@
   .notice span {
     display: block;
     padding: 6px 12px;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--fg);
     color: var(--bg);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
   .warn {
     background: var(--warn-bg);
   }
   .error {
     background: var(--danger-bg);
+    color: inherit;
   }
 </style>

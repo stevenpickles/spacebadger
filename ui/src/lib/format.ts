@@ -46,3 +46,24 @@ export function describeItems(items: number, folders: number, files: number): st
   if (folders > 0) parts.push(`${plural(folders, "folder")} (${plural(files - loose, "file")} inside)`);
   return parts.join(" and ");
 }
+
+/** `part` as a share of `whole`, e.g. "12.5%"; tiny non-zero shares read "<0.1%". */
+export function percent(part: number, whole: number): string {
+  if (whole <= 0) return "0%";
+  const p = (part / whole) * 100;
+  if (p > 0 && p < 0.1) return "<0.1%";
+  return `${p >= 10 ? Math.round(p) : p.toFixed(1)}%`;
+}
+
+/** Whether the app runs on macOS, where ⌘ replaces Ctrl in key names. */
+export const isMac = navigator.userAgent.includes("Mac");
+
+/** A key combination named for this platform: "Ctrl+A", or "⌘A" on macOS. */
+export function shortcut(keys: string): string {
+  if (!isMac) return keys;
+  const mac: Record<string, string> = { Ctrl: "⌘", Alt: "⌥", Shift: "⇧" };
+  return keys
+    .split("+")
+    .map((k) => mac[k] ?? k)
+    .join("");
+}

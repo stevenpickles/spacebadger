@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, allocated/logical sizes, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Download
 
@@ -44,7 +44,7 @@ cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
 
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).
 
-In the map: click selects, double-click (or Enter) opens a folder, Backspace goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
+Press `?` (or the ? button in the toolbar) for a list of shortcuts. In the map: click selects, double-click (or Enter) opens a folder, Backspace or the ↑ button beside the breadcrumbs goes up, arrow keys move the selection, and Escape clears it. Right-click, the Menu key, or Shift+F10 shows actions: open in the map, go up, show in Explorer/Finder/file manager, and copy the path. Double-clicking a file does nothing; files are never opened.
 
 Selecting several items works as in a file manager, in the map, the result list, and the small-items list: Ctrl+click (⌘-click on macOS) adds or removes an item, Shift+click selects the range from the last item clicked (in the map, among items in the same folder, largest first), and Ctrl+A selects everything drawn in the viewed folder. The details panel totals the selection.
 

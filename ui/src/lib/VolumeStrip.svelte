@@ -1,9 +1,10 @@
 <script lang="ts">
   // Whole-volume capacity, kept apart from the treemap: files the scan
   // measured, used space no measured file accounts for, and free space. The
-  // middle block is only called "not attributed" once a scan has completed;
-  // before that it still includes files not scanned yet.
-  import { exactBytes, formatBytes, formatCount } from "./format";
+  // middle block is only called "used, but not by files found" once a scan
+  // has completed; before that it still includes files not scanned yet. It
+  // compares against space on disk, since that is what the volume reports.
+  import { exactBytes, formatBytes, plural } from "./format";
   import type { ScanStatus } from "./protocol/ScanStatus";
   import type { VolumeInfo } from "./protocol/VolumeInfo";
 
@@ -26,7 +27,7 @@
     status.phase.kind === "complete" || status.phase.kind === "completeWithOmissions",
   );
   const gapLabel = $derived.by(() => {
-    if (complete) return "Not attributed to files";
+    if (complete) return "Used, but not by files found";
     if (status.phase.kind === "scanning") return "Not scanned yet";
     return "Not scanned";
   });
@@ -50,22 +51,22 @@
 <section class="volume" aria-label="Volume overview">
   <div class="bar" aria-hidden="true">
     <div class="files" style:width={width(files)}></div>
-    <button
-      type="button"
+    <!-- The key below has the keyboard and screen-reader equivalent. -->
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div
       class="gap"
       class:pending={!complete}
       style:width={width(gap)}
-      tabindex="-1"
       title={gapLabel}
       onclick={() => (explain = !explain)}
-    ></button>
+    ></div>
     <div class="free" style:width={width(volume.free)}></div>
   </div>
   <ul class="key">
     <li title={exactBytes(files)}>
       <span class="swatch files"></span>Files found {formatBytes(files)} ({pct(files)})
     </li>
-    <li>
+    <li title={exactBytes(gap)}>
       <span class="swatch gap" class:pending={!complete}></span>
       <button type="button" class="link" aria-expanded={explain} onclick={() => (explain = !explain)}>
         {gapLabel} {formatBytes(gap)} ({pct(gap)})
@@ -89,41 +90,42 @@
         </p>
       {:else}
         <p>
-          The volume reports {formatBytes(used)} used, but the files SpaceBadger could measure take
-          {formatBytes(files)}. The difference isn't spread over folders in the map. Likely sources:
+          The drive reports {formatBytes(used)} in use, but the files SpaceBadger found take up
+          {formatBytes(files)} on disk. The other {formatBytes(gap)} isn't shown in the map. It's most likely:
         </p>
         <ul>
           {#if ntfs}
             <li>
-              NTFS metadata (the master file table and journal):
+              The file system's own index (master file table) and journal.
               {#if volume.metadata !== null}
-                master file table {formatBytes(volume.metadata)}.
+                The index takes {formatBytes(volume.metadata)}.
               {:else}
-                not measured; start SpaceBadger as administrator to measure the master file table.
+                Their size isn't known; start SpaceBadger as administrator to measure the index.
               {/if}
             </li>
           {:else}
-            <li>Filesystem structures and blocks the filesystem reserves for itself.</li>
+            <li>Space the file system keeps for its own records and reserves.</li>
           {/if}
           {#if unreadable > 0}
             <li>
-              {formatCount(unreadable)} items couldn't be read, so their contents aren't counted.
+              {plural(unreadable, "item")} that couldn't be read, so their contents aren't counted.
               <button type="button" class="link" onclick={onshowomissions}>Show them</button>
             </li>
           {/if}
           {#if os === "windows"}
             <li>
-              Restore points and shadow copies in System Volume Information, which only an
+              Restore points and shadow copies (in System Volume Information), which only an
               administrator can measure.
             </li>
-            <li>Alternate data streams, which SpaceBadger doesn't measure.</li>
+            <li>Alternate data streams (extra data attached to files), which SpaceBadger doesn't measure.</li>
           {:else}
-            <li>Snapshots, which aren't part of the folder tree.</li>
+            <li>Snapshots, which aren't part of any folder.</li>
           {/if}
         </ul>
         {#if measured > 0}
           <p class="muted">
-            Measured: {formatBytes(measured)}. Unexplained: {formatBytes(gap - measured)}.
+            The index accounts for {formatBytes(measured)} of the {formatBytes(gap)}; the remaining
+            {formatBytes(gap - measured)} can't be explained exactly.
           </p>
         {/if}
       {/if}
@@ -154,9 +156,6 @@
     background: var(--accent);
   }
   .gap {
-    padding: 0;
-    border: none;
-    border-radius: 0;
     background: var(--gap);
     cursor: pointer;
   }
@@ -204,18 +203,6 @@
   }
   .swatch.free {
     background: var(--bg);
-  }
-  .link {
-    border: none;
-    background: none;
-    padding: 0;
-    color: var(--link);
-    font: inherit;
-    text-decoration: underline;
-    cursor: pointer;
-  }
-  .muted {
-    color: var(--muted);
   }
   .explain {
     max-width: 760px;

@@ -116,3 +116,9 @@ export function fileManagerName(os: string): string {
 export function onScanStatus(handler: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>(SCAN_STATUS_EVENT, (event) => handler(event.payload));
 }
+
+/** A failure from a command or the system, as a sentence for messages. */
+export function errorText(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e);
+  return text.replace(/^Error:\s*/, "").trim() || "Unknown error";
+}
