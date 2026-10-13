@@ -222,8 +222,15 @@ pub fn run<C: Contents>(
                     buf: vec![0; BUFFER],
                 };
                 while let Some(task) = work.next(plan, cancel) {
+                    // Hands the task back even if reading panics, so the
+                    // other readers don't wait for it forever.
+                    let mut taken = Taken {
+                        work: &work,
+                        stream: task.streams(plan),
+                        more: Vec::new(),
+                    };
                     let result = reader.perform(plan, &task);
-                    work.complete(plan, task, result, counters, &on_event);
+                    work.complete(plan, task, result, counters, &on_event, &mut taken.more);
                 }
             });
         }
@@ -241,6 +248,35 @@ enum Task {
     Sample { group: usize, file: usize },
     /// All of it, after its sample matched another's.
     Whole { bucket: Arc<Bucket>, file: usize },
+}
+
+impl Task {
+    /// Whether it reads a large file whole, which takes one of the
+    /// [`STREAMS`].
+    fn streams(&self, plan: &Plan) -> bool {
+        matches!(self, Task::Whole { bucket, .. } if plan.groups[bucket.group].size > LARGE)
+    }
+}
+
+/// A task a reader has taken; dropping it returns its place in the queue
+/// along with any whole-file reads it led to.
+struct Taken<'a> {
+    work: &'a Work,
+    stream: bool,
+    more: Vec<(Arc<Bucket>, usize)>,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        // Runs while unwinding too, so a poisoned lock is still used.
+        let mut q = self.work.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.busy -= 1;
+        if self.stream {
+            q.streams -= 1;
+        }
+        q.whole.extend(self.more.drain(..));
+        self.work.changed.notify_all();
+    }
 }
 
 /// Files of one group whose samples matched, being read whole.
@@ -344,7 +380,8 @@ impl Work {
     }
 
     /// Records a task's result; the last result for a set of files decides
-    /// what happens to them next. A cancelled task is dropped.
+    /// what happens to them next, which may add whole-file reads to `more`.
+    /// A cancelled task is dropped.
     fn complete(
         &self,
         plan: &Plan,
@@ -352,8 +389,8 @@ impl Work {
         result: Result<Result<Digest, Skip>, Cancelled>,
         counters: &Counters,
         on_event: &impl Fn(Event),
+        more: &mut Vec<(Arc<Bucket>, usize)>,
     ) {
-        let mut more = Vec::new();
         let (group, file) = match &task {
             Task::Sample { group, file } => (*group, *file),
             Task::Whole { bucket, file } => (bucket.group, *file),
@@ -370,16 +407,20 @@ impl Work {
                 Task::Whole { bucket, .. } => &bucket.results,
             };
             let mut r = results.lock().unwrap();
-            match result {
-                Ok(digest) => r.digests.push((digest, file)),
-                Err(why) => {
-                    finish(1);
-                    on_event(Event::Skipped(g.files[file].node, why));
+            let skipped = match result {
+                Ok(digest) => {
+                    r.digests.push((digest, file));
+                    None
                 }
-            }
+                Err(why) => Some(why),
+            };
             r.left -= 1;
             let all = (r.left == 0).then(|| std::mem::take(&mut r.digests));
             drop(r);
+            if let Some(why) = skipped {
+                finish(1);
+                on_event(Event::Skipped(g.files[file].node, why));
+            }
             for same in all.map(alike).unwrap_or_default() {
                 match &task {
                     // Small files were read whole by the sample.
@@ -402,13 +443,6 @@ impl Work {
                 }
             }
         }
-        let mut q = self.queue.lock().unwrap();
-        q.busy -= 1;
-        if matches!(task, Task::Whole { .. }) && g.size > LARGE {
-            q.streams -= 1;
-        }
-        q.whole.extend(more);
-        self.changed.notify_all();
     }
 }
 
@@ -518,6 +552,7 @@ mod tests {
     use sb_core::tree::FileSizes;
     use std::io::Cursor;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     /// File contents by path; a missing path has vanished.
     #[derive(Default)]
@@ -938,5 +973,49 @@ mod tests {
             contents.open.lock().unwrap().1 > 1,
             "the group's files were read in parallel"
         );
+    }
+
+    #[test]
+    fn a_reader_that_panics_lets_the_others_finish() {
+        struct Panics(FakeContents);
+        impl Contents for Panics {
+            type File = Cursor<Vec<u8>>;
+            fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
+                assert!(!path.ends_with("bad"), "reading failed badly");
+                self.0.open(path, len)
+            }
+        }
+        let mut f = Fixture::new();
+        f.file("bad", bytes(5000, 1));
+        f.file("good", bytes(5000, 1));
+        for i in 0..6 {
+            f.file(&format!("other{i}"), bytes(7000, 1));
+        }
+        let plan = plan(&f.tree, NodeId::ROOT, None, 0);
+        let contents = Panics(std::mem::take(&mut f.contents));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let found = AtomicUsize::new(0);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    &plan,
+                    &contents,
+                    3,
+                    &AtomicBool::new(false),
+                    &Counters::default(),
+                    |e| {
+                        if matches!(e, Event::Found(_)) {
+                            found.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                )
+            }));
+            let _ = tx.send((outcome.is_err(), found.load(Ordering::Relaxed)));
+        });
+        let (panicked, found) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run returned");
+        assert!(panicked, "the panic reaches the caller");
+        assert_eq!(found, 1, "the other group was still read");
     }
 }
