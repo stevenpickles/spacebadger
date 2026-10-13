@@ -120,13 +120,16 @@ async fn layout(state: State<'_, AppState>, request: LayoutRequest) -> Result<Re
     Ok(Response::new(session.layout(&request)?))
 }
 
+/// Details of a scanned item; with `search`, also what that filter matches
+/// at or under it.
 #[tauri::command]
 async fn node_details(
     state: State<'_, AppState>,
     generation: u64,
     node: u32,
+    search: Option<u32>,
 ) -> Result<NodeDetails, String> {
-    state.session(generation)?.details(node)
+    state.session(generation)?.details(node, search)
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.

@@ -471,10 +471,23 @@ impl Session {
         })
     }
 
-    pub fn details(&self, id: u32) -> Result<proto::NodeDetails, String> {
+    /// Details of a node; with `search`, also what that filter matches
+    /// under it. A search that's no longer current gives no matching totals
+    /// rather than an error, since a newer one is on its way.
+    pub fn details(&self, id: u32, search: Option<u32>) -> Result<proto::NodeDetails, String> {
+        let mut active = self.search.lock().map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
         let n = node(&tree, id)?;
+        let matching = search
+            .and_then(|s| current_search(&mut active, s, &tree).ok())
+            .map(|a| {
+                let t = a.search.totals(n);
+                proto::Matching {
+                    files: u64::from(t.files),
+                    logical: t.logical,
+                }
+            });
         let node_flags = tree.flags(n);
         let is_dir = tree.is_dir(n);
         let allocated = if is_dir {
@@ -511,6 +524,7 @@ impl Session {
             hardlinked: node_flags & flags::HARDLINKED != 0,
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
+            matching,
         })
     }
 
@@ -826,6 +840,54 @@ mod tests {
     }
 
     #[test]
+    fn details_report_what_the_filter_matches() {
+        let tmp = fixture_named("matching");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        let search = session.search_set("*.log").unwrap().unwrap().search;
+
+        let root = session.details(0, Some(search)).unwrap();
+        assert_eq!(
+            root.matching,
+            Some(proto::Matching {
+                files: 2,
+                logical: 8000
+            })
+        );
+        assert_eq!(
+            (root.files, root.logical),
+            (3, 8100),
+            "the whole folder too"
+        );
+        let old = session.details(old, Some(search)).unwrap();
+        assert_eq!(
+            old.matching,
+            Some(proto::Matching {
+                files: 2,
+                logical: 8000
+            })
+        );
+
+        assert_eq!(session.details(0, None).unwrap().matching, None);
+        assert_eq!(
+            session.details(0, Some(search + 7)).unwrap().matching,
+            None,
+            "a search that isn't current gives no totals, not an error"
+        );
+    }
+
+    #[test]
     fn lists_the_largest_files_under_a_folder() {
         let tmp = fixture_named("files");
         let statuses = Arc::new(Mutex::new(Vec::new()));
@@ -906,8 +968,8 @@ mod tests {
         let last = statuses.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.revision, before + 1);
         assert_eq!((last.files, last.dirs, last.logical), (1, 0, 100));
-        assert!(session.details(id(old)).is_err());
-        assert!(session.details(id(keep)).is_ok());
+        assert!(session.details(id(old), None).is_err());
+        assert!(session.details(id(keep), None).is_ok());
         let summary = session.search_summary(search.search).unwrap();
         assert_eq!(summary.files, 0);
 
