@@ -48,7 +48,9 @@ jobs:
       - name: Manifests
         id: manifests
         shell: bash
-        run: echo "dir=$(scripts/release/winget.sh "$VERSION")" >> "$GITHUB_OUTPUT"
+        run: |
+          dir=$(scripts/release/winget.sh "$VERSION")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:
