@@ -303,7 +303,13 @@ pub fn is_privileged() -> bool {
 pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     let flags =
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
-    let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| match e {
+    // `O_NOATIME` spares the disk a write per file read, but only the
+    // file's owner (or root) may ask for it.
+    let fd = match rustix::fs::open(path, flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open(path, flags, Mode::empty()),
+        opened => opened,
+    }
+    .map_err(|e| match e {
         rustix::io::Errno::LOOP => Skip::Changed,
         e => Skip::of(&e.into()),
     })?;
