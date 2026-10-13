@@ -241,7 +241,7 @@ mod tests {
             logical: bytes,
             allocated: Allocated::known(bytes),
         };
-        t.add_file(dir, name.as_ref(), sizes, 0).unwrap();
+        t.add_file(dir, name.as_ref(), sizes, None, 0).unwrap();
     }
 
     fn names(entries: Vec<&Entry>) -> Vec<(&str, u32, u64)> {

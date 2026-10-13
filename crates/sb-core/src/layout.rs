@@ -577,7 +577,7 @@ mod tests {
     }
 
     fn file(tree: &mut Tree, parent: NodeId, name: &str, bytes: u64) -> NodeId {
-        tree.add_file(parent, OsStr::new(name), sizes(bytes), 0)
+        tree.add_file(parent, OsStr::new(name), sizes(bytes), None, 0)
             .unwrap()
     }
 
@@ -727,7 +727,7 @@ mod tests {
             logical: 50,
             allocated: Allocated::UNKNOWN,
         };
-        t.add_file(NodeId::ROOT, OsStr::new("unknown"), unknown, 0)
+        t.add_file(NodeId::ROOT, OsStr::new("unknown"), unknown, None, 0)
             .unwrap();
         let l = run(&t, NodeId::ROOT, &LayoutParams::new(100.0, 100.0));
         assert_eq!(l.rects.len(), 1);

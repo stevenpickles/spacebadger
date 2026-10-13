@@ -641,11 +641,14 @@ mod tests {
         let mut t = Tree::new("/data");
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let b = t.add_dir(a, "b".as_ref()).unwrap();
-        t.add_file(a, "big.iso".as_ref(), sizes(5 << 20), 0)
+        t.add_file(a, "big.iso".as_ref(), sizes(5 << 20), None, 0)
             .unwrap();
-        t.add_file(a, "note.txt".as_ref(), sizes(10), 0).unwrap();
-        t.add_file(b, "ü.bin".as_ref(), sizes(2 << 20), 0).unwrap();
-        t.add_file(NodeId::ROOT, "x".as_ref(), sizes(1), 0).unwrap();
+        t.add_file(a, "note.txt".as_ref(), sizes(10), None, 0)
+            .unwrap();
+        t.add_file(b, "ü.bin".as_ref(), sizes(2 << 20), None, 0)
+            .unwrap();
+        t.add_file(NodeId::ROOT, "x".as_ref(), sizes(1), None, 0)
+            .unwrap();
         // `b` couldn't be read.
         t.set_dir_state(NodeId::ROOT, DirState::Listed);
         t.set_dir_state(a, DirState::Listed);

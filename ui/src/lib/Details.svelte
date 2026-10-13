@@ -1,7 +1,7 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
   import { describeChange } from "./compare";
-  import { describeItems, exactBytes, formatBytes, percent, plural, shortcut } from "./format";
+  import { describeItems, exactBytes, formatBytes, formatDate, percent, plural, shortcut } from "./format";
   import type { FolderState } from "./protocol/FolderState";
   import type { ItemChange } from "./protocol/ItemChange";
   import type { NodeDetails } from "./protocol/NodeDetails";
@@ -153,6 +153,10 @@
     {@render changeRow(d, c)}
     <dt>Type</dt>
     <dd>{d.folder ? "Folder" : "File"}</dd>
+    {#if !d.folder && d.modified !== null}
+      <dt>Modified</dt>
+      <dd>{formatDate(d.modified)}</dd>
+    {/if}
     {#if d.folder}
       {#if !d.matching}
         <dt>Files</dt>

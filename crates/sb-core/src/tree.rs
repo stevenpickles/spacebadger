@@ -14,6 +14,7 @@ use crate::size::Allocated;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const NONE: u32 = u32::MAX;
 
@@ -110,6 +111,8 @@ pub struct Tree {
     unknown: Vec<u32>,
     /// Files: 1. Directories: descendant file count.
     files: Vec<u32>,
+    /// Files: last modified, in [`epoch_seconds`] form. Directories: 0.
+    modified: Vec<u32>,
     /// Hard-link alias → owning node.
     alias_owner: HashMap<u32, u32>,
     dir_count: u64,
@@ -136,6 +139,7 @@ impl Tree {
             allocated: Vec::new(),
             unknown: Vec::new(),
             files: Vec::new(),
+            modified: Vec::new(),
             alias_owner: HashMap::new(),
             dir_count: 0,
             changes: Vec::new(),
@@ -187,6 +191,7 @@ impl Tree {
         self.allocated.push(0);
         self.unknown.push(0);
         self.files.push(0);
+        self.modified.push(0);
         if parent != NONE {
             let p = parent as usize;
             self.next_sibling[id as usize] = self.first_child[p];
@@ -205,17 +210,20 @@ impl Tree {
     }
 
     /// Adds a file under `parent` and adds its sizes to every ancestor.
+    /// `modified` is its last-modified time, if the listing gave one.
     pub fn add_file(
         &mut self,
         parent: NodeId,
         name: &OsStr,
         sizes: FileSizes,
+        modified: Option<SystemTime>,
         extra_flags: u8,
     ) -> Result<NodeId, CapacityExceeded> {
         debug_assert!(self.is_dir(parent) && !self.is_removed(parent));
         let id = self.push(parent.0, name, extra_flags & !flags::DIRECTORY)?;
         let i = id.index();
         self.files[i] = 1;
+        self.modified[i] = epoch_seconds(modified);
         self.logical[i] = sizes.logical;
         match sizes.allocated.get() {
             Some(bytes) if extra_flags & flags::HARDLINK_ALIAS == 0 => self.allocated[i] = bytes,
@@ -370,6 +378,14 @@ impl Tree {
         self.unknown[node.index()]
     }
 
+    /// A file's last-modified time in seconds since the Unix epoch, or
+    /// `None` when unknown (and for folders). Any time before 1970 reads as
+    /// 1 and any after early 2106 as `u32::MAX`; see [`epoch_seconds`].
+    pub fn modified(&self, node: NodeId) -> Option<u32> {
+        let secs = self.modified[node.index()];
+        (secs != 0).then_some(secs)
+    }
+
     /// Files at or under this node.
     pub fn file_count(&self, node: NodeId) -> u32 {
         self.files[node.index()]
@@ -507,11 +523,25 @@ impl Tree {
 
     /// Approximate heap bytes held by the tree.
     pub fn memory_bytes(&self) -> usize {
-        let per_node = 4 * 4 + 2 + 2 + 8 * 2 + 4 * 2;
+        let per_node = 4 * 4 + 2 + 2 + 8 * 2 + 4 * 3;
         self.parent.capacity() * per_node
             + self.names.capacity()
             + self.alias_owner.capacity() * 16
             + self.changes.capacity() * 4
+    }
+}
+
+/// A time as whole seconds since the Unix epoch, the way the tree stores
+/// it: 0 for unknown, times before 1970 as 1, and times after early 2106
+/// (where `u32` runs out) as `u32::MAX`. Four bytes per node is the point;
+/// second resolution is plenty for filtering by age.
+pub fn epoch_seconds(time: Option<SystemTime>) -> u32 {
+    let Some(time) = time else {
+        return 0;
+    };
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(since) => u32::try_from(since.as_secs()).unwrap_or(u32::MAX).max(1),
+        Err(_) => 1,
     }
 }
 
@@ -553,10 +583,11 @@ mod tests {
         let mut t = Tree::new("/root");
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let b = t.add_dir(a, "b".as_ref()).unwrap();
-        t.add_file(a, "x".as_ref(), sizes(10, 4096), 0).unwrap();
-        t.add_file(b, "y".as_ref(), sizes(1_000_000, 65_536), 0)
+        t.add_file(a, "x".as_ref(), sizes(10, 4096), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "z".as_ref(), sizes(5, 0), 0)
+        t.add_file(b, "y".as_ref(), sizes(1_000_000, 65_536), None, 0)
+            .unwrap();
+        t.add_file(NodeId::ROOT, "z".as_ref(), sizes(5, 0), None, 0)
             .unwrap();
 
         assert_eq!(t.logical(b), 1_000_000);
@@ -580,6 +611,7 @@ mod tests {
                     logical: 500,
                     allocated: Allocated::UNKNOWN,
                 },
+                None,
                 flags::CLOUD,
             )
             .unwrap();
@@ -599,9 +631,11 @@ mod tests {
         let mut t = Tree::new("/root");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let owner = t
-            .add_file(NodeId::ROOT, "a".as_ref(), sizes(100, 4096), 0)
+            .add_file(NodeId::ROOT, "a".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
-        let alias = t.add_file(d, "b".as_ref(), sizes(100, 4096), 0).unwrap();
+        let alias = t
+            .add_file(d, "b".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
         t.mark_alias(alias, owner);
 
         assert_eq!(t.allocated(NodeId::ROOT), 4096);
@@ -631,9 +665,9 @@ mod tests {
         let mut t = Tree::new(PathBuf::from("base"));
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let f = t
-            .add_file(a, "ü file.txt".as_ref(), sizes(1, 1), 0)
+            .add_file(a, "ü file.txt".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
-        t.add_file(a, "g".as_ref(), sizes(1, 1), 0).unwrap();
+        t.add_file(a, "g".as_ref(), sizes(1, 1), None, 0).unwrap();
         assert_eq!(t.path(f), Path::new("base").join("a").join("ü file.txt"));
         assert_eq!(t.path(NodeId::ROOT), Path::new("base"));
         let names: Vec<_> = t.children(a).map(|c| name(&t, c)).collect();
@@ -648,7 +682,9 @@ mod tests {
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let b = t.add_dir(a, "b".as_ref()).unwrap();
         let c = t.add_dir(a, "c".as_ref()).unwrap();
-        let x = t.add_file(b, "x".as_ref(), sizes(10, 4096), 0).unwrap();
+        let x = t
+            .add_file(b, "x".as_ref(), sizes(10, 4096), None, 0)
+            .unwrap();
         let y = t
             .add_file(
                 b,
@@ -657,11 +693,14 @@ mod tests {
                     logical: 7,
                     allocated: Allocated::UNKNOWN,
                 },
+                None,
                 0,
             )
             .unwrap();
-        let z = t.add_file(c, "z".as_ref(), sizes(1, 512), 0).unwrap();
-        let w = t.add_file(a, "w".as_ref(), sizes(2, 1024), 0).unwrap();
+        let z = t.add_file(c, "z".as_ref(), sizes(1, 512), None, 0).unwrap();
+        let w = t
+            .add_file(a, "w".as_ref(), sizes(2, 1024), None, 0)
+            .unwrap();
 
         assert!(t.remove(b));
         assert_eq!(t.logical(a), 3);
@@ -702,10 +741,14 @@ mod tests {
         let mut t = Tree::new("/root");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let owner = t
-            .add_file(NodeId::ROOT, "a".as_ref(), sizes(100, 4096), 0)
+            .add_file(NodeId::ROOT, "a".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
-        let first = t.add_file(d, "b".as_ref(), sizes(100, 4096), 0).unwrap();
-        let second = t.add_file(d, "c".as_ref(), sizes(100, 4096), 0).unwrap();
+        let first = t
+            .add_file(d, "b".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let second = t
+            .add_file(d, "c".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
         t.mark_alias(first, owner);
         t.mark_alias(second, owner);
         assert_eq!(t.allocated(NodeId::ROOT), 4096);
@@ -735,12 +778,44 @@ mod tests {
     fn removed_nodes_ignore_late_updates() {
         let mut t = Tree::new("/root");
         let f = t
-            .add_file(NodeId::ROOT, "f".as_ref(), sizes(10, 4096), 0)
+            .add_file(NodeId::ROOT, "f".as_ref(), sizes(10, 4096), None, 0)
             .unwrap();
         t.remove(f);
         t.update_file(f, sizes(20, 8192));
         assert_eq!(t.allocated(NodeId::ROOT), 0);
         assert_eq!(t.logical(f), 0);
+    }
+
+    #[test]
+    fn stores_modified_times_in_seconds() {
+        use std::time::Duration;
+        let at = |secs| Some(UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(epoch_seconds(None), 0);
+        assert_eq!(epoch_seconds(at(1_700_000_000)), 1_700_000_000);
+        assert_eq!(epoch_seconds(at(0)), 1, "0 means unknown");
+        assert_eq!(
+            epoch_seconds(UNIX_EPOCH.checked_sub(Duration::from_secs(86_400))),
+            1,
+            "before 1970"
+        );
+        assert_eq!(epoch_seconds(at(1 << 33)), u32::MAX, "after 2106");
+
+        let mut t = Tree::new("/root");
+        let f = t
+            .add_file(
+                NodeId::ROOT,
+                "f".as_ref(),
+                sizes(1, 1),
+                at(1_234_567_890),
+                0,
+            )
+            .unwrap();
+        let g = t
+            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        assert_eq!(t.modified(f), Some(1_234_567_890));
+        assert_eq!(t.modified(g), None);
+        assert_eq!(t.modified(NodeId::ROOT), None);
     }
 
     #[test]

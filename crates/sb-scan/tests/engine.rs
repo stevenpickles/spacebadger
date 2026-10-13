@@ -319,3 +319,19 @@ fn finished_scans_can_be_edited_as_a_new_revision() {
     assert_eq!((after.logical, after.allocated), (10, 4096));
     assert_eq!(s.progress().revision, after.revision);
 }
+
+#[test]
+fn modified_times_reach_the_tree() {
+    let fs = FakeFs::new();
+    let when = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs.file("a/dated.txt", 1, 4096)
+        .set_modified("a/dated.txt", when)
+        .file("undated.txt", 1, 4096);
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert_eq!(
+        tree.modified(find(&tree, "a/dated.txt")),
+        Some(1_700_000_000)
+    );
+    assert_eq!(tree.modified(find(&tree, "undated.txt")), None);
+}

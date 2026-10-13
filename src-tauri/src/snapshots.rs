@@ -305,6 +305,7 @@ mod tests {
                 logical,
                 allocated: Allocated::known(logical),
             },
+            None,
             0,
         )
         .unwrap();

@@ -422,17 +422,17 @@ mod tests {
         let docs = t.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
         let media = t.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
         let tmp = t.add_dir(NodeId::ROOT, "tmp".as_ref()).unwrap();
-        t.add_file(docs, "report.pdf".as_ref(), sizes(3 * MB), 0)
+        t.add_file(docs, "report.pdf".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
-        t.add_file(docs, "notes.txt".as_ref(), sizes(1024), 0)
+        t.add_file(docs, "notes.txt".as_ref(), sizes(1024), None, 0)
             .unwrap();
-        t.add_file(media, "a.mkv".as_ref(), sizes(10 * MB), 0)
+        t.add_file(media, "a.mkv".as_ref(), sizes(10 * MB), None, 0)
             .unwrap();
-        t.add_file(media, "old.mkv".as_ref(), sizes(4 * MB), 0)
+        t.add_file(media, "old.mkv".as_ref(), sizes(4 * MB), None, 0)
             .unwrap();
-        t.add_file(tmp, "cache.bin".as_ref(), sizes(2 * MB), 0)
+        t.add_file(tmp, "cache.bin".as_ref(), sizes(2 * MB), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "small.log".as_ref(), sizes(100), 0)
+        t.add_file(NodeId::ROOT, "small.log".as_ref(), sizes(100), None, 0)
             .unwrap();
         listed(t)
     }
@@ -445,18 +445,19 @@ mod tests {
         let docs = t.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
         let media = t.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
         let new = t.add_dir(NodeId::ROOT, "new".as_ref()).unwrap();
-        t.add_file(docs, "report.pdf".as_ref(), sizes(3 * MB), 0)
+        t.add_file(docs, "report.pdf".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
-        t.add_file(docs, "notes.txt".as_ref(), sizes(5 * MB), 0)
+        t.add_file(docs, "notes.txt".as_ref(), sizes(5 * MB), None, 0)
             .unwrap();
-        t.add_file(media, "a.mkv".as_ref(), sizes(12 * MB), 0)
+        t.add_file(media, "a.mkv".as_ref(), sizes(12 * MB), None, 0)
             .unwrap();
-        t.add_file(media, "older.mkv".as_ref(), sizes(4 * MB), 0)
+        t.add_file(media, "older.mkv".as_ref(), sizes(4 * MB), None, 0)
             .unwrap();
-        t.add_file(new, "b.iso".as_ref(), sizes(8 * MB), 0).unwrap();
-        t.add_file(NodeId::ROOT, "small.log".as_ref(), sizes(200), 0)
+        t.add_file(new, "b.iso".as_ref(), sizes(8 * MB), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "fresh.txt".as_ref(), sizes(10), 0)
+        t.add_file(NodeId::ROOT, "small.log".as_ref(), sizes(200), None, 0)
+            .unwrap();
+        t.add_file(NodeId::ROOT, "fresh.txt".as_ref(), sizes(10), None, 0)
             .unwrap();
         listed(t)
     }
@@ -578,16 +579,18 @@ mod tests {
     fn case_matters_only_where_the_snapshot_says_so() {
         let mut t = Tree::new("/data");
         let d = t.add_dir(NodeId::ROOT, "Photos".as_ref()).unwrap();
-        t.add_file(d, "IMG.JPG".as_ref(), sizes(2 * MB), 0).unwrap();
-        t.add_file(d, "Small.txt".as_ref(), sizes(5), 0).unwrap();
+        t.add_file(d, "IMG.JPG".as_ref(), sizes(2 * MB), None, 0)
+            .unwrap();
+        t.add_file(d, "Small.txt".as_ref(), sizes(5), None, 0)
+            .unwrap();
         let t = listed(t);
         let mut renamed = Tree::new("/data");
         let d = renamed.add_dir(NodeId::ROOT, "photos".as_ref()).unwrap();
         renamed
-            .add_file(d, "img.jpg".as_ref(), sizes(3 * MB), 0)
+            .add_file(d, "img.jpg".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
         renamed
-            .add_file(d, "small.TXT".as_ref(), sizes(5), 0)
+            .add_file(d, "small.TXT".as_ref(), sizes(5), None, 0)
             .unwrap();
         let renamed = listed(renamed);
 
@@ -625,7 +628,7 @@ mod tests {
     #[test]
     fn a_folder_replacing_a_file_is_new() {
         let mut t = Tree::new("/data");
-        t.add_file(NodeId::ROOT, "x".as_ref(), sizes(2 * MB), 0)
+        t.add_file(NodeId::ROOT, "x".as_ref(), sizes(2 * MB), None, 0)
             .unwrap();
         let t = listed(t);
         let mut now = Tree::new("/data");
@@ -664,9 +667,9 @@ mod tests {
         let mut now = Tree::new("/data");
         let docs = now.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
         let media = now.add_dir(NodeId::ROOT, "media".as_ref()).unwrap();
-        now.add_file(media, "a.mkv".as_ref(), sizes(10 * MB), 0)
+        now.add_file(media, "a.mkv".as_ref(), sizes(10 * MB), None, 0)
             .unwrap();
-        now.add_file(media, "old.mkv".as_ref(), sizes(4 * MB), 0)
+        now.add_file(media, "old.mkv".as_ref(), sizes(4 * MB), None, 0)
             .unwrap();
         let mut now = listed(now);
         now.set_dir_state(docs, DirState::Failed);
@@ -704,9 +707,9 @@ mod tests {
     fn exact_names_win_over_names_equal_ignoring_case() {
         // A case-sensitive folder on a case-insensitive system.
         let mut t = Tree::new("/data");
-        t.add_file(NodeId::ROOT, "A".as_ref(), sizes(2 * MB), 0)
+        t.add_file(NodeId::ROOT, "A".as_ref(), sizes(2 * MB), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), 0)
+        t.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
         let t = listed(t);
         let snap = Snapshot::capture(&t, 0, true);
@@ -722,7 +725,7 @@ mod tests {
 
         // Only `a` is left: it's found exactly, and `A` is removed.
         let mut now = Tree::new("/data");
-        now.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), 0)
+        now.add_file(NodeId::ROOT, "a".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
         let now = listed(now);
         let cmp = Comparison::new(&now, &snap);
@@ -733,11 +736,11 @@ mod tests {
 
         // A different case only, and unambiguous: still the same file.
         let mut now = Tree::new("/data");
-        now.add_file(NodeId::ROOT, "\u{e1}.txt".as_ref(), sizes(3 * MB), 0)
+        now.add_file(NodeId::ROOT, "\u{e1}.txt".as_ref(), sizes(3 * MB), None, 0)
             .unwrap();
         let now = listed(now);
         let mut then = Tree::new("/data");
-        then.add_file(NodeId::ROOT, "\u{c1}.TXT".as_ref(), sizes(2 * MB), 0)
+        then.add_file(NodeId::ROOT, "\u{c1}.TXT".as_ref(), sizes(2 * MB), None, 0)
             .unwrap();
         let then = listed(then);
         let cmp = Comparison::new(&now, &Snapshot::capture(&then, 0, true));

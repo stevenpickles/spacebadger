@@ -4,6 +4,14 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+### Filter
+- Size terms: `size:>500MB`, `size:>=1GB`, `size:<10KB`, `size:<=2GB`, and ranges like `size:10MB..1GB`. Units are B, KB, MB, GB, and TB, counted like the sizes on screen (1,024 bytes per KB on Windows, 1,000 on macOS and Linux).
+- Age terms: `older:1y` and `newer:30d` (with `h`, `d`, `w`, `mo`, or `y`), or a date: `older:2024-01-01`. Files whose modified time is unknown never match one.
+- Size and age terms narrow everything else in the filter, and every one must hold; on their own they match every file that passes. `!` turns one around. Suggestions offer them, with common values such as `>1GB` and `6mo`.
+
+### Details
+- Files show when they were last modified.
+
 ### Compare with an earlier scan
 - Each completed scan is saved as a compact snapshot. Scan the same folder again later, and **Compare…** in the toolbar lists the earlier scans to compare with: what grew, what shrank, and what's new since.
 - Color by **Change**: grown items warm, shrunk ones cool, new ones purple, deeper the bigger the change.
