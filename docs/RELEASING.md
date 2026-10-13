@@ -46,11 +46,13 @@ Shown for 0.1.0; use the new version throughout.
 
    The workflow checks that the tag is `v` plus the `Cargo.toml` version and points at a commit on `main`, builds on Windows, Linux (Ubuntu 22.04), and macOS (Apple Silicon), packs each download with `LICENSE`, `README.md`, and `THIRD-PARTY-LICENSES.html`, and publishes the release with the changelog section as notes, plus `SHA256SUMS`. It then builds the winget and Chocolatey packages and submits them when their secrets are set; see [Package managers](#package-managers).
 
-   If a check fails, nothing is published. Delete the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on the release branch, merge it into `main` again, and re-tag.
+   If a check or build fails, nothing is published. Delete the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on the release branch, merge it into `main` again, and re-tag.
+
+   The package-manager job runs only after the release is published. If it fails, the release and its downloads stay as they are: **never delete a published tag.** Fix the cause, then retry with **Actions → Packages → Run workflow** and the version (see [Package managers](#package-managers)).
 
 6. **Merge back into `dev`.** Open a pull request from `release/v0.1.0` into `dev`, again with a merge commit, so the version, changelog, and any fixes made on the release branch reach `dev`. Then delete the release branch.
 
-Pull requests from other branches that change the release files (`release.yml`, `scripts/release/`, `packaging/`, `tauri.conf.json`) also build the downloads without publishing.
+Pull requests from other branches that change the release files (`release.yml`, `packages.yml`, `scripts/release/`, `packaging/`, `tauri.conf.json`) also build the downloads without publishing. Pull requests that change the winget or Chocolatey packaging (`packages.yml`, `packaging/winget/`, `packaging/chocolatey/`, and their scripts) also build and validate those packages for the latest published release, without submitting them.
 
 ## Downloads
 
@@ -72,8 +74,8 @@ The Windows zip is also offered through winget (`StevenPickles.SpaceBadger`) and
 |---|---|
 | `packaging/winget/template/` | winget manifests (schema 1.10.0) with placeholders |
 | `packaging/winget/manifests/s/StevenPickles/SpaceBadger/<version>/` | Generated manifests, in the layout of `microsoft/winget-pkgs` |
-| `packaging/chocolatey/template/` | Chocolatey `.nuspec` and install script with placeholders |
-| `packaging/chocolatey/spacebadger/` | Generated package for the latest release |
+| `packaging/chocolatey/template/` | Chocolatey `.nuspec` and install script with placeholders; the package's source link (`packageSourceUrl`) points here |
+| `packaging/chocolatey/spacebadger/` | Generated package for the latest release; change the template, not this |
 | `scripts/release/winget.sh`, `chocolatey.sh` | Fill in the version, download URL, and SHA-256 from the published release's `SHA256SUMS` |
 
 The Chocolatey package downloads the zip when it's installed instead of embedding it, so it needs no `VERIFICATION.txt` or `LICENSE.txt`.
