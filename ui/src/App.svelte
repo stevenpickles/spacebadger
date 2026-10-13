@@ -1255,17 +1255,19 @@
     border-left: 1px solid var(--line);
     background: var(--panel);
   }
+  /* A fixed share of the panel, so the list below doesn't jump as the
+     selection changes; long details scroll. */
   .details {
     flex: none;
-    max-height: 55%;
+    height: clamp(200px, 45%, 480px);
     overflow-y: auto;
+    border-bottom: 1px solid var(--line);
   }
   .tabs {
     display: flex;
     flex: none;
     gap: 2px;
     padding: 0 var(--space-2);
-    border-top: 1px solid var(--line);
     border-bottom: 1px solid var(--line);
   }
   .tabs button {
@@ -1300,7 +1302,7 @@
       overflow-y: auto;
     }
     .details {
-      max-height: none;
+      height: auto;
       overflow: visible;
     }
     .list {
