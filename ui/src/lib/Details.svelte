@@ -113,7 +113,7 @@
   {#if said}
     <dt>Change</dt>
     <dd class="change {c?.kind}">
-      {said.text}{#if said.was}<span class="muted"> ({said.was})</span>{/if}
+      {said.text}{#if said.was}<span class="muted">{` (${said.was})`}</span>{/if}
     </dd>
   {/if}
 {/snippet}

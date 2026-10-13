@@ -195,8 +195,8 @@
     {#snippet main(r)}
       <span class="row-name name" class:gone={r.kind === "removed"}>{r.name}</span>
       <span class="row-name subfolder">
-        {#if r.folder && (r.kind === "new" || r.kind === "removed")}Folder ·
-        {/if}{r.subfolder || "Directly in this folder"}
+        {r.folder && (r.kind === "new" || r.kind === "removed") ? "Folder · " : ""}{r.subfolder ||
+          "Directly in this folder"}
       </span>
     {/snippet}
     {#snippet size(r)}
