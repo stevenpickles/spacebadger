@@ -66,7 +66,9 @@
   let anchor = $state<number | null>(null);
   /** Totals when several items are selected. */
   let multi = $state.raw<SelectionSummary | null>(null);
-  let metric = $state<Metric>("allocated");
+  /** The map, lists, and totals measure file size; on-disk size appears
+   * only in the volume overview, which compares against disk usage. */
+  const metric: Metric = "logical";
   let colors = $state<ColorMode>(savedColors());
   let viewDetails = $state.raw<NodeDetails | null>(null);
   let selectedDetails = $state.raw<NodeDetails | null>(null);
@@ -474,7 +476,7 @@
   });
 
   $effect(() => {
-    void [generation, view, metric, searchId];
+    void [generation, view, searchId];
     smallOf = null;
   });
 
@@ -560,23 +562,18 @@
   const empty = $derived.by((): { text: string; toRoot?: boolean } | null => {
     if (!layout || layout.total > 0 || !status) return null;
     if (status.phase.kind === "failed") return null;
-    const what = metric === "allocated" ? "allocated space" : "data";
     if (search) {
       if (search.files === 0) {
         const text = `No file names match “${search.query}”`;
         return { text: scanning ? `${text} yet.` : `${text}.`, toRoot: view !== ROOT };
       }
       if (view !== ROOT) {
-        return { text: `No matching files with measurable ${what} in this folder.`, toRoot: true };
+        return { text: "The matching files in this folder are all empty.", toRoot: true };
       }
-      return { text: `The matching files have no measurable ${what}. They're in the result list.` };
+      return { text: "The matching files are all empty. They're in the result list." };
     }
-    if (scanning) return { text: `Scanning… no measurable ${what} found here yet.` };
-    let text = `Nothing here has measurable ${what}.`;
-    if (metric === "allocated" && (viewDetails?.unknownAllocationFiles ?? 0) > 0) {
-      text += ` ${plural(viewDetails!.unknownAllocationFiles, "file")} have unknown allocation; try Logical size.`;
-    }
-    return { text };
+    if (scanning) return { text: "Scanning… no data found here yet." };
+    return { text: "Everything here is empty." };
   });
 </script>
 
@@ -585,10 +582,6 @@
     <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
     <button type="button" onclick={() => run(scanRefresh)} disabled={generation === null}>Refresh</button>
     <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
-    <div class="metric" role="radiogroup" aria-label="Size measure">
-      <label><input type="radio" bind:group={metric} value="allocated" /> Allocated</label>
-      <label><input type="radio" bind:group={metric} value="logical" /> Logical</label>
-    </div>
     <label
       class="check"
       title={volume?.isRoot
@@ -649,12 +642,10 @@
   {/if}
 
   {#if showVolume && volume?.isRoot && status}
-    {#if metric === "allocated" && !search}
+    {#if !search}
       <VolumeStrip {volume} {status} {os} onshowomissions={() => (showOmissions = true)} />
     {:else}
-      <p class="volume-note">
-        The volume overview compares allocated space, so it's hidden with Logical size or a filter.
-      </p>
+      <p class="volume-note">The volume overview is hidden while a filter is on.</p>
     {/if}
   {/if}
 
@@ -752,7 +743,7 @@
           {metric}
           revision={status?.revision ?? 0}
           {scanning}
-          scanned={metric === "allocated" ? (status?.allocated ?? 0) : (status?.logical ?? 0)}
+          scanned={status?.logical ?? 0}
           selected={pickedSet}
           {anchor}
           onpick={pick}
