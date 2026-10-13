@@ -12,6 +12,7 @@
     scanChoose,
     scanRefresh,
     scanStatus,
+    restartElevated,
     reveal,
     searchSet,
     searchSummary,
@@ -108,10 +109,27 @@
   let notice = $state<string | null>(null);
   let showShortcuts = $state(false);
   let showFilterHelp = $state(false);
+  /** Waiting on the restart question or the Windows elevation prompt. */
+  let elevating = $state(false);
   /** The list chosen below the details; the panel falls back to one that's open. */
   let tab = $state<PanelTab | null>(null);
 
   const scanning = $derived(status?.phase.kind === "scanning");
+  /** Restarting with administrator rights is offered on Windows only. */
+  const canElevate = $derived(os === "windows" && !privileged);
+
+  async function elevate() {
+    if (elevating) return;
+    elevating = true;
+    try {
+      // On success this window closes; otherwise the user said no.
+      await restartElevated();
+    } catch (e) {
+      problem = errorText(e);
+    } finally {
+      elevating = false;
+    }
+  }
   const deleteBlocked = $derived(
     !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
   );
@@ -842,6 +860,15 @@
         <span class="badge" title="Started with administrator or root rights: protected folders are scanned too.">
           Administrator
         </span>
+      {:else if canElevate}
+        <button
+          type="button"
+          disabled={elevating || deleting}
+          title="Reopen SpaceBadger with administrator rights, so folders that need them are scanned too. Windows asks for permission first."
+          onclick={elevate}
+        >
+          Restart as administrator…
+        </button>
       {/if}
       <label
         class="check allow"
@@ -1034,7 +1061,12 @@
               />
             {/key}
           {:else if activeTab === "omissions" && status}
-            <Omissions groups={status.omissions} autofocus onclose={() => (showOmissions = false)} />
+            <Omissions
+              groups={status.omissions}
+              autofocus
+              onclose={() => (showOmissions = false)}
+              onelevate={canElevate && !elevating && !deleting ? elevate : undefined}
+            />
           {:else if activeTab === "small" && smallOf && generation !== null}
             {#key smallOf.folder}
               <SmallItems
