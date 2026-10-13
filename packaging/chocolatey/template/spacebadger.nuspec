@@ -9,7 +9,7 @@
     <owners>Steven Pickles</owners>
     <projectUrl>https://github.com/stevenpickles/spacebadger</projectUrl>
     <projectSourceUrl>https://github.com/stevenpickles/spacebadger</projectSourceUrl>
-    <packageSourceUrl>https://github.com/stevenpickles/spacebadger/tree/main/packaging/chocolatey</packageSourceUrl>
+    <packageSourceUrl>https://github.com/stevenpickles/spacebadger/tree/main/packaging/chocolatey/template</packageSourceUrl>
     <docsUrl>https://github.com/stevenpickles/spacebadger#readme</docsUrl>
     <bugTrackerUrl>https://github.com/stevenpickles/spacebadger/issues</bugTrackerUrl>
     <iconUrl>https://cdn.jsdelivr.net/gh/stevenpickles/spacebadger@v@VERSION@/src-tauri/icons/128x128.png</iconUrl>
