@@ -71,10 +71,10 @@
   const matches = $derived(typed.trim().toLowerCase() === WORD);
   const ready = $derived(matches && left === 0 && !busy);
   const missing = $derived.by(() => {
-    if (busy) return "";
-    if (!matches) return `Type ${WORD} to confirm`;
-    if (left > 0) return `Wait ${left} s`;
-    return "";
+    // The field's label already asks for the word; this adds the wait.
+    if (busy) return "Moving…";
+    if (left > 0) return `You can confirm in ${left} s`;
+    return matches ? "" : `Type ${WORD} above`;
   });
 
   const what = $derived(
@@ -226,15 +226,9 @@
       <span class="check" class:on={matches} aria-hidden="true">✓</span>
       {#if matches}<span class="sr-only">Matches</span>{/if}
     </label>
-    {#if left > 0}
-      <p class="muted small countdown">You can confirm in {left} s</p>
-    {/if}
     <div class="buttons">
-      {#if busy}
-        <span class="muted small hint" role="status">Moving…</span>
-      {:else if missing}
-        <span class="muted small hint">{missing}</span>
-      {/if}
+      <!-- Always present, so the dialog doesn't change height as it counts down. -->
+      <span class="muted small hint" role={busy ? "status" : undefined}>{missing}</span>
       <button type="button" disabled={busy} onclick={oncancel}>Cancel</button>
       <button type="button" class="danger filled" disabled={!ready} onclick={confirm}>
         Move to the {trashName}
@@ -312,9 +306,6 @@
   }
   .check.on {
     visibility: visible;
-  }
-  .countdown {
-    margin: var(--space-1) 0 0;
   }
   .buttons {
     display: flex;
