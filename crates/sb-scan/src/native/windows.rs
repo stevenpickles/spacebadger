@@ -36,13 +36,14 @@ use windows::Win32::Security::{
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo,
-    FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -196,14 +197,18 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     )
     .map_err(skip)?;
     let compressed = check_contents(&probe, len)?;
-    let id = file_id(&probe)?;
+    let id = file_id(&probe);
     drop(probe);
     let mut flags = FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN;
     if !compressed {
         flags |= FILE_FLAG_OPEN_REPARSE_POINT;
     }
     let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags).map_err(skip)?;
-    if file_id(&handle)? != id {
+    // A filesystem that gives no ID (FAT, some shares) relies on the
+    // other checks.
+    if let (Some(before), Some(now)) = (id, file_id(&handle))
+        && before != now
+    {
         return Err(Skip::Changed);
     }
     check_contents(&handle, len)?;
@@ -248,9 +253,21 @@ fn check_contents(handle: &OwnedHandle, len: u64) -> Result<bool, Skip> {
     Ok(compressed)
 }
 
-fn file_id(handle: &OwnedHandle) -> Result<(u64, [u8; 16]), Skip> {
-    let id = info::<FILE_ID_INFO>(handle, FileIdInfo).map_err(info_skip)?;
-    Ok((id.VolumeSerialNumber, id.FileId.Identifier))
+/// The volume and file ID of a handle's file: the 128-bit ID where the
+/// filesystem has one, else the older 64-bit index, else `None`.
+fn file_id(handle: &OwnedHandle) -> Option<(u64, [u8; 16])> {
+    if let Ok(id) = info::<FILE_ID_INFO>(handle, FileIdInfo) {
+        return Some((id.VolumeSerialNumber, id.FileId.Identifier));
+    }
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(raw(handle), &mut by_handle) }.ok()?;
+    let index = (u64::from(by_handle.nFileIndexHigh) << 32) | u64::from(by_handle.nFileIndexLow);
+    if index == 0 {
+        return None;
+    }
+    let mut id = [0; 16];
+    id[..8].copy_from_slice(&index.to_le_bytes());
+    Some((u64::from(by_handle.dwVolumeSerialNumber), id))
 }
 
 fn raw(handle: &OwnedHandle) -> HANDLE {
@@ -677,6 +694,20 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn file_ids_match_for_one_file_and_differ_between_files() {
+        let dir = std::env::temp_dir().join(format!("sb-file-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let id = |p: &Path| file_id(&open(p, FILE_READ_ATTRIBUTES.0).unwrap());
+        assert!(id(&a).is_some());
+        assert_eq!(id(&a), id(&a));
+        assert_ne!(id(&a), id(&b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
