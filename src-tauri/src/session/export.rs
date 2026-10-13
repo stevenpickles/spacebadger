@@ -5,8 +5,14 @@
 //! written to disk with the locks released. A running scan, the map, and
 //! the lists carry on in between, and memory stays bounded however many
 //! rows there are.
+//!
+//! The file is first written beside the target as `.<name>.partial` and
+//! renamed over it only once complete, so a failed export never destroys a
+//! file the user chose to replace. Between steps the export stops if a new
+//! scan has replaced this one, or if the filter it started with is gone;
+//! re-applying the same filter text doesn't count as a change.
 
-use super::{Session, current_search, display_path, metric, node};
+use super::{ActiveSearch, Session, display_path, metric, node};
 use sb_core::export::{Csv, Report, ReportInfo, Scope};
 use sb_core::search::Search;
 use sb_core::tree::{NodeId, Tree};
@@ -23,25 +29,71 @@ const EXPORT_STEP: usize = 50_000;
 
 const FILTER_CHANGED: &str = "The filter changed while exporting. Export again.";
 
+const REPLACED: &str = "A new scan started, so the export was stopped.";
+
+/// Characters no file name may hold on any of the supported systems.
+const UNSAFE: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+/// What one export needs at every step.
+struct Job<'a> {
+    req: &'a proto::ExportRequest,
+    /// The filter's text when the export started.
+    query: Option<String>,
+    /// Whether this session is still the app's current scan.
+    current: &'a dyn Fn() -> bool,
+}
+
 impl Session {
     /// Writes the export `req` asks for to `path`, calling `progress` with
-    /// the rows written (items examined, for a report) after each step. An
-    /// export that fails leaves no partial file behind.
+    /// 0 once the file is created and then with the rows written (items
+    /// examined, for a report) after each step. Stops when `current` says
+    /// this session was replaced. An export that fails leaves `path` as it
+    /// was.
     pub fn export(
         &self,
         req: &proto::ExportRequest,
         path: &Path,
+        current: impl Fn() -> bool,
         progress: impl Fn(u64),
     ) -> Result<proto::ExportReport, String> {
+        let query = match req.search {
+            Some(id) => Some(
+                self.search
+                    .lock()
+                    .map_err(|_| "search is unavailable")?
+                    .as_ref()
+                    .filter(|a| a.id == id)
+                    .map(|a| a.search.matcher().query().to_owned())
+                    .ok_or(FILTER_CHANGED)?,
+            ),
+            None => None,
+        };
+        let job = Job {
+            req,
+            query,
+            current: &current,
+        };
         let shown = display_path(path);
+        let name = path
+            .file_name()
+            .ok_or_else(|| format!("{shown} isn't a file name."))?;
+        let temp = path.with_file_name(format!(".{}.partial", name.to_string_lossy()));
         let failed = |e: std::io::Error| format!("Couldn't write {shown}: {e}");
-        let file = File::create(path).map_err(|e| format!("Couldn't create {shown}: {e}"))?;
+        let file = File::create(&temp).map_err(|e| format!("Couldn't create {shown}: {e}"))?;
+        progress(0);
         let mut out = BufWriter::new(file);
         let written = match req.format {
-            proto::ExportFormat::Csv => self.export_csv(req, &mut out, &progress, &failed),
-            proto::ExportFormat::Report => self.export_report(req, &mut out, &progress, &failed),
+            proto::ExportFormat::Csv => self.export_csv(&job, &mut out, &progress, &failed),
+            proto::ExportFormat::Report => self.export_report(&job, &mut out, &progress, &failed),
         }
-        .and_then(|rows| out.flush().map(|()| rows).map_err(failed));
+        .and_then(|rows| {
+            // The file must be closed before it can be renamed on Windows.
+            let file = out.into_inner().map_err(|e| failed(e.into_error()))?;
+            file.sync_all().map_err(failed)?;
+            drop(file);
+            std::fs::rename(&temp, path).map_err(failed)?;
+            Ok(rows)
+        });
         match written {
             Ok(rows) => Ok(proto::ExportReport {
                 generation: self.generation(),
@@ -50,20 +102,48 @@ impl Session {
                 rows,
             }),
             Err(e) => {
-                drop(out);
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&temp);
                 Err(e)
             }
         }
     }
 
+    /// The name to suggest in the save dialog: only the last part of what
+    /// the interface asked for, without characters file names can't hold,
+    /// and with the format's extension.
+    pub fn export_file_name(requested: &str, format: proto::ExportFormat) -> String {
+        let ext = match format {
+            proto::ExportFormat::Csv => "csv",
+            proto::ExportFormat::Report => "txt",
+        };
+        let last = requested.rsplit(['/', '\\']).next().unwrap_or("");
+        let clean: String = last
+            .chars()
+            .map(|c| {
+                if UNSAFE.contains(&c) || c.is_control() {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let stem = match clean.rsplit_once('.') {
+            Some((stem, old)) if old.eq_ignore_ascii_case(ext) => stem,
+            _ => clean.as_str(),
+        };
+        let stem = stem.trim_matches(|c: char| c.is_whitespace() || c == '.');
+        let stem = if stem.is_empty() { "SpaceBadger" } else { stem };
+        format!("{stem}.{ext}")
+    }
+
     fn export_csv(
         &self,
-        req: &proto::ExportRequest,
+        job: &Job<'_>,
         out: &mut impl Write,
         progress: &impl Fn(u64),
         failed: &impl Fn(std::io::Error) -> String,
     ) -> Result<u64, String> {
+        let req = job.req;
         let scope = match req.scope {
             proto::ExportScope::Contents => Scope::Contents,
             proto::ExportScope::Everything => Scope::Everything,
@@ -71,7 +151,7 @@ impl Session {
         let mut csv = Csv::new(NodeId::from_index(req.folder), scope, metric(req.metric));
         let mut text = String::new();
         loop {
-            let done = self.export_step(req, |tree, filter| {
+            let done = self.export_step(job, |tree, filter| {
                 csv.step(tree, filter, EXPORT_STEP, &mut text)
             })?;
             out.write_all(text.as_bytes()).map_err(failed)?;
@@ -85,13 +165,14 @@ impl Session {
 
     fn export_report(
         &self,
-        req: &proto::ExportRequest,
+        job: &Job<'_>,
         out: &mut impl Write,
         progress: &impl Fn(u64),
         failed: &impl Fn(std::io::Error) -> String,
     ) -> Result<u64, String> {
+        let req = job.req;
         let mut report = Report::new(NodeId::from_index(req.folder), metric(req.metric));
-        while !self.export_step(req, |tree, filter| report.step(tree, filter, EXPORT_STEP))? {
+        while !self.export_step(job, |tree, filter| report.step(tree, filter, EXPORT_STEP))? {
             progress(report.examined());
         }
         let scan = self.scan.progress();
@@ -107,7 +188,7 @@ impl Session {
                 .collect(),
         };
         let mut text = Vec::new();
-        let listed = self.export_step(req, |tree, filter| {
+        let listed = self.export_step(job, |tree, filter| {
             info.filter = filter.map(|s| s.matcher().query().to_owned());
             report.write(tree, filter, &info, &mut text)
         })?;
@@ -121,26 +202,41 @@ impl Session {
     /// filtered export, so an unfiltered one never holds up the filtered map.
     fn export_step<R>(
         &self,
-        req: &proto::ExportRequest,
+        job: &Job<'_>,
         step: impl FnOnce(&Tree, Option<&Search>) -> R,
     ) -> Result<R, String> {
-        let mut search = match req.search {
+        if !(job.current)() {
+            return Err(REPLACED.into());
+        }
+        let mut search = match job.query {
             Some(_) => Some(self.search.lock().map_err(|_| "search is unavailable")?),
             None => None,
         };
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        node(&tree, req.folder)?;
-        let filter = match (search.as_deref_mut(), req.search) {
-            (Some(active), Some(id)) => Some(
-                &current_search(active, id, &tree)
-                    .map_err(|_| FILTER_CHANGED)?
-                    .search,
-            ),
+        node(&tree, job.req.folder)?;
+        let filter = match (search.as_deref_mut(), &job.query) {
+            (Some(slot), Some(query)) => Some(&same_filter(slot, query, &tree)?.search),
             _ => None,
         };
         Ok(step(&tree, filter))
     }
+}
+
+/// The active search if its query is `query`, caught up with `tree`. The
+/// text is compared rather than the search number, since applying the same
+/// filter again starts a new search.
+fn same_filter<'a>(
+    slot: &'a mut Option<ActiveSearch>,
+    query: &str,
+    tree: &Tree,
+) -> Result<&'a mut ActiveSearch, String> {
+    let active = slot
+        .as_mut()
+        .filter(|a| a.search.matcher().query() == query)
+        .ok_or(FILTER_CHANGED)?;
+    active.search.catch_up(tree, usize::MAX);
+    Ok(active)
 }
 
 /// How the scan went, for a report's header.
@@ -258,11 +354,20 @@ mod tests {
         let calls = Mutex::new(Vec::new());
         let req = request(&session, proto::ExportFormat::Csv);
         let report = session
-            .export(&req, &path, |rows| calls.lock().unwrap().push(rows))
+            .export(
+                &req,
+                &path,
+                || true,
+                |rows| calls.lock().unwrap().push(rows),
+            )
             .unwrap();
         assert_eq!(report.rows, 5, "two folders and three files");
         assert_eq!(report.path, display_path(&path));
-        assert_eq!(calls.into_inner().unwrap().last(), Some(&5));
+        assert_eq!(
+            calls.into_inner().unwrap(),
+            [0, 5],
+            "0 once the file exists"
+        );
 
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"\xEF\xBB\xBF"), "UTF-8 byte order mark");
@@ -290,7 +395,7 @@ mod tests {
         let path = tmp.0.join("out").join("logs.csv");
         let mut req = request(&session, proto::ExportFormat::Csv);
         req.search = Some(search);
-        let report = session.export(&req, &path, |_| {}).unwrap();
+        let report = session.export(&req, &path, || true, |_| {}).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let names: Vec<&str> = text
             .split("\r\n")
@@ -302,11 +407,88 @@ mod tests {
         assert_eq!(report.rows, 3);
         assert!(text.contains(",old,folder,5000,"), "matching totals");
 
-        // A filter replaced meanwhile: nothing is left behind.
+        // The same filter applied again is a new search, but not a change.
+        let again = session.search_set("a.log").unwrap().unwrap().search;
+        assert_ne!(again, search);
+        req.search = Some(again);
+        assert_eq!(
+            session.export(&req, &path, || true, |_| {}).unwrap().rows,
+            3
+        );
+
+        // A different filter: the file already there is kept as it was,
+        // and no partial file is left behind.
         session.search_set("keep").unwrap();
-        let err = session.export(&req, &path, |_| {}).unwrap_err();
+        let err = session.export(&req, &path, || true, |_| {}).unwrap_err();
         assert_eq!(err, FILTER_CHANGED);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_filter_changed_between_steps_stops_the_export() {
+        let (tmp, session) = scanned("midway");
+        session.search_set("*.log").unwrap();
+        let path = tmp.0.join("out").join("report.txt");
+        std::fs::write(&path, "keep me").unwrap();
+        let mut req = request(&session, proto::ExportFormat::Report);
+        let steps = Mutex::new(0);
+        // `current` runs before every step: change the filter after the first.
+        let mut run = |query: &str| {
+            *steps.lock().unwrap() = 0;
+            req.search = Some(session.search_set("*.log").unwrap().unwrap().search);
+            session.export(
+                &req,
+                &path,
+                || {
+                    let mut n = steps.lock().unwrap();
+                    *n += 1;
+                    if *n == 2 {
+                        session.search_set(query).unwrap();
+                    }
+                    true
+                },
+                |_| {},
+            )
+        };
+        assert_eq!(run("keep").unwrap_err(), FILTER_CHANGED);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        assert!(run("*.log").is_ok(), "the same text applied again");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("SpaceBadger report")
+        );
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_replaced_scan_stops_the_export() {
+        let (tmp, session) = scanned("replaced");
+        let path = tmp.0.join("out").join("all.csv");
+        let req = request(&session, proto::ExportFormat::Csv);
+        let err = session.export(&req, &path, || false, |_| {}).unwrap_err();
+        assert_eq!(err, REPLACED);
         assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn suggested_names_are_plain_file_names() {
+        use proto::ExportFormat::{Csv, Report};
+        let name = Session::export_file_name;
+        assert_eq!(
+            name("SpaceBadger-Downloads-2026-10-13.csv", Csv),
+            "SpaceBadger-Downloads-2026-10-13.csv"
+        );
+        assert_eq!(name("a.CSV", Csv), "a.csv");
+        assert_eq!(name("report.csv", Report), "report.csv.txt");
+        assert_eq!(name("..\\..\\Windows\\evil.exe", Csv), "evil.exe.csv");
+        assert_eq!(name("/etc/passwd", Report), "passwd.txt");
+        assert_eq!(name("a:b*c?\"<>|.csv", Csv), "a-b-c-----.csv");
+        assert_eq!(name("x\u{7}y", Csv), "x-y.csv");
+        assert_eq!(name("", Csv), "SpaceBadger.csv");
+        assert_eq!(name(" .. ", Report), "SpaceBadger.txt");
     }
 
     #[test]
@@ -316,7 +498,7 @@ mod tests {
         let path = tmp.0.join("out").join("report.txt");
         let mut req = request(&session, proto::ExportFormat::Report);
         req.search = Some(search);
-        let report = session.export(&req, &path, |_| {}).unwrap();
+        let report = session.export(&req, &path, || true, |_| {}).unwrap();
         assert_eq!(report.rows, 4, "two folders and two files");
         let text = std::fs::read_to_string(&path)
             .unwrap()
@@ -340,7 +522,7 @@ mod tests {
         let (tmp, session) = scanned("unwritable");
         let path = tmp.0.join("missing").join("x.csv");
         let req = request(&session, proto::ExportFormat::Csv);
-        let err = session.export(&req, &path, |_| {}).unwrap_err();
+        let err = session.export(&req, &path, || true, |_| {}).unwrap_err();
         assert!(err.starts_with("Couldn't create "), "{err}");
     }
 

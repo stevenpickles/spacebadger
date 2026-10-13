@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[derive(Default)]
@@ -302,14 +302,18 @@ async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Resul
 
 /// Asks where to save, then exports what's under a folder there as CSV or
 /// a report. Returns `None` if the save dialog was dismissed. Writing runs
-/// on a blocking thread and reports its progress as events.
+/// on a blocking thread and reports its progress as events; it stops if a
+/// new scan replaces this one meanwhile.
 #[tauri::command]
 async fn export_save(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     request: ExportRequest,
 ) -> Result<Option<ExportReport>, String> {
-    let session = state.session(request.generation)?;
+    let generation = request.generation;
+    // Not held across the dialog, so a scan started meanwhile isn't kept alive.
+    state.session(generation)?;
     let (kind, extension) = match request.format {
         ExportFormat::Csv => ("CSV", "csv"),
         ExportFormat::Report => ("Text", "txt"),
@@ -317,19 +321,31 @@ async fn export_save(
     let picked = app
         .dialog()
         .file()
+        .set_parent(&window)
         .set_title("Export")
-        .set_file_name(&request.file_name)
+        .set_file_name(Session::export_file_name(
+            &request.file_name,
+            request.format,
+        ))
         .add_filter(kind, &[extension])
         .blocking_save_file();
     let Some(picked) = picked else {
         return Ok(None);
     };
     let path = picked.into_path().map_err(|e| e.to_string())?;
-    let generation = request.generation;
+    let session = state
+        .session(generation)
+        .map_err(|_| "A new scan started, so nothing was exported.".to_owned())?;
     let emitter = app.clone();
     let target = path.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
-        session.export(&request, &target, |rows| {
+        let current = || {
+            emitter
+                .state::<AppState>()
+                .current()
+                .is_some_and(|s| s.generation() == generation)
+        };
+        session.export(&request, &target, current, |rows| {
             let _ = emitter.emit(EXPORT_PROGRESS_EVENT, ExportProgress { generation, rows });
         })
     })
