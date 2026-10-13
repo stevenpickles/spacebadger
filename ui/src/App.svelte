@@ -36,6 +36,7 @@
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
   import type { SearchRow } from "./lib/protocol/SearchRow";
+  import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
   import SearchResults from "./lib/SearchResults.svelte";
@@ -284,6 +285,17 @@
       { label: "Copy path", action: () => copyPath(row.node) },
       ...deleteItemsFor(row.node),
     ];
+  }
+
+  function smallItemMenu(it: SmallItem): MenuItem[] {
+    const items: MenuItem[] = [];
+    if (it.folder) items.push({ label: "Open in map", hint: "Enter", action: () => openFolder(it.node) });
+    items.push(
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
+      { label: "Copy path", action: () => copyPath(it.node) },
+      ...deleteItemsFor(it.node),
+    );
+    return items;
   }
 
   // ---- selection and delete -------------------------------------------
@@ -870,7 +882,6 @@
                 folder={smallOf.folder}
                 folderName={smallOf.name}
                 count={smallOf.count}
-                {metric}
                 search={searchId ?? null}
                 revision={status?.revision ?? 0}
                 selected={pickedSet}
@@ -879,13 +890,13 @@
                 ondelete={askDelete}
                 onopen={openFolder}
                 onclose={() => (smallOf = null)}
+                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it) })}
               />
             {/key}
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
               {generation}
               summary={search}
-              {metric}
               revision={status?.revision ?? 0}
               {scanning}
               scanned={status?.logical ?? 0}
