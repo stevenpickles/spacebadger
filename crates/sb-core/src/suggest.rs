@@ -10,6 +10,7 @@
 use crate::tree::{NodeId, Tree};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// Folder names kept in an index, largest first.
 pub const MAX_FOLDER_NAMES: usize = 100_000;
@@ -19,13 +20,20 @@ const MAX_EXT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// As first seen in the tree, e.g. `Node_Modules` or `mkv`.
-    pub name: String,
     lower: String,
+    /// As first seen in the tree, when that differs from `lower`.
+    display: Option<String>,
     /// Folders with this name, or files with this extension.
     pub count: u32,
     /// Logical bytes in them (see the module notes for folders).
     pub logical: u64,
+}
+
+impl Entry {
+    /// As first seen in the tree, e.g. `Node_Modules` or `mkv`.
+    pub fn name(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.lower)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -38,8 +46,12 @@ impl NameIndex {
     /// Indexes every folder (except the scan root, whose name is a path)
     /// and file extension in `tree`.
     pub fn build(tree: &Tree) -> Self {
-        let mut folders: HashMap<String, Entry> = HashMap::new();
-        let mut extensions: HashMap<String, Entry> = HashMap::new();
+        let mut folders = Grouped::default();
+        let mut extensions = Grouped::default();
+        // Each folder's entry in `folders`, so a folder inside another of
+        // the same name is found by comparing numbers.
+        let mut folder_of = vec![NONE; tree.len()];
+        let mut lower = String::new();
         for i in 1..tree.len() {
             let node = NodeId::from_index(i as u32);
             if tree.is_removed(node) {
@@ -47,37 +59,32 @@ impl NameIndex {
             }
             let name = tree.name(node);
             if tree.is_dir(node) {
-                let display = name.to_string_lossy();
-                let entry = folders
-                    .entry(display.to_lowercase())
-                    .or_insert_with_key(|lower| Entry {
-                        name: display.into_owned(),
-                        lower: lower.clone(),
-                        count: 0,
-                        logical: 0,
-                    });
-                entry.count += 1;
-                if !inside_same_name(tree, node, name) {
-                    entry.logical += tree.logical(node);
+                lowercase_into(name.as_encoded_bytes(), name, &mut lower);
+                let id = folders.id(&lower, || name.to_string_lossy().into_owned());
+                folder_of[i] = id;
+                let nested = ancestors(tree, node).any(|a| folder_of[a.index()] == id);
+                let e = &mut folders.entries[id as usize];
+                e.count += 1;
+                if !nested {
+                    e.logical += tree.logical(node);
                 }
-            } else if let Some(ext) = extension(name) {
-                let entry = extensions
-                    .entry(ext.to_lowercase())
-                    .or_insert_with_key(|lower| Entry {
-                        name: lower.clone(),
-                        lower: lower.clone(),
-                        count: 0,
-                        logical: 0,
-                    });
-                entry.count += 1;
-                entry.logical += tree.logical(node);
+            } else if let Some(ext) = extension(name.as_encoded_bytes()) {
+                lowercase_into(ext, name, &mut lower);
+                let id = extensions.id(&lower, String::new);
+                let e = &mut extensions.entries[id as usize];
+                e.count += 1;
+                e.logical += tree.logical(node);
             }
         }
-        let mut folders: Vec<Entry> = folders.into_values().collect();
-        let mut extensions: Vec<Entry> = extensions.into_values().collect();
+        let mut folders = folders.entries;
+        let mut extensions = extensions.entries;
         let order = |a: &Entry, b: &Entry| b.logical.cmp(&a.logical).then(a.lower.cmp(&b.lower));
+        // Only the kept names need sorting.
+        if folders.len() > MAX_FOLDER_NAMES {
+            folders.select_nth_unstable_by(MAX_FOLDER_NAMES - 1, order);
+            folders.truncate(MAX_FOLDER_NAMES);
+        }
         folders.sort_unstable_by(order);
-        folders.truncate(MAX_FOLDER_NAMES);
         extensions.sort_unstable_by(order);
         Self {
             folders,
@@ -94,6 +101,82 @@ impl NameIndex {
     /// Up to `limit` extensions for `typed`, as for [`NameIndex::folders`].
     pub fn extensions(&self, typed: &str, limit: usize) -> Vec<&Entry> {
         find(&self.extensions, typed, limit)
+    }
+}
+
+const NONE: u32 = u32::MAX;
+
+/// Entries grouped by lowercased name. Looking up a name already seen
+/// doesn't allocate.
+#[derive(Default)]
+struct Grouped {
+    /// By the lowercased name's hash, so a lookup needs no copy of it.
+    ids: HashMap<u64, u32, BuildHasherDefault<WordHasher>>,
+    /// Names whose hash another name already has.
+    collided: HashMap<String, u32>,
+    entries: Vec<Entry>,
+}
+
+/// A fast, non-cryptographic hasher for short names (the Fx hash used in
+/// rustc). The default hasher resists collision attacks, which file names
+/// on the user's own disk don't need, and is several times slower here.
+#[derive(Default)]
+struct WordHasher(u64);
+
+impl Hasher for WordHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().expect("8 bytes")));
+        }
+        for &b in chunks.remainder() {
+            self.add(u64::from(b));
+        }
+    }
+
+    fn write_u8(&mut self, b: u8) {
+        self.add(u64::from(b));
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl WordHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Grouped {
+    /// The entry for `lower`, added if new. `display` gives the name as
+    /// seen, for a new entry; it's kept only when it differs from `lower`.
+    fn id(&mut self, lower: &str, display: impl FnOnce() -> String) -> u32 {
+        let mut hasher = WordHasher::default();
+        hasher.write(lower.as_bytes());
+        let hash = hasher.finish();
+        let next = self.entries.len() as u32;
+        match self.ids.get(&hash) {
+            Some(&id) if self.entries[id as usize].lower == lower => return id,
+            Some(_) => {
+                if let Some(&id) = self.collided.get(lower) {
+                    return id;
+                }
+                self.collided.insert(lower.to_owned(), next);
+            }
+            None => {
+                self.ids.insert(hash, next);
+            }
+        }
+        let display = display();
+        self.entries.push(Entry {
+            lower: lower.to_owned(),
+            display: (!display.is_empty() && display != lower).then_some(display),
+            count: 0,
+            logical: 0,
+        });
+        next
     }
 }
 
@@ -116,35 +199,35 @@ fn find<'a>(entries: &'a [Entry], typed: &str, limit: usize) -> Vec<&'a Entry> {
     starts
 }
 
-/// Whether a folder above `dir` (below the scan root) has the same name,
-/// ignoring case.
-fn inside_same_name(tree: &Tree, dir: NodeId, name: &OsStr) -> bool {
-    let mut cur = tree.parent(dir);
-    while let Some(p) = cur.filter(|&p| p != NodeId::ROOT) {
-        if same_name(tree.name(p), name) {
-            return true;
-        }
-        cur = tree.parent(p);
-    }
-    false
+/// The folders above `node`, below the scan root.
+fn ancestors(tree: &Tree, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    std::iter::successors(tree.parent(node), |&p| tree.parent(p)).take_while(|&p| p != NodeId::ROOT)
 }
 
-fn same_name(a: &OsStr, b: &OsStr) -> bool {
-    let (x, y) = (a.as_encoded_bytes(), b.as_encoded_bytes());
-    if x.is_ascii() && y.is_ascii() {
-        return x.eq_ignore_ascii_case(y);
+/// `bytes` lowercased into `out`, reusing its allocation. Non-ASCII text
+/// is lowercased from the whole `name` it's the end of.
+fn lowercase_into(bytes: &[u8], name: &OsStr, out: &mut String) {
+    out.clear();
+    if bytes.is_ascii() {
+        out.extend(bytes.iter().map(|&b| char::from(b.to_ascii_lowercase())));
+    } else {
+        let whole = name.to_string_lossy().to_lowercase();
+        // `bytes` is a suffix of the name (the whole name, or its extension
+        // after the last dot, which is ASCII-delimited).
+        let tail = match whole.rfind('.') {
+            Some(dot) if bytes.len() < name.as_encoded_bytes().len() => &whole[dot + 1..],
+            _ => &whole[..],
+        };
+        out.push_str(tail);
     }
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
-/// The text after a name's last dot, as `FileType::of` reads it: none for
+/// The bytes after a name's last dot, as `FileType::of` reads it: none for
 /// hidden files (`.bashrc`), and none when it's long or has spaces.
-fn extension(name: &OsStr) -> Option<String> {
-    let name = name.to_string_lossy();
-    let dot = name.rfind('.')?;
+fn extension(name: &[u8]) -> Option<&[u8]> {
+    let dot = name.iter().rposition(|&b| b == b'.')?;
     let ext = &name[dot + 1..];
-    (dot > 0 && !ext.is_empty() && ext.len() <= MAX_EXT && !ext.contains(' '))
-        .then(|| ext.to_owned())
+    (dot > 0 && !ext.is_empty() && ext.len() <= MAX_EXT && !ext.contains(&b' ')).then_some(ext)
 }
 
 #[cfg(test)]
@@ -164,7 +247,7 @@ mod tests {
     fn names(entries: Vec<&Entry>) -> Vec<(&str, u32, u64)> {
         entries
             .into_iter()
-            .map(|e| (e.name.as_str(), e.count, e.logical))
+            .map(|e| (e.name(), e.count, e.logical))
             .collect()
     }
 

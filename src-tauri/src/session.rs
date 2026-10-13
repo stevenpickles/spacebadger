@@ -52,7 +52,7 @@ struct Names {
 }
 
 /// While scanning, the completion index is rebuilt at most this often.
-const NAMES_REFRESH: Duration = Duration::from_secs(2);
+const NAMES_REFRESH: Duration = Duration::from_secs(5);
 
 struct FolderFiles {
     /// What the ranking was made from: folder, scan revision, search and
@@ -410,7 +410,7 @@ impl Session {
         Ok(found
             .into_iter()
             .map(|e| proto::Suggestion {
-                name: e.name.clone(),
+                name: e.name().to_owned(),
                 count: e.count,
                 logical: e.logical,
             })
