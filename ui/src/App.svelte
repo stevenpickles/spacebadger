@@ -1091,12 +1091,17 @@
     <div class="group">
       <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
       {#if generation !== null}
-        <button
-          type="button"
-          onclick={() => run(scanRefresh)}
-          title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
-        >
-        <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
+        <!-- One place for both, so the toolbar stays on one row: a scan can
+             be cancelled while it runs and repeated once it's done. -->
+        {#if scanning}
+          <button type="button" onclick={cancel}>Cancel</button>
+        {:else}
+          <button
+            type="button"
+            onclick={() => run(scanRefresh)}
+            title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
+          >
+        {/if}
         <button
           type="button"
           disabled={scanning}
@@ -1118,16 +1123,18 @@
       {/if}
     </div>
     {#if generation !== null}
-      <fieldset class="group">
-        <legend>Color by</legend>
-        <label><input type="radio" bind:group={colors} value="depth" /> Depth</label>
-        <label><input type="radio" bind:group={colors} value="type" /> File type</label>
-        {#if comparison}
-          <label title="Color by how much each item changed since {since}">
-            <input type="radio" bind:group={colors} value="change" /> Change
-          </label>
-        {/if}
-      </fieldset>
+      <!-- A list rather than radio buttons keeps the toolbar on one row. -->
+      <label
+        class="group colors"
+        title={comparison ? `Change colors items by how much they changed since ${since}` : undefined}
+      >
+        Color by
+        <select bind:value={colors}>
+          <option value="depth">Depth</option>
+          <option value="type">File type</option>
+          {#if comparison}<option value="change">Change</option>{/if}
+        </select>
+      </label>
       {#if volume?.isRoot}
         <label class="group check" title="Show the drive's capacity, free space, and used space no file accounts for">
           <input type="checkbox" bind:checked={showVolume} /> Volume overview
@@ -1533,12 +1540,12 @@
     padding-left: 0;
     border-left: none;
   }
-  fieldset.group legend {
-    float: left;
-    padding: 0;
+  .colors {
     color: var(--muted);
   }
-  .group label,
+  .colors select {
+    color: var(--fg);
+  }
   .check {
     display: flex;
     align-items: center;
