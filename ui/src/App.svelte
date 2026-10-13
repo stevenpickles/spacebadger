@@ -899,9 +899,7 @@
             {/if}
           </div>
         {/if}
-        {#if colors === "type"}
-          <Legend />
-        {/if}
+        <Legend mode={colors} />
       {/if}
     </main>
     <aside>
