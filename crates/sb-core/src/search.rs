@@ -799,13 +799,13 @@ mod tests {
         let docs = t.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
         let report_dir = t.add_dir(NodeId::ROOT, "report".as_ref()).unwrap();
         let a = t
-            .add_file(docs, "report.pdf".as_ref(), sizes(100, 4096), 0)
+            .add_file(docs, "report.pdf".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
-        t.add_file(docs, "notes.txt".as_ref(), sizes(50, 4096), 0)
+        t.add_file(docs, "notes.txt".as_ref(), sizes(50, 4096), None, 0)
             .unwrap();
-        t.add_file(report_dir, "data.csv".as_ref(), sizes(10, 4096), 0)
+        t.add_file(report_dir, "data.csv".as_ref(), sizes(10, 4096), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "Report-2.pdf".as_ref(), sizes(0, 0), 0)
+        t.add_file(NodeId::ROOT, "Report-2.pdf".as_ref(), sizes(0, 0), None, 0)
             .unwrap();
 
         let s = search("report", &t);
@@ -830,15 +830,15 @@ mod tests {
     fn catches_up_with_new_files_in_budgeted_steps() {
         let mut t = Tree::new("/r");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
-        t.add_file(d, "x1".as_ref(), sizes(1, 1), 0).unwrap();
+        t.add_file(d, "x1".as_ref(), sizes(1, 1), None, 0).unwrap();
         let mut s = Search::new(Matcher::new("x").unwrap());
         assert!(!s.catch_up(&t, 2));
         assert!(s.catch_up(&t, 2));
         assert_eq!(s.totals(NodeId::ROOT).files, 1);
 
         let v = s.version();
-        t.add_file(d, "x2".as_ref(), sizes(2, 2), 0).unwrap();
-        t.add_file(d, "y".as_ref(), sizes(4, 4), 0).unwrap();
+        t.add_file(d, "x2".as_ref(), sizes(2, 2), None, 0).unwrap();
+        t.add_file(d, "y".as_ref(), sizes(4, 4), None, 0).unwrap();
         assert!(s.catch_up(&t, usize::MAX));
         assert_eq!(s.totals(d).logical, 3);
         assert!(s.version() > v);
@@ -849,10 +849,16 @@ mod tests {
         let mut t = Tree::new("/r");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let owner = t
-            .add_file(NodeId::ROOT, "movie.mkv".as_ref(), sizes(100, 4096), 0)
+            .add_file(
+                NodeId::ROOT,
+                "movie.mkv".as_ref(),
+                sizes(100, 4096),
+                None,
+                0,
+            )
             .unwrap();
         let alias = t
-            .add_file(d, "movie link.mkv".as_ref(), sizes(100, 4096), 0)
+            .add_file(d, "movie link.mkv".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
         let mut s = search("link", &t);
         assert_eq!(s.totals(d).allocated, 4096);
@@ -883,8 +889,14 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let size = (x >> 40) % 10_000;
-            t.add_file(NodeId::ROOT, format!("f{i}").as_ref(), sizes(size, size), 0)
-                .unwrap();
+            t.add_file(
+                NodeId::ROOT,
+                format!("f{i}").as_ref(),
+                sizes(size, size),
+                None,
+                0,
+            )
+            .unwrap();
         }
         let s = search("f", &t);
         let mut expected = s.matches().to_vec();
@@ -903,10 +915,14 @@ mod tests {
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let e = t.add_dir(d, "e".as_ref()).unwrap();
         let keep = t
-            .add_file(NodeId::ROOT, "a.log".as_ref(), sizes(1, 4096), 0)
+            .add_file(NodeId::ROOT, "a.log".as_ref(), sizes(1, 4096), None, 0)
             .unwrap();
-        let gone = t.add_file(d, "b.log".as_ref(), sizes(2, 8192), 0).unwrap();
-        let deeper = t.add_file(e, "c.log".as_ref(), sizes(4, 4096), 0).unwrap();
+        let gone = t
+            .add_file(d, "b.log".as_ref(), sizes(2, 8192), None, 0)
+            .unwrap();
+        let deeper = t
+            .add_file(e, "c.log".as_ref(), sizes(4, 4096), None, 0)
+            .unwrap();
         let mut s = search("log", &t);
         assert_eq!(s.totals(NodeId::ROOT).files, 3);
         let v = s.version();
@@ -942,7 +958,7 @@ mod tests {
     fn changes_to_unexamined_files_are_read_when_examined() {
         let mut t = Tree::new("/r");
         let f = t
-            .add_file(NodeId::ROOT, "a".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "a".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         let mut s = Search::new(Matcher::new("a").unwrap());
         s.catch_up(&t, 1); // only the root
@@ -986,7 +1002,8 @@ mod tests {
             (cache, "blob.bin"),
             (NodeId::ROOT, "top.js"),
         ] {
-            t.add_file(dir, name.as_ref(), sizes(10, 4096), 0).unwrap();
+            t.add_file(dir, name.as_ref(), sizes(10, 4096), None, 0)
+                .unwrap();
         }
 
         let s = search("dir:node_modules", &t);
@@ -1029,9 +1046,9 @@ mod tests {
         let mut s = search("dir:node_modules", &t);
         assert!(s.matches().is_empty());
         let inner = t.add_dir(nm, "pkg".as_ref()).unwrap();
-        t.add_file(inner, "a.js".as_ref(), sizes(5, 4096), 0)
+        t.add_file(inner, "a.js".as_ref(), sizes(5, 4096), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "b.js".as_ref(), sizes(5, 4096), 0)
+        t.add_file(NodeId::ROOT, "b.js".as_ref(), sizes(5, 4096), None, 0)
             .unwrap();
         assert!(s.catch_up(&t, usize::MAX));
         assert_eq!(names(&s, &t), ["a.js"]);
@@ -1049,7 +1066,8 @@ mod tests {
             (NodeId::ROOT, "app.ts", 2),
             (NodeId::ROOT, "stream.ts", 2 << 20),
         ] {
-            t.add_file(dir, name.as_ref(), sizes(len, 4096), 0).unwrap();
+            t.add_file(dir, name.as_ref(), sizes(len, 4096), None, 0)
+                .unwrap();
         }
 
         let s = search("is:video", &t);

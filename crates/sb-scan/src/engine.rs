@@ -609,25 +609,26 @@ impl<A: FsAdapter> Aggregator<A> {
                     allocated: entry.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
                 };
                 let extra = if entry.cloud { flags::CLOUD } else { 0 };
-                tree.add_file(dir, &entry.name, sizes, extra).map(|id| {
-                    if let Identity::MaybeShared { key } = entry.identity {
-                        match self.owners.entry(key) {
-                            MapEntry::Vacant(v) => {
-                                v.insert(id);
-                            }
-                            MapEntry::Occupied(o) => {
-                                let owner = *o.get();
-                                tree.mark_alias(id, owner);
-                                // Listings of other names can be stale (NTFS),
-                                // so re-measure both sides once.
-                                remeasure.push(id);
-                                if self.remeasured.insert(owner) {
-                                    remeasure.push(owner);
+                tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
+                    .map(|id| {
+                        if let Identity::MaybeShared { key } = entry.identity {
+                            match self.owners.entry(key) {
+                                MapEntry::Vacant(v) => {
+                                    v.insert(id);
+                                }
+                                MapEntry::Occupied(o) => {
+                                    let owner = *o.get();
+                                    tree.mark_alias(id, owner);
+                                    // Listings of other names can be stale (NTFS),
+                                    // so re-measure both sides once.
+                                    remeasure.push(id);
+                                    if self.remeasured.insert(owner) {
+                                        remeasure.push(owner);
+                                    }
                                 }
                             }
                         }
-                    }
-                })
+                    })
             };
             if added.is_err() {
                 self.stop = Some(ScanState::Failed(

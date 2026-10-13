@@ -305,6 +305,7 @@ fn grow(tree: &mut Tree, count: usize, seed: u64) -> usize {
                 logical: 4096,
                 allocated: sb_core::size::Allocated::known(4096),
             },
+            None,
             0,
         )
         .expect("within capacity");

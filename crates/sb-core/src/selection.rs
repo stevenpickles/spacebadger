@@ -88,10 +88,14 @@ mod tests {
         let mut t = Tree::new("/r");
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let b = t.add_dir(a, "b".as_ref()).unwrap();
-        let x = t.add_file(b, "x".as_ref(), sizes(10, 4096), 0).unwrap();
-        let y = t.add_file(a, "y".as_ref(), sizes(20, 8192), 0).unwrap();
+        let x = t
+            .add_file(b, "x".as_ref(), sizes(10, 4096), None, 0)
+            .unwrap();
+        let y = t
+            .add_file(a, "y".as_ref(), sizes(20, 8192), None, 0)
+            .unwrap();
         let z = t
-            .add_file(NodeId::ROOT, "z".as_ref(), sizes(1, 512), 0)
+            .add_file(NodeId::ROOT, "z".as_ref(), sizes(1, 512), None, 0)
             .unwrap();
 
         let r = resolve(&t, &[id(x), id(z), id(a), id(b), id(z)]);
@@ -111,10 +115,10 @@ mod tests {
     fn skips_the_root_and_unknown_or_removed_items() {
         let mut t = Tree::new("/r");
         let f = t
-            .add_file(NodeId::ROOT, "f".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "f".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         let g = t
-            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         t.remove(g);
         let r = resolve(&t, &[0, id(f), id(g), 999]);
