@@ -11,7 +11,7 @@
     typeColor,
     type ColorMode,
   } from "./colors";
-  import { formatBytes, plural } from "./format";
+  import { formatBytes, percent, plural } from "./format";
   import {
     decodeLayout,
     FILE_TYPES,
@@ -90,7 +90,12 @@
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
   let hover = $state<{ index: number; x: number; y: number } | null>(null);
-  let hoverDetails = $state.raw<NodeDetails | null>(null);
+  /** Details for the tooltip's item, fetched shortly after it changes. */
+  let tipDetails = $state.raw<NodeDetails | null>(null);
+  /** The tooltip follows the keyboard selection until the mouse moves. */
+  let keyTip = $state(false);
+  let tipWidth = $state(0);
+  let tipHeight = $state(0);
   const dark = $derived(theme.dark);
 
   /** Canvas colors from the app.css tokens, re-read when the theme changes. */
@@ -407,39 +412,17 @@
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
-  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
-
   function onMove(e: MouseEvent) {
     const l = layout;
     if (!l) return;
     const [x, y] = point(e);
     const index = hitTest(l, x, y);
-    const changed = !hover || hover.index !== index;
     hover = index >= 0 ? { index, x, y } : null;
-    if (changed) {
-      hoverDetails = null;
-      clearTimeout(hoverTimer);
-      if (index >= 0 && l.kind[index] !== KIND_OTHER) {
-        const node = l.node[index]!;
-        const gen = generation;
-        hoverTimer = setTimeout(() => {
-          nodeDetails(gen, node).then(
-            (d) => {
-              if (hover && layout?.node[hover.index] === d.node && d.generation === generation) {
-                hoverDetails = d;
-              }
-            },
-            () => {},
-          );
-        }, 120);
-      }
-    }
+    keyTip = false;
   }
 
   function onLeave() {
-    clearTimeout(hoverTimer);
     hover = null;
-    hoverDetails = null;
   }
 
   /** Replaces the selection with the item at rectangle `i`. */
@@ -599,28 +582,111 @@
     e.preventDefault();
   }
 
+  // ---- tooltip ---------------------------------------------------------
+
+  /** The rectangle the tooltip describes: hovered, or keyboard-selected. */
+  const tipIndex = $derived.by(() => {
+    const l = layout;
+    if (!l) return -1;
+    if (hover) return hover.index < l.count ? hover.index : -1;
+    return keyTip ? selectedIndex(l, selection) : -1;
+  });
+
+  /** The node whose details the tooltip needs; -1 for none or small items. */
+  const tipNode = $derived(
+    tipIndex >= 0 && layout && layout.kind[tipIndex] !== KIND_OTHER ? layout.node[tipIndex]! : -1,
+  );
+
+  $effect(() => {
+    const node = tipNode;
+    const gen = generation;
+    tipDetails = null;
+    if (node < 0) return;
+    const timer = setTimeout(() => {
+      nodeDetails(gen, node).then(
+        (d) => {
+          if (d.node === tipNode && d.generation === generation) tipDetails = d;
+        },
+        () => {},
+      );
+    }, 120);
+    return () => clearTimeout(timer);
+  });
+
+  /** Size of the folder rectangle `i` is drawn in, or 0 if not drawn. */
+  function parentWeight(l: DecodedLayout, i: number): number {
+    const parent = l.parent[i]!;
+    if (parent === l.view) return l.total;
+    // Parents come before their children.
+    for (let j = i - 1; j >= 0; j--) {
+      if (l.node[j] === parent && l.kind[j] === KIND_FOLDER) return l.weight[j]!;
+    }
+    return 0;
+  }
+
+  /** "12% of parent" for rectangle `i`, or `null` when unknown. */
+  function shareOfParent(l: DecodedLayout, i: number): string | null {
+    const whole = parentWeight(l, i);
+    return whole > 0 ? `${percent(l.weight[i]!, whole)} of parent` : null;
+  }
+
+  /**
+   * What the tooltip shows. Every line it will have is there from the
+   * start; `null` marks one still waiting for details, drawn as a
+   * placeholder so the tooltip keeps its size when they arrive.
+   */
   const tooltip = $derived.by(() => {
     const l = layout;
-    if (!hover || !l || hover.index >= l.count) return null;
-    const i = hover.index;
+    const i = tipIndex;
+    if (!l || i < 0) return null;
+    const share = shareOfParent(l, i);
+    const size = [formatBytes(l.weight[i]!), share].filter(Boolean).join(" · ");
     if (l.kind[i] === KIND_OTHER) {
       return {
         title: plural(l.items[i]!, "small item"),
-        lines: [`${formatBytes(l.weight[i]!)} combined`, "Too small to draw individually"],
+        path: undefined,
+        lines: [`${size} combined`, "Too small to draw individually"],
       };
     }
-    const d = hoverDetails;
-    const name = d?.name ?? l.labels.get(i) ?? "";
-    const lines: string[] = [];
-    if (d) {
-      lines.push(d.path);
-      const allocated = d.allocated === null ? "unknown" : formatBytes(d.allocated);
-      lines.push(`Allocated ${allocated} · Logical ${formatBytes(d.logical)}`);
-    } else {
-      lines.push(formatBytes(l.weight[i]!));
+    const d = tipDetails;
+    const folder = l.kind[i] === KIND_FOLDER;
+    const lines: (string | null)[] = [size];
+    if (folder) lines.push(d ? plural(d.files, "file") : null);
+    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned yet");
+    if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
+    return { title: d?.name ?? l.labels.get(i) ?? "", path: d ? d.path : null, lines };
+  });
+
+  /**
+   * Where the tooltip may go: right of `right` or left of `left`, below
+   * `below` or above `above`, whichever fits inside the map.
+   */
+  const tipAnchor = $derived.by(() => {
+    const l = layout;
+    if (!l || tipIndex < 0) return null;
+    if (hover) {
+      return { right: hover.x + 12, left: hover.x - 12, below: hover.y + 12, above: hover.y - 12 };
     }
-    if (colors === "type" && l.kind[i] === KIND_FILE) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
-    return { title: name, lines };
+    // Keyboard: under small tiles, just inside the top of big ones.
+    const x = l.x[tipIndex]!;
+    const y = l.y[tipIndex]!;
+    return {
+      right: x + 8,
+      left: x + 8,
+      below: Math.min(y + l.h[tipIndex]! + 4, y + 24),
+      above: y - 4,
+    };
+  });
+
+  const tipPosition = $derived.by(() => {
+    const a = tipAnchor;
+    if (!a) return null;
+    const clamp = (v: number, max: number) => Math.max(4, Math.min(v, max - 4));
+    let left = a.right;
+    if (left + tipWidth > width - 4) left = a.left - tipWidth;
+    let top = a.below;
+    if (top + tipHeight > height - 4) top = a.above - tipHeight;
+    return { left: clamp(left, width - tipWidth), top: clamp(top, height - tipHeight) };
   });
 </script>
 
@@ -642,15 +708,22 @@
 >
   <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px" aria-hidden="true"
   ></canvas>
-  {#if tooltip && hover}
+  {#if tooltip && tipPosition}
     <div
       class="tooltip"
-      style:left="{Math.min(hover.x + 14, Math.max(0, width - 320))}px"
-      style:top="{hover.y + 18 > height - 60 ? hover.y - 64 : hover.y + 18}px"
+      aria-hidden="true"
+      bind:clientWidth={tipWidth}
+      bind:clientHeight={tipHeight}
+      style:left="{tipPosition.left}px"
+      style:top="{tipPosition.top}px"
+      style:visibility={tipHeight > 0 ? "visible" : "hidden"}
     >
-      <strong>{tooltip.title}</strong>
+      <strong class="title">{tooltip.title || "\u00a0"}</strong>
+      {#if tooltip.path !== undefined}
+        <div class="path selectable" class:pending={tooltip.path === null}>{tooltip.path ?? ""}</div>
+      {/if}
       {#each tooltip.lines as line, i (i)}
-        <div>{line}</div>
+        <div class="line" class:pending={line === null}>{line ?? ""}</div>
       {/each}
     </div>
   {/if}
@@ -680,16 +753,50 @@
   }
   .tooltip {
     position: absolute;
-    max-width: 300px;
+    /* A fixed width, so details arriving later never resize it. */
+    box-sizing: border-box;
+    width: 300px;
+    max-width: calc(100% - 8px);
     padding: 6px 8px;
-    border-radius: 4px;
+    border-radius: var(--radius);
     background: var(--panel);
     color: var(--fg);
     border: 1px solid var(--line);
     box-shadow: 0 2px 8px rgb(0 0 0 / 0.25);
     pointer-events: none;
-    font-size: 12px;
+    font-size: var(--fs-sm);
+    line-height: 1.35;
+  }
+  .tooltip .title {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tooltip .line {
+    min-height: 1.35em;
+  }
+  /* Paths take up to two lines, reserved from the start. */
+  .tooltip .path {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    height: 2.7em;
+    overflow: hidden;
     overflow-wrap: anywhere;
+    color: var(--muted);
+  }
+  .tooltip .pending::before {
+    content: "";
+    display: inline-block;
+    width: 60%;
+    height: 0.75em;
+    border-radius: 2px;
+    background: var(--line);
+  }
+  .tooltip .line.pending::before {
+    width: 30%;
   }
   .perf {
     position: absolute;
