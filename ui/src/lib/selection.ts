@@ -108,3 +108,26 @@ export function listRange<T>(items: T[], from: number, to: number, node: (item: 
 export function replacePick(node: number): Pick {
   return { focus: { node, other: false }, nodes: [node], mode: "replace", keepAnchor: false };
 }
+
+/**
+ * The pick that moves the focus to `node` and leaves the selected items
+ * alone, as Ctrl+Arrow does in a list, or a right-click inside the
+ * selection.
+ */
+export function focusPick(node: number): Pick {
+  return { focus: { node, other: false }, nodes: [], mode: "add", keepAnchor: true };
+}
+
+/** The pick that adds `node` to the selected items or removes it, as Ctrl+Space does. */
+export function togglePick(node: number): Pick {
+  return { focus: { node, other: false }, nodes: [node], mode: "toggle", keepAnchor: false };
+}
+
+/**
+ * The pick that selects `nodes` (a Shift range, or everything for Ctrl+A)
+ * with the focus on `node`; `add` keeps what was already selected. The
+ * anchor stays where it was.
+ */
+export function rangePick(node: number, nodes: number[], add = false): Pick {
+  return { focus: { node, other: false }, nodes, mode: add ? "add" : "replace", keepAnchor: true };
+}
