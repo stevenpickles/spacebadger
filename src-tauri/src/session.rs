@@ -1,6 +1,8 @@
 //! One scan and the view state derived from it, plus conversions from the
 //! scanner's types to the protocol's.
 
+mod export;
+
 use crate::delete::{self, Outcome};
 use crate::duplicates::{self, Job};
 use crate::snapshots::Store;

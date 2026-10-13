@@ -13,6 +13,9 @@ import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
 import type { DuplicatesList } from "./protocol/DuplicatesList";
 import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
 import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
+import type { ExportProgress } from "./protocol/ExportProgress";
+import type { ExportReport } from "./protocol/ExportReport";
+import type { ExportRequest } from "./protocol/ExportRequest";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { ItemChange } from "./protocol/ItemChange";
@@ -36,6 +39,9 @@ export const EXPECTED_PROTOCOL_VERSION = 4;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
+
+/** Must match `sb_protocol::EXPORT_PROGRESS_EVENT`. */
+const EXPORT_PROGRESS_EVENT = "export-progress";
 
 export function appInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("app_info");
@@ -101,6 +107,24 @@ export function volumeInfo(generation: number): Promise<VolumeInfo | null> {
 /** Shows the item selected in Explorer, Finder, or the desktop's file manager. */
 export function reveal(generation: number, node: number): Promise<void> {
   return invoke("reveal", { generation, node });
+}
+
+/**
+ * Asks where to save with the native dialog, then writes the export there;
+ * `null` if the dialog was dismissed. Progress arrives as events once the
+ * file is chosen.
+ */
+export function exportSave(request: ExportRequest): Promise<ExportReport | null> {
+  return invoke<ExportReport | null>("export_save", { request });
+}
+
+/** Shows the file last exported selected in the system file manager. */
+export function revealExport(): Promise<void> {
+  return invoke("reveal_export");
+}
+
+export function onExportProgress(handler: (progress: ExportProgress) => void): Promise<UnlistenFn> {
+  return listen<ExportProgress>(EXPORT_PROGRESS_EVENT, (event) => handler(event.payload));
 }
 
 /** What a set of selected items amounts to. */
