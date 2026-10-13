@@ -11,7 +11,7 @@
     typeColor,
     type ColorMode,
   } from "./colors";
-  import { formatBytes, percent, plural } from "./format";
+  import { formatBytes, formatCount, percent, plural } from "./format";
   import {
     decodeLayout,
     FILE_TYPES,
@@ -262,11 +262,6 @@
     ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
     ctx.textBaseline = "alphabetic";
     const gap = p.gap;
-    // Baselines of the first and second label lines, from the tile top.
-    const line1 = p.fontSize + 1;
-    const line2 = line1 + p.fontSize + 2;
-    // Tiles shorter than this get no label at all.
-    const minLabel = Math.max(14, p.fontSize + 3);
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -276,42 +271,17 @@
       const kind = l.kind[i]!;
       ctx.fillStyle = gap;
       ctx.fillRect(x, y, w, h);
-      const fill = fillFor(l, i);
-      ctx.fillStyle = fill;
+      ctx.fillStyle = fillFor(l, i);
       if (w > 2 && h > 2) ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
       else ctx.fillRect(x, y, w, h);
 
       if (kind === KIND_FOLDER && l.rflags[i]! & RF_INCOMPLETE) {
         ctx.strokeStyle = p.incomplete;
+        ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
         ctx.setLineDash([]);
       }
-
-      if (h < minLabel || w < 16) continue;
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x, y, w, h);
-      ctx.clip();
-      // Dark or light text, whichever contrasts with this tile.
-      ctx.fillStyle = isDarkFill(fill) ? p.textLight : p.textDark;
-      const name = l.labels.get(i);
-      const size = formatBytes(l.weight[i]!);
-      if (kind === KIND_FOLDER && l.rflags[i]! & RF_HEADER && name !== undefined) {
-        const sizeWidth = ctx.measureText(size).width;
-        if (w - 8 > sizeWidth + 40) {
-          label(ctx, name, x + 4, y + line1, w - 14 - sizeWidth);
-          ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
-        } else {
-          label(ctx, name, x + 4, y + line1, w - 8);
-        }
-      } else if (kind === KIND_FILE && name !== undefined) {
-        label(ctx, name, x + 4, y + line1, w - 8);
-        if (h >= line2 + 3) label(ctx, size, x + 4, y + line2, w - 8);
-      } else if (kind === KIND_OTHER && w >= 60) {
-        label(ctx, `${plural(l.items[i]!, "small item")}`, x + 4, y + line1, w - 8);
-      }
-      ctx.restore();
     }
 
     // Selection: a light accent tint (labels stay readable) under an accent
@@ -344,11 +314,14 @@
       }
     }
 
-    // Hover stays a faint hairline.
+    // Hover: a slight lighten and a 2px line, quieter than the selection.
     const hi = hover ? hover.index : -1;
     if (hi >= 0 && hi < l.count) {
-      ctx.globalAlpha = 0.6;
-      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 1, ink);
+      ctx.globalAlpha = dark ? 0.1 : 0.22;
+      ctx.fillStyle = p.textLight;
+      ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
+      ctx.globalAlpha = 0.7;
+      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, ink);
       ctx.globalAlpha = 1;
     }
 
@@ -363,6 +336,58 @@
       band(ctx, x, y, w, h, 3, 1, paper);
       if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
     }
+
+    // Labels go last, so tints and frames never hide them.
+    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i);
+  }
+
+  function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number) {
+    const p = palette;
+    const x = l.x[i]!;
+    const y = l.y[i]!;
+    const w = l.w[i]!;
+    const h = l.h[i]!;
+    const kind = l.kind[i]!;
+    // Baselines of the first and second label lines, from the tile top.
+    const line1 = p.fontSize + 1;
+    const line2 = line1 + p.fontSize + 2;
+    // Tiles shorter than this get no label at all.
+    if (h < Math.max(14, p.fontSize + 3) || w < 16) return;
+    const name = l.labels.get(i);
+    const header = kind === KIND_FOLDER && (l.rflags[i]! & RF_HEADER) !== 0;
+    if (kind !== KIND_OTHER && (name === undefined || (kind === KIND_FOLDER && !header))) return;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    // Dark or light text, whichever contrasts with this tile.
+    ctx.fillStyle = isDarkFill(fillFor(l, i)) ? p.textLight : p.textDark;
+    const room = w - 8;
+    if (kind === KIND_OTHER) {
+      // Shorter wordings as the region narrows.
+      const n = formatCount(l.items[i]!);
+      const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
+        (t) => ctx.measureText(t).width <= room,
+      );
+      if (text) ctx.fillText(text, x + 4, y + line1);
+    } else {
+      const size = formatBytes(l.weight[i]!);
+      const sizeWidth = ctx.measureText(size).width;
+      if (kind === KIND_FILE && h >= line2 + 3) {
+        // Tall enough for two lines: name, then size.
+        label(ctx, name!, x + 4, y + line1, room);
+        if (sizeWidth <= room) ctx.fillText(size, x + 4, y + line2);
+      } else if (room >= sizeWidth + 30) {
+        // One line: the size right-aligned, the name cut to fit before it.
+        label(ctx, name!, x + 4, y + line1, room - sizeWidth - 6);
+        ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
+      } else if (sizeWidth <= room) {
+        // The size matters most, so it wins when both don't fit.
+        ctx.fillText(size, x + 4, y + line1);
+      }
+    }
+    ctx.restore();
   }
 
   /** Strokes a band `width` px wide, `inset` px inside the rectangle. */
