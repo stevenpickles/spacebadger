@@ -1085,7 +1085,10 @@
     gap: 4px;
     cursor: pointer;
   }
+  /* The group that wraps to a second row first: a rule there would
+     dangle at the row's start. */
   .filter {
+    border-left: none;
     flex: 1 1 200px;
     max-width: 420px;
     min-width: 180px;

@@ -101,7 +101,7 @@
   dl {
     display: grid;
     /* The same first column in every group, so descriptions line up. */
-    grid-template-columns: minmax(0, 15em) 1fr;
+    grid-template-columns: minmax(0, 12em) 1fr;
     gap: 4px 16px;
     margin: 0;
   }
