@@ -624,11 +624,26 @@
     return items;
   }
 
-  function treemapHeading(r: MenuRequest): string | undefined {
+  function treemapHeading(r: MenuRequest, name: string | undefined): string | undefined {
+    const node = r.selection?.node ?? view;
+    if (r.kind === "other") return name ? `Small items in ${name}` : "Small items";
+    return menuHeading(node, name);
+  }
+
+  function openTreemapMenu(r: MenuRequest) {
     const node = r.selection?.node ?? view;
     const known = [selectedDetails, viewDetails].find((d) => d?.node === node);
-    if (r.kind === "other") return known ? `Small items in ${known.name}` : "Small items";
-    return menuHeading(node, known?.name);
+    const opened = { x: r.x, y: r.y, items: menuItems(r), heading: treemapHeading(r, known?.name) };
+    menu = opened;
+    // An item right-clicked before it was selected: name it once known.
+    const gen = generation;
+    if (known || gen === null) return;
+    nodeDetails(gen, node).then(
+      (d) => {
+        if (menu === opened) menu = { ...opened, heading: treemapHeading(r, d.name) };
+      },
+      () => {},
+    );
   }
 
   // Release builds replace the webview's own menu (Back, Reload, Inspect)
@@ -889,7 +904,7 @@
           onopen={openFolder}
           onup={goUp}
           onlayout={(l) => (layout = l)}
-          onmenu={(r) => (menu = { x: r.x, y: r.y, items: menuItems(r), heading: treemapHeading(r) })}
+          onmenu={openTreemapMenu}
         />
         {#if empty}
           <div class="placeholder overlay">
