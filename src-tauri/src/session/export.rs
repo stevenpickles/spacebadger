@@ -13,7 +13,8 @@
 //! re-applying the same filter text doesn't count as a change.
 
 use super::{ActiveSearch, Session, display_path, metric, node};
-use sb_core::export::{Csv, Report, ReportInfo, Scope};
+use chrono::{SecondsFormat, TimeZone};
+use sb_core::export::{Csv, Report, ReportInfo, Scope, iso_utc, short_utc};
 use sb_core::search::Search;
 use sb_core::tree::{NodeId, Tree};
 use sb_protocol as proto;
@@ -148,7 +149,8 @@ impl Session {
             proto::ExportScope::Contents => Scope::Contents,
             proto::ExportScope::Everything => Scope::Everything,
         };
-        let mut csv = Csv::new(NodeId::from_index(req.folder), scope, metric(req.metric));
+        let mut csv = Csv::new(NodeId::from_index(req.folder), scope, metric(req.metric))
+            .with_time_format(iso_local);
         let mut text = String::new();
         loop {
             let done = self.export_step(job, |tree, filter| {
@@ -171,7 +173,8 @@ impl Session {
         failed: &impl Fn(std::io::Error) -> String,
     ) -> Result<u64, String> {
         let req = job.req;
-        let mut report = Report::new(NodeId::from_index(req.folder), metric(req.metric));
+        let mut report = Report::new(NodeId::from_index(req.folder), metric(req.metric))
+            .with_time_format(short_local);
         while !self.export_step(job, |tree, filter| report.step(tree, filter, EXPORT_STEP))? {
             progress(report.examined());
         }
@@ -237,6 +240,23 @@ fn same_filter<'a>(
         .ok_or(FILTER_CHANGED)?;
     active.search.catch_up(tree, usize::MAX);
     Ok(active)
+}
+
+/// ISO 8601 in local time with its offset, such as
+/// `2026-10-13T18:05:09+02:00`; the offset is the one in effect then.
+fn iso_local(secs: i64) -> String {
+    chrono::Local.timestamp_opt(secs, 0).single().map_or_else(
+        || iso_utc(secs),
+        |t| t.to_rfc3339_opts(SecondsFormat::Secs, false),
+    )
+}
+
+/// A short local date and time, such as `2026-10-13 18:05`.
+fn short_local(secs: i64) -> String {
+    chrono::Local.timestamp_opt(secs, 0).single().map_or_else(
+        || short_utc(secs),
+        |t| t.format("%Y-%m-%d %H:%M").to_string(),
+    )
 }
 
 /// How the scan went, for a report's header.
@@ -379,8 +399,24 @@ mod tests {
         let size = format_bytes(8000, SYSTEM_KILO);
         assert_eq!(
             lines[1],
-            format!("{},old,folder,8000,{size},2,,98.77", display_path(&old))
+            format!("{},old,folder,8000,{size},2,,98.77,", display_path(&old)),
+            "folders have no modified time"
         );
+        // A file's: local time with the offset in effect then.
+        let a = lines.iter().find(|l| l.contains(",a.log,")).unwrap();
+        let modified = a.rsplit(',').next().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(modified).unwrap();
+        let written = std::fs::metadata(session.root.join("old").join("logs").join("a.log"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let written = chrono::DateTime::<chrono::Local>::from(written);
+        assert_eq!(parsed.timestamp(), written.timestamp());
+        assert_eq!(
+            parsed.offset().local_minus_utc(),
+            written.offset().local_minus_utc()
+        );
+        assert!(!modified.ends_with('Z'), "{modified}");
         assert!(
             text.contains(",\"b, q.log\",file,3000,"),
             "a name with a comma is one quoted field"
@@ -524,6 +560,23 @@ mod tests {
         let req = request(&session, proto::ExportFormat::Csv);
         let err = session.export(&req, &path, || true, |_| {}).unwrap_err();
         assert!(err.starts_with("Couldn't create "), "{err}");
+    }
+
+    #[test]
+    fn local_times_carry_their_offset() {
+        let secs = 1_700_000_000;
+        let t = chrono::Local.timestamp_opt(secs, 0).unwrap();
+        assert_eq!(
+            iso_local(secs),
+            t.to_rfc3339_opts(SecondsFormat::Secs, false)
+        );
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&iso_local(secs))
+                .unwrap()
+                .timestamp(),
+            secs
+        );
+        assert_eq!(short_local(secs), t.format("%Y-%m-%d %H:%M").to_string());
     }
 
     #[test]
