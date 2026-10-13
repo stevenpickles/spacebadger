@@ -6,10 +6,14 @@
 //!
 //! After a full scan it also times treemap layouts of the root at 1920×1080
 //! (a first, sorting layout and a repeat that reuses the sibling order), and
-//! filename searches with a filtered layout for a few sample queries.
+//! filename searches with a filtered layout for a few sample queries, and
+//! the snapshot saved for comparing later scans: its size, how long it
+//! takes to capture, write, read back, and match against the tree.
 
+use sb_core::compare::Comparison;
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache};
 use sb_core::search::{Matcher, Search};
+use sb_core::snapshot::{self, Snapshot};
 use sb_core::tree::NodeId;
 use sb_scan::{NativeFs, Scan, ScanConfig};
 use std::path::PathBuf;
@@ -127,6 +131,30 @@ fn main() {
             l.rects.len()
         );
     }
+    let t = Instant::now();
+    let snap = Snapshot::capture(&tree, 0, snapshot::CASE_INSENSITIVE);
+    let captured = t.elapsed();
+    let t = Instant::now();
+    let bytes = snap.encode();
+    let file = std::env::temp_dir().join(format!("sb-scan-{}.sbsnap", std::process::id()));
+    std::fs::write(&file, &bytes).expect("write snapshot");
+    let written = t.elapsed();
+    let t = Instant::now();
+    let back = Snapshot::decode(&std::fs::read(&file).expect("read snapshot")).unwrap();
+    let read = t.elapsed();
+    let _ = std::fs::remove_file(&file);
+    let t = Instant::now();
+    let cmp = Comparison::new(&tree, &back);
+    let matched = t.elapsed();
+    let t = Instant::now();
+    let changes = cmp.changes_under(&tree, &back, NodeId::ROOT, false).len();
+    println!(
+        "snapshot: {} entries, {:.1} MiB; capture {captured:?}, encode and write {written:?}, \
+         read and decode {read:?}, match {matched:?}, list changes {:?} ({changes})",
+        snap.len(),
+        bytes.len() as f64 / (1u64 << 20) as f64,
+        t.elapsed()
+    );
     let mut top: Vec<NodeId> = tree.children(NodeId::ROOT).collect();
     top.sort_by_key(|&n| std::cmp::Reverse(tree.allocated(n)));
     println!("largest entries at the root (allocated / logical):");

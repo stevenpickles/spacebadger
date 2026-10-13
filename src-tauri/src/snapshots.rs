@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 pub const KEEP_PER_ROOT: usize = 10;
 
 /// Room for all snapshots together.
-pub const MAX_TOTAL_BYTES: u64 = 512 << 20;
+pub const MAX_TOTAL_BYTES: u64 = 256 << 20;
 
 const EXTENSION: &str = "sbsnap";
 const TEMP_EXTENSION: &str = "tmp";
