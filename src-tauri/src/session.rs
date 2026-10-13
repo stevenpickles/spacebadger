@@ -50,6 +50,9 @@ pub struct Session {
     snapshots: Option<Arc<Store>>,
     /// The snapshot saved for this scan once it completed.
     saved_snapshot: Arc<Mutex<Option<String>>>,
+    /// When the scan started (ms since the Unix epoch): only snapshots from
+    /// before then are earlier scans.
+    started_ms: u64,
     /// The comparison with an earlier scan, when on.
     compare: Mutex<Option<compare::Active>>,
 }
@@ -97,6 +100,7 @@ impl Session {
         snapshots: Option<Arc<Store>>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        let started_ms = compare::now_ms();
         let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
@@ -132,6 +136,7 @@ impl Session {
             names: Mutex::new(None),
             snapshots,
             saved_snapshot,
+            started_ms,
             compare: Mutex::new(None),
         }
     }

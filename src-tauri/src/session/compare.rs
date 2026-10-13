@@ -75,7 +75,7 @@ impl Saver {
     }
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -105,7 +105,7 @@ impl Session {
         store
             .list(&self.root)
             .into_iter()
-            .filter(|(id, _)| Some(id) != own.as_ref())
+            .filter(|(id, h)| Some(id) != own.as_ref() && h.created_ms < self.started_ms)
             .map(|(id, h)| info(id, &h))
             .collect()
     }
