@@ -740,9 +740,13 @@ impl Session {
         nodes: &[u32],
     ) -> Result<proto::DuplicatesCheck, String> {
         let job = self.duplicates_job(job)?;
-        let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        Ok(job.check(&tree, nodes))
+        let pending = {
+            let tree = self.scan.tree();
+            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            job.check(&tree, nodes)
+        };
+        // The disk is looked at with no lock held.
+        Ok(pending.finish())
     }
 
     /// Stops reading; the groups found so far stay.
@@ -1306,6 +1310,10 @@ mod tests {
         let after = session.duplicates_status(filtered.job).unwrap();
         assert_eq!((after.groups, after.reclaimable), (0, 0));
         assert_ne!(after.version, filtered.version);
+        // Deleting the copy left would still lose the last of them.
+        let last = list.groups[0].files[1].node;
+        let check = session.duplicates_check(filtered.job, &[last]).unwrap();
+        assert_eq!((check.all_selected, check.kept_gone), (1, 0));
         assert!(
             session.duplicates_list(done.job).is_err(),
             "replaced by the newer search"

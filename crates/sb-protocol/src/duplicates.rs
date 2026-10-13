@@ -161,6 +161,9 @@ pub struct DuplicatesCheck {
     /// Groups whose files that would stay are gone from disk or have
     /// changed size since they were compared.
     pub kept_gone: u32,
+    /// Groups with copies that would stay, which weren't looked for on disk
+    /// because there were too many to check quickly.
+    pub unchecked: u32,
     /// A file that would be deleted from some of those groups, at most
     /// [`DUPLICATE_CHECK_EXAMPLES`].
     pub examples: Vec<String>,

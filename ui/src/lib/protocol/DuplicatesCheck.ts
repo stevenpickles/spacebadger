@@ -14,6 +14,11 @@ allSelected: number,
  */
 keptGone: number, 
 /**
+ * Groups with copies that would stay, which weren't looked for on disk
+ * because there were too many to check quickly.
+ */
+unchecked: number, 
+/**
  * A file that would be deleted from some of those groups, at most
  * [`DUPLICATE_CHECK_EXAMPLES`].
  */

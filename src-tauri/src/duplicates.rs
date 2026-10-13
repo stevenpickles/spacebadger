@@ -8,7 +8,7 @@ use sb_core::tree::{NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::{self, Contents, Counters, Event, Group, Plan, Skip};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -221,12 +221,26 @@ impl Job {
     }
 }
 
+/// Most groups whose staying copies one check looks for on disk, and
+/// most copies it looks for per group, so a slow share can't hold up the
+/// delete dialog for long.
+const CHECK_GROUPS: usize = 200;
+const CHECK_COPIES: usize = 8;
+
+/// A delete check whose remaining part looks at the disk, done without
+/// holding any lock.
+pub struct PendingCheck {
+    check: proto::DuplicatesCheck,
+    /// Per group: a file that would go, the size, and copies that would stay.
+    on_disk: Vec<(String, u64, Vec<PathBuf>)>,
+}
+
 impl Job {
-    /// Groups that deleting `selected` (with everything in selected
-    /// folders) would leave with no copy: every file selected, or the ones
-    /// that would stay no longer on disk at the size compared. Reads each
-    /// staying file's metadata, so this runs off the interface thread.
-    pub fn check(&self, tree: &Tree, selected: &[u32]) -> proto::DuplicatesCheck {
+    /// Starts checking which groups deleting `selected` (with everything in
+    /// selected folders) would leave with no copy: every remaining file
+    /// selected, or the ones that would stay no longer on disk at the size
+    /// compared. Groups already down to one file count too.
+    pub fn check(&self, tree: &Tree, selected: &[u32]) -> PendingCheck {
         let items: HashSet<NodeId> = selection::resolve(tree, selected)
             .items
             .into_iter()
@@ -241,30 +255,61 @@ impl Job {
             }
             false
         };
-        let mut check = proto::DuplicatesCheck {
-            all_selected: 0,
-            kept_gone: 0,
-            examples: Vec::new(),
+        let mut pending = PendingCheck {
+            check: proto::DuplicatesCheck {
+                all_selected: 0,
+                kept_gone: 0,
+                unchecked: 0,
+                examples: Vec::new(),
+            },
+            on_disk: Vec::new(),
         };
-        let (groups, _) = self.current(tree);
-        for g in groups {
-            let (going, staying): (Vec<NodeId>, Vec<NodeId>) =
-                g.files.iter().partition(|&&n| picked(n));
+        let found = self.found.lock().unwrap();
+        for g in &found.groups {
+            let (going, staying): (Vec<NodeId>, Vec<NodeId>) = g
+                .files
+                .iter()
+                .copied()
+                .filter(|&n| tree.contains(n) && !tree.is_removed(n))
+                .partition(|&n| picked(n));
             let Some(&example) = going.first() else {
                 continue;
             };
+            let example = display_path(&tree.path(example));
             if staying.is_empty() {
-                check.all_selected += 1;
-            } else if !staying.iter().any(|&n| still_there(&tree.path(n), g.size)) {
-                check.kept_gone += 1;
+                pending.check.all_selected += 1;
+                pending.example(example);
+            } else if pending.on_disk.len() < CHECK_GROUPS {
+                let copies = staying
+                    .iter()
+                    .take(CHECK_COPIES)
+                    .map(|&n| tree.path(n))
+                    .collect();
+                pending.on_disk.push((example, g.size, copies));
             } else {
-                continue;
-            }
-            if check.examples.len() < proto::DUPLICATE_CHECK_EXAMPLES {
-                check.examples.push(display_path(&tree.path(example)));
+                pending.check.unchecked += 1;
             }
         }
-        check
+        pending
+    }
+}
+
+impl PendingCheck {
+    fn example(&mut self, path: String) {
+        if self.check.examples.len() < proto::DUPLICATE_CHECK_EXAMPLES {
+            self.check.examples.push(path);
+        }
+    }
+
+    /// Looks on disk for the copies that would stay.
+    pub fn finish(mut self) -> proto::DuplicatesCheck {
+        for (example, size, copies) in std::mem::take(&mut self.on_disk) {
+            if !copies.iter().any(|p| still_there(p, size)) {
+                self.check.kept_gone += 1;
+                self.example(example);
+            }
+        }
+        self.check
     }
 }
 
