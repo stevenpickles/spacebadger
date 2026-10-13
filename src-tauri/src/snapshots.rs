@@ -17,7 +17,7 @@ use sb_core::snapshot::{self, Snapshot, SnapshotHeader};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// The newest snapshots kept per scan root.
@@ -248,20 +248,37 @@ fn created_of(id: &str) -> u64 {
 }
 
 /// The root as compared: its path with one kind of separator (on Windows,
-/// where `/` and `\` both work), without trailing separators, and folded
-/// as names are compared where case doesn't matter.
+/// where `/` and `\` both work), without a `\\?\` prefix, with `.` and
+/// `..` resolved by name, without trailing separators, and folded as names
+/// are compared where case doesn't matter.
 fn root_key(root: &Path) -> String {
     let mut text = root.to_string_lossy().into_owned();
     if cfg!(windows) {
         text = text.replace('/', "\\");
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            text = format!(r"\\{rest}");
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            text = rest.to_owned();
+        }
     }
-    let trimmed = text.trim_end_matches(['/', '\\']);
-    // "C:\" and "/" keep their separator.
-    let text = if trimmed.is_empty() || trimmed.ends_with(':') {
-        &text
-    } else {
-        trimmed
-    };
+    let mut parts: Vec<Component> = Vec::new();
+    for c in Path::new(&text).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(parts.last(), Some(Component::Normal(_))) => {
+                parts.pop();
+            }
+            // Above the root is the root.
+            Component::ParentDir
+                if matches!(
+                    parts.last(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) => {}
+            c => parts.push(c),
+        }
+    }
+    let normal: PathBuf = parts.iter().collect();
+    let text = normal.to_string_lossy();
     let mut buf = Vec::new();
     let folded = snapshot::fold(text.as_bytes(), snapshot::CASE_INSENSITIVE, &mut buf);
     String::from_utf8_lossy(folded).into_owned()
@@ -433,10 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn root_keys_ignore_trailing_separators() {
+    fn root_keys_are_normalized() {
         assert_eq!(
             root_key(Path::new("/data/a/")),
             root_key(Path::new("/data/a"))
+        );
+        assert_eq!(
+            root_key(Path::new("/data/./b/../a/.")),
+            root_key(Path::new("/data/a")),
+            "`.` and `..` resolved by name"
         );
         assert_eq!(
             root_key(Path::new("/")).len(),
@@ -453,6 +475,15 @@ mod tests {
                 root_key(Path::new("C:/Users/me")),
                 root_key(Path::new(r"C:\Users\me"))
             );
+            assert_eq!(
+                root_key(Path::new(r"\\?\C:\Users\me")),
+                root_key(Path::new(r"C:\Users\me"))
+            );
+            assert_eq!(
+                root_key(Path::new(r"\\?\UNC\server\share\x")),
+                root_key(Path::new(r"\\server\share\x"))
+            );
+            assert_eq!(root_key(Path::new(r"C:\..")), root_key(Path::new(r"C:\")));
         }
         if snapshot::CASE_INSENSITIVE {
             // Folded like names, one character at a time: `ß` isn't `SS`.
