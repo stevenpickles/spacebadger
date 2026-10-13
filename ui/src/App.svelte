@@ -1096,14 +1096,6 @@
           <input type="checkbox" bind:checked={showVolume} /> Volume overview
         </label>
       {/if}
-      <div class="group">
-        <button
-          type="button"
-          disabled={exporting !== null}
-          title="Save the folder in the map as a CSV file or a text report"
-          onclick={() => askExport(view)}>Export…</button
-        >
-      </div>
       <div class="group filter">
         <FilterBox
           bind:value={query}
@@ -1229,6 +1221,16 @@
           >
         </span>
       {/if}
+      <!-- Beside the path of the folder it exports; the toolbar is full at
+           1280 px. -->
+      <button
+        type="button"
+        class="export"
+        class:alone={!filterError && !search}
+        disabled={exporting !== null}
+        title="Save the folder in the map as a CSV file or a text report"
+        onclick={() => askExport(view)}>Export…</button
+      >
     </div>
   {/if}
 
@@ -1632,6 +1634,15 @@
     padding: 2px 8px;
     min-height: 28px;
     border-bottom: 1px solid var(--line);
+  }
+  .crumbs .export {
+    flex: none;
+    margin-left: var(--space-2);
+    padding: 1px 8px;
+    font-size: var(--fs-sm);
+  }
+  .crumbs .export.alone {
+    margin-left: auto;
   }
   .filtered {
     display: flex;
