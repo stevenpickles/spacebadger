@@ -77,11 +77,13 @@ fn app_info() -> AppInfo {
 #[tauri::command]
 async fn scan_choose(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<ScanStarted>, String> {
     let picked = app
         .dialog()
         .file()
+        .set_parent(&window)
         .set_title("Choose a folder or drive to scan")
         .blocking_pick_folder();
     let Some(picked) = picked else {
