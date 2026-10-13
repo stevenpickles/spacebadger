@@ -501,46 +501,57 @@ fn size_range(value: &str) -> Result<Option<Range>, String> {
     }
     if let Some((from, to)) = value.split_once("..") {
         let (from, to) = (from.trim(), to.trim());
-        if to.is_empty() {
-            return Ok(None);
-        }
         let lo = if from.is_empty() {
-            0
+            0.0
         } else {
             bytes(from, value)?
         };
+        if to.is_empty() {
+            return Ok(None);
+        }
         let hi = bytes(to, value)?;
         if lo > hi {
             return Err(format!(
                 "“size:{value}” goes from larger to smaller. Put the smaller size first."
             ));
         }
-        return Ok(Some(Range::new(lo, hi)));
+        return Ok(Some(Range::new(whole(lo.ceil()), whole(hi.floor()))));
     }
     let (op, number) = [">=", "<=", ">", "<"]
         .into_iter()
         .find_map(|op| value.strip_prefix(op).map(|rest| (op, rest.trim())))
         .ok_or_else(|| {
+            // "size:=1GB" reads as "size:>1GB", not "size:>=1GB", in the hint.
+            let size = value.trim_start_matches('=').trim_start();
             format!(
-                "“size:{value}” needs a comparison: size:>{value}, size:<{value}, \
+                "“size:{value}” needs a comparison: size:>{size}, size:<{size}, \
                  or a range like size:10MB..1GB."
             )
         })?;
     if number.is_empty() {
         return Ok(None);
     }
+    // Fractional bounds round toward what the comparison means: on Windows
+    // 1.3KB is 1,331.2 bytes, so <1.3KB keeps 1,331 bytes and >1.3KB starts
+    // at 1,332.
     let n = bytes(number, value)?;
     Ok(Some(match op {
-        ">" => Range::new(n.saturating_add(1), u64::MAX),
-        ">=" => Range::new(n, u64::MAX),
-        "<" => Range::below(n),
-        _ => Range::new(0, n),
+        ">" => Range::new(whole(n.floor()).saturating_add(1), u64::MAX),
+        ">=" => Range::new(whole(n.ceil()), u64::MAX),
+        "<" => Range::below(whole(n.ceil())),
+        _ => Range::new(0, whole(n.floor())),
     }))
 }
 
-/// A size such as `500MB`, `1.5 GB`, or `4096` (bytes). `value` is the
-/// whole term, for the error message.
-fn bytes(text: &str, value: &str) -> Result<u64, String> {
+/// A whole, non-negative number of bytes as `u64`; the conversion
+/// saturates, so an absurd size simply matches nothing.
+fn whole(n: f64) -> u64 {
+    n as u64
+}
+
+/// A size such as `500MB`, `1.5 GB`, or `4096` (bytes), possibly
+/// fractional. `value` is the whole term, for the error message.
+fn bytes(text: &str, value: &str) -> Result<f64, String> {
     let (number, unit) = split_number(text);
     let multiplier = match unit.to_ascii_lowercase().as_str() {
         "" | "b" => Some(1),
@@ -555,8 +566,7 @@ fn bytes(text: &str, value: &str) -> Result<u64, String> {
         _ => None,
     };
     match (number.parse::<f64>(), multiplier) {
-        // The conversion saturates, so an absurd size simply matches nothing.
-        (Ok(n), Some(m)) if n.is_finite() && n >= 0.0 => Ok((n * m as f64).round() as u64),
+        (Ok(n), Some(m)) if n.is_finite() && n >= 0.0 => Ok(n * m as f64),
         _ => Err(format!(
             "“size:{value}” isn't a size: try size:>500MB or size:>1.5GB (B, KB, MB, GB, TB)."
         )),
@@ -1433,6 +1443,22 @@ mod tests {
         }
         assert!(m("size:..1KB", 0), "an open start is 0");
 
+        // Fractional bounds round the way each comparison means.
+        let x = 1.3 * k as f64;
+        let (floor, ceil) = (x.floor() as u64, x.ceil() as u64);
+        assert!(m("size:<1.3KB", ceil - 1) && !m("size:<1.3KB", ceil));
+        assert!(m("size:<=1.3KB", floor) && !m("size:<=1.3KB", floor + 1));
+        assert!(!m("size:>1.3KB", floor) && m("size:>1.3KB", floor + 1));
+        assert!(m("size:>=1.3KB", ceil) && !m("size:>=1.3KB", ceil - 1));
+        let y = 1.7 * k as f64;
+        assert!(m("size:1.3KB..1.7KB", ceil) && !m("size:1.3KB..1.7KB", ceil - 1));
+        assert!(m("size:1.3KB..1.7KB", y.floor() as u64));
+        assert!(!m("size:1.3KB..1.7KB", y.floor() as u64 + 1));
+        assert!(
+            !m("size:0.2..0.8", 0) && !m("size:0.2..0.8", 1),
+            "no whole byte"
+        );
+
         assert!(!m("!size:>1GB", 2 * k * k * k), "! turns a term around");
         assert!(m("!size:>1GB", k));
         assert!(
@@ -1450,6 +1476,7 @@ mod tests {
             ("size:>5PB", "isn't a size"),
             ("size:>-1", "isn't a size"),
             ("size:1GB..10MB", "larger to smaller"),
+            ("size:abc..", "isn't a size"),
             ("older:30", "isn't an age"),
             ("newer:soon", "isn't an age"),
             ("older:6m", "use mo for months"),
@@ -1459,6 +1486,10 @@ mod tests {
             let err = Matcher::parse(query).unwrap_err();
             assert!(err.contains(words), "{query}: {err}");
             assert!(err.contains(query.split_once(':').unwrap().1), "{err}");
+        }
+        for (query, hint) in [("size:==1GB", "size:>1GB,"), ("size:=1GB", "size:<1GB,")] {
+            let err = Matcher::parse(query).unwrap_err();
+            assert!(err.contains(hint) && !err.contains(">="), "{err}");
         }
         for typing in [
             "size:",
