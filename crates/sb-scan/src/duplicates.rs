@@ -18,11 +18,11 @@
 use sb_core::layout::{self, Metric};
 use sb_core::search::Search;
 use sb_core::tree::{NodeId, Tree, flags};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Bytes hashed from each end of a file to tell same-size files apart.
@@ -200,7 +200,9 @@ pub struct Counters {
 
 /// Reads the planned files with `readers` threads and reports each group of
 /// duplicates as soon as it's confirmed, and each file it couldn't read.
-/// Returns `false` if `cancel` was set first; groups already reported stand.
+/// Work is handed out a file at a time, so one large group keeps every
+/// reader busy. Returns `false` if `cancel` was set first; groups already
+/// reported stand.
 pub fn run<C: Contents>(
     plan: &Plan,
     contents: &C,
@@ -209,9 +211,8 @@ pub fn run<C: Contents>(
     counters: &Counters,
     on_event: impl Fn(Event) + Sync,
 ) -> bool {
-    let next = AtomicUsize::new(0);
-    let readers = readers.clamp(1, plan.groups.len().max(1));
-    let streams = Gate::new(STREAMS);
+    let work = Work::new(plan);
+    let readers = readers.clamp(1, plan.files().max(1));
     std::thread::scope(|s| {
         for _ in 0..readers {
             s.spawn(|| {
@@ -219,13 +220,11 @@ pub fn run<C: Contents>(
                     contents,
                     cancel,
                     counters,
-                    streams: &streams,
                     buf: vec![0; BUFFER],
                 };
-                while let Some(group) = plan.groups.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    if cancel.load(Ordering::Relaxed) || reader.sift(group, &on_event).is_err() {
-                        return;
-                    }
+                while let Some(task) = work.next(plan, cancel) {
+                    let result = reader.perform(plan, &task);
+                    work.complete(plan, task, result, counters, &on_event);
                 }
             });
         }
@@ -237,105 +236,217 @@ struct Cancelled;
 
 type Digest = [u8; 32];
 
-/// Lets at most `limit` threads through at once.
-struct Gate {
-    inside: Mutex<usize>,
-    left: Condvar,
-    limit: usize,
+/// One file to hash.
+enum Task {
+    /// Its first and last [`SAMPLE`] bytes, or all of a small file.
+    Sample { group: usize, file: usize },
+    /// All of it, after its sample matched another's.
+    Whole { bucket: Arc<Bucket>, file: usize },
 }
 
-struct Pass<'a>(&'a Gate);
+/// Files of one group whose samples matched, being read whole.
+struct Bucket {
+    group: usize,
+    results: Mutex<Results>,
+}
 
-impl Gate {
-    fn new(limit: usize) -> Self {
+/// Digests of a set of files, and how many are still being read.
+struct Results {
+    left: usize,
+    /// Digest and index of the file in its group.
+    digests: Vec<(Digest, usize)>,
+}
+
+impl Results {
+    fn new(left: usize) -> Self {
         Self {
-            inside: Mutex::new(0),
-            left: Condvar::new(),
-            limit,
+            left,
+            digests: Vec::new(),
+        }
+    }
+}
+
+/// What's left to read, shared by the readers.
+struct Work {
+    queue: Mutex<Queue>,
+    changed: Condvar,
+    /// Each group's sample digests.
+    samples: Vec<Mutex<Results>>,
+}
+
+struct Queue {
+    /// Whole-file reads, taken before further samples so that groups are
+    /// confirmed early.
+    whole: VecDeque<(Arc<Bucket>, usize)>,
+    /// The next sample to take: group and file.
+    next: (usize, usize),
+    /// Tasks taken but not completed, which may add whole-file reads.
+    busy: usize,
+    /// Large files being read whole, at most [`STREAMS`].
+    streams: usize,
+}
+
+impl Work {
+    fn new(plan: &Plan) -> Self {
+        Self {
+            queue: Mutex::new(Queue {
+                whole: VecDeque::new(),
+                next: (0, 0),
+                busy: 0,
+                streams: 0,
+            }),
+            changed: Condvar::new(),
+            samples: plan
+                .groups
+                .iter()
+                .map(|g| Mutex::new(Results::new(g.files.len())))
+                .collect(),
         }
     }
 
-    /// Waits for a place, giving up if `cancel` is set meanwhile.
-    fn enter(&self, cancel: &AtomicBool) -> Result<Pass<'_>, Cancelled> {
-        let mut inside = self.inside.lock().unwrap();
-        while *inside >= self.limit {
+    /// The next file to hash, waiting while others may still add work;
+    /// `None` when everything is done or `cancel` is set.
+    fn next(&self, plan: &Plan, cancel: &AtomicBool) -> Option<Task> {
+        let large = |b: &Bucket| plan.groups[b.group].size > LARGE;
+        let mut q = self.queue.lock().unwrap();
+        loop {
             if cancel.load(Ordering::Relaxed) {
-                return Err(Cancelled);
+                return None;
             }
-            inside = self
-                .left
-                .wait_timeout(inside, Duration::from_millis(50))
+            let streams_free = q.streams < STREAMS;
+            if let Some(i) = q.whole.iter().position(|(b, _)| streams_free || !large(b)) {
+                let (bucket, file) = q.whole.remove(i).expect("position is in range");
+                if large(&bucket) {
+                    q.streams += 1;
+                }
+                q.busy += 1;
+                return Some(Task::Whole { bucket, file });
+            }
+            let (group, file) = q.next;
+            if let Some(g) = plan.groups.get(group) {
+                q.next = if file + 1 < g.files.len() {
+                    (group, file + 1)
+                } else {
+                    (group + 1, 0)
+                };
+                q.busy += 1;
+                return Some(Task::Sample { group, file });
+            }
+            if q.busy == 0 && q.whole.is_empty() {
+                self.changed.notify_all();
+                return None;
+            }
+            q = self
+                .changed
+                .wait_timeout(q, Duration::from_millis(50))
                 .unwrap()
                 .0;
         }
-        *inside += 1;
-        Ok(Pass(self))
+    }
+
+    /// Records a task's result; the last result for a set of files decides
+    /// what happens to them next. A cancelled task is dropped.
+    fn complete(
+        &self,
+        plan: &Plan,
+        task: Task,
+        result: Result<Result<Digest, Skip>, Cancelled>,
+        counters: &Counters,
+        on_event: &impl Fn(Event),
+    ) {
+        let mut more = Vec::new();
+        let (group, file) = match &task {
+            Task::Sample { group, file } => (*group, *file),
+            Task::Whole { bucket, file } => (bucket.group, *file),
+        };
+        let g = &plan.groups[group];
+        let finish = |files: usize| {
+            counters
+                .done
+                .fetch_add(g.size * files as u64, Ordering::Relaxed);
+        };
+        if let Ok(result) = result {
+            let results = match &task {
+                Task::Sample { .. } => &self.samples[group],
+                Task::Whole { bucket, .. } => &bucket.results,
+            };
+            let mut r = results.lock().unwrap();
+            match result {
+                Ok(digest) => r.digests.push((digest, file)),
+                Err(why) => {
+                    finish(1);
+                    on_event(Event::Skipped(g.files[file].node, why));
+                }
+            }
+            r.left -= 1;
+            let all = (r.left == 0).then(|| std::mem::take(&mut r.digests));
+            drop(r);
+            for same in all.map(alike).unwrap_or_default() {
+                match &task {
+                    // Small files were read whole by the sample.
+                    Task::Sample { .. } if same.len() >= 2 && g.size > 2 * SAMPLE => {
+                        let bucket = Arc::new(Bucket {
+                            group,
+                            results: Mutex::new(Results::new(same.len())),
+                        });
+                        more.extend(same.into_iter().map(|f| (Arc::clone(&bucket), f)));
+                    }
+                    _ => {
+                        finish(same.len());
+                        if same.len() >= 2 {
+                            on_event(Event::Found(Group {
+                                size: g.size,
+                                files: same.iter().map(|&f| g.files[f].node).collect(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        let mut q = self.queue.lock().unwrap();
+        q.busy -= 1;
+        if matches!(task, Task::Whole { .. }) && g.size > LARGE {
+            q.streams -= 1;
+        }
+        q.whole.extend(more);
+        self.changed.notify_all();
     }
 }
 
-impl Drop for Pass<'_> {
-    fn drop(&mut self) {
-        *self.0.inside.lock().unwrap() -= 1;
-        self.0.left.notify_one();
+/// Files with equal digests, each set in plan order.
+fn alike(digests: Vec<(Digest, usize)>) -> Vec<Vec<usize>> {
+    let mut by_digest: BTreeMap<Digest, Vec<usize>> = BTreeMap::new();
+    for (digest, file) in digests {
+        by_digest.entry(digest).or_default().push(file);
     }
+    by_digest
+        .into_values()
+        .map(|mut files| {
+            files.sort_unstable();
+            files
+        })
+        .collect()
 }
 
 struct Reader<'a, C> {
     contents: &'a C,
     cancel: &'a AtomicBool,
     counters: &'a Counters,
-    /// Large files read whole pass through here.
-    streams: &'a Gate,
     buf: Vec<u8>,
 }
 
 impl<C: Contents> Reader<'_, C> {
-    /// Splits one size group into groups of identical files.
-    fn sift(&mut self, group: &SizeGroup, on_event: &impl Fn(Event)) -> Result<(), Cancelled> {
-        let size = group.size;
-        // Small files are read whole by the sample.
-        let whole = size <= 2 * SAMPLE;
-        let mut by_sample: BTreeMap<Digest, Vec<&Candidate>> = BTreeMap::new();
-        for c in &group.files {
-            match self.digest(c, size, !whole)? {
-                Ok(d) => by_sample.entry(d).or_default().push(c),
-                Err(why) => self.skip(c, size, why, on_event),
+    fn perform(&mut self, plan: &Plan, task: &Task) -> Result<Result<Digest, Skip>, Cancelled> {
+        match task {
+            Task::Sample { group, file } => {
+                let g = &plan.groups[*group];
+                self.digest(&g.files[*file], g.size, g.size > 2 * SAMPLE)
+            }
+            Task::Whole { bucket, file } => {
+                let g = &plan.groups[bucket.group];
+                self.digest(&g.files[*file], g.size, false)
             }
         }
-        for same in by_sample.into_values() {
-            if same.len() < 2 || whole {
-                self.finish(size, same.len());
-                if same.len() >= 2 {
-                    on_event(Event::Found(found(size, &same)));
-                }
-                continue;
-            }
-            let mut by_content: BTreeMap<Digest, Vec<&Candidate>> = BTreeMap::new();
-            for c in same {
-                match self.digest(c, size, false)? {
-                    Ok(d) => {
-                        self.finish(size, 1);
-                        by_content.entry(d).or_default().push(c);
-                    }
-                    Err(why) => self.skip(c, size, why, on_event),
-                }
-            }
-            for same in by_content.into_values().filter(|s| s.len() >= 2) {
-                on_event(Event::Found(found(size, &same)));
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&self, size: u64, files: usize) {
-        self.counters
-            .done
-            .fetch_add(size * files as u64, Ordering::Relaxed);
-    }
-
-    fn skip(&self, c: &Candidate, size: u64, why: Skip, on_event: &impl Fn(Event)) {
-        self.finish(size, 1);
-        on_event(Event::Skipped(c.node, why));
     }
 
     /// Hashes the file's first and last [`SAMPLE`] bytes, or all of it.
@@ -345,11 +456,6 @@ impl<C: Contents> Reader<'_, C> {
         size: u64,
         sample: bool,
     ) -> Result<Result<Digest, Skip>, Cancelled> {
-        let _stream = if !sample && size > LARGE {
-            Some(self.streams.enter(self.cancel)?)
-        } else {
-            None
-        };
         let mut file = match self.contents.open(&c.path, size) {
             Ok(file) => file,
             Err(why) => return Ok(Err(why)),
@@ -402,13 +508,6 @@ impl<C: Contents> Reader<'_, C> {
             left -= n as u64;
         }
         Ok(Ok(()))
-    }
-}
-
-fn found(size: u64, same: &[&Candidate]) -> Group {
-    Group {
-        size,
-        files: same.iter().map(|c| c.node).collect(),
     }
 }
 
@@ -778,5 +877,60 @@ mod tests {
             })]
         );
         assert_eq!(f.contents.opened.lock().unwrap().len(), 5, "nothing after");
+    }
+
+    #[test]
+    fn one_large_group_keeps_every_reader_busy() {
+        /// Holds each open a moment and counts how many overlap.
+        struct Slow {
+            inner: FakeContents,
+            open: Mutex<(usize, usize)>,
+        }
+        impl Contents for Slow {
+            type File = Cursor<Vec<u8>>;
+            fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
+                {
+                    let mut open = self.open.lock().unwrap();
+                    open.0 += 1;
+                    open.1 = open.1.max(open.0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.open.lock().unwrap().0 -= 1;
+                self.inner.open(path, len)
+            }
+        }
+        let mut f = Fixture::new();
+        let files: Vec<_> = (0..8)
+            .map(|i| f.file(&format!("copy{i}"), bytes(BIG, 1)))
+            .collect();
+        let plan = plan(&f.tree, NodeId::ROOT, None, 0);
+        assert_eq!(plan.groups.len(), 1);
+        let contents = Slow {
+            inner: std::mem::take(&mut f.contents),
+            open: Mutex::new((0, 0)),
+        };
+        let events = Mutex::new(Vec::new());
+        let counters = Counters::default();
+        let done = run(
+            &plan,
+            &contents,
+            4,
+            &AtomicBool::new(false),
+            &counters,
+            |e| events.lock().unwrap().push(e),
+        );
+        assert!(done);
+        assert_eq!(counters.done.load(Ordering::Relaxed), plan.bytes);
+        assert_eq!(
+            events.into_inner().unwrap(),
+            [Event::Found(Group {
+                size: BIG as u64,
+                files
+            })]
+        );
+        assert!(
+            contents.open.lock().unwrap().1 > 1,
+            "the group's files were read in parallel"
+        );
     }
 }
