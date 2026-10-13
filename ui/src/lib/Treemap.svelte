@@ -645,6 +645,14 @@
     e.preventDefault();
   }
 
+  /** Zoom-in over what double-click opens: folders and small items. */
+  const cursor = $derived.by(() => {
+    const l = layout;
+    if (!l || !hover || hover.index >= l.count) return "default";
+    const i = hover.index;
+    return l.kind[i] !== KIND_FILE && l.node[i] !== view ? "zoom-in" : "default";
+  });
+
   // ---- tooltip ---------------------------------------------------------
 
   /** The rectangle the tooltip describes: hovered, or keyboard-selected. */
@@ -763,6 +771,7 @@
   role="application"
   aria-label="Treemap"
   aria-describedby={helpId}
+  style:cursor
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}
