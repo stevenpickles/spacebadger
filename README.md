@@ -5,11 +5,18 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, winget and Chocolatey packages are prepared (milestone 8), and apt and Homebrew are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Download
 
 Portable builds for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Silicon are on the [releases page](https://github.com/stevenpickles/spacebadger/releases). Nothing is installed: extract and run. They aren't code-signed, so Windows and macOS warn on first launch; see [`docs/RELEASING.md`](docs/RELEASING.md#downloads) for how to open them and how releases are made.
+
+On Windows, once the packages are accepted (submitted, awaiting review), either package manager installs the same portable app and adds a `spacebadger` command:
+
+```sh
+winget install StevenPickles.SpaceBadger
+choco install spacebadger
+```
 
 ## Layout
 
