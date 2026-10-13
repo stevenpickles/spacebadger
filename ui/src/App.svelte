@@ -24,7 +24,7 @@
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
-  import Contents from "./lib/Contents.svelte";
+  import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Announcer from "./lib/Announcer.svelte";
@@ -157,6 +157,10 @@
   $effect(() => remember("colors", colors));
   $effect(() => remember("volume", showVolume ? "on" : "off"));
 
+  /** The contents list shows folders too; off, it lists files from every level. */
+  let contentsFolders = $state(saved("contents-folders") !== "off");
+  $effect(() => remember("contents-folders", contentsFolders ? "on" : "off"));
+
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
     if (generation !== null && next <= generation) return;
@@ -275,9 +279,20 @@
   });
 
   /** Opens a result's folder in the map with the file selected. */
-  function showInMap(row: SearchRow) {
+  function showInMap(row: { node: number; parent: number }) {
     view = row.parent;
     selectOnly(row.node);
+  }
+
+  function contentsMenu(r: ContentsRow): MenuItem[] {
+    const parent = r.parent;
+    if (r.folder || parent === null || parent === view) return smallItemMenu(r);
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap({ node: r.node, parent }) },
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(r.node), separator: true },
+      { label: "Copy path", action: () => copyPath(r.node) },
+      ...deleteItemsFor(r.node),
+    ];
   }
 
   function resultItems(row: SearchRow): MenuItem[] {
@@ -1001,6 +1016,8 @@
                 folderSize={!search && viewDetails?.node === view ? viewDetails.logical : 0}
                 search={searchId ?? null}
                 revision={status?.revision ?? 0}
+                folders={contentsFolders}
+                onfolders={(on) => (contentsFolders = on)}
                 selected={pickedSet}
                 {anchor}
                 onpick={pick}
@@ -1009,7 +1026,11 @@
                   refocusContents = true;
                   openFolder(node);
                 }}
-                onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
+                onshow={(node, parent) => {
+                  refocusContents = true;
+                  showInMap({ node, parent });
+                }}
+                onmenu={(r, x, y) => (menu = { x, y, items: contentsMenu(r), heading: menuHeading(r.node, r.name) })}
               />
             {/key}
           {:else if activeTab === "omissions" && status}
