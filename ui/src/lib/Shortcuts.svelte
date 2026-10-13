@@ -35,7 +35,7 @@
       keys: [
         ["↑ ↓, Home, End", "Move through the list"],
         ["Shift+↑ ↓", "Extend the selection"],
-        ["Enter, double-click", "Show the item in the map"],
+        ["Enter, double-click", "Open a folder, or show a result in the map"],
       ],
     },
     {

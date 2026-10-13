@@ -311,6 +311,36 @@ pub fn small_children(
     (weighted.split_off(start), empty)
 }
 
+/// Every file anywhere under `dir` with a weight, in tree order (matching
+/// files only when filtered), and how many other files have no weight.
+/// Rank them with [`crate::search::Ranked::from_files`].
+pub fn files_under(
+    tree: &Tree,
+    dir: NodeId,
+    metric: Metric,
+    filter: Option<&Search>,
+) -> (Vec<NodeId>, usize) {
+    let mut files = Vec::new();
+    let mut empty = 0;
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        for c in tree.children(d) {
+            // Folders without matches can be skipped whole.
+            if filter.is_some_and(|s| s.totals(c).files == 0) {
+                continue;
+            }
+            if tree.is_dir(c) {
+                stack.push(c);
+            } else if metric.weight_in(tree, filter, c) == 0 {
+                empty += 1;
+            } else {
+                files.push(c);
+            }
+        }
+    }
+    (files, empty)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Area {
     x: f32,
@@ -777,6 +807,33 @@ mod tests {
         assert_eq!(items, [(b, 7), (a, 3)]);
         assert_eq!(items.iter().map(|i| i.1).sum::<u64>(), other.weight);
         assert_eq!(empty, 1);
+    }
+
+    #[test]
+    fn files_under_reaches_every_level_and_honors_the_filter() {
+        use crate::search::{Matcher, Ranked, Search};
+        let mut t = Tree::new("/r");
+        let a = dir(&mut t, NodeId::ROOT, "a");
+        let deep = dir(&mut t, a, "deep");
+        let top = file(&mut t, NodeId::ROOT, "top.txt", 50);
+        let mid = file(&mut t, a, "mid.jpg", 200);
+        let low = file(&mut t, deep, "low.jpg", 900);
+        file(&mut t, deep, "zero.jpg", 0);
+
+        let (files, empty) = files_under(&t, NodeId::ROOT, Metric::Logical, None);
+        let mut ranked = Ranked::from_files(files, Metric::Logical);
+        assert_eq!(ranked.top(&t, 10), [low, mid, top]);
+        assert_eq!(empty, 1);
+
+        let (files, _) = files_under(&t, a, Metric::Logical, None);
+        assert_eq!(files.len(), 2, "only files under the folder");
+
+        let mut s = Search::new(Matcher::new("*.jpg").unwrap());
+        s.catch_up(&t, usize::MAX);
+        let (files, empty) = files_under(&t, NodeId::ROOT, Metric::Logical, Some(&s));
+        let mut ranked = Ranked::from_files(files, Metric::Logical);
+        assert_eq!(ranked.top(&t, 10), [low, mid]);
+        assert_eq!(empty, 1, "the empty match");
     }
 
     #[test]

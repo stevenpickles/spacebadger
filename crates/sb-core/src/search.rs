@@ -448,6 +448,17 @@ impl Ranked {
         }
     }
 
+    /// Ranks any set of files, such as those under one folder. Its
+    /// currency is the caller's to track.
+    pub fn from_files(files: Vec<NodeId>, metric: Metric) -> Self {
+        Self {
+            metric,
+            version: 0,
+            files,
+            sorted: 0,
+        }
+    }
+
     /// Whether this ranking still reflects `search` under `metric`.
     pub fn is_current(&self, search: &Search, metric: Metric) -> bool {
         self.metric == metric && self.version == search.version()

@@ -141,6 +141,14 @@
     list?.focus();
   }
 
+  /** Scrolls row `index` into view and makes it the active row, e.g. for an
+   * item selected in the map. The selection is left alone. */
+  export function scrollToRow(index: number) {
+    if (index < 0 || index >= total || !list) return;
+    active = index;
+    reveal(index);
+  }
+
   /** Starts a new range request, giving up any earlier one. */
   function newRange(): AbortSignal {
     ranging?.abort();

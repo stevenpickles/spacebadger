@@ -312,6 +312,52 @@ pub struct SmallItemsPage {
     pub empty: u32,
 }
 
+/// Asks for a page of the files anywhere under a folder, largest first by
+/// `metric`; with a search, matching files only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFilesRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub metric: Metric,
+    pub search: Option<u32>,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFile {
+    pub node: u32,
+    pub name: String,
+    /// The containing folder.
+    pub parent: u32,
+    /// The subfolder holding the file, relative to the requested folder;
+    /// empty when the file is directly in it.
+    pub subfolder: String,
+    /// Size in the requested metric.
+    #[ts(type = "number")]
+    pub weight: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FolderFilesPage {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    pub offset: u32,
+    /// Files with a size under the folder, in all.
+    pub total: u32,
+    pub files: Vec<FolderFile>,
+    /// Other files under the folder with no size in this metric.
+    pub empty: u32,
+}
+
 /// Capacity of the volume holding the scan root, for the volume overview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

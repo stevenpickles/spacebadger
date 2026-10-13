@@ -24,6 +24,7 @@
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
+  import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Announcer from "./lib/Announcer.svelte";
@@ -50,7 +51,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "results" | "small" | "omissions";
+  type PanelTab = "contents" | "results" | "small" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -155,6 +156,10 @@
 
   $effect(() => remember("colors", colors));
   $effect(() => remember("volume", showVolume ? "on" : "off"));
+
+  /** The contents list shows folders too; off, it lists files from every level. */
+  let contentsFolders = $state(saved("contents-folders") !== "off");
+  $effect(() => remember("contents-folders", contentsFolders ? "on" : "off"));
 
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
@@ -274,9 +279,20 @@
   });
 
   /** Opens a result's folder in the map with the file selected. */
-  function showInMap(row: SearchRow) {
+  function showInMap(row: { node: number; parent: number }) {
     view = row.parent;
     selectOnly(row.node);
+  }
+
+  function contentsMenu(r: ContentsRow): MenuItem[] {
+    const parent = r.parent;
+    if (r.folder || parent === null || parent === view) return smallItemMenu(r);
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap({ node: r.node, parent }) },
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(r.node), separator: true },
+      { label: "Copy path", action: () => copyPath(r.node) },
+      ...deleteItemsFor(r.node),
+    ];
   }
 
   function resultItems(row: SearchRow): MenuItem[] {
@@ -680,6 +696,7 @@
 
   const tabs = $derived(
     [
+      generation !== null ? { id: "contents" as const, label: "Contents" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
@@ -696,6 +713,23 @@
   });
   $effect(() => {
     if (showOmissions) untrack(() => (tab = "omissions"));
+  });
+
+  let contents: ReturnType<typeof Contents> | undefined = $state();
+  /** A folder opened from the contents list: the new list takes the focus. */
+  let refocusContents = false;
+
+  $effect(() => {
+    if (contents && refocusContents) {
+      refocusContents = false;
+      contents.focus();
+    }
+  });
+
+  // An item selected in the map scrolls into view in the contents list.
+  $effect(() => {
+    const sel = selection;
+    if (sel && !sel.other) untrack(() => contents?.reveal(sel.node));
   });
 
   function onTabKey(e: KeyboardEvent) {
@@ -948,7 +982,7 @@
           ondelete={askDelete}
         />
       </div>
-      {#if activeTab}
+      {#if activeTab && tabs.length > 1}
         <div class="tabs" role="tablist" aria-label="Lists">
           {#each tabs as t (t.id)}
             <button
@@ -963,8 +997,43 @@
             >
           {/each}
         </div>
-        <div class="list" id="panel-list" role="tabpanel" aria-labelledby="tab-{activeTab}">
-          {#if activeTab === "omissions" && status}
+      {/if}
+      {#if activeTab}
+        <!-- With one list there are no tabs, so no tab panel either. -->
+        <div
+          class="list"
+          id="panel-list"
+          role={tabs.length > 1 ? "tabpanel" : undefined}
+          aria-labelledby={tabs.length > 1 ? `tab-${activeTab}` : undefined}
+        >
+          {#if activeTab === "contents" && generation !== null}
+            {#key view}
+              <Contents
+                bind:this={contents}
+                {generation}
+                folder={view}
+                folderName={viewDetails?.node === view ? viewDetails.name : ""}
+                folderSize={!search && viewDetails?.node === view ? viewDetails.logical : 0}
+                search={searchId ?? null}
+                revision={status?.revision ?? 0}
+                folders={contentsFolders}
+                onfolders={(on) => (contentsFolders = on)}
+                selected={pickedSet}
+                {anchor}
+                onpick={pick}
+                ondelete={askDelete}
+                onopen={(node) => {
+                  refocusContents = true;
+                  openFolder(node);
+                }}
+                onshow={(node, parent) => {
+                  refocusContents = true;
+                  showInMap({ node, parent });
+                }}
+                onmenu={(r, x, y) => (menu = { x, y, items: contentsMenu(r), heading: menuHeading(r.node, r.name) })}
+              />
+            {/key}
+          {:else if activeTab === "omissions" && status}
             <Omissions groups={status.omissions} autofocus onclose={() => (showOmissions = false)} />
           {:else if activeTab === "small" && smallOf && generation !== null}
             {#key smallOf.folder}
@@ -1255,17 +1324,19 @@
     border-left: 1px solid var(--line);
     background: var(--panel);
   }
+  /* A fixed share of the panel, so the list below doesn't jump as the
+     selection changes; long details scroll. */
   .details {
     flex: none;
-    max-height: 55%;
+    height: clamp(200px, 45%, 480px);
     overflow-y: auto;
+    border-bottom: 1px solid var(--line);
   }
   .tabs {
     display: flex;
     flex: none;
     gap: 2px;
     padding: 0 var(--space-2);
-    border-top: 1px solid var(--line);
     border-bottom: 1px solid var(--line);
   }
   .tabs button {
@@ -1300,7 +1371,7 @@
       overflow-y: auto;
     }
     .details {
-      max-height: none;
+      height: auto;
       overflow: visible;
     }
     .list {

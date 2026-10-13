@@ -25,7 +25,8 @@ const MAX_PAGE: u32 = 500;
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` before the tree, and `order` last.
+// Lock order: `deleting` first, `search` before the tree, then
+// `folder_files`, and `order` last.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -36,6 +37,16 @@ pub struct Session {
     latest_search: AtomicU32,
     /// Held while deleting, so deletes run one at a time.
     deleting: Mutex<()>,
+    /// The files under the folder last asked for, ranked by size.
+    folder_files: Mutex<Option<FolderFiles>>,
+}
+
+struct FolderFiles {
+    /// What the ranking was made from: folder, scan revision, search and
+    /// its version, metric.
+    key: (u32, u64, Option<(u32, u64)>, layout::Metric),
+    ranked: Ranked,
+    empty: usize,
 }
 
 struct ActiveSearch {
@@ -69,6 +80,7 @@ impl Session {
             search: Mutex::new(None),
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
+            folder_files: Mutex::new(None),
         }
     }
 
@@ -276,6 +288,73 @@ impl Session {
             offset: start as u32,
             total: total as u32,
             rows,
+        })
+    }
+
+    /// One page of the files anywhere under a folder, largest first.
+    pub fn folder_files(
+        &self,
+        req: &proto::FolderFilesRequest,
+    ) -> Result<proto::FolderFilesPage, String> {
+        let revision = self.scan.progress().revision;
+        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let folder = node(&tree, req.folder)?;
+        let filter = match req.search {
+            Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
+            None => None,
+        };
+        let metric = metric(req.metric);
+        let key = (
+            req.folder,
+            revision,
+            filter.map(|s| (req.search.unwrap_or(0), s.version())),
+            metric,
+        );
+        let mut cache = self
+            .folder_files
+            .lock()
+            .map_err(|_| "folder files are unavailable")?;
+        let cached = match &mut *cache {
+            Some(c) if c.key == key => c,
+            slot => {
+                let (files, empty) = layout::files_under(&tree, folder, metric, filter);
+                slot.insert(FolderFiles {
+                    key,
+                    ranked: Ranked::from_files(files, metric),
+                    empty,
+                })
+            }
+        };
+        let total = cached.ranked.len();
+        let start = (req.offset as usize).min(total);
+        let end = start
+            .saturating_add(req.limit.min(MAX_PAGE) as usize)
+            .min(total);
+        let base = tree.path(folder);
+        let files = cached.ranked.top(&tree, end)[start..]
+            .iter()
+            .map(|&f| {
+                let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
+                let path = tree.path(parent);
+                let sub = path.strip_prefix(&base).unwrap_or(&path);
+                proto::FolderFile {
+                    node: f.index() as u32,
+                    name: tree.name(f).to_string_lossy().into_owned(),
+                    parent: parent.index() as u32,
+                    subfolder: display_path(sub),
+                    weight: metric.weight_in(&tree, filter, f),
+                }
+            })
+            .collect();
+        Ok(proto::FolderFilesPage {
+            generation: self.generation(),
+            folder: req.folder,
+            offset: start as u32,
+            total: total as u32,
+            files,
+            empty: cached.empty as u32,
         })
     }
 
@@ -611,7 +690,12 @@ mod tests {
     }
 
     fn fixture() -> TempDir {
-        let dir = std::env::temp_dir().join(format!("sb-session-{}", std::process::id()));
+        fixture_named("delete")
+    }
+
+    /// Each test gets its own folder, since tests run in parallel.
+    fn fixture_named(name: &str) -> TempDir {
+        let dir = std::env::temp_dir().join(format!("sb-session-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("old").join("logs")).unwrap();
         std::fs::write(dir.join("old").join("logs").join("a.log"), vec![0; 5000]).unwrap();
@@ -644,6 +728,45 @@ mod tests {
         tree.children(parent)
             .find(|&c| tree.name(c) == name)
             .unwrap()
+    }
+
+    #[test]
+    fn lists_the_largest_files_under_a_folder() {
+        let tmp = fixture_named("files");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        let request = |folder: u32, offset: u32| proto::FolderFilesRequest {
+            generation: session.generation(),
+            folder,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset,
+            limit: 2,
+        };
+        let page = session.folder_files(&request(0, 0)).unwrap();
+        assert_eq!(page.total, 3);
+        let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.log", "b.log"], "largest first, from every level");
+        let sub = Path::new("old").join("logs");
+        assert_eq!(page.files[0].subfolder, display_path(&sub));
+        let rest = session.folder_files(&request(0, 2)).unwrap();
+        assert_eq!(rest.files[0].name, "keep.txt");
+        assert_eq!(rest.files[0].subfolder, "");
+
+        let page = session.folder_files(&request(old, 0)).unwrap();
+        assert_eq!(page.total, 2, "only files under the folder");
+        assert_eq!(page.files[0].subfolder, "logs");
     }
 
     #[test]

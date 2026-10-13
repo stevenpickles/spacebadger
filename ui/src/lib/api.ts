@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { FolderFilesPage } from "./protocol/FolderFilesPage";
+import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -70,6 +72,11 @@ export function searchResults(request: SearchResultsRequest): Promise<SearchPage
 
 export function smallItems(request: SmallItemsRequest): Promise<SmallItemsPage> {
   return invoke<SmallItemsPage>("small_items", { request });
+}
+
+/** The largest files anywhere under a folder. */
+export function folderFiles(request: FolderFilesRequest): Promise<FolderFilesPage> {
+  return invoke<FolderFilesPage>("folder_files", { request });
 }
 
 /** Capacity of the scanned volume; `null` where unavailable. */
