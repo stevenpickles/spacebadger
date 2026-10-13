@@ -58,6 +58,8 @@
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
     ["*.jpg; *.png", "either pattern (separate patterns with ;)"],
     ["!*.tmp", "leave out names ending in .tmp"],
+    ["dir:cache", "files inside folders named like “cache”, at any depth"],
+    ["*.js; !dir:node_modules", "JavaScript files, except inside node_modules"],
   ];
 
   let generation = $state<number | null>(null);
@@ -698,7 +700,7 @@
     if (status.phase.kind === "failed") return null;
     if (search) {
       if (search.files === 0) {
-        const text = `No file names match “${search.query}”`;
+        const text = `No files match “${search.query}”`;
         return { text: scanning ? `${text} yet.` : `${text}.`, toRoot: view !== ROOT };
       }
       if (view !== ROOT) {
@@ -832,7 +834,7 @@
           onkeydown={(e) => e.key === "Escape" && clearQuery()}
         />
         <span class="spinner" class:on={searching} aria-hidden="true"></span>
-        <span id="filter-hint" class="sr-only">Matches file names only. Escape clears.</span>
+        <span id="filter-hint" class="sr-only">Matches file names; dir: matches folder names. Escape clears.</span>
         <div class="filter-help">
           <button
             type="button"
@@ -843,7 +845,7 @@
           >
           {#if showFilterHelp}
             <div class="popover" role="note">
-              <p>Matches file names (not folders or paths), ignoring case.</p>
+              <p>Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names.</p>
               <dl>
                 {#each FILTER_HELP as [pattern, meaning] (pattern)}
                   <dt><code>{pattern}</code></dt>
