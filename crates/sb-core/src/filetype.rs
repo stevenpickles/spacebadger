@@ -92,6 +92,66 @@ pub const TS_VIDEO_MIN: u64 = 1 << 20;
 const MAX_EXT: usize = 8;
 
 impl FileType {
+    /// Every type, in the order the filter's `is:` keywords are listed.
+    pub const ALL: [Self; 9] = [
+        Self::Video,
+        Self::Audio,
+        Self::Image,
+        Self::Document,
+        Self::Archive,
+        Self::DiskImage,
+        Self::Program,
+        Self::Code,
+        Self::Other,
+    ];
+
+    /// The filter keyword for this type, as in `is:video`.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::Image => "image",
+            Self::Document => "document",
+            Self::Archive => "archive",
+            Self::DiskImage => "diskimage",
+            Self::Program => "program",
+            Self::Code => "code",
+            Self::Other => "other",
+        }
+    }
+
+    /// The type a keyword names, ignoring case. Any unambiguous start of a
+    /// keyword works (`vid`, `doc`); otherwise the error lists the choices.
+    pub fn from_keyword(word: &str) -> Result<Self, String> {
+        let word = word.to_ascii_lowercase();
+        if let Some(&t) = Self::ALL.iter().find(|t| t.keyword() == word) {
+            return Ok(t);
+        }
+        let starts: Vec<Self> = Self::ALL
+            .into_iter()
+            .filter(|t| !word.is_empty() && t.keyword().starts_with(&word))
+            .collect();
+        match starts[..] {
+            [t] => Ok(t),
+            [] => Err(format!(
+                "“is:{word}” isn't a file type. Use one of: {}.",
+                Self::keywords(&Self::ALL)
+            )),
+            _ => Err(format!(
+                "“is:{word}” could be {}.",
+                Self::keywords(&starts).replace(", ", " or ")
+            )),
+        }
+    }
+
+    fn keywords(types: &[Self]) -> String {
+        types
+            .iter()
+            .map(|t| t.keyword())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The type of a file with this name and logical length.
     pub fn of(name: &OsStr, len: u64) -> Self {
         let bytes = name.as_encoded_bytes();
@@ -164,5 +224,21 @@ mod tests {
                 assert!(seen.insert(*e), "duplicate extension {e}");
             }
         }
+    }
+
+    #[test]
+    fn keywords_name_every_type_and_accept_unambiguous_starts() {
+        for t in FileType::ALL {
+            assert_eq!(FileType::from_keyword(t.keyword()), Ok(t));
+        }
+        assert_eq!(FileType::from_keyword("VIDEO"), Ok(FileType::Video));
+        assert_eq!(FileType::from_keyword("doc"), Ok(FileType::Document));
+        assert_eq!(FileType::from_keyword("disk"), Ok(FileType::DiskImage));
+        assert!(
+            FileType::from_keyword("d").is_err(),
+            "document or diskimage"
+        );
+        assert!(FileType::from_keyword("movie").is_err());
+        assert!(FileType::from_keyword("").is_err());
     }
 }

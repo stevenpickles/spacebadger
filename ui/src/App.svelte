@@ -28,6 +28,7 @@
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import FilterBox from "./lib/FilterBox.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
   import { formatBytes, plural } from "./lib/format";
@@ -60,6 +61,8 @@
     ["!*.tmp", "leave out names ending in .tmp"],
     ["dir:cache", "files inside folders named like “cache”, at any depth"],
     ["*.js; !dir:node_modules", "JavaScript files, except inside node_modules"],
+    ["is:video", "videos; also audio, image, document, archive, diskimage, program, code, other"],
+    ["is:image; dir:Photos", "images inside Photos folders"],
   ];
 
   let generation = $state<number | null>(null);
@@ -108,6 +111,8 @@
   /** The search the map and results show; `null` when unfiltered. */
   let search = $state.raw<SearchSummary | null>(null);
   let searching = $state(false);
+  /** Why the typed filter can't be used, e.g. an unknown is: type. */
+  let filterError = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let showShortcuts = $state(false);
   let showFilterHelp = $state(false);
@@ -264,6 +269,11 @@
     applySearch("");
   }
 
+  function applyNow() {
+    clearTimeout(searchTimer);
+    applySearch(query);
+  }
+
   async function applySearch(text: string) {
     const gen = generation;
     if (gen === null) return;
@@ -273,10 +283,12 @@
       const summary = await searchSet(gen, text);
       if (seq !== searchSeq || gen !== generation) return;
       search = summary;
+      filterError = null;
       menu = null;
     } catch (e) {
       // A newer search replaced this one; its reply will arrive instead.
-      if (seq === searchSeq && gen === generation) problem = `Search failed: ${String(e)}`;
+      // The one that failed is the query as typed, e.g. an unknown type.
+      if (seq === searchSeq && gen === generation) filterError = errorText(e);
     } finally {
       if (seq === searchSeq) searching = false;
     }
@@ -824,17 +836,14 @@
         </label>
       {/if}
       <div class="group filter">
-        <input
-          type="search"
-          placeholder="Filter files: *.jpg; *.png; !*.tmp"
-          aria-label="Filter by file name"
-          aria-describedby="filter-hint"
+        <FilterBox
           bind:value={query}
+          {searching}
+          {generation}
           oninput={onQueryInput}
-          onkeydown={(e) => e.key === "Escape" && clearQuery()}
+          onapply={applyNow}
+          onclear={clearQuery}
         />
-        <span class="spinner" class:on={searching} aria-hidden="true"></span>
-        <span id="filter-hint" class="sr-only">Matches file names; dir: matches folder names. Escape clears.</span>
         <div class="filter-help">
           <button
             type="button"
@@ -845,7 +854,10 @@
           >
           {#if showFilterHelp}
             <div class="popover" role="note">
-              <p>Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names.</p>
+              <p>
+                Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names, or
+                <code>is:</code> for a file type. Press ↓ for suggestions.
+              </p>
               <dl>
                 {#each FILTER_HELP as [pattern, meaning] (pattern)}
                   <dt><code>{pattern}</code></dt>
@@ -937,7 +949,9 @@
       {:else if status}
         <span class="muted">{status.root}</span>
       {/if}
-      {#if search}
+      {#if filterError}
+        <span class="filtered invalid" role="alert">{filterError}</span>
+      {:else if search}
         <span class="filtered">
           Showing files matching <code>{search.query}</code>
           <button type="button" class="icon-button" aria-label="Clear the filter" title="Clear the filter" onclick={clearQuery}
@@ -1196,30 +1210,6 @@
     max-width: 420px;
     min-width: 180px;
   }
-  .filter input {
-    flex: 1;
-    min-width: 0;
-  }
-  .spinner {
-    width: 12px;
-    height: 12px;
-    margin-left: -30px;
-    margin-right: 6px;
-    border: 2px solid var(--line);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    visibility: hidden;
-    pointer-events: none;
-  }
-  .spinner.on {
-    visibility: visible;
-    animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
   .filter-help {
     position: relative;
   }
@@ -1338,6 +1328,11 @@
     border-radius: 12px;
     background: var(--selected);
     font-size: var(--fs-sm);
+  }
+  .filtered.invalid {
+    padding: 2px 10px;
+    background: none;
+    color: var(--danger);
   }
   .body {
     flex: 1;
