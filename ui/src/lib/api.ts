@@ -52,8 +52,9 @@ export function requestLayout(request: LayoutRequest): Promise<ArrayBuffer> {
   return invoke<ArrayBuffer>("layout", { request });
 }
 
-export function nodeDetails(generation: number, node: number): Promise<NodeDetails> {
-  return invoke<NodeDetails>("node_details", { generation, node });
+/** With `search`, the details also say what that filter matches there. */
+export function nodeDetails(generation: number, node: number, search?: number | null): Promise<NodeDetails> {
+  return invoke<NodeDetails>("node_details", { generation, node, search: search ?? null });
 }
 
 /**

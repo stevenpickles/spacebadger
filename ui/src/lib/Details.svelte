@@ -105,18 +105,35 @@
     <p class="path selectable"><PathText path={d.path} /></p>
   {/if}
   <dl>
-    <dt>Size</dt>
-    <dd title={sizeTitle(d.logical, d.allocated)}>
-      {formatBytes(d.logical)}
-      {#if parent !== null && parent > 0}
-        <span class="muted">· {percent(d.logical, parent)} of parent folder</span>
-      {/if}
-    </dd>
+    {#if d.folder && d.matching}
+      <!-- Filtered: what the map shows first, then the whole folder. -->
+      <dt>Matching</dt>
+      <dd title={exactBytes(d.matching.logical)}>
+        {formatBytes(d.matching.logical)}
+        {#if parent !== null && parent > 0}
+          <span class="muted">· {percent(d.matching.logical, parent)} of the parent folder's matches</span>
+        {/if}
+      </dd>
+      <dt>Files</dt>
+      <dd>{d.matching.files.toLocaleString()} of {d.files.toLocaleString()} match</dd>
+      <dt>All files</dt>
+      <dd title={sizeTitle(d.logical, d.allocated)}>{formatBytes(d.logical)}</dd>
+    {:else}
+      <dt>Size</dt>
+      <dd title={sizeTitle(d.logical, d.allocated)}>
+        {formatBytes(d.logical)}
+        {#if parent !== null && parent > 0}
+          <span class="muted">· {percent(d.logical, parent)} of parent folder</span>
+        {/if}
+      </dd>
+    {/if}
     <dt>Type</dt>
     <dd>{d.folder ? "Folder" : "File"}</dd>
     {#if d.folder}
-      <dt>Files</dt>
-      <dd>{d.files.toLocaleString()}</dd>
+      {#if !d.matching}
+        <dt>Files</dt>
+        <dd>{d.files.toLocaleString()}</dd>
+      {/if}
       <dt>Status</dt>
       <dd>{folderStates[d.folder]}</dd>
     {/if}
@@ -172,7 +189,7 @@
     {/if}
     {@render deleteAction(`Move ${plural(multi.items, "item")} to the ${trashName}…`)}
   {:else if !selection && viewed}
-    <p class="eyebrow">Viewing</p>
+    <p class="eyebrow">{viewed.matching ? "Viewing · filtered" : "Viewing"}</p>
     {@render item(viewed, viewedParentSize)}
     <p class="muted small hint">
       Click an item in the map for its details; {ctrl}+click or Shift+click selects several.
@@ -195,8 +212,12 @@
         <dt>Size</dt>
         <dd title={exactBytes(other.weight)}>
           {formatBytes(other.weight)}
-          {#if details && details.logical > 0}
-            <span class="muted">· {percent(other.weight, details.logical)} of the folder</span>
+          {#if details && (details.matching?.logical ?? details.logical) > 0}
+            <span class="muted">
+              · {percent(other.weight, details.matching?.logical ?? details.logical)} of the folder{details.matching
+                ? "'s matches"
+                : ""}
+            </span>
           {/if}
         </dd>
       </dl>

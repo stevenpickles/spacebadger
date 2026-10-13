@@ -520,14 +520,19 @@
     );
   }
 
+  /** What a folder adds up to in the map: its matching files when filtered. */
+  const shownSize = (d: NodeDetails) => d.matching?.logical ?? d.logical;
+
   // Breadcrumbs follow the view; its details also refresh as the scan
-  // updates sizes, since they're shown when nothing is selected.
+  // updates sizes and the filter changes, since they're shown when nothing
+  // is selected.
   $effect(() => {
     const gen = generation;
     const node = view;
+    const filter = searchId;
     void status?.revision;
     if (gen === null) return;
-    nodeDetails(gen, node).then(
+    nodeDetails(gen, node, filter).then(
       (d) => {
         if (gen === generation && node === view) viewDetails = d;
       },
@@ -539,13 +544,14 @@
   $effect(() => {
     const gen = generation;
     const sel = selection;
+    const filter = searchId;
     void [status?.revision, detailsRetry];
     detailsError = null;
     if (gen === null || !sel) {
       selectedDetails = null;
       return;
     }
-    nodeDetails(gen, sel.node).then(
+    nodeDetails(gen, sel.node, filter).then(
       (d) => {
         if (gen === generation && selection?.node === sel.node) selectedDetails = d;
       },
@@ -566,12 +572,12 @@
     parentSize = null;
     if (gen === null || !d || parent === undefined || selection?.other) return;
     if (parent === view && viewDetails?.node === view) {
-      parentSize = viewDetails.logical;
+      parentSize = shownSize(viewDetails);
       return;
     }
-    nodeDetails(gen, parent).then(
+    nodeDetails(gen, parent, searchId).then(
       (p) => {
-        if (gen === generation && selectedDetails === d) parentSize = p.logical;
+        if (gen === generation && selectedDetails === d) parentSize = shownSize(p);
       },
       () => {},
     );
@@ -585,9 +591,9 @@
     const parent = d?.ancestors.at(-2)?.node;
     viewParentSize = null;
     if (gen === null || !d || parent === undefined) return;
-    nodeDetails(gen, parent).then(
+    nodeDetails(gen, parent, searchId).then(
       (p) => {
-        if (gen === generation && viewDetails === d) viewParentSize = p.logical;
+        if (gen === generation && viewDetails === d) viewParentSize = shownSize(p);
       },
       () => {},
     );
@@ -1076,7 +1082,7 @@
                 {generation}
                 folder={view}
                 folderName={viewDetails?.node === view ? viewDetails.name : ""}
-                folderSize={!search && viewDetails?.node === view ? viewDetails.logical : 0}
+                folderSize={viewDetails?.node === view ? shownSize(viewDetails) : 0}
                 search={searchId ?? null}
                 revision={status?.revision ?? 0}
                 folders={contentsFolders}
