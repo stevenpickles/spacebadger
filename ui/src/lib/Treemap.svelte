@@ -138,6 +138,15 @@
 
   // ---- layout requests -------------------------------------------------
 
+  /** What the drawn layout shows; differs from the props while a new one loads. */
+  let shown = $state<{ generation: number; view: number; search: number | null } | null>(null);
+  /** The map is dimmed while it shows another view or search than asked for.
+   * Scan revisions refresh in place without dimming. */
+  const stale = $derived(
+    shown !== null &&
+      (shown.generation !== generation || shown.view !== view || shown.search !== search),
+  );
+
   let nextRequest = 1;
   let inFlight = false;
   let again = false;
@@ -175,6 +184,7 @@
           ) {
             stats.layout.add(performance.now() - started);
             layout = reply;
+            shown = { generation: want.generation, view: want.view, search: want.search };
             error = null;
             onlayout?.(reply);
           }
@@ -786,7 +796,12 @@
     Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
     actions. Escape clears the selection.
   </p>
-  <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px" aria-hidden="true"
+  <canvas
+    bind:this={canvas}
+    class:stale
+    style:width="{width}px"
+    style:height="{height}px"
+    aria-hidden="true"
   ></canvas>
   {#if tooltip && tipPosition}
     <div
@@ -808,7 +823,7 @@
     </div>
   {/if}
   {#if error}
-    <p class="error" role="alert">Couldn't draw the map: {error}</p>
+    <p class="error selectable" role="alert">Couldn't draw the map: {error}</p>
   {/if}
   {#if showPerf}
     <pre class="perf" aria-label="Timing diagnostics">{perfText}</pre>
@@ -830,6 +845,10 @@
   }
   canvas {
     display: block;
+    transition: opacity 0.15s;
+  }
+  canvas.stale {
+    opacity: 0.6;
   }
   .tooltip {
     position: absolute;
@@ -890,11 +909,20 @@
     font-size: 11px;
     pointer-events: none;
   }
+  /* A solid chip, readable over any tile. */
   .error {
     position: absolute;
-    left: 8px;
-    bottom: 8px;
+    left: var(--space-2);
+    bottom: var(--space-2);
+    max-width: calc(100% - 2 * var(--space-2));
+    box-sizing: border-box;
     margin: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--danger);
+    border-radius: var(--radius);
+    background: var(--danger-bg);
     color: var(--danger);
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
   }
 </style>
