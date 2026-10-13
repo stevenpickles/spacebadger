@@ -2,6 +2,9 @@
   import { untrack } from "svelte";
   import {
     appInfo,
+    compareItem,
+    compareSet,
+    compareSnapshots,
     deleteItems,
     duplicatesCancel,
     duplicatesCheck,
@@ -27,6 +30,9 @@
     volumeInfo,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
+  import Changes from "./lib/Changes.svelte";
+  import { formatWhen } from "./lib/compare";
+  import CompareControl from "./lib/CompareControl.svelte";
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
@@ -40,10 +46,12 @@
   import { formatBytes, KILO, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
+  import type { CompareSummary } from "./lib/protocol/CompareSummary";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
   import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
   import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
+  import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
@@ -52,6 +60,7 @@
   import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
+  import type { SnapshotInfo } from "./lib/protocol/SnapshotInfo";
   import SearchResults from "./lib/SearchResults.svelte";
   import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
@@ -62,7 +71,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "contents" | "results" | "small" | "duplicates" | "omissions";
+  type PanelTab = "contents" | "changes" | "results" | "small" | "duplicates" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -202,7 +211,10 @@
     }
   }
 
-  $effect(() => remember("colors", colors));
+  // Change colors last only as long as the comparison, so aren't remembered.
+  $effect(() => {
+    if (colors !== "change") remember("colors", colors);
+  });
   $effect(() => remember("volume", showVolume ? "on" : "off"));
 
   /** The contents list shows folders too; off, it lists files from every level. */
@@ -212,6 +224,9 @@
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
     if (generation !== null && next <= generation) return;
+    // Rescanning the same folder goes on comparing with the same earlier
+    // scan once the new one completes.
+    carried = comparison && status ? { snapshot: comparison.snapshot, root: status.root } : null;
     generation = next;
     status = null;
     view = ROOT;
@@ -223,6 +238,8 @@
     search = null;
     volume = null;
     dupes = null;
+    snapshots = [];
+    endComparison();
     // Keep the filter across Refresh and new roots.
     if (query) applySearch(query);
   }
@@ -271,6 +288,116 @@
     volumeInfo(gen).then(
       (v) => {
         if (gen === generation) volume = v;
+      },
+      () => {},
+    );
+  });
+
+  // ---- comparing with an earlier scan -------------------------------------
+
+  /** Earlier scans of this root, newest first, offered once a scan completes. */
+  let snapshots = $state.raw<SnapshotInfo[]>([]);
+  /** The comparison that's on. Nothing about it is remembered across restarts. */
+  let comparison = $state.raw<CompareSummary | null>(null);
+  let comparing = $state(false);
+  /** The colors to go back to when comparing stops. */
+  let colorsBefore: ColorMode = "depth";
+  /** List folders in the Changes tab, not only files. */
+  let changesFolders = $state(true);
+  let selectedChange = $state.raw<ItemChange | null>(null);
+  let viewChange = $state.raw<ItemChange | null>(null);
+  const compareId = $derived(comparison?.snapshot.id ?? null);
+  const since = $derived(comparison ? formatWhen(comparison.snapshot.createdMs) : "");
+  /** Only a completed scan is saved, and only it can be compared. */
+  const completed = $derived(status?.phase.kind === "complete" || status?.phase.kind === "completeWithOmissions");
+
+  $effect(() => {
+    const gen = generation;
+    if (gen === null || !completed) return;
+    compareSnapshots(gen).then(
+      (list) => {
+        if (gen === generation) snapshots = list;
+      },
+      () => {},
+    );
+  });
+
+  /** The comparison to take up again after a rescan of the same folder. */
+  let carried: { snapshot: SnapshotInfo; root: string } | null = null;
+
+  $effect(() => {
+    const gen = generation;
+    if (gen === null || !completed || !status) return;
+    const root = status.root;
+    untrack(() => {
+      const c = carried;
+      carried = null;
+      // Quietly: the earlier scan may have been pruned meanwhile.
+      if (c && c.root === root) void startComparison(c.snapshot, true);
+    });
+  });
+
+  async function startComparison(s: SnapshotInfo, again = false) {
+    const gen = generation;
+    if (gen === null || comparing) return;
+    comparing = true;
+    try {
+      const summary = await compareSet(gen, s.id);
+      if (gen !== generation || !summary) return;
+      comparison = summary;
+      if (colors !== "change") colorsBefore = colors;
+      colors = "change";
+      if (!again) tab = "changes";
+      announce(`Comparing with the scan of ${formatWhen(s.createdMs)}`);
+    } catch (e) {
+      if (!again) problem = `Couldn't compare: ${errorText(e)}`;
+    } finally {
+      comparing = false;
+    }
+  }
+
+  function stopComparison() {
+    const gen = generation;
+    if (gen !== null) compareSet(gen, null).catch(() => {});
+    endComparison();
+  }
+
+  function endComparison() {
+    comparison = null;
+    selectedChange = null;
+    viewChange = null;
+    if (colors === "change") colors = colorsBefore;
+  }
+
+  // How the selected item and the viewed folder changed, for the details.
+  $effect(() => {
+    const gen = generation;
+    const cmp = compareId;
+    const node = selection && !selection.other ? selection.node : null;
+    void status?.revision;
+    if (gen === null || cmp === null || node === null) {
+      selectedChange = null;
+      return;
+    }
+    compareItem(gen, cmp, node).then(
+      (c) => {
+        if (gen === generation && compareId === cmp) selectedChange = c;
+      },
+      () => {},
+    );
+  });
+  $effect(() => {
+    const gen = generation;
+    const cmp = compareId;
+    const node = view;
+    void status?.revision;
+    if (gen === null || cmp === null) {
+      viewChange = null;
+      return;
+    }
+    compareItem(gen, cmp, node).then(
+      (c) => {
+        if (gen === generation && compareId === cmp) viewChange = c;
       },
       () => {},
     );
@@ -875,6 +1002,7 @@
   const tabs = $derived(
     [
       generation !== null ? { id: "contents" as const, label: "Contents" } : null,
+      comparison && generation !== null ? { id: "changes" as const, label: "Changes" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
       dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
@@ -977,6 +1105,16 @@
             : "Look for files with the same contents in the folder in view, matching the filter if one is on. This reads the files; cloud files are skipped."}
           onclick={() => findDuplicates(view)}>Find duplicates</button
         >
+        {#if snapshots.length > 0 || comparison}
+          <CompareControl
+            {snapshots}
+            current={comparison?.snapshot ?? null}
+            now={status?.logical ?? 0}
+            busy={comparing}
+            onchoose={startComparison}
+            onstop={stopComparison}
+          />
+        {/if}
       {/if}
     </div>
     {#if generation !== null}
@@ -984,6 +1122,11 @@
         <legend>Color by</legend>
         <label><input type="radio" bind:group={colors} value="depth" /> Depth</label>
         <label><input type="radio" bind:group={colors} value="type" /> File type</label>
+        {#if comparison}
+          <label title="Color by how much each item changed since {since}">
+            <input type="radio" bind:group={colors} value="change" /> Change
+          </label>
+        {/if}
       </fieldset>
       {#if volume?.isRoot}
         <label class="group check" title="Show the drive's capacity, free space, and used space no file accounts for">
@@ -1135,6 +1278,7 @@
           {view}
           {metric}
           {colors}
+          compare={compareId}
           search={search?.search ?? null}
           revision={status?.revision ?? 0}
           {selection}
@@ -1155,7 +1299,7 @@
             {/if}
           </div>
         {/if}
-        <Legend mode={colors} />
+        <Legend mode={colors} {since} filtered={search !== null} />
       {/if}
     </main>
     <aside>
@@ -1181,6 +1325,9 @@
           onreveal={showInFileManager}
           oncopy={copyPath}
           ondelete={askDelete}
+          change={selectedChange}
+          viewedChange={viewChange}
+          {since}
         />
       </div>
       {#if activeTab && tabs.length > 1}
@@ -1232,6 +1379,26 @@
                   showInMap({ node, parent });
                 }}
                 onmenu={(r, x, y) => (menu = { x, y, items: contentsMenu(r), heading: menuHeading(r.node, r.name) })}
+              />
+            {/key}
+          {:else if activeTab === "changes" && comparison && generation !== null}
+            {#key `${view}:${comparison.snapshot.id}`}
+              <Changes
+                {generation}
+                snapshot={comparison.snapshot.id}
+                {since}
+                folder={view}
+                folderName={viewDetails?.node === view ? viewDetails.name : ""}
+                revision={status?.revision ?? 0}
+                folders={changesFolders}
+                onfolders={(on) => (changesFolders = on)}
+                selected={pickedSet}
+                {anchor}
+                onpick={pick}
+                onclear={() => pick(null)}
+                ondelete={askDelete}
+                onopen={openFolder}
+                onshow={(node, parent) => showInMap({ node, parent })}
               />
             {/key}
           {:else if activeTab === "omissions" && status}
@@ -1382,9 +1549,9 @@
      dangle at the row's start. */
   .filter {
     border-left: none;
-    flex: 1 1 200px;
+    flex: 1 1 150px;
     max-width: 420px;
-    min-width: 180px;
+    min-width: 150px;
   }
   .filter-help {
     position: relative;

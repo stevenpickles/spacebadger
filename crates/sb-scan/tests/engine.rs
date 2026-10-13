@@ -118,7 +118,7 @@ fn links_mounts_and_special_files_are_skipped_and_counted() {
         .other("fifo", EntryKind::Special)
         .other("weird", EntryKind::UnknownReparse)
         .other("vanished", EntryKind::Failed(ErrorKind::Vanished));
-    let (progress, _) = run(&fs);
+    let (progress, tree) = run(&fs);
     let o = &progress.omissions;
 
     assert_eq!(progress.state, ScanState::CompleteWithOmissions);
@@ -129,6 +129,10 @@ fn links_mounts_and_special_files_are_skipped_and_counted() {
     assert_eq!(o.count(OmissionReason::UnknownReparse), 1);
     assert_eq!(o.count(OmissionReason::Vanished), 1);
     assert_eq!(o.errors(), 1);
+    // The entry that couldn't be read may be missing from the listing.
+    let tree = tree.read().unwrap();
+    assert!(!tree.fully_listed(NodeId::ROOT));
+    assert!(tree.fully_listed(find(&tree, "sub")));
     let symlinks: Vec<_> = o
         .samples(OmissionReason::Symlink)
         .iter()

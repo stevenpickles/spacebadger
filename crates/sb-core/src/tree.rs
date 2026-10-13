@@ -45,6 +45,9 @@ pub mod flags {
     pub const CLOUD: u8 = 1 << 3;
     /// Removed from the tree (deleted from disk) along with its contents.
     pub const REMOVED: u8 = 1 << 4;
+    /// A listed folder with entries that couldn't be read (they vanished
+    /// or couldn't be measured), so some of its children may be missing.
+    pub const UNREADABLE_ENTRIES: u8 = 1 << 5;
 }
 
 /// Traversal state of a directory.
@@ -297,6 +300,20 @@ impl Tree {
     pub fn set_dir_state(&mut self, dir: NodeId, state: DirState) {
         debug_assert!(self.is_dir(dir));
         self.dir_state[dir.index()] = state as u8;
+    }
+
+    /// Notes that some of `dir`'s entries couldn't be read (see
+    /// [`flags::UNREADABLE_ENTRIES`]).
+    pub fn mark_unreadable_entries(&mut self, dir: NodeId) {
+        debug_assert!(self.is_dir(dir));
+        self.flags[dir.index()] |= flags::UNREADABLE_ENTRIES;
+    }
+
+    /// Whether `dir` was listed with every entry read, so all its children
+    /// are in the tree.
+    pub fn fully_listed(&self, dir: NodeId) -> bool {
+        self.dir_state(dir) == DirState::Listed
+            && self.flags[dir.index()] & flags::UNREADABLE_ENTRIES == 0
     }
 
     pub fn dir_state(&self, dir: NodeId) -> DirState {

@@ -1,9 +1,11 @@
 // Treemap colors. Depth mode tints each nesting level; file-type mode colors
 // files by FILE_TYPES and draws folders in one muted slate.
 
+import { MARK_GROWN, MARK_LEVELS, MARK_NEW, MARK_SHRUNK, MARK_UNCHANGED } from "./compare";
 import { FILE_TYPES } from "./layoutWire";
 
-export type ColorMode = "depth" | "type";
+/** "change" is offered only while comparing with an earlier scan. */
+export type ColorMode = "depth" | "type" | "change";
 
 const DEPTH_HUES = [212, 28, 145, 270, 188, 340, 50, 105];
 
@@ -32,6 +34,48 @@ export function typeModeFolderColor(dark: boolean): string {
 export function otherSmallColor(dark: boolean): string {
   return dark ? "#4b505b" : "#c4c8cf";
 }
+
+const GROWN_HUE = 16;
+const SHRUNK_HUE = 208;
+const NEW_HUE = 285;
+
+/**
+ * Change mode, by change mark (see compare.ts): grown items warm and
+ * shrunk ones cool, deeper the more they changed relative to their earlier
+ * size; new items purple; unchanged ones a neutral beige-grey, and items
+ * whose earlier size isn't known paler still. Folders take the same color,
+ * muted, so files carry the contrast.
+ */
+export function changeColor(mark: number, folder: boolean, dark: boolean): string {
+  const muted = folder ? 0.6 : 1;
+  const shade = folder ? 6 : 0;
+  let hue: number;
+  let s: number;
+  let l: number;
+  if (mark >= MARK_GROWN && mark < MARK_SHRUNK + MARK_LEVELS) {
+    const grown = mark < MARK_SHRUNK;
+    const t = (mark - (grown ? MARK_GROWN : MARK_SHRUNK)) / (MARK_LEVELS - 1);
+    hue = grown ? GROWN_HUE : SHRUNK_HUE;
+    s = dark ? 35 + 30 * t : 55 + 30 * t;
+    l = dark ? 28 + 18 * t : 84 - 28 * t;
+  } else if (mark === MARK_NEW) {
+    hue = NEW_HUE;
+    s = dark ? 40 : 50;
+    l = dark ? 48 : 66;
+  } else {
+    hue = 40;
+    const known = mark === MARK_UNCHANGED;
+    s = known ? 8 : 6;
+    l = dark ? (known ? 34 : 25) : known ? 82 : 91;
+  }
+  return `hsl(${hue} ${Math.round(s * muted)}% ${l - shade}%)`;
+}
+
+/** The legend's rows for change mode: grown and shrunk as ramps. */
+export const CHANGE_LEGEND = {
+  grown: [0, 2, 4].map((level) => MARK_GROWN + level),
+  shrunk: [0, 2, 4].map((level) => MARK_SHRUNK + level),
+};
 
 export const TYPE_LEGEND = FILE_TYPES.map((label, type) => ({ label, type })).filter(
   (t) => t.type !== 0,

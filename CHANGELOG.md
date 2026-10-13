@@ -12,6 +12,12 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 ### Details
 - Files show when they were last modified.
 
+### Compare with an earlier scan
+- Each completed scan is saved as a compact snapshot. Scan the same folder again later, and **Compare…** in the toolbar lists the earlier scans to compare with: what grew, what shrank, and what's new since.
+- Color by **Change**: grown items warm, shrunk ones cool, new ones purple, deeper the bigger the change.
+- The details show an item's change, such as "+1.20 GB since Oct 1, 2:03 PM (was 3.40 GB)", and a **Changes** tab lists the biggest changes under the folder in view, including removed items.
+- Files under 1 MiB are recorded without their size: one that grew past 1 MiB shows as grown by at least the difference, and otherwise no change is shown. Each folder keeps its newest 5 snapshots, the first of each earlier day, and its first, and at most 256 MiB in all.
+
 ### Duplicates
 - Find duplicates, in the toolbar or a folder's menu, finds files with the same contents in the folder in view, among the files the filter matches: `is:video` then Find duplicates finds duplicate videos. It's the only feature that reads file contents, and only when asked. Cloud files are never read, so nothing is downloaded, and two names of one hard-linked file don't count.
 - The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at, from 1 KB to 100 MB (1 MB to start).

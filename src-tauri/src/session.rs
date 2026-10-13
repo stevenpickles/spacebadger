@@ -3,6 +3,7 @@
 
 use crate::delete::{self, Outcome};
 use crate::duplicates::{self, Job};
+use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
@@ -14,8 +15,10 @@ use sb_scan::duplicates::plan;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
+
+mod compare;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -29,8 +32,9 @@ const MAX_PAGE: u32 = 500;
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` before the tree, then
-// `folder_files`, and `order` last.
+// Lock order: `deleting` first, `search` and `compare` before the tree,
+// then `folder_files`, and `order` last. `rematching` is taken with the
+// tree read-locked, and `compare` briefly inside it.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -49,6 +53,20 @@ pub struct Session {
     duplicates: Mutex<Option<Arc<Job>>>,
     /// Number of the latest search for duplicates.
     latest_duplicates: AtomicU32,
+    /// Where snapshots of completed scans are kept; `None` in tests.
+    snapshots: Option<Arc<Store>>,
+    /// The snapshot saved for this scan once it completed.
+    saved_snapshot: Arc<Mutex<Option<String>>>,
+    /// When the scan started (ms since the Unix epoch): only snapshots from
+    /// before then are earlier scans.
+    started_ms: u64,
+    /// The comparison with an earlier scan, when on.
+    compare: Mutex<Option<compare::Active>>,
+    /// Held while the comparison is matched again after the scan changed,
+    /// so only one request does it.
+    rematching: Mutex<()>,
+    /// The earlier scan carried over from the previous scan of this root.
+    carried: Option<compare::Carried>,
 }
 
 struct Names {
@@ -78,19 +96,50 @@ struct ActiveSearch {
 }
 
 impl Session {
+    /// Starts scanning without saving a snapshot at the end.
+    #[cfg(test)]
     pub fn start(
         root: PathBuf,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with(root, None, None, on_status)
+    }
+
+    /// Starts scanning; once the scan completes, a snapshot of it is saved
+    /// in `snapshots`, so later scans can be compared with it. `carried` is
+    /// the earlier scan a previous scan of this root was compared with, kept
+    /// so comparing can go on after the rescan (see [`Session::carry`]).
+    pub fn start_with(
+        root: PathBuf,
+        snapshots: Option<Arc<Store>>,
+        carried: Option<compare::Carried>,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
+        let started_ms = compare::now_ms();
         let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
+        let tree_cell = Arc::new(OnceLock::new());
+        let saved_snapshot = Arc::new(Mutex::new(None));
+        let saver = snapshots.as_ref().map(|store| compare::Saver {
+            store: Arc::clone(store),
+            root: root.clone(),
+            tree: Arc::clone(&tree_cell),
+            saved: Arc::clone(&saved_snapshot),
+            protect: carried.as_ref().map(|c| c.id().to_owned()),
+        });
         let scan = Scan::start(
             root.clone(),
             NativeFs::new(),
             native::scan_config(&root),
-            move |p| sink(status(&display, p)),
+            move |p| {
+                sink(status(&display, p));
+                if let Some(saver) = &saver {
+                    saver.progress(&p.state);
+                }
+            },
         );
+        let _ = tree_cell.set(Arc::downgrade(&scan.tree()));
         Self {
             root,
             scan,
@@ -103,6 +152,12 @@ impl Session {
             names: Mutex::new(None),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
+            snapshots,
+            saved_snapshot,
+            started_ms,
+            compare: Mutex::new(None),
+            rematching: Mutex::new(()),
+            carried,
         }
     }
 
