@@ -3,6 +3,8 @@
   // map, so switching color modes never resizes the map. It can be folded
   // down to its heading; that choice is remembered per viewer.
   import {
+    CHANGE_LEGEND,
+    changeColor,
     depthColor,
     typeModeFolderColor,
     otherSmallColor,
@@ -10,14 +12,20 @@
     typeColor,
     type ColorMode,
   } from "./colors";
+  import { MARK_NEW, MARK_UNCHANGED, MARK_UNKNOWN } from "./compare";
   import { theme } from "./theme.svelte";
 
   interface Props {
     /** Defaults to "type", the only mode the legend was shown for before. */
     mode?: ColorMode;
+    /** In change mode: when the earlier scan was, e.g. "Oct 1, 2:03 PM". */
+    since?: string;
+    /** A name filter is on: tiles show matching files, but changes are
+     * of all files. */
+    filtered?: boolean;
   }
 
-  let { mode = "type" }: Props = $props();
+  let { mode = "type", since = "", filtered = false }: Props = $props();
 
   const dark = $derived(theme.dark);
   const listId = $props.id();
@@ -43,7 +51,9 @@
     }
   }
 
-  const heading = $derived(mode === "type" ? "File types" : "Colors");
+  const heading = $derived(
+    mode === "type" ? "File types" : mode === "change" ? (since ? `Change since ${since}` : "Change") : "Colors",
+  );
 </script>
 
 <section class="legend" aria-labelledby="{listId}-heading">
@@ -67,6 +77,30 @@
         {/each}
         <li><span class="swatch" style:background={typeModeFolderColor(dark)}></span>Folders</li>
         <li><span class="swatch" style:background={otherSmallColor(dark)}></span>Small items</li>
+      {:else if mode === "change"}
+        <li>
+          <span class="ramp" aria-hidden="true">
+            {#each CHANGE_LEGEND.grown as mark (mark)}
+              <span class="swatch" style:background={changeColor(mark, false, dark)}></span>
+            {/each}
+          </span>Grown
+        </li>
+        <li>
+          <span class="ramp" aria-hidden="true">
+            {#each CHANGE_LEGEND.shrunk as mark (mark)}
+              <span class="swatch" style:background={changeColor(mark, false, dark)}></span>
+            {/each}
+          </span>Shrunk
+        </li>
+        <li><span class="swatch" style:background={changeColor(MARK_NEW, false, dark)}></span>New</li>
+        <li><span class="swatch" style:background={changeColor(MARK_UNCHANGED, false, dark)}></span>Unchanged</li>
+        <li class="wide">
+          <span class="swatch" style:background={changeColor(MARK_UNKNOWN, false, dark)}></span>Earlier size unknown
+        </li>
+        <li class="wide muted">Deeper colors: bigger change for its size</li>
+        {#if filtered}
+          <li class="wide muted note">Colors show the change in all files, not only matching ones</li>
+        {/if}
       {:else}
         <li class="wide">
           <span class="depths" aria-hidden="true">
@@ -123,10 +157,14 @@
     gap: 5px;
     white-space: nowrap;
   }
+  li.note {
+    white-space: normal;
+  }
   li.wide {
     grid-column: 1 / -1;
   }
-  .depths {
+  .depths,
+  .ramp {
     display: flex;
     gap: 1px;
   }

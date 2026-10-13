@@ -10,6 +10,7 @@ mod elevate_windows;
 #[cfg(windows)]
 mod recycle_windows;
 mod session;
+mod snapshots;
 
 use sb_protocol::{
     AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
@@ -32,6 +33,9 @@ struct AppState {
     /// Deleting was turned on in this run of the app. Never saved, so every
     /// start begins with it off.
     delete_allowed: AtomicBool,
+    /// Where snapshots of completed scans are saved, for comparing later
+    /// scans with; `None` if the app has no data folder.
+    snapshots: Option<Arc<snapshots::Store>>,
 }
 
 impl AppState {
@@ -48,10 +52,24 @@ impl AppState {
 
     /// Replaces the current scan; dropping the old session cancels it.
     fn start(&self, app: &AppHandle, root: PathBuf) -> ScanStarted {
+        // `spacebadger .` names the folder it was started in; snapshots are
+        // kept by absolute path, so another folder's never match.
+        let root = std::path::absolute(&root).unwrap_or(root);
+        // Rescanning the same folder goes on comparing with the same
+        // earlier scan, held in memory in case its file is pruned.
+        let carried = self
+            .current()
+            .filter(|s| s.root == root)
+            .and_then(|s| s.carry());
         let emitter = app.clone();
-        let session = Arc::new(Session::start(root, move |status| {
-            let _ = emitter.emit(SCAN_STATUS_EVENT, status);
-        }));
+        let session = Arc::new(Session::start_with(
+            root,
+            self.snapshots.clone(),
+            carried,
+            move |status| {
+                let _ = emitter.emit(SCAN_STATUS_EVENT, status);
+            },
+        ));
         let started = session.started();
         *self.session.lock().unwrap() = Some(session);
         started
@@ -222,6 +240,76 @@ async fn selection_summary(
     state.session(request.generation)?.selection(&request.nodes)
 }
 
+/// Earlier scans of the current root that it can be compared with, newest
+/// first. Reads each snapshot's header, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_snapshots(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<Vec<sb_protocol::SnapshotInfo>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.snapshots())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Compares the scan with an earlier one, or with `None` stops comparing.
+/// Reading a large snapshot and matching it takes a moment, so this runs on
+/// a blocking thread.
+#[tauri::command]
+async fn compare_set(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: Option<String>,
+) -> Result<Option<sb_protocol::CompareSummary>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_set(snapshot.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// How one item changed since the earlier scan. After a delete the scan
+/// is matched again first, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_item(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: String,
+    node: u32,
+) -> Result<sb_protocol::ItemChange, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_item(&snapshot, node))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One byte per node of a drawn layout, for the "Change" colors. Runs on a
+/// blocking thread, like `compare_item`.
+#[tauri::command]
+async fn change_marks(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangeMarksRequest,
+) -> Result<Response, String> {
+    let session = state.session(request.generation)?;
+    let marks = tauri::async_runtime::spawn_blocking(move || session.change_marks(&request))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Response::new(marks))
+}
+
+/// The biggest changes under a folder since the earlier scan. The first
+/// page walks the folder, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_changes(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangesRequest,
+) -> Result<sb_protocol::ChangesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.changes(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Asks first, then starts SpaceBadger again with administrator rights,
 /// scanning the same folder, and closes this copy. Returns `false` if the
 /// user said no, here or at the Windows elevation prompt.
@@ -333,7 +421,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let state = AppState::default();
+            let state = AppState {
+                snapshots: app
+                    .path()
+                    .app_local_data_dir()
+                    .ok()
+                    .map(|dir| Arc::new(snapshots::Store::new(dir.join("snapshots")))),
+                ..AppState::default()
+            };
             // `spacebadger <folder>` starts scanning that folder right away.
             if let Some(root) = std::env::args_os().nth(1) {
                 state.start(app.handle(), PathBuf::from(root));
@@ -365,7 +460,12 @@ pub fn run() {
             selection_summary,
             set_delete_allowed,
             restart_elevated,
-            delete_items
+            delete_items,
+            compare_snapshots,
+            compare_set,
+            compare_item,
+            change_marks,
+            compare_changes
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");
