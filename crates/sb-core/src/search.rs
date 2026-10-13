@@ -3,8 +3,11 @@
 //! A query is a list of patterns separated by `;`, matched against a file's
 //! basename (including the extension), ignoring case. A pattern with `*` or
 //! `?` wildcards must match the whole name; one without matches any name
-//! containing it. A leading `!` excludes. Folder names and full paths are
-//! never matched, and file contents are never read.
+//! containing it. A leading `!` excludes. A pattern starting with `dir:`
+//! matches folder names instead: a file then matches only inside a folder
+//! (at any depth below the scan root) that matches one, and `!dir:` leaves
+//! out files inside matching folders. Full paths are never matched, and file
+//! contents are never read.
 //!
 //! [`Search`] keeps its own totals for matching files and every folder above
 //! them, so the treemap can be drawn from matching bytes only. It catches up
@@ -20,16 +23,21 @@ use std::ffi::OsStr;
 
 const NONE: u32 = u32::MAX;
 
-/// Case-insensitive file name matcher for a query such as
-/// `*.jpg; *.png; !thumb*`.
+/// Case-insensitive matcher for a query such as `*.jpg; *.png; !thumb*` or
+/// `*.js; !dir:node_modules`.
 ///
-/// A name matches when it matches any included pattern (or there are none)
-/// and no excluded one.
+/// A file matches when its name matches any included file pattern (or there
+/// are none) and no excluded one, it's inside a folder matching an included
+/// `dir:` pattern (or there are none), and inside no folder matching an
+/// excluded one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     query: String,
     include: Vec<Pattern>,
     exclude: Vec<Pattern>,
+    /// `dir:` patterns, matched against folder names.
+    dir_include: Vec<Pattern>,
+    dir_exclude: Vec<Pattern>,
     /// Every pattern is ASCII, so ASCII names can be matched bytewise.
     ascii: bool,
     /// Some pattern has `?`, so non-ASCII names are needed as characters.
@@ -193,30 +201,50 @@ fn wildcard<T: Copy + PartialEq>(
 
 impl Matcher {
     /// `None` when the query has no patterns. Patterns are separated by `;`
-    /// and trimmed; a leading `!` excludes.
+    /// and trimmed; a leading `!` excludes, and a `dir:` prefix (any case)
+    /// makes a folder pattern.
     pub fn new(query: &str) -> Option<Self> {
         let mut include = Vec::new();
         let mut exclude = Vec::new();
+        let mut dir_include = Vec::new();
+        let mut dir_exclude = Vec::new();
         for term in query.split(';') {
             let term = term.trim();
-            let (list, term) = match term.strip_prefix('!') {
-                Some(rest) => (&mut exclude, rest.trim_start()),
-                None => (&mut include, term),
+            let (excluded, term) = match term.strip_prefix('!') {
+                Some(rest) => (true, rest.trim_start()),
+                None => (false, term),
+            };
+            let (folder, term) = match strip_prefix_ignore_case(term, "dir:") {
+                Some(rest) => (true, rest.trim_start()),
+                None => (false, term),
+            };
+            let list = match (folder, excluded) {
+                (false, false) => &mut include,
+                (false, true) => &mut exclude,
+                (true, false) => &mut dir_include,
+                (true, true) => &mut dir_exclude,
             };
             if !term.is_empty() {
                 list.push(Pattern::new(term));
             }
         }
-        if include.is_empty() && exclude.is_empty() {
-            return None;
-        }
-        let all = || include.iter().chain(&exclude);
+        let all = || {
+            include
+                .iter()
+                .chain(&exclude)
+                .chain(&dir_include)
+                .chain(&dir_exclude)
+        };
+        // No patterns at all.
+        all().next()?;
         let ascii = all().all(|p| p.text().is_ascii());
         let globs = all().any(|p| matches!(p, Pattern::Glob { .. }));
         Some(Self {
             query: query.to_owned(),
             include,
             exclude,
+            dir_include,
+            dir_exclude,
             ascii,
             globs,
         })
@@ -226,11 +254,37 @@ impl Matcher {
         &self.query
     }
 
+    /// Whether a file name passes the file patterns. The folder patterns
+    /// are applied by [`Search`], which knows where the file is.
     pub fn matches(&self, name: &OsStr) -> bool {
+        self.with_name(name, |test| {
+            (self.include.is_empty() || self.include.iter().any(test))
+                && !self.exclude.iter().any(test)
+        })
+    }
+
+    /// The query has `dir:` patterns.
+    pub fn has_folder_patterns(&self) -> bool {
+        !self.dir_include.is_empty() || !self.dir_exclude.is_empty()
+    }
+
+    /// How a folder's own name meets the `dir:` patterns.
+    pub fn folder(&self, name: &OsStr) -> FolderMatch {
+        if !self.has_folder_patterns() {
+            return FolderMatch::default();
+        }
+        self.with_name(name, |test| FolderMatch {
+            included: self.dir_include.iter().any(test),
+            excluded: self.dir_exclude.iter().any(test),
+        })
+    }
+
+    /// Calls `decide` with a test of `name` against one pattern.
+    fn with_name<R>(&self, name: &OsStr, decide: impl FnOnce(&dyn Fn(&Pattern) -> bool) -> R) -> R {
         let bytes = name.as_encoded_bytes();
         // Fast path without allocating: ASCII names against ASCII patterns.
         if self.ascii && bytes.is_ascii() {
-            return self.decide(|p| p.matches_ascii(bytes));
+            return decide(&|p| p.matches_ascii(bytes));
         }
         let lower = name.to_string_lossy().to_lowercase();
         let chars: Vec<char> = if self.globs {
@@ -238,13 +292,48 @@ impl Matcher {
         } else {
             Vec::new()
         };
-        self.decide(|p| p.matches_lower(&lower, &chars))
+        decide(&|p| p.matches_lower(&lower, &chars))
     }
 
-    fn decide(&self, test: impl Fn(&Pattern) -> bool) -> bool {
-        (self.include.is_empty() || self.include.iter().any(&test))
-            && !self.exclude.iter().any(&test)
+    /// Whether a file inside folders described by `scope` can match.
+    fn in_scope(&self, scope: FolderMatch) -> bool {
+        (self.dir_include.is_empty() || scope.included) && !scope.excluded
     }
+}
+
+/// Whether a folder, or one above it, matches the included or excluded
+/// `dir:` patterns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderMatch {
+    pub included: bool,
+    pub excluded: bool,
+}
+
+impl FolderMatch {
+    fn within(self, outer: Self) -> Self {
+        Self {
+            included: self.included || outer.included,
+            excluded: self.excluded || outer.excluded,
+        }
+    }
+
+    fn bits(self) -> u8 {
+        u8::from(self.included) | (u8::from(self.excluded) << 1)
+    }
+
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            included: bits & 1 != 0,
+            excluded: bits & 2 != 0,
+        }
+    }
+}
+
+/// `text` without `prefix`, compared ignoring ASCII case.
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 /// Sizes of the matching files at or under a node.
@@ -287,6 +376,9 @@ pub struct Search {
     slot: Vec<u32>,
     totals: Vec<Totals>,
     matches: Vec<NodeId>,
+    /// Per examined folder, [`FolderMatch`] bits for it and the folders
+    /// above it; empty without `dir:` patterns.
+    scope: Vec<u8>,
     /// Bumped whenever any total changes.
     version: u64,
 }
@@ -301,6 +393,7 @@ impl Search {
             slot: Vec::new(),
             totals: Vec::new(),
             matches: Vec::new(),
+            scope: Vec::new(),
             version: 0,
         }
     }
@@ -329,9 +422,27 @@ impl Search {
 
         let end = tree.len().min(self.next.saturating_add(budget));
         self.slot.resize(end, NONE);
+        let folders = self.matcher.has_folder_patterns();
+        if folders {
+            self.scope.resize(end, 0);
+        }
         for i in self.next..end {
             let node = NodeId::from_index(i as u32);
-            if !tree.is_dir(node) && !tree.is_removed(node) && self.matcher.matches(tree.name(node))
+            // A folder's ID is lower than its contents', so the folders
+            // above a node were examined before it.
+            let outer = match tree.parent(node) {
+                Some(p) if folders => FolderMatch::from_bits(self.scope[p.index()]),
+                _ => FolderMatch::default(),
+            };
+            if tree.is_dir(node) {
+                // The scan root's name is its whole path, so it never counts.
+                if folders && node != NodeId::ROOT {
+                    let own = self.matcher.folder(tree.name(node));
+                    self.scope[i] = own.within(outer).bits();
+                }
+            } else if !tree.is_removed(node)
+                && self.matcher.in_scope(outer)
+                && self.matcher.matches(tree.name(node))
             {
                 self.add(tree, node);
             }
@@ -638,7 +749,7 @@ mod tests {
             .unwrap();
 
         let s = search("report", &t);
-        assert_eq!(s.matches().len(), 2, "folder names never match");
+        assert_eq!(s.matches().len(), 2, "plain patterns never match folders");
         assert_eq!(
             s.totals(a),
             Totals {
@@ -786,5 +897,83 @@ mod tests {
                 files: 1
             }
         );
+    }
+
+    /// Names of the matching files, sorted.
+    fn names(s: &Search, t: &Tree) -> Vec<String> {
+        let mut n: Vec<_> = s
+            .matches()
+            .iter()
+            .map(|&f| t.name(f).to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn dir_patterns_match_folder_names_at_any_depth() {
+        let mut t = Tree::new("/r/cache");
+        let src = t.add_dir(NodeId::ROOT, "src".as_ref()).unwrap();
+        let nm = t.add_dir(NodeId::ROOT, "node_modules".as_ref()).unwrap();
+        let deep = t.add_dir(nm, "lib".as_ref()).unwrap();
+        let cache = t.add_dir(src, "Cache".as_ref()).unwrap();
+        for (dir, name) in [
+            (src, "app.js"),
+            (src, "readme.md"),
+            (nm, "index.js"),
+            (deep, "util.js"),
+            (deep, "notes.md"),
+            (cache, "blob.bin"),
+            (NodeId::ROOT, "top.js"),
+        ] {
+            t.add_file(dir, name.as_ref(), sizes(10, 4096), 0).unwrap();
+        }
+
+        let s = search("dir:node_modules", &t);
+        assert_eq!(names(&s, &t), ["index.js", "notes.md", "util.js"]);
+        assert_eq!(s.totals(nm).files, 3);
+        assert_eq!(s.totals(src), Totals::default());
+
+        let s = search("DIR: cache", &t);
+        assert_eq!(
+            names(&s, &t),
+            ["blob.bin"],
+            "case and spaces don't matter; the scan root's own name doesn't count"
+        );
+
+        let s = search("dir:node_modules; *.js", &t);
+        assert_eq!(
+            names(&s, &t),
+            ["index.js", "util.js"],
+            "a folder pattern narrows the file patterns"
+        );
+
+        let s = search("*.js; !dir:node_modules", &t);
+        assert_eq!(names(&s, &t), ["app.js", "top.js"]);
+
+        let s = search("!dir:node*", &t);
+        assert_eq!(s.matches().len(), 4, "only exclusions: everything else");
+
+        let s = search("dir:no_such_folder", &t);
+        assert!(s.matches().is_empty());
+        assert!(
+            Matcher::new("dir:").is_none(),
+            "an empty folder pattern is no pattern"
+        );
+    }
+
+    #[test]
+    fn dir_patterns_apply_to_folders_added_later() {
+        let mut t = Tree::new("/r");
+        let nm = t.add_dir(NodeId::ROOT, "node_modules".as_ref()).unwrap();
+        let mut s = search("dir:node_modules", &t);
+        assert!(s.matches().is_empty());
+        let inner = t.add_dir(nm, "pkg".as_ref()).unwrap();
+        t.add_file(inner, "a.js".as_ref(), sizes(5, 4096), 0)
+            .unwrap();
+        t.add_file(NodeId::ROOT, "b.js".as_ref(), sizes(5, 4096), 0)
+            .unwrap();
+        assert!(s.catch_up(&t, usize::MAX));
+        assert_eq!(names(&s, &t), ["a.js"]);
     }
 }
