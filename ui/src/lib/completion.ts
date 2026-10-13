@@ -1,0 +1,107 @@
+// What the filter's completion offers at the caret. A query is a list of
+// `;`-separated terms; only the term the caret ends is completed, and its
+// leading `!` is kept. See sb-core's search module for the syntax.
+
+import { FILE_TYPES } from "./layoutWire";
+
+/** `is:` keywords by FILE_TYPES index, as sb-core's FileType::keyword. */
+const TYPE_KEYWORDS = ["other", "video", "audio", "image", "document", "archive", "diskimage", "program", "code"];
+
+/** In the order sb-core lists them: Other last. */
+export const TYPES = [1, 2, 3, 4, 5, 6, 7, 8, 0].map((type) => ({
+  type,
+  keyword: TYPE_KEYWORDS[type]!,
+  label: FILE_TYPES[type]!,
+}));
+
+export type ContextKind = "keyword" | "type" | "folder" | "extension";
+
+export interface Context {
+  kind: ContextKind;
+  /** What's typed after the keyword or prefix, e.g. "no" in "dir:no". */
+  typed: string;
+  /** The term's span in the query, after any `!`, to replace on accept. */
+  start: number;
+  end: number;
+  /** Put before an accepted name: "dir:", "is:", "*.", or ".". */
+  prefix: string;
+}
+
+/** The completion context for a caret at `caret`, or `null` when the caret
+ * isn't at the end of a term. */
+export function contextAt(query: string, caret: number): Context | null {
+  const segStart = query.lastIndexOf(";", caret - 1) + 1;
+  const next = query.indexOf(";", caret);
+  const segEnd = next < 0 ? query.length : next;
+  // Only complete at the end of a term.
+  if (query.slice(caret, segEnd).trim() !== "") return null;
+  let start = segStart;
+  while (start < caret && query[start] === " ") start++;
+  if (query[start] === "!") {
+    start++;
+    while (start < caret && query[start] === " ") start++;
+  }
+  const term = query.slice(start, caret);
+  const at = (kind: ContextKind, prefix: string, typed: string): Context => ({
+    kind,
+    typed,
+    start,
+    end: caret,
+    prefix,
+  });
+  const keyword = /^(dir|is):\s*/i.exec(term);
+  if (keyword) {
+    const typed = term.slice(keyword[0].length);
+    return keyword[1]!.toLowerCase() === "dir" ? at("folder", "dir:", typed) : at("type", "is:", typed);
+  }
+  if (/[*?]/.test(term.replace(/^\*\./, ""))) return null;
+  if (term.startsWith("*.")) return at("extension", "*.", term.slice(2));
+  if (term.startsWith(".") && term.length > 1) return at("extension", ".", term.slice(1));
+  return at("keyword", "", term);
+}
+
+export interface Keyword {
+  /** Inserted as typed: "dir:" or "is:video". */
+  text: string;
+  describe: string;
+  /** A FILE_TYPES index, for a color swatch. */
+  type?: number;
+}
+
+/** Keywords starting with `typed`, ignoring case: "d" offers `dir:`, "is"
+ * every type. Empty `typed` offers `dir:` and `is:`. */
+export function keywords(typed: string): Keyword[] {
+  const t = typed.toLowerCase();
+  if (t === "") {
+    return [
+      { text: "dir:", describe: "files inside folders with this name" },
+      { text: "is:", describe: "files of a type: video, image, document…" },
+    ];
+  }
+  const found: Keyword[] = [];
+  if ("dir:".startsWith(t)) found.push({ text: "dir:", describe: "files inside folders with this name" });
+  if ("is:".startsWith(t)) found.push(...types(""));
+  return found;
+}
+
+/** Types whose keyword starts with `typed`, as `is:` keywords. */
+export function types(typed: string): Keyword[] {
+  const t = typed.toLowerCase();
+  return TYPES.filter((k) => k.keyword.startsWith(t)).map((k) => ({
+    text: `is:${k.keyword}`,
+    describe: k.label,
+    type: k.type,
+  }));
+}
+
+/** Folder names and extensions that the filter would read as something
+ * else can't be inserted as they are. */
+export function insertable(name: string): boolean {
+  return !/[;*?]/.test(name) && name.trim() === name && !name.startsWith("!");
+}
+
+/** The query with `ctx`'s term replaced by `text`, and where the caret goes. */
+export function replaceTerm(query: string, ctx: Context, text: string): { query: string; caret: number } {
+  const before = query.slice(0, ctx.start);
+  return { query: before + text + query.slice(ctx.end), caret: before.length + text.length };
+}
