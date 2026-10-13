@@ -522,6 +522,7 @@ impl Session {
             files: u64::from(tree.file_count(n)),
             cloud: node_flags & flags::CLOUD != 0,
             hardlinked: node_flags & flags::HARDLINKED != 0,
+            modified: tree.modified(n).map(u64::from),
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
