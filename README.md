@@ -65,6 +65,14 @@ The filter box matches file names (not paths), ignoring case. Separate patterns 
 
 As you type, the filter suggests keywords, file types after `is:`, folder names from the scan after `dir:`, and extensions from the scan after `*.`, with their counts and sizes. Press ↓ or Ctrl+Space to open the suggestions, Enter or Tab to use one, and Escape to close them. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
 
+**Find duplicates** in the toolbar (or **Find duplicates here** on a folder's menu) looks for files with the same contents in the folder in view, among the files the filter matches if one is on: `is:video` then Find duplicates finds duplicate videos. It is the one feature that reads what's inside files, and only when you ask:
+
+- Only files that share their size with another are read. Each is compared by a hash of its first and last 64 KB, and those still alike by a hash of their whole contents (BLAKE3).
+- Cloud files are never read, so nothing is downloaded, and links are never followed. Two names of one hard-linked file aren't duplicates: deleting one frees nothing. Files that are gone, changed, or in use are left out and counted.
+- Files smaller than the size chosen in the Duplicates tab (1 MB to start) are left out.
+
+Groups appear as they're confirmed, with the most reclaimable space (the copies beyond the first) on top; Stop keeps what was found. Files in the list select like anywhere else, and **Select all but the first** selects every copy except the one with the shortest path in each group. Nothing is ever deleted for you: deleting goes through the guarded delete above, and deleted files leave their groups.
+
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.
