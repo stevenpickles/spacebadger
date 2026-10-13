@@ -8,8 +8,10 @@
     deleteItems,
     errorText,
     EXPECTED_PROTOCOL_VERSION,
+    exportSave,
     fileManagerName,
     nodeDetails,
+    onExportProgress,
     onScanStatus,
     scanCancel,
     scanChoose,
@@ -17,6 +19,7 @@
     scanStatus,
     restartElevated,
     reveal,
+    revealExport,
     searchSet,
     searchSummary,
     selectionSummary,
@@ -34,6 +37,8 @@
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import ExportDialog, { exportFileName, localTime, type ExportChoice } from "./lib/ExportDialog.svelte";
+  import ExportToast from "./lib/ExportToast.svelte";
   import FilterBox from "./lib/FilterBox.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
@@ -42,6 +47,7 @@
   import Omissions from "./lib/Omissions.svelte";
   import type { CompareSummary } from "./lib/protocol/CompareSummary";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
+  import type { ExportReport } from "./lib/protocol/ExportReport";
   import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
@@ -478,9 +484,79 @@
     items.push(
       { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
       { label: "Copy path", action: () => copyPath(it.node) },
-      ...deleteItemsFor(it.node),
     );
+    if (it.folder) items.push(...exportItemsFor(it.node));
+    items.push(...deleteItemsFor(it.node));
     return items;
+  }
+
+  // ---- export -----------------------------------------------------------
+
+  /** The folder the export dialog is open for. */
+  let exportOf = $state.raw<{ node: number; name: string } | null>(null);
+  /** An export is running: rows written so far, `null` until the file is chosen. */
+  let exporting = $state<{ rows: number | null } | null>(null);
+  /** The last finished export, shown until dismissed. */
+  let exported = $state.raw<ExportReport | null>(null);
+
+  async function askExport(node: number) {
+    const gen = generation;
+    if (gen === null || exporting) return;
+    try {
+      const d = await nodeDetails(gen, node);
+      if (gen === generation) exportOf = { node, name: d.name };
+    } catch (e) {
+      problem = `Couldn't export: ${errorText(e)}`;
+    }
+  }
+
+  async function runExport(choice: ExportChoice) {
+    const target = exportOf;
+    const gen = generation;
+    exportOf = null;
+    if (!target || gen === null || exporting) return;
+    exporting = { rows: null };
+    exported = null;
+    // Listening before asking, so even a small export's progress is seen.
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await onExportProgress((p) => {
+        if (p.generation === gen && exporting) exporting = { rows: p.rows };
+      });
+      const report = await exportSave({
+        generation: gen,
+        folder: target.node,
+        scope: choice.scope,
+        format: choice.format,
+        metric,
+        search: searchId ?? null,
+        fileName: exportFileName(target.name, choice.format),
+        exportedAt: localTime(),
+      });
+      if (report) {
+        exported = report;
+        announce(
+          report.format === "csv"
+            ? `Exported ${plural(report.rows, "row")} to ${report.path}`
+            : `Saved the report to ${report.path}`,
+        );
+      }
+    } catch (e) {
+      problem = `Couldn't export: ${errorText(e)}`;
+    } finally {
+      exporting = null;
+      unlisten?.();
+    }
+  }
+
+  /** Where focus goes when the export dialog closes and the control that
+   * opened it is gone or disabled. */
+  function focusMap() {
+    document.querySelector<HTMLElement>(".map .treemap")?.focus();
+  }
+
+  function showExport() {
+    revealExport().catch((e: unknown) => (problem = errorText(e)));
   }
 
   // ---- selection and delete -------------------------------------------
@@ -567,6 +643,18 @@
         danger: true,
         disabled: !!reason,
         title: reason ?? undefined,
+      },
+    ];
+  }
+
+  /** Menu entry to export a folder; unavailable while an export runs. */
+  function exportItemsFor(node: number): MenuItem[] {
+    return [
+      {
+        label: "Export…",
+        action: () => askExport(node),
+        disabled: exporting !== null,
+        title: exporting ? "An export is running." : undefined,
       },
     ];
   }
@@ -824,6 +912,7 @@
       separator: true,
     });
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    if (kind === "folder") items.push(...exportItemsFor(node));
     if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
   }
@@ -1132,6 +1221,16 @@
           >
         </span>
       {/if}
+      <!-- Beside the path of the folder it exports; the toolbar is full at
+           1280 px. -->
+      <button
+        type="button"
+        class="export"
+        class:alone={!filterError && !search}
+        disabled={exporting !== null}
+        title="Save the folder in the map as a CSV file or a text report"
+        onclick={() => askExport(view)}>Export…</button
+      >
     </div>
   {/if}
 
@@ -1354,6 +1453,25 @@
       }}
     />
   {/if}
+  {#if exportOf}
+    <ExportDialog
+      folderName={exportOf.name}
+      filter={search?.query ?? null}
+      onexport={runExport}
+      oncancel={() => (exportOf = null)}
+      fallbackFocus={focusMap}
+    />
+  {/if}
+  <!-- Progress shows once the file is chosen, not while the save dialog is open. -->
+  {#if exporting ? exporting.rows !== null : exported}
+    <ExportToast
+      rows={exporting?.rows ?? null}
+      report={exporting ? null : exported}
+      {fileManager}
+      onreveal={showExport}
+      onclose={() => (exported = null)}
+    />
+  {/if}
   {#if showShortcuts}
     <Shortcuts trashName={trash} onclose={() => (showShortcuts = false)} />
   {/if}
@@ -1516,6 +1634,15 @@
     padding: 2px 8px;
     min-height: 28px;
     border-bottom: 1px solid var(--line);
+  }
+  .crumbs .export {
+    flex: none;
+    margin-left: var(--space-2);
+    padding: 1px 8px;
+    font-size: var(--fs-sm);
+  }
+  .crumbs .export.alone {
+    margin-left: auto;
   }
   .filtered {
     display: flex;

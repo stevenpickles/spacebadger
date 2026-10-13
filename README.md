@@ -5,7 +5,7 @@ A desktop disk-space explorer for Windows, Linux, and macOS. A Rust scanner feed
 - Product specification: [`spacebadger-implementation-brief.md`](spacebadger-implementation-brief.md)
 - Implementation plan and milestones: [`docs/PLAN.md`](docs/PLAN.md)
 
-Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. Scan a folder again later and compare with an earlier scan to see what grew. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
+Status: milestones 1–6 are complete; portable downloads (milestone 7) are set up, and package-manager packages are next. Choose a folder or drive and explore a live treemap while it scans: select, zoom, breadcrumbs, cancel with partial results. Select a "small items" region to list what it contains. Filter by file name to see only matching files in the map and a size-sorted result list. Right-click an item to show it in Explorer, Finder, or your file manager. Select several items and move them to the Recycle Bin or Trash. Color the map by folder depth or by file type, with a legend. Export a folder as CSV or a text report. Scan a folder again later and compare with an earlier scan to see what grew. When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file (with likely reasons), and free space.
 
 ## Download
 
@@ -15,7 +15,7 @@ Portable builds for Windows x64, Linux x86_64 (AppImage), and macOS on Apple Sil
 
 | Path | Contents |
 |---|---|
-| `crates/sb-core` | Scan model, size accounting, aggregation, search, treemap layout |
+| `crates/sb-core` | Scan model, size accounting, aggregation, search, treemap layout, export |
 | `crates/sb-scan` | Filesystem traversal and per-OS metadata adapters |
 | `crates/sb-protocol` | Versioned IPC types; exports TypeScript bindings via `ts-rs` |
 | `crates/sb-probe` | Filesystem correctness-probe CLI |
@@ -75,6 +75,15 @@ To see what grew, scan a folder again later and compare. Each time a scan comple
 - With a name filter on, the map shows matching files, but changes are always of all files.
 
 Snapshots record every folder, and files of 1 MiB or more with their sizes. Smaller files are recorded only by a hash of their name: one that has since grown past 1 MiB shows as grown by at least the difference, one that is still small gets no change shown rather than a guess, and a small file shows as new when its name wasn't there before (a rare hash collision makes it say nothing instead). A folder that couldn't be read, then or now, says nothing about what changed inside it, and one with entries that couldn't be read doesn't call a missing item removed or a found one new. Items are matched by path, ignoring case on Windows and macOS; a renamed item shows as removed under its old name and new under its new one. Each folder keeps its newest 5 snapshots, the first of each earlier day, and always its first; beyond 256 MiB in all, the oldest go. A full scan of a 3.6-million-item drive makes a 32 MiB snapshot.
+
+**Export…** at the right end of the breadcrumbs, or in a folder's right-click menu, saves what's in a folder as a file. Choose **This folder's contents** (its own files and folders) or **Everything under this folder** (every file and folder at any depth), and a format:
+
+- **CSV**, for spreadsheets: one row per item with its full path, name, `folder` or `file`, size in bytes, size as shown in the app, the number of files (for folders), the file type (the same categories as `is:` and the file-type colors), its share of the exported folder in percent, and, for files, when it was last modified, in ISO 8601 local time with the UTC offset in effect then (such as `2026-10-13T18:05:09+02:00`; empty when unknown, or when the file system reports a time before 1970 or after 2106). Each folder comes before its contents, largest first. The file is UTF-8 with a byte order mark and CRLF line endings, quoted as in RFC 4180, so Excel and other spreadsheet apps read names with commas, quotes, line breaks, or non-English characters correctly. A name that starts with `=`, `+`, `-`, `@`, a tab, or a carriage return is written with a leading `'` (`=SUM(A1).txt` becomes `'=SUM(A1).txt`, `@types` becomes `'@types`), so a spreadsheet shows it as text instead of running it as a formula.
+- **Text report**: the folder, scan root, how the scan went, when it was exported, totals, the 50 largest folders and the 50 largest files under the folder (files with when they were last modified), and what the scan didn't count.
+
+With a filter on, only matching files are exported, with the folders that contain them and the size and count of their matching files. You choose where to save in the system's save dialog; the suggested name is like `SpaceBadger-Downloads-2026-10-13.csv`. The file is written in the background, in steps, so the map and a running scan carry on; when it's done, **Show in Explorer** (Finder, file manager) shows the file. If you choose a file that already exists, it's replaced only once the export is complete; a failed export leaves it as it was. Rescanning or choosing another folder stops an export in progress, as does changing the filter.
+
+An export taken while scanning holds what had been scanned so far. Sizes are as of the moment each row was written, shares are of the folder's size at that moment, and each folder's contents are ordered largest first as they were when the export reached that folder, so later rows may be larger than earlier ones.
 
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 

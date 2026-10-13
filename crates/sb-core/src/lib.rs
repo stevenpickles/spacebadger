@@ -3,6 +3,7 @@
 //! API or desktop window.
 
 pub mod compare;
+pub mod export;
 pub mod filetype;
 pub mod layout;
 pub mod search;
