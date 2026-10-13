@@ -4,6 +4,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+- Windows: Restart as administrator from the toolbar (or beside "Permission denied" under Not counted) reopens SpaceBadger elevated and scans the same folder again, after asking; declining leaves it as it was.
 - Interface pass: sizes are file sizes throughout (the Allocated/Logical switch is gone; the volume overview still compares on-disk usage).
 - Toolbar regrouped, with a filter syntax popover, a scan progress bar, and a keyboard and mouse shortcuts sheet (press `?`).
 - Breadcrumbs have an Up button and collapse deep paths. The side panel keeps the details on top at a fixed height and lists the contents of the folder in the map below, largest first, in step with the map's selection. Unchecking "Folders" lists only files, the largest from every level under the folder. Results, small items, and what wasn't counted join it as tabs when open; narrow windows stack the panel under the map.
