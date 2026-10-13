@@ -14,6 +14,7 @@ mod synth;
 
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache, RectKind};
 use sb_core::search::{Matcher, Ranked, Search};
+use sb_core::suggest::NameIndex;
 use sb_core::tree::{FileSizes, NodeId, Tree};
 use sb_protocol::wire;
 use std::process::Command;
@@ -212,6 +213,14 @@ fn run(nodes: usize, seed: u64) {
         "widest:  folder with {width} children: layout {}, listing {other} small items {}",
         ms(wide),
         ms(small)
+    );
+
+    let (indexed, index) = time(3, || NameIndex::build(&tree));
+    let (asked, found) = time(3, || index.folders("ab", 8).len());
+    println!(
+        "suggest: name index {}; folder suggestions for \"ab\" ({found}) {}",
+        ms(indexed),
+        ms(asked)
     );
 
     for query in [
