@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PathText from "./PathText.svelte";
   // The largest few of a set of selected items, then "…and N more". Used by
   // the details panel and the delete dialog.
   import { exactBytes, formatBytes, formatCount } from "./format";
@@ -23,7 +24,7 @@
         <span class="row-size" title={exactBytes(item.logical)}>{formatBytes(item.logical)}</span>
       </div>
       {#if paths}
-        <div class="path muted selectable">{item.path}</div>
+        <div class="path muted selectable"><PathText path={item.path} /></div>
       {/if}
     </li>
   {/each}

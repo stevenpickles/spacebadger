@@ -11,6 +11,7 @@
 </script>
 
 <script lang="ts">
+  import PathText from "./PathText.svelte";
   // Confirms moving items to the Recycle Bin or Trash, saying exactly what
   // it covers. The confirm button stays disabled until the word "delete" is
   // typed and a short countdown has run, so a reflexive Enter or click can't
@@ -182,7 +183,7 @@
       <ul class="failures">
         {#each result.failures as failure, i (i)}
           <li>
-            <div class="selectable path">{failure.path}</div>
+            <div class="selectable path"><PathText path={failure.path} /></div>
             <div class="muted small selectable">{failure.message}</div>
           </li>
         {/each}

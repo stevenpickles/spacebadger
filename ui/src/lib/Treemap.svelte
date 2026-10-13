@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PathText from "./PathText.svelte";
   // Canvas treemap. Pulls a layout from the backend whenever its inputs
   // change; at most one request is in flight, and changes that arrive
   // meanwhile are folded into one follow-up request (natural backpressure).
@@ -820,7 +821,7 @@
     >
       <strong class="title">{tooltip.title || "\u00a0"}</strong>
       {#if tooltip.path !== undefined}
-        <div class="path selectable" class:pending={tooltip.path === null}>{tooltip.path ?? ""}</div>
+        <div class="path selectable" class:pending={tooltip.path === null}>{#if tooltip.path}<PathText path={tooltip.path} />{/if}</div>
       {/if}
       {#each tooltip.lines as line, i (i)}
         <div class="line" class:pending={line === null}>{line ?? ""}</div>

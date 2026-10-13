@@ -1,4 +1,5 @@
 <script lang="ts">
+  import PathText from "./PathText.svelte";
   import { describeItems, exactBytes, formatBytes, percent, plural, shortcut } from "./format";
   import type { FolderState } from "./protocol/FolderState";
   import type { NodeDetails } from "./protocol/NodeDetails";
@@ -126,7 +127,7 @@
   {:else if selection.other}
     <h2>Small items</h2>
     {#if details}
-      <p class="path selectable">in {details.path}</p>
+      <p class="path selectable">in <PathText path={details.path} /></p>
     {/if}
     {#if other}
       <dl>
@@ -150,7 +151,7 @@
     </div>
   {:else if details}
     <h2>{details.name}</h2>
-    <p class="path selectable">{details.path}</p>
+    <p class="path selectable"><PathText path={details.path} /></p>
     <dl>
       <dt>Size</dt>
       <dd title={sizeTitle(details.logical, details.allocated)}>
