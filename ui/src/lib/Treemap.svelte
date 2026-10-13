@@ -2,6 +2,7 @@
   // Canvas treemap. Pulls a layout from the backend whenever its inputs
   // change; at most one request is in flight, and changes that arrive
   // meanwhile are folded into one follow-up request (natural backpressure).
+  import { announce } from "./announce.svelte";
   import { nodeDetails, requestLayout } from "./api";
   import {
     depthColor,
@@ -11,7 +12,7 @@
     typeColor,
     type ColorMode,
   } from "./colors";
-  import { formatBytes, formatCount, percent, plural } from "./format";
+  import { formatBytes, formatCount, percent, plural, shortcut } from "./format";
   import {
     decodeLayout,
     FILE_TYPES,
@@ -83,6 +84,7 @@
     onmenu,
   }: Props = $props();
 
+  const helpId = $props.id();
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
   let width = $state(0);
@@ -530,6 +532,36 @@
     });
   }
 
+  /** Says what rectangle `i` is: "name, size, 12% of parent, folder". */
+  function announceAt(i: number) {
+    const l = layout;
+    if (!l) return;
+    const size = formatBytes(l.weight[i]!);
+    const share = shareOfParent(l, i);
+    const say = (name: string, kind: string) =>
+      announce([name, size, share, kind].filter(Boolean).join(", "));
+    const kind = l.kind[i];
+    if (kind === KIND_OTHER) {
+      say(plural(l.items[i]!, "small item"), "merged");
+      return;
+    }
+    const what = kind === KIND_FOLDER ? "folder" : "file";
+    const name = l.labels.get(i);
+    if (name !== undefined) {
+      say(name, what);
+      return;
+    }
+    // Small tiles carry no label; ask for the name.
+    const node = l.node[i]!;
+    const gen = generation;
+    nodeDetails(gen, node).then(
+      (d) => {
+        if (selection?.node === node && !selection.other && generation === gen) say(d.name, what);
+      },
+      () => {},
+    );
+  }
+
   /** Selects every file and folder drawn directly in the view. */
   function selectAll() {
     const l = layout;
@@ -586,12 +618,18 @@
     const move = moves[e.key];
     if (move && !e.altKey) {
       const i = neighbour(move[0], move[1]);
-      if (i >= 0) onpick(only(i));
+      if (i >= 0) {
+        onpick(only(i));
+        keyTip = true;
+        hover = null;
+        announceAt(i);
+      }
     } else if (e.key === "Enter") {
       open(selection);
     } else if (e.key === "Backspace" || (e.key === "ArrowUp" && e.altKey)) {
       onup();
     } else if (e.key === "Escape") {
+      keyTip = false;
       onpick(null);
     } else if (e.key.toLowerCase() === "a" && toggles(e)) {
       selectAll();
@@ -723,14 +761,22 @@
   bind:this={container}
   tabindex="0"
   role="application"
-  aria-label="Treemap. Arrow keys move the selection, Ctrl+click or Shift+click selects several items, Enter opens a folder, Backspace goes up, Delete moves the selection to the trash once deleting is allowed, Shift+F10 shows actions, Escape clears the selection."
+  aria-label="Treemap"
+  aria-describedby={helpId}
   onmousemove={onMove}
   onmouseleave={onLeave}
   onclick={onClick}
   ondblclick={onDblClick}
   oncontextmenu={onContextMenu}
   onkeydown={onKey}
+  onblur={() => (keyTip = false)}
 >
+  <p id={helpId} class="sr-only">
+    Arrow keys move the selection. {shortcut("Ctrl")}+click or Shift+click selects several items,
+    and {shortcut("Ctrl+A")} selects everything in view. Enter opens a folder, Backspace goes up.
+    Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
+    actions. Escape clears the selection.
+  </p>
   <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px" aria-hidden="true"
   ></canvas>
   {#if tooltip && tipPosition}
