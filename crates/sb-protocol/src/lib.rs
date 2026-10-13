@@ -194,7 +194,8 @@ pub struct NodeDetails {
     pub cloud: bool,
     pub hardlinked: bool,
     /// A file's last-modified time in seconds since the Unix epoch; `None`
-    /// for folders and when the filesystem didn't say.
+    /// for folders, when the filesystem didn't say, and for times before
+    /// 1970 or after 2106, which the scan doesn't keep exactly.
     #[ts(type = "number | null")]
     pub modified: Option<u64>,
     /// For a hard-link alias, the path that owns the allocation.

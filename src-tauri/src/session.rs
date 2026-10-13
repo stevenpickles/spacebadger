@@ -522,7 +522,12 @@ impl Session {
             files: u64::from(tree.file_count(n)),
             cloud: node_flags & flags::CLOUD != 0,
             hardlinked: node_flags & flags::HARDLINKED != 0,
-            modified: tree.modified(n).map(u64::from),
+            // 1 and u32::MAX stand for any time before 1970 or after 2106,
+            // which would show as a misleading exact date.
+            modified: tree
+                .modified(n)
+                .filter(|&s| s != 1 && s != u32::MAX)
+                .map(u64::from),
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
@@ -825,6 +830,61 @@ mod tests {
         assert_eq!((t.year(), t.month(), t.day()), (2024, 6, 30));
         assert_eq!((t.hour(), t.minute()), (0, 0));
         assert_eq!(local_midnight(2024, 2, 30), None);
+    }
+
+    #[test]
+    fn details_give_modified_times_except_clamped_ones() {
+        let tmp = fixture_named("modified");
+        let set = |name: &str, time| {
+            std::fs::File::options()
+                .write(true)
+                .open(tmp.0.join(name))
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        set(
+            "keep.txt",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        // Before 1970; filesystems without such times make the test moot.
+        let ancient = SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(86_400 * 3_650));
+        if let Some(ancient) = ancient {
+            set(&format!("old{}b.log", std::path::MAIN_SEPARATOR), ancient);
+        }
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (keep, b) = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let old = child(&tree, NodeId::ROOT, "old");
+            (
+                child(&tree, NodeId::ROOT, "keep.txt").index() as u32,
+                child(&tree, old, "b.log").index() as u32,
+            )
+        };
+        assert_eq!(
+            session.details(keep, None).unwrap().modified,
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            session.details(0, None).unwrap().modified,
+            None,
+            "folders have none"
+        );
+        let stored = std::fs::metadata(tmp.0.join("old").join("b.log"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        if stored < SystemTime::UNIX_EPOCH {
+            assert_eq!(session.details(b, None).unwrap().modified, None);
+        }
     }
 
     #[test]

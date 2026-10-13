@@ -379,7 +379,8 @@ impl Tree {
     }
 
     /// A file's last-modified time in seconds since the Unix epoch, or
-    /// `None` when unknown (and for folders). See [`epoch_seconds`].
+    /// `None` when unknown (and for folders). Any time before 1970 reads as
+    /// 1 and any after early 2106 as `u32::MAX`; see [`epoch_seconds`].
     pub fn modified(&self, node: NodeId) -> Option<u32> {
         let secs = self.modified[node.index()];
         (secs != 0).then_some(secs)
