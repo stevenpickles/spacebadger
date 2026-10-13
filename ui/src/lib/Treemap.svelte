@@ -309,39 +309,73 @@
       ctx.restore();
     }
 
-    if (selected.size > 0) {
-      // Selected items are tinted, with everything drawn inside them.
+    // Selection: a light accent tint (labels stay readable) under an accent
+    // frame edged in dark and light, so it can't pass for a blue depth fill.
+    const ink = dark ? p.textLight : p.textDark;
+    const paper = dark ? p.textDark : p.textLight;
+    const tint = dark ? 0.24 : 0.18;
+    const si = selectedIndex(l, selection);
+    const pickedAt = (i: number) =>
+      l.kind[i] === KIND_OTHER ? i === si : selected.has(l.node[i]!);
+
+    for (let i = 0; i < l.count; i++) {
+      // Small-items regions are never in `selected`; they count as picked
+      // while they hold the focus.
+      if (!pickedAt(i)) continue;
+      const x = l.x[i]!;
+      const y = l.y[i]!;
+      const w = l.w[i]!;
+      const h = l.h[i]!;
+      ctx.globalAlpha = tint;
       ctx.fillStyle = p.accent;
-      ctx.strokeStyle = p.accent;
-      ctx.lineWidth = 2;
-      for (let i = 0; i < l.count; i++) {
-        if (l.kind[i] === KIND_OTHER || !selected.has(l.node[i]!)) continue;
-        ctx.globalAlpha = dark ? 0.38 : 0.3;
-        ctx.fillRect(l.x[i]!, l.y[i]!, l.w[i]!, l.h[i]!);
-        ctx.globalAlpha = 1;
-        if (l.w[i]! > 4 && l.h[i]! > 4) {
-          ctx.strokeRect(l.x[i]! + 1, l.y[i]! + 1, l.w[i]! - 2, l.h[i]! - 2);
-        }
+      ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = 1;
+      if (w > 8 && h > 8) {
+        band(ctx, x, y, w, h, 0, 1, ink);
+        band(ctx, x, y, w, h, 1, 2, p.accent);
+        band(ctx, x, y, w, h, 3, 1, paper);
+      } else if (w > 2 && h > 2) {
+        band(ctx, x, y, w, h, 0, 1, p.accent);
       }
     }
 
+    // Hover stays a faint hairline.
     const hi = hover ? hover.index : -1;
     if (hi >= 0 && hi < l.count) {
-      ctx.strokeStyle = dark ? p.textLight : p.textDark;
       ctx.globalAlpha = 0.6;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(l.x[hi]! + 0.5, l.y[hi]! + 0.5, l.w[hi]! - 1, l.h[hi]! - 1);
+      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 1, ink);
       ctx.globalAlpha = 1;
     }
-    const si = selectedIndex(l, selection);
+
+    // The focused item: a heavy dark-and-light ring, keeping the accent
+    // inside it when the item is also picked.
     if (si >= 0) {
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = dark ? p.textLight : p.textDark;
-      ctx.strokeRect(l.x[si]! + 1.5, l.y[si]! + 1.5, Math.max(0, l.w[si]! - 3), Math.max(0, l.h[si]! - 3));
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = dark ? p.textDark : p.textLight;
-      ctx.strokeRect(l.x[si]! + 3.5, l.y[si]! + 3.5, Math.max(0, l.w[si]! - 7), Math.max(0, l.h[si]! - 7));
+      const x = l.x[si]!;
+      const y = l.y[si]!;
+      const w = l.w[si]!;
+      const h = l.h[si]!;
+      band(ctx, x, y, w, h, 0, 3, ink);
+      band(ctx, x, y, w, h, 3, 1, paper);
+      if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
     }
+  }
+
+  /** Strokes a band `width` px wide, `inset` px inside the rectangle. */
+  function band(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    inset: number,
+    width: number,
+    color: string,
+  ) {
+    const o = inset + width / 2;
+    if (w <= 2 * o || h <= 2 * o) return;
+    ctx.lineWidth = width;
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x + o, y + o, w - 2 * o, h - 2 * o);
   }
 
   let frame = 0;
