@@ -3,9 +3,8 @@
 //! This is the one place SpaceBadger reads what's inside files, and only
 //! when the user asks. Candidates come from the scan tree: files of at
 //! least a minimum size that share their size with another candidate.
-//! A hard-linked file counts once, by its first name, since deleting one
-//! name frees nothing, and cloud files are left out so nothing is
-//! downloaded.
+//! A hard-linked file counts once, since deleting one of its names frees
+//! nothing, and cloud files are left out so nothing is downloaded.
 //!
 //! Each size group is split by a hash of the first and last 64 KiB of its
 //! files (the whole file when that's all there is), and what's left is
@@ -124,17 +123,24 @@ impl Plan {
 pub fn plan(tree: &Tree, folder: NodeId, filter: Option<&Search>, min_size: u64) -> Plan {
     let (files, _empty) = layout::files_under(tree, folder, Metric::Logical, filter);
     let min_size = min_size.max(1);
-    // A hard-linked file counts once, by the name the scan found first.
-    // Its other names are left out: where that first name is a candidate
-    // it stands for them, and where it isn't (outside the folder, or not
-    // matching), deleting another name would free nothing anyway.
-    let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
+    // A hard-linked file counts once, by one of its names among the
+    // candidates: the name the scan found first if it's one of them, else
+    // the first other name that is. Two names of one file are never a
+    // group, since deleting one frees nothing.
+    let mut names: HashMap<NodeId, NodeId> = HashMap::new();
     for f in files {
-        let size = tree.logical(f);
-        if size < min_size || tree.is_removed(f) || tree.flags(f) & flags::HARDLINK_ALIAS != 0 {
+        if tree.logical(f) < min_size || tree.is_removed(f) {
             continue;
         }
-        by_size.entry(size).or_default().push(f);
+        let file = tree.alias_owner(f).unwrap_or(f);
+        let name = names.entry(file).or_insert(f);
+        if f == file {
+            *name = f;
+        }
+    }
+    let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
+    for f in names.into_values() {
+        by_size.entry(tree.logical(f)).or_default().push(f);
     }
     let mut plan = Plan::default();
     for (size, mut files) in by_size {
@@ -760,12 +766,15 @@ mod tests {
             "one name stands for the file"
         );
 
-        // An alias whose first name isn't a candidate frees nothing either.
+        // Where the first name is filtered out, another name stands for the
+        // file, so the separate copy still has its partner.
         let mut search = Search::new(Matcher::new("!owner").unwrap());
         search.catch_up(&f.tree, usize::MAX);
         assert_eq!(search.totals(NodeId::ROOT).files, 2);
         let plan = plan(&f.tree, NodeId::ROOT, Some(&search), 0);
-        assert!(plan.groups.is_empty(), "alias and copy are no group");
+        assert_eq!(plan.groups.len(), 1);
+        let nodes: Vec<_> = plan.groups[0].files.iter().map(|c| c.node).collect();
+        assert_eq!(nodes, [alias, copy]);
     }
 
     #[test]
