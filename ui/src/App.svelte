@@ -385,10 +385,12 @@
     if (!target || gen === null || exporting) return;
     exporting = { rows: null };
     exported = null;
-    const unlisten = onExportProgress((p) => {
-      if (p.generation === gen && exporting) exporting = { rows: p.rows };
-    });
+    // Listening before asking, so even a small export's progress is seen.
+    let unlisten: (() => void) | undefined;
     try {
+      unlisten = await onExportProgress((p) => {
+        if (p.generation === gen && exporting) exporting = { rows: p.rows };
+      });
       const report = await exportSave({
         generation: gen,
         folder: target.node,
@@ -411,8 +413,14 @@
       problem = `Couldn't export: ${errorText(e)}`;
     } finally {
       exporting = null;
-      void unlisten.then((f) => f());
+      unlisten?.();
     }
+  }
+
+  /** Where focus goes when the export dialog closes and the control that
+   * opened it is gone or disabled. */
+  function focusMap() {
+    document.querySelector<HTMLElement>(".map .treemap")?.focus();
   }
 
   function showExport() {
@@ -1276,9 +1284,11 @@
       filter={search?.query ?? null}
       onexport={runExport}
       oncancel={() => (exportOf = null)}
+      fallbackFocus={focusMap}
     />
   {/if}
-  {#if exporting || exported}
+  <!-- Progress shows once the file is chosen, not while the save dialog is open. -->
+  {#if exporting ? exporting.rows !== null : exported}
     <ExportToast
       rows={exporting?.rows ?? null}
       report={exporting ? null : exported}

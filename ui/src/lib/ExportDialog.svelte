@@ -48,9 +48,12 @@
     filter: string | null;
     onexport: (choice: ExportChoice) => void;
     oncancel: () => void;
+    /** Takes the focus on closing when the control that opened the dialog
+     * is gone or disabled, as the Export button is while exporting. */
+    fallbackFocus?: () => void;
   }
 
-  let { folderName, filter, onexport, oncancel }: Props = $props();
+  let { folderName, filter, onexport, oncancel, fallbackFocus }: Props = $props();
 
   const id = $props.id();
 
@@ -83,7 +86,11 @@
     first?.focus();
     return () => {
       gone = true;
-      returnFocus?.focus();
+      // After the update that closed the dialog, which may disable the opener.
+      requestAnimationFrame(() => {
+        if (returnFocus?.isConnected && !returnFocus.matches(":disabled")) returnFocus.focus();
+        else fallbackFocus?.();
+      });
     };
   });
 
