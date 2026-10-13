@@ -4,6 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { DuplicatesList } from "./protocol/DuplicatesList";
+import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
+import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
@@ -145,4 +148,34 @@ export function errorText(e: unknown): string {
 /** Folder names or extensions in the scan, for the filter's completion. */
 export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
   return invoke<Suggestion[]>("filter_suggest", { request });
+}
+
+/** Must match `sb_protocol::DUPLICATES_STATUS_EVENT`. */
+const DUPLICATES_STATUS_EVENT = "duplicates-status";
+
+/**
+ * Starts looking for files with the same contents under a folder, replacing
+ * any search already running. This reads the files (never cloud files);
+ * progress arrives through `onDuplicatesStatus`. Rejects while scanning.
+ */
+export function duplicatesStart(request: DuplicatesRequest): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_start", { request });
+}
+
+export function duplicatesStatus(generation: number, job: number): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_status", { generation, job });
+}
+
+/** The groups of duplicates found so far, most reclaimable space first. */
+export function duplicatesList(generation: number, job: number): Promise<DuplicatesList> {
+  return invoke<DuplicatesList>("duplicates_list", { generation, job });
+}
+
+/** Stops reading; the groups found so far stay. */
+export function duplicatesCancel(generation: number, job: number): Promise<void> {
+  return invoke("duplicates_cancel", { generation, job });
+}
+
+export function onDuplicatesStatus(handler: (status: DuplicatesStatus) => void): Promise<UnlistenFn> {
+  return listen<DuplicatesStatus>(DUPLICATES_STATUS_EVENT, (event) => handler(event.payload));
 }
