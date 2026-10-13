@@ -76,8 +76,8 @@ const DIR: Keyword = { text: "dir:", describe: "files inside folders with this n
 const IS: Keyword = { text: "is:", describe: "files of a type: video, image, document…" };
 /** Keywords that narrow by size or age, each with a short example. */
 const RESTRICTIONS: Keyword[] = [
-  { text: "size:", describe: "by size: size:>1GB, size:10MB..1GB" },
-  { text: "older:", describe: "modified before: older:1y, older:2024-01-01" },
+  { text: "size:", describe: "by size: size:>1GB" },
+  { text: "older:", describe: "modified before: older:1y" },
   { text: "newer:", describe: "modified since: newer:30d" },
 ];
 
