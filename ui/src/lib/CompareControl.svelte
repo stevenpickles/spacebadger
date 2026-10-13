@@ -2,7 +2,7 @@
   // The toolbar's "Compare…" control: lists the earlier scans of this
   // folder (saved when each scan completed), newest first, and turns
   // comparing with one on or off.
-  import { formatDelta, formatWhen } from "./compare";
+  import { formatDay, formatDelta, formatWhen } from "./compare";
   import { formatBytes, plural } from "./format";
   import type { SnapshotInfo } from "./protocol/SnapshotInfo";
 
@@ -21,6 +21,19 @@
   let { snapshots, current, now, busy, onchoose, onstop }: Props = $props();
 
   const listId = $props.id();
+
+  /** Each scan's time, with seconds where two would otherwise read alike. */
+  const labels = $derived.by(() => {
+    const plain = snapshots.map((s) => formatWhen(s.createdMs));
+    return snapshots.map((s, i) =>
+      plain.indexOf(plain[i]!) !== plain.lastIndexOf(plain[i]!) ? formatWhen(s.createdMs, true) : plain[i]!,
+    );
+  });
+  const currentWhen = $derived.by(() => {
+    if (!current) return "";
+    const i = snapshots.findIndex((s) => s.id === current.id);
+    return i >= 0 ? labels[i]! : formatWhen(current.createdMs);
+  });
   let open = $state(false);
   let root: HTMLDivElement;
 
@@ -52,10 +65,12 @@
     aria-expanded={open}
     aria-controls={listId}
     disabled={busy}
-    title="Compare this scan with an earlier scan of the same folder: what grew, shrank, or is new"
+    title={current
+      ? `Comparing with the scan of ${currentWhen}. Choose another earlier scan`
+      : "Compare this scan with an earlier scan of the same folder: what grew, shrank, or is new"}
     onclick={() => (open = !open)}
   >
-    {#if busy}Comparing…{:else if current}Since {formatWhen(current.createdMs)}{:else}Compare…{/if}
+    {#if busy}Comparing…{:else if current}Since {formatDay(current.createdMs)}{:else}Compare…{/if}
   </button>
   {#if current}
     <button type="button" class="icon-button" aria-label="Stop comparing" title="Stop comparing" onclick={onstop}
@@ -66,10 +81,10 @@
     <div class="popover" id={listId} role="group" aria-label="Earlier scans">
       <p class="muted small">Compare with an earlier scan of this folder:</p>
       <ul>
-        {#each snapshots as s (s.id)}
+        {#each snapshots as s, i (s.id)}
           <li>
             <button type="button" class="pick" class:chosen={s.id === current?.id} onclick={() => choose(s)}>
-              <span class="when">{formatWhen(s.createdMs)}</span>
+              <span class="when">{labels[i]}</span>
               <span class="muted small">
                 {formatBytes(s.logical)} in {plural(s.files, "file")} · {formatDelta(s.logical, now)} since
               </span>

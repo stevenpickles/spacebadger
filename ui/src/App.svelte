@@ -201,6 +201,9 @@
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
     if (generation !== null && next <= generation) return;
+    // Rescanning the same folder goes on comparing with the same earlier
+    // scan once the new one completes.
+    carried = comparison && status ? { snapshot: comparison.snapshot, root: status.root } : null;
     generation = next;
     status = null;
     view = ROOT;
@@ -295,7 +298,22 @@
     );
   });
 
-  async function startComparison(s: SnapshotInfo) {
+  /** The comparison to take up again after a rescan of the same folder. */
+  let carried: { snapshot: SnapshotInfo; root: string } | null = null;
+
+  $effect(() => {
+    const gen = generation;
+    if (gen === null || !completed || !status) return;
+    const root = status.root;
+    untrack(() => {
+      const c = carried;
+      carried = null;
+      // Quietly: the earlier scan may have been pruned meanwhile.
+      if (c && c.root === root) void startComparison(c.snapshot, true);
+    });
+  });
+
+  async function startComparison(s: SnapshotInfo, again = false) {
     const gen = generation;
     if (gen === null || comparing) return;
     comparing = true;
@@ -305,10 +323,10 @@
       comparison = summary;
       if (colors !== "change") colorsBefore = colors;
       colors = "change";
-      tab = "changes";
+      if (!again) tab = "changes";
       announce(`Comparing with the scan of ${formatWhen(s.createdMs)}`);
     } catch (e) {
-      problem = `Couldn't compare: ${errorText(e)}`;
+      if (!again) problem = `Couldn't compare: ${errorText(e)}`;
     } finally {
       comparing = false;
     }
@@ -1149,7 +1167,7 @@
             {/if}
           </div>
         {/if}
-        <Legend mode={colors} {since} />
+        <Legend mode={colors} {since} filtered={search !== null} />
       {/if}
     </main>
     <aside>
@@ -1245,6 +1263,7 @@
                 selected={pickedSet}
                 {anchor}
                 onpick={pick}
+                onclear={() => pick(null)}
                 ondelete={askDelete}
                 onopen={openFolder}
                 onshow={(node, parent) => showInMap({ node, parent })}
