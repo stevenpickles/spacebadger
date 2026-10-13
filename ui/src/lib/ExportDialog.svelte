@@ -23,9 +23,11 @@
   }
 
   /** The name the save dialog suggests, e.g. SpaceBadger-Downloads-2026-10-13.csv.
-   * A drive such as C:\ gives "C". */
+   * The scan root's name is its full path, so only the last part is used;
+   * a drive such as C:\ gives "C". */
   export function exportFileName(folder: string, format: ExportFormat, d = new Date()): string {
-    const safe = folder
+    const last = folder.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    const safe = last
       .replace(UNSAFE, "-")
       .replace(/^[\s.-]+|[\s.-]+$/g, "")
       .slice(0, 80);
