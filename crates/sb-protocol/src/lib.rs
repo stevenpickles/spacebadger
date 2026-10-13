@@ -197,6 +197,20 @@ pub struct NodeDetails {
     pub alias_of: Option<String>,
     /// From the scan root down to and including this node.
     pub ancestors: Vec<Crumb>,
+    /// What a filter matches at or under this node, when the request named
+    /// the current search.
+    pub matching: Option<Matching>,
+}
+
+/// Files matching a filter at or under a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Matching {
+    #[ts(type = "number")]
+    pub files: u64,
+    #[ts(type = "number")]
+    pub logical: u64,
 }
 
 /// Totals for the files matching a filename search, across the whole scan.

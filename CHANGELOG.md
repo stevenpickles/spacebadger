@@ -4,6 +4,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+- With a filter on, a folder's details (selected or in view) show what matches there: matching size and share, how many of its files match, and the whole folder's size.
 - Filter: `is:video`, `is:image`, `is:document`, and the other file-type categories match files by type, and `!is:` leaves a type out. The filter suggests keywords, types, folder names after `dir:`, and extensions after `*.` from the scan as you type.
 - Sizes read KB, MB, and GB, counted as the system's file manager counts them (1,024 bytes per KB on Windows, 1,000 on macOS and Linux). With nothing selected, the details describe the folder in view. Show in Explorer/Finder opens a folder instead of selecting it in its parent; files are still only shown selected.
 - Filter: a `dir:` prefix matches folder names, so `dir:cache` finds the files inside folders named like `cache`, and `!dir:node_modules` leaves those folders out. Combined with file patterns, folder patterns narrow where they apply.
