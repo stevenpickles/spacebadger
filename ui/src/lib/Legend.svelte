@@ -27,9 +27,10 @@
 
   function read(): boolean {
     try {
-      return localStorage.getItem(STORE_KEY) === "1";
+      // Folded until opened once, so it doesn't cover the map by default.
+      return localStorage.getItem(STORE_KEY) !== "0";
     } catch {
-      return false;
+      return true;
     }
   }
 
