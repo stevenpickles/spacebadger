@@ -165,12 +165,37 @@ impl FsAdapter for UnixFs {
     }
 }
 
-/// Opens a file to read its contents for finding duplicates. Without a
-/// portable `O_NOFOLLOW`, the path is checked to be a plain file before
-/// opening and the opened file checked to be that same file after, so a
+/// `open` flags for finding duplicates: `O_NOFOLLOW` refuses a link and
+/// `O_NONBLOCK` keeps a FIFO from blocking, with the values macOS and the
+/// BSDs share; other systems rely on the checks in [`open_contents`] alone.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+mod open_flags {
+    pub const NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
+    pub const ELOOP: i32 = 62;
+}
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+mod open_flags {
+    pub const NOFOLLOW_NONBLOCK: i32 = 0;
+    pub const ELOOP: i32 = -1;
+}
+
+/// Opens a file to read its contents for finding duplicates. The path must
+/// be a plain file of the scanned size before opening, the open refuses a
+/// link and never blocks, and the opened file must be that same file, so a
 /// link is never read through. Dataless (cloud-only) files are refused, and
 /// this process never materializes them anyway (see `open_root`).
 pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    use std::os::unix::fs::OpenOptionsExt;
     let before = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
     if is_cloud(&before) {
         return Err(Skip::Cloud);
@@ -178,7 +203,14 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     if !before.is_file() || before.size() != len {
         return Err(Skip::Changed);
     }
-    let file = std::fs::File::open(path).map_err(|e| Skip::of(&e))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(open_flags::NOFOLLOW_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(code) if code == open_flags::ELOOP => Skip::Changed,
+            _ => Skip::of(&e),
+        })?;
     let meta = file.metadata().map_err(|e| Skip::of(&e))?;
     if is_cloud(&meta) {
         return Err(Skip::Cloud);
