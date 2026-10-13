@@ -784,7 +784,7 @@
         <div class="filter-help">
           <button
             type="button"
-            class="icon-button"
+            class="icon-button help"
             aria-label="Filter syntax"
             aria-expanded={showFilterHelp}
             onclick={() => (showFilterHelp = !showFilterHelp)}>?</button

@@ -100,7 +100,8 @@
   }
   dl {
     display: grid;
-    grid-template-columns: max-content 1fr;
+    /* The same first column in every group, so descriptions line up. */
+    grid-template-columns: minmax(0, 15em) 1fr;
     gap: 4px 16px;
     margin: 0;
   }
