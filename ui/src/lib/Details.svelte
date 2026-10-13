@@ -27,6 +27,10 @@
     deleteBlocked: string | null;
     /** Size of the selected item's parent folder, for "n% of parent folder". */
     parentSize?: number | null;
+    /** The folder the map shows, described when nothing is selected. */
+    viewed?: NodeDetails | null;
+    /** Size of the viewed folder's parent. */
+    viewedParentSize?: number | null;
     /** The multi-selection totals are being recounted; `multi` is stale. */
     updating?: boolean;
     /** Loading the selected item's details failed. */
@@ -51,6 +55,8 @@
     canDelete,
     deleteBlocked,
     parentSize = null,
+    viewed = null,
+    viewedParentSize = null,
     updating = false,
     error = null,
     onretry,
@@ -92,7 +98,56 @@
   </div>
 {/snippet}
 
-<section class="details" aria-label="Selected item">
+{#snippet item(d: NodeDetails, parent: number | null)}
+  <h2>{d.name}</h2>
+  <!-- The scan root's name is already its path. -->
+  {#if d.path !== d.name}
+    <p class="path selectable"><PathText path={d.path} /></p>
+  {/if}
+  <dl>
+    <dt>Size</dt>
+    <dd title={sizeTitle(d.logical, d.allocated)}>
+      {formatBytes(d.logical)}
+      {#if parent !== null && parent > 0}
+        <span class="muted">· {percent(d.logical, parent)} of parent folder</span>
+      {/if}
+    </dd>
+    <dt>Type</dt>
+    <dd>{d.folder ? "Folder" : "File"}</dd>
+    {#if d.folder}
+      <dt>Files</dt>
+      <dd>{d.files.toLocaleString()}</dd>
+      <dt>Status</dt>
+      <dd>{folderStates[d.folder]}</dd>
+    {/if}
+  </dl>
+  {#if d.cloud}
+    <p class="note">Cloud file: only the part stored on this device takes up space.</p>
+  {/if}
+  {#if d.aliasOf}
+    <p class="note">Hard link: its size is counted once, at {d.aliasOf}.</p>
+  {:else if d.hardlinked}
+    <p class="note">Hard-linked: its size is counted here, once.</p>
+  {/if}
+  <div class="actions">
+    {#if d.folder && d.node !== view}
+      <button type="button" onclick={() => onopen(d.node)}>Open folder in map</button>
+    {/if}
+    <button type="button" onclick={() => onreveal(d.node)}>Show in {fileManager}</button>
+    <button type="button" onclick={() => oncopy(d.node)}>Copy path</button>
+  </div>
+  {#if d.node === ROOT}
+    <p class="muted small reason">This is the scanned folder itself, so it can't be moved to the {trashName} from here.</p>
+  {:else if d.node === view}
+    <p class="muted small reason">
+      This is the folder you're viewing. Go up a level to move it to the {trashName}.
+    </p>
+  {:else}
+    {@render deleteAction(`Move to the ${trashName}…`)}
+  {/if}
+{/snippet}
+
+<section class="details" aria-label={selection || multi ? "Selected item" : "Folder in view"}>
   {#if multi && multi.items > 1}
     <h2>{plural(multi.items, "item")} selected</h2>
     {#if updating}
@@ -116,6 +171,12 @@
       </div>
     {/if}
     {@render deleteAction(`Move ${plural(multi.items, "item")} to the ${trashName}…`)}
+  {:else if !selection && viewed}
+    <p class="eyebrow">Viewing</p>
+    {@render item(viewed, viewedParentSize)}
+    <p class="muted small hint">
+      Click an item in the map for its details; {ctrl}+click or Shift+click selects several.
+    </p>
   {:else if !selection}
     <h2>Nothing selected</h2>
     <ul class="muted small tips">
@@ -150,49 +211,7 @@
       <button type="button" onclick={() => onreveal(selection.node)}>Show folder in {fileManager}</button>
     </div>
   {:else if details}
-    <h2>{details.name}</h2>
-    <p class="path selectable"><PathText path={details.path} /></p>
-    <dl>
-      <dt>Size</dt>
-      <dd title={sizeTitle(details.logical, details.allocated)}>
-        {formatBytes(details.logical)}
-        {#if parentSize !== null && parentSize > 0}
-          <span class="muted">· {percent(details.logical, parentSize)} of parent folder</span>
-        {/if}
-      </dd>
-      <dt>Type</dt>
-      <dd>{details.folder ? "Folder" : "File"}</dd>
-      {#if details.folder}
-        <dt>Files</dt>
-        <dd>{details.files.toLocaleString()}</dd>
-        <dt>Status</dt>
-        <dd>{folderStates[details.folder]}</dd>
-      {/if}
-    </dl>
-    {#if details.cloud}
-      <p class="note">Cloud file: only the part stored on this device takes up space.</p>
-    {/if}
-    {#if details.aliasOf}
-      <p class="note">Hard link: its size is counted once, at {details.aliasOf}.</p>
-    {:else if details.hardlinked}
-      <p class="note">Hard-linked: its size is counted here, once.</p>
-    {/if}
-    <div class="actions">
-      {#if details.folder && details.node !== view}
-        <button type="button" onclick={() => onopen(details.node)}>Open folder in map</button>
-      {/if}
-      <button type="button" onclick={() => onreveal(details.node)}>Show in {fileManager}</button>
-      <button type="button" onclick={() => oncopy(details.node)}>Copy path</button>
-    </div>
-    {#if details.node === ROOT}
-      <p class="muted small reason">This is the scanned folder itself, so it can't be moved to the {trashName} from here.</p>
-    {:else if details.node === view}
-      <p class="muted small reason">
-        This is the folder you're viewing. Go up a level to move it to the {trashName}.
-      </p>
-    {:else}
-      {@render deleteAction(`Move to the ${trashName}…`)}
-    {/if}
+    {@render item(details, parentSize)}
   {:else if error}
     <p class="error selectable">Couldn't load details: {error}</p>
     {#if onretry}
@@ -250,6 +269,17 @@
   }
   .samples {
     margin: 0 0 var(--space-2);
+  }
+  .eyebrow {
+    margin: 0 0 2px;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .hint {
+    margin: var(--space-3) 0 0;
   }
   .tips {
     margin: 0;
