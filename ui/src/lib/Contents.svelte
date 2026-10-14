@@ -21,12 +21,13 @@
   // time as they scroll into view; the list refetches what's visible when
   // the scan changes, and starts over for a new folder, filter, or mode.
   //
-  // Rankings move as the scan goes on, so pages fetched at different times
-  // can overlap or leave gaps. The rows shown are one set, bound to the
-  // revision it was fetched for: a newer revision refetches every visible
-  // page together and replaces the set whole, one refresh at a time with
-  // only the newest waiting, and replies for a set that's been replaced
-  // are dropped.
+  // Rankings move as the scan goes on, so pages ranked at different
+  // revisions can overlap or leave gaps. The rows shown are one set, bound
+  // to the revision its pages were ranked at (each page says): a page of
+  // another revision is never added to it. A newer revision refetches the
+  // loaded pages together and replaces the set whole, one refresh at a time
+  // with only the newest waiting, and replies for a set that's been
+  // replaced are dropped.
   import { onDestroy, tick, untrack } from "svelte";
   import { errorText, folderFiles, smallItems } from "./api";
   import { exactBytes, formatBytes, percent, plural } from "./format";
@@ -101,6 +102,8 @@
     offset: number;
     total: number;
     empty: number;
+    /** The scan revision the page was ranked at. */
+    revision: number;
     rows: ContentsRow[];
   }
 
@@ -125,19 +128,22 @@
    * supersedes replies for the one before, and teardown drops them all. */
   const sets = latest();
   /** The set rows are added to as they scroll into view, and the revision
-   * it belongs to; `null` before the first. */
-  let shownSet = $state.raw<{ ticket: Ticket; revision: number } | null>(null);
+   * its pages were ranked at, `null` until the first arrives; `null` before
+   * the first set. */
+  let shownSet = $state.raw<{ ticket: Ticket; revision: number | null } | null>(null);
   /** Pages of the shown set fetched or on their way. */
   let loaded = new Set<number>();
-  /** A refresh is fetching the next set; pages wait for it. */
-  let refreshing = $state(false);
-  const refreshes = new Coalescer();
+  /** The refresh fetching the next set, if any; pages of the shown set
+   * wait for it, unless a fresh start has superseded it. */
+  let refreshing = $state.raw<Ticket | null>(null);
+  let refreshes = new Coalescer();
   onDestroy(() => refreshes.dispose());
 
-  /** Everything that decides which rows a set holds and in what order. A
-   * reply that says which revision it ranked can be checked against it
-   * with `sets.accepts`. */
-  const setKey = (rev: number) => queryKey(generation, folder, search, folders, rev);
+  /** Refreshes fetch this many pages at a time. */
+  const PARALLEL = 4;
+  /** Times a refresh asks again when the visible pages came back ranked
+   * at different revisions. */
+  const ATTEMPTS = 3;
 
   /** The pages covering the visible rows. */
   function visiblePages(): number[] {
@@ -157,24 +163,35 @@
     empty = 0;
     error = null;
     revealed = false;
-    const rev = untrack(() => revision);
-    refreshes.clear();
+    // A refresh of the old set may never settle; it mustn't hold this one up.
+    refreshes.dispose();
+    refreshes = new Coalescer();
     loaded = new Set();
-    shownSet = { ticket: sets.begin(setKey(rev)), revision: rev };
+    shownSet = { ticket: sets.begin(key), revision: null };
     list?.reset();
   });
 
   // Fetch the pages of the shown set that come into view.
   $effect(() => {
     const set = shownSet;
+    const blocked = refreshing;
     void attempt;
-    if (!set || refreshing) return;
+    if (!set || (blocked && sets.current(blocked))) return;
     for (const p of visiblePages()) {
       if (loaded.has(p)) continue;
       loaded.add(p);
       fetchPage(p * PAGE).then(
         (page) => {
-          if (sets.current(set.ticket)) addPage(page);
+          if (!sets.current(set.ticket)) return;
+          if (set.revision === null) set.revision = page.revision;
+          if (page.revision === set.revision) {
+            addPage(page);
+            return;
+          }
+          // Ranked at another revision: not part of this set. A newer
+          // one means the set is behind, so refresh it.
+          loaded.delete(p);
+          if (page.revision > set.revision) refreshes.run(refresh);
         },
         (e: unknown) => {
           if (!sets.current(set.ticket)) return;
@@ -207,37 +224,56 @@
     if (at >= 0) void tick().then(() => list?.scrollToRow(at));
   }
 
-  // A newer revision refetches what's visible as one set.
+  // A newer revision refetches the set.
   $effect(() => {
     const rev = revision;
     const set = untrack(() => shownSet);
-    if (!set || set.revision === rev) return;
+    if (!set || set.revision === null || set.revision >= rev) return;
     // The refresh reads what it needs when it starts; nothing it reads
     // should rerun this.
     untrack(() => refreshes.run(refresh));
   });
 
-  /** Pages a refresh fetches at most besides the visible ones. */
-  const KEEP_PAGES = 10;
+  /** Fetches `pages`, a few at a time, each with its page number. */
+  async function fetchPages(pages: number[]): Promise<(Page & { number: number })[]> {
+    const got: (Page & { number: number })[] = [];
+    for (let i = 0; i < pages.length; i += PARALLEL) {
+      const batch = pages.slice(i, i + PARALLEL);
+      const replies = await Promise.all(batch.map((p) => fetchPage(p * PAGE)));
+      replies.forEach((page, k) => got.push({ ...page, number: batch[k]! }));
+    }
+    return got;
+  }
 
-  /** Fetches the visible pages for the newest revision and replaces the
-   * rows with them, all at once. Pages loaded earlier come along while
-   * there are few, so ranges and Select all still reach them; otherwise
-   * rows out of view are dropped and fetched again when they come into
-   * view. */
+  /**
+   * Fetches the loaded pages again and replaces the rows with them, all at
+   * once, so ranges and Select all still reach every row seen and the
+   * Shift anchor stays. The visible pages come first and must agree on a
+   * revision, which becomes the set's; other pages ranked at another
+   * revision (the scan moved on meanwhile) are left out and fetched again
+   * when they come into view.
+   */
   async function refresh() {
-    const rev = revision;
-    if (shownSet?.revision === rev) return;
-    const ticket = sets.begin(setKey(rev));
-    const visible = visiblePages();
-    const pages = loaded.size <= KEEP_PAGES ? [...new Set([...loaded, ...visible])].sort((a, b) => a - b) : visible;
-    refreshing = true;
+    const before = shownSet;
+    if (!before || before.revision === null) return;
+    const ticket = sets.begin(shown);
+    refreshing = ticket;
     try {
-      const got = await Promise.all(pages.map((p) => fetchPage(p * PAGE)));
+      let visible = visiblePages();
+      let seen: (Page & { number: number })[] = [];
+      for (let n = 0; n < ATTEMPTS; n++) {
+        visible = visiblePages();
+        seen = await fetchPages(visible);
+        if (!sets.current(ticket)) return;
+        if (new Set(seen.map((pg) => pg.revision)).size <= 1) break;
+      }
+      const newest = Math.max(before.revision, ...seen.map((pg) => pg.revision));
+      const others = await fetchPages([...loaded].filter((p) => !visible.includes(p)).sort((a, b) => a - b));
       if (!sets.current(ticket)) return;
+      const kept = [...seen, ...others].filter((pg) => pg.revision === newest);
       const next = new Map<number, ContentsRow>();
-      for (const page of got) page.rows.forEach((r, i) => next.set(page.offset + i, r));
-      const end = got[got.length - 1];
+      for (const page of kept) page.rows.forEach((r, i) => next.set(page.offset + i, r));
+      const end = kept[kept.length - 1];
       if (end) {
         for (const i of next.keys()) if (i >= end.total) next.delete(i);
         total = end.total;
@@ -246,17 +282,15 @@
       rows = next;
       error = null;
       revealOnce();
-      loaded = new Set(pages);
-      shownSet = { ticket, revision: rev };
+      loaded = new Set(kept.map((pg) => pg.number));
+      shownSet = { ticket, revision: newest };
     } catch (e) {
       if (!sets.current(ticket)) return;
-      // The rows shown stay as they were; pages coming into view are
-      // fetched for the new revision.
+      // The rows shown stay, and so does the revision they belong to.
       error = errorText(e);
-      loaded = new Set();
-      shownSet = { ticket, revision: rev };
+      shownSet = { ticket, revision: before.revision };
     } finally {
-      refreshing = false;
+      if (refreshing === ticket) refreshing = null;
     }
   }
 
