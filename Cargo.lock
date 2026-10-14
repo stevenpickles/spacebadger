@@ -2898,6 +2898,7 @@ version = "0.2.0"
 dependencies = [
  "sb-core",
  "sb-protocol",
+ "sb-scan",
  "windows",
 ]
 
