@@ -27,9 +27,9 @@ use sb_scan::Progress;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError, Weak};
 use std::time::Duration;
 
-/// Nodes the job examines per hold of the locks, about 1 ms: the longest a
-/// request waits for it.
-const CATCH_UP_STEP: usize = 25_000;
+/// Nodes the job examines per hold of the locks, about 0.4 ms (40 ns a
+/// node): the longest a request should wait for it.
+const CATCH_UP_STEP: usize = 10_000;
 
 /// How long the job waits before trying again while requests read the search.
 const BUSY_RETRY: Duration = Duration::from_millis(1);
