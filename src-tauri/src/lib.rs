@@ -10,6 +10,7 @@ mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
 mod identity;
+mod metrics;
 #[cfg(windows)]
 mod recycle_windows;
 mod session;
@@ -17,7 +18,8 @@ mod snapshots;
 
 use sb_protocol::{
     AppInfo, DUPLICATES_RECHECK_EVENT, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest,
-    DuplicatesCheck, DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
     FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
     SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
@@ -145,7 +147,9 @@ async fn scan_status(state: State<'_, AppState>) -> Result<Option<ScanStatus>, S
 #[tauri::command]
 async fn layout(state: State<'_, AppState>, request: LayoutRequest) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    Ok(Response::new(session.layout(&request)?))
+    Ok(Response::new(metrics::run("layout", || {
+        session.layout(&request)
+    })?))
 }
 
 /// Details of a scanned item; with `search`, also what that filter matches
@@ -157,7 +161,8 @@ async fn node_details(
     node: u32,
     search: Option<u32>,
 ) -> Result<NodeDetails, String> {
-    state.session(generation)?.details(node, search)
+    let session = state.session(generation)?;
+    metrics::run("node_details", || session.details(node, search))
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.
@@ -170,9 +175,7 @@ async fn search_set(
     query: String,
 ) -> Result<Option<SearchSummary>, String> {
     let session = state.session(generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.search_set(&query))
-        .await
-        .map_err(|e| e.to_string())?
+    metrics::blocking("search_set", move || session.search_set(&query)).await?
 }
 
 #[tauri::command]
@@ -181,7 +184,8 @@ async fn search_summary(
     generation: u64,
     search: u32,
 ) -> Result<SearchSummary, String> {
-    state.session(generation)?.search_summary(search)
+    let session = state.session(generation)?;
+    metrics::run("search_summary", || session.search_summary(search))
 }
 
 #[tauri::command]
@@ -189,7 +193,8 @@ async fn search_results(
     state: State<'_, AppState>,
     request: SearchResultsRequest,
 ) -> Result<SearchPage, String> {
-    state.session(request.generation)?.search_results(&request)
+    let session = state.session(request.generation)?;
+    metrics::run("search_results", || session.search_results(&request))
 }
 
 /// The largest files anywhere under a folder. Ranking a large folder takes a
@@ -200,9 +205,7 @@ async fn folder_files(
     request: FolderFilesRequest,
 ) -> Result<FolderFilesPage, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.folder_files(&request))
-        .await
-        .map_err(|e| e.to_string())?
+    metrics::blocking("folder_files", move || session.folder_files(&request)).await?
 }
 
 /// Folder names or extensions from the scan for the filter's completion.
@@ -214,9 +217,7 @@ async fn filter_suggest(
     request: SuggestRequest,
 ) -> Result<Vec<Suggestion>, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.suggest(&request))
-        .await
-        .map_err(|e| e.to_string())?
+    metrics::blocking("filter_suggest", move || session.suggest(&request)).await?
 }
 
 /// The files and folders merged into an "other small items" region.
@@ -225,7 +226,8 @@ async fn small_items(
     state: State<'_, AppState>,
     request: SmallItemsRequest,
 ) -> Result<SmallItemsPage, String> {
-    state.session(request.generation)?.small_items(&request)
+    let session = state.session(request.generation)?;
+    metrics::run("small_items", || session.small_items(&request))
 }
 
 /// Capacity and free space of the scanned volume; `None` where unavailable.
@@ -247,7 +249,8 @@ async fn selection_summary(
     state: State<'_, AppState>,
     request: SelectionRequest,
 ) -> Result<SelectionSummary, String> {
-    state.session(request.generation)?.selection(&request.nodes)
+    let session = state.session(request.generation)?;
+    metrics::run("selection_summary", || session.selection(&request.nodes))
 }
 
 /// Starts looking for duplicate files under a folder, the one command that
@@ -279,8 +282,8 @@ async fn duplicates_status(
     state.session(generation)?.duplicates_status(job)
 }
 
-/// The groups of duplicates found so far. Builds every listed path, so this
-/// runs on a blocking thread.
+/// The groups of duplicates found so far, with the first few files of each.
+/// Builds their paths, so this runs on a blocking thread.
 #[tauri::command]
 async fn duplicates_list(
     state: State<'_, AppState>,
@@ -289,6 +292,33 @@ async fn duplicates_list(
 ) -> Result<DuplicatesList, String> {
     let session = state.session(generation)?;
     tauri::async_runtime::spawn_blocking(move || session.duplicates_list(job))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// More of a group's files. The first page asked for orders the group by
+/// path, so this runs on a blocking thread.
+#[tauri::command]
+async fn duplicate_files(
+    state: State<'_, AppState>,
+    request: DuplicateFilesRequest,
+) -> Result<DuplicateFilesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicate_files(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Every file but the first of each listed group, by node, for selecting
+/// them. Orders the groups by path, so this runs on a blocking thread.
+#[tauri::command]
+async fn duplicates_extras(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicateExtras, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicates_extras(job))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -356,9 +386,10 @@ async fn compare_item(
     node: u32,
 ) -> Result<sb_protocol::ItemChange, String> {
     let session = state.session(generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.compare_item(&snapshot, node))
-        .await
-        .map_err(|e| e.to_string())?
+    metrics::blocking("compare_item", move || {
+        session.compare_item(&snapshot, node)
+    })
+    .await?
 }
 
 /// One byte per node of a drawn layout, for the "Change" colors. Runs on a
@@ -369,9 +400,7 @@ async fn change_marks(
     request: sb_protocol::ChangeMarksRequest,
 ) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    let marks = tauri::async_runtime::spawn_blocking(move || session.change_marks(&request))
-        .await
-        .map_err(|e| e.to_string())??;
+    let marks = metrics::blocking("change_marks", move || session.change_marks(&request)).await??;
     Ok(Response::new(marks))
 }
 
@@ -383,9 +412,25 @@ async fn compare_changes(
     request: sb_protocol::ChangesRequest,
 ) -> Result<sb_protocol::ChangesPage, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.changes(&request))
-        .await
-        .map_err(|e| e.to_string())?
+    metrics::blocking("compare_changes", move || session.changes(&request)).await?
+}
+
+/// Whether request timings are kept (`SPACEBADGER_TRACE` is set), so the
+/// interface keeps its own too.
+#[tauri::command]
+fn trace_enabled() -> bool {
+    metrics::enabled()
+}
+
+/// The request timings so far as a text table, then forgotten if `reset`;
+/// `None` when they aren't kept. For diagnosing slow interactions.
+#[tauri::command]
+fn trace_report(reset: bool) -> Option<String> {
+    let report = metrics::report();
+    if reset {
+        metrics::reset();
+    }
+    report
 }
 
 /// Asks first, then starts SpaceBadger again with administrator rights,
@@ -627,6 +672,8 @@ pub fn run() {
             duplicates_start,
             duplicates_status,
             duplicates_list,
+            duplicate_files,
+            duplicates_extras,
             duplicates_check,
             duplicates_cancel,
             duplicates_recheck_cancel,
@@ -637,8 +684,15 @@ pub fn run() {
             compare_set,
             compare_item,
             change_marks,
-            compare_changes
+            compare_changes,
+            trace_enabled,
+            trace_report
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running SpaceBadger");
+        .build(tauri::generate_context!())
+        .expect("error while running SpaceBadger")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                metrics::write_report();
+            }
+        });
 }

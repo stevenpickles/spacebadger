@@ -1,4 +1,5 @@
 // Decoder for the binary layout reply described in crates/sb-protocol/src/wire.rs.
+import { measure } from "./metrics";
 
 export const KIND_FILE = 0;
 export const KIND_FOLDER = 1;
@@ -60,6 +61,10 @@ export interface DecodedLayout {
 }
 
 export function decodeLayout(buffer: ArrayBuffer): DecodedLayout {
+  return measure("decode layout", () => decode(buffer));
+}
+
+function decode(buffer: ArrayBuffer): DecodedLayout {
   const v = new DataView(buffer);
   if (v.getUint32(0, true) !== MAGIC) throw new Error("not a layout reply");
   const version = v.getUint16(4, true);
