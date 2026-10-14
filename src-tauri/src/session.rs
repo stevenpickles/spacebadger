@@ -845,7 +845,11 @@ impl Session {
     pub fn selection(&self, nodes: &[u32]) -> Result<proto::SelectionSummary, String> {
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        // A large selection takes a moment to total, and another selection
+        // may have replaced it while this one waited for the tree.
+        crate::runner::check()?;
         let r = selection::resolve(&tree, nodes);
+        crate::runner::check()?;
         Ok(proto::SelectionSummary {
             generation: self.generation(),
             items: r.items.len() as u32,
