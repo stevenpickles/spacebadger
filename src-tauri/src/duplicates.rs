@@ -146,8 +146,17 @@ impl Job {
     /// The tally brought up to date: groups found since added, and every
     /// group's figures worked out again if the scan changed since.
     fn tally(&self, tree: &Tree, revision: u64) -> MutexGuard<'_, Tally> {
-        let mut tally = self.tally.lock().unwrap();
-        let new = self.found.lock().unwrap().groups[tally.entries.len()..].to_vec();
+        // A panic while the tally was held leaves it in doubt: start over,
+        // rather than failing every later status and list.
+        let mut tally = self.tally.lock().unwrap_or_else(|poisoned| {
+            let mut tally = poisoned.into_inner();
+            *tally = Tally::default();
+            self.tally.clear_poison();
+            tally
+        });
+        let new = self.found.lock().unwrap_or_else(|e| e.into_inner()).groups
+            [tally.entries.len()..]
+            .to_vec();
         if tally.revision != revision {
             tally.revision = revision;
             let mut totals = Totals::default();
@@ -166,7 +175,7 @@ impl Job {
     }
 
     fn summary(&self) -> Summary {
-        let found = self.found.lock().unwrap();
+        let found = self.found.lock().unwrap_or_else(|e| e.into_inner());
         Summary {
             skipped: found.skipped.clone(),
             version: found.version,
@@ -214,21 +223,23 @@ impl Job {
         let groups = listed
             .iter()
             .enumerate()
-            .map(|(i, &id)| {
+            .filter_map(|(i, &id)| {
                 let rest = listed.len() - i - 1;
                 let entry = &mut tally.entries[id];
-                let take = (budget - rest)
+                let take = budget
+                    .saturating_sub(rest)
                     .min(proto::DUPLICATE_GROUP_PREVIEW as usize)
                     .min(entry.live as usize);
                 budget -= take;
                 let files = entry.files(tree, 0, take);
-                proto::DuplicateGroup {
+                // Never a group without its first file to name it.
+                (!files.is_empty()).then(|| proto::DuplicateGroup {
                     id: id as u32,
                     size: entry.group.size,
                     on_disk: entry.on_disk,
                     count: entry.live,
                     files,
-                }
+                })
             })
             .collect();
         proto::DuplicatesList {
@@ -278,13 +289,19 @@ impl Job {
         for id in listed {
             let entry = &mut tally.entries[id];
             let group = Arc::clone(&entry.group);
-            let order = entry.order(tree);
-            extras.content += group.size * (order.len() as u64 - 1);
-            extras.nodes.extend(
-                order[1..]
-                    .iter()
-                    .map(|&i| group.files[i as usize].index() as u32),
-            );
+            // Files still in the scan, checked again here, so the first
+            // left is never selected.
+            let mut files = entry
+                .order(tree)
+                .iter()
+                .map(|&i| group.files[i as usize])
+                .filter(|&n| in_scan(tree, n));
+            if files.next().is_none() {
+                continue;
+            }
+            let before = extras.nodes.len();
+            extras.nodes.extend(files.map(|n| n.index() as u32));
+            extras.content += group.size * (extras.nodes.len() - before) as u64;
         }
         extras
     }
@@ -384,11 +401,13 @@ impl Entry {
     /// Up to `limit` files from `offset`, shortest path first.
     fn files(&mut self, tree: &Tree, offset: usize, limit: usize) -> Vec<proto::DuplicateFile> {
         let group = Arc::clone(&self.group);
-        let order = self.order(tree);
-        let start = offset.min(order.len());
-        let end = start.saturating_add(limit).min(order.len());
-        order[start..end]
+        // Checked again here, so a file gone since the order was worked out
+        // is never sent.
+        self.order(tree)
             .iter()
+            .filter(|&&i| in_scan(tree, group.files[i as usize]))
+            .skip(offset)
+            .take(limit)
             .map(|&i| {
                 let (n, print) = (group.files[i as usize], &group.prints[i as usize]);
                 proto::DuplicateFile {
@@ -1043,6 +1062,56 @@ mod tests {
         assert_eq!(list.groups[0].count, 2);
         // A group down to one file has no extras.
         assert_eq!(job.extras(&tree, 1).nodes, [a[2].index() as u32]);
+    }
+
+    /// A tree edited without its revision changing, as a call that read the
+    /// revision before a delete's edit would see it: nothing sent names a
+    /// file gone, no group goes out without a file, and nothing panics.
+    #[test]
+    fn a_stale_revision_never_sends_files_gone() {
+        let mut tree = Tree::new("/r");
+        let job = job();
+        let pair = files(&mut tree, NodeId::ROOT, "a", 2, 100);
+        let three = files(&mut tree, NodeId::ROOT, "b", 3, 50);
+        job.record(found(100, pair.clone()));
+        job.record(found(50, three.clone()));
+        // Orders both groups by path.
+        assert_eq!(job.extras(&tree, 0).nodes.len(), 3);
+
+        for &n in pair.iter().chain(&three[..1]) {
+            tree.remove(n);
+        }
+        let list = job.list(&tree, 0);
+        assert_eq!(list.groups.len(), 1, "the pair has no file left to name it");
+        assert_eq!(nodes(&list.groups[0].files), nodes_of(&three[1..]));
+        let page = job.files(&tree, 0, 1, 0, 10).unwrap();
+        assert_eq!(nodes(&page.files), nodes_of(&three[1..]));
+        assert!(job.files(&tree, 0, 0, 0, 10).unwrap().files.is_empty());
+        let extras = job.extras(&tree, 0);
+        assert_eq!(extras.nodes, nodes_of(&three[2..]), "the first left stays");
+        assert_eq!(extras.content, 50);
+
+        // Caught up once the revision says so.
+        let status = job.status(&tree, 1);
+        assert_eq!((status.groups, status.files), (1, 2));
+    }
+
+    #[test]
+    fn a_panic_while_tallying_starts_the_tally_over() {
+        let mut tree = Tree::new("/r");
+        let job = job();
+        job.record(found(100, files(&mut tree, NodeId::ROOT, "a", 2, 100)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = job.tally(&tree, 0);
+            panic!("failed while tallying");
+        }));
+        assert!(job.tally.is_poisoned());
+        assert_eq!(job.status(&tree, 0).groups, 1);
+        assert!(!job.tally.is_poisoned());
+    }
+
+    fn nodes_of(files: &[NodeId]) -> Vec<u32> {
+        files.iter().map(|n| n.index() as u32).collect()
     }
 
     /// One group of 200,000 identical small files found among 20,000 groups
