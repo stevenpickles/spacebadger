@@ -470,8 +470,11 @@ impl Session {
             if !fresh {
                 let tree = self.scan.tree();
                 let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+                // Read again with the tree's lock held, so the index is kept
+                // under the revision of the tree it's built from.
+                let revision = self.scan.progress().revision;
                 *names = Some(Names {
-                    revision: progress.revision,
+                    revision,
                     built: Instant::now(),
                     index: Arc::new(NameIndex::build(&tree)),
                 });
@@ -1429,6 +1432,38 @@ mod tests {
         let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["b.log", "keep.txt"]);
         assert_eq!(session.folder_files(&request).unwrap().total, 2);
+    }
+
+    #[test]
+    fn suggestions_asked_during_a_delete_are_kept_under_the_edited_revision() {
+        let tmp = fixture_named("suggest-delete");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old")
+        };
+        let request = proto::SuggestRequest {
+            generation: session.generation(),
+            kind: proto::SuggestKind::Folder,
+            typed: "lo".to_owned(),
+            limit: 10,
+        };
+        let found = during_delete(&session, old, || session.suggest(&request)).unwrap();
+        assert!(found.is_empty(), "built from the edited tree");
+        let names = session.names.lock().unwrap();
+        assert_eq!(
+            names.as_ref().unwrap().revision,
+            session.scan.progress().revision,
+            "kept under the revision of the tree it was built from"
+        );
     }
 
     #[test]
