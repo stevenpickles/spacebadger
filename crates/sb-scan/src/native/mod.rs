@@ -1,6 +1,6 @@
 //! Native filesystem adapters. [`NativeFs`] is the adapter for the current OS.
 
-use crate::duplicates::{Contents, Skip};
+use crate::duplicates::{Contents, Fingerprint, Skip};
 use crate::engine::ScanConfig;
 use std::path::Path;
 
@@ -96,13 +96,44 @@ pub struct NativeContents;
 impl Contents for NativeContents {
     type File = std::fs::File;
 
-    fn open(&self, path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    fn open(&self, path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
         #[cfg(windows)]
         return windows::open_contents(path, len);
         #[cfg(target_os = "linux")]
         return linux::open_contents(path, len);
         #[cfg(all(unix, not(target_os = "linux")))]
         return unix::open_contents(path, len);
+    }
+
+    fn fingerprint(&self, file: &std::fs::File) -> Result<Fingerprint, Skip> {
+        #[cfg(windows)]
+        return windows::fingerprint(file);
+        #[cfg(unix)]
+        return file
+            .metadata()
+            .map(|m| fingerprint(&m))
+            .map_err(|e| Skip::of(&e));
+    }
+
+    fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+        #[cfg(windows)]
+        return windows::examine_contents(path, len);
+        #[cfg(target_os = "linux")]
+        return linux::examine_contents(path, len);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        return unix::examine_contents(path, len);
+    }
+}
+
+/// A file's device and inode, length, modified time, and number of names.
+#[cfg(unix)]
+fn fingerprint(meta: &std::fs::Metadata) -> Fingerprint {
+    use std::os::unix::fs::MetadataExt;
+    Fingerprint {
+        id: Some((meta.dev(), u128::from(meta.ino()))),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        links: u32::try_from(meta.nlink()).ok(),
     }
 }
 
@@ -120,12 +151,29 @@ mod tests {
         std::fs::write(&file, b"hello").unwrap();
 
         let mut text = String::new();
-        NativeContents
-            .open(&file, 5)
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
+        let (mut opened, print) = NativeContents.open(&file, 5).unwrap();
+        opened.read_to_string(&mut text).unwrap();
         assert_eq!(text, "hello");
+        assert!(print.id.is_some() && print.modified.is_some());
+        assert_eq!((print.len, print.links), (5, Some(1)));
+        assert_eq!(NativeContents.fingerprint(&opened).unwrap(), print);
+        assert_eq!(NativeContents.examine(&file, 5).unwrap(), print);
+        drop(opened);
+        // Rewritten to the same length at another time: same file, but
+        // not unchanged.
+        let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        std::io::Write::write_all(&mut &f, b"HELLO").unwrap();
+        f.set_modified(mtime).unwrap();
+        drop(f);
+        let now = NativeContents.examine(&file, 5).unwrap();
+        assert_eq!((now.id, now.modified), (print.id, Some(mtime)));
+        assert!(!print.unchanged(&now));
+        let other = dir.join("b.bin");
+        std::fs::write(&other, b"hello").unwrap();
+        assert_ne!(NativeContents.examine(&other, 5).unwrap().id, print.id);
+        std::fs::hard_link(&other, dir.join("c.bin")).unwrap();
+        assert_eq!(NativeContents.examine(&other, 5).unwrap().links, Some(2));
         assert_eq!(NativeContents.open(&file, 4).unwrap_err(), Skip::Changed);
         assert_eq!(
             NativeContents.open(&dir.join("gone"), 5).unwrap_err(),

@@ -12,7 +12,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
-use crate::duplicates::Skip;
+use crate::duplicates::{Fingerprint, Skip};
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
@@ -300,7 +300,7 @@ pub fn is_privileged() -> bool {
 /// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
 /// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
 /// blocking; anything but a plain file of the scanned size is refused.
-pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
     let flags =
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
     // `O_NOATIME` spares the disk a write per file read, but only the
@@ -318,7 +318,17 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     if !meta.is_file() || meta.len() != len {
         return Err(Skip::Changed);
     }
-    Ok(file)
+    Ok((file, super::fingerprint(&meta)))
+}
+
+/// The fingerprint of the file at `path`, without opening it: a plain file
+/// of `len` bytes, not a link.
+pub fn examine_contents(path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(super::fingerprint(&meta))
 }
 
 #[cfg(test)]
