@@ -29,6 +29,10 @@ export interface Ticket {
   readonly lane: Lane;
 }
 
+// Lane keys start with a prefix of this page load, so after the webview
+// reloads, requests of the old page still in the backend never share a lane
+// with (and supersede or outrank) the new page's.
+const page = Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join("");
 let lanes = 0;
 
 /**
@@ -36,7 +40,7 @@ let lanes = 0;
  * tooltip: each `next()` supersedes the requests asked with earlier ones.
  */
 export class Lanes {
-  readonly #key = `lane${++lanes}`;
+  readonly #key = `${page}-lane${++lanes}`;
   #seq = 0;
 
   next(): Lane {
@@ -55,7 +59,7 @@ export function queryKey(...parts: (string | number | boolean | null | undefined
 
 export class Latest {
   /** Lanes for `run` (numbered by identity) and `begin` (by ticket). */
-  readonly #lane = `latest${++lanes}`;
+  readonly #lane = `${page}-latest${++lanes}`;
   #disposed = false;
   /** The identity asked about; `null` when nothing is. */
   #key: string | null = null;
