@@ -237,6 +237,20 @@ impl Session {
         self.deleting.try_lock().is_err()
     }
 
+    /// Has `emit` called when the filter catches up after requests were
+    /// answered from it as of an earlier status and the scan has gone quiet
+    /// (see `Filter::on_caught_up`), so the interface can ask again.
+    pub fn on_filter_updated(&self, emit: impl Fn(proto::FilterUpdated) + Send + Sync + 'static) {
+        let generation = self.generation();
+        self.filter.on_caught_up(move |search, revision| {
+            emit(proto::FilterUpdated {
+                generation,
+                search,
+                revision,
+            })
+        });
+    }
+
     pub fn generation(&self) -> u64 {
         self.scan.generation()
     }
