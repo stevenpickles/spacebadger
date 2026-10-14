@@ -18,6 +18,7 @@ Posted moves are followed by a `mouseleave` when the real cursor isn't over the 
 
 ## Results
 
+
 | Case | Measure | Before | After |
 |---|---|---|---|
 | Within one tile | Whole-map draws per move | 1 (64 of 64; 111 of 111) | 0 (0 of 110) |
@@ -30,22 +31,31 @@ Posted moves are followed by a `mouseleave` when the real cursor isn't over the 
 | | `measureText` calls | 416 | 416 |
 | Selection clicks | Whole-map draws | 10 | 10 |
 
+The "after" column was measured with the highlight on its own canvas. After review it became an element instead (below), which moves without any canvas drawing at all; the overlay then counts hovered-tile changes instead of hover-layer draws.
+
 ### Label cache: tried and dropped
 
-Caching text widths and fitted labels (keyed by font, text, and room) cut `measureText` calls to 0 per draw once warm, but the label pass stayed at p50 1.1–1.2 ms against 1.2–1.4 ms without it: `fillText` and clipping dominate, not measuring. With no measurable gain, it was removed. Hover no longer redraws labels at all, so they are drawn only on layout, selection, color, theme, and size changes.
+Caching text widths and fitted labels (keyed by font, text, and room) cut `measureText` calls to 0 per draw once warm, but the label pass stayed at p50 1.1–1.2 ms against 1.2–1.4 ms without it: `fillText` and clipping dominate, not measuring. With no measurable gain, it was removed. Hover no longer redraws labels at all, so they are drawn only on layout, selection, color, theme, size, and pixel-ratio changes.
 
 ## What changed
 
 - **Hovered tile apart from pointer position.** `hoverIndex` (which tile) and `pointer` (where, for the tooltip) are separate state. A move within one tile only moves the tooltip.
-- **Three stacked canvases.** The bottom one has tiles and selection tints and frames; the middle one only the hover highlight; the top one the focus ring and labels. That keeps the drawing order of the single canvas (selection, hover, focus ring, labels), so layered they composite the same. A change of hovered tile clears and redraws only the middle canvas. Both are drawn in one animation frame, each only when its inputs changed.
-- The canvases sit in one wrapper that is dimmed while another view loads, so the dimming applies to the composite as before.
+- **Two canvases with the highlight between them.** The bottom canvas has tiles and selection tints and frames; the top one the focus ring and labels. Between them, two absolutely positioned elements at the hovered tile's rectangle draw the highlight: a translucent fill and a 2px border in the ink color. That keeps the single canvas's drawing order (selection, hover, focus ring, labels). A change of hovered tile only moves the elements. A first version used a third full-size canvas for the highlight; the elements save that canvas (up to about 33 MB on a 4K screen).
+- The layers sit in one wrapper that is dimmed while another view loads, so the dimming applies to the composite as before.
+- **A new layout under a resting pointer** (scan refresh, resize, navigation) is hit-tested again at the pointer's last position, so the highlight and tooltip show the tile now under it. Before, they kept the old index, which named another tile (seen after a resize: the tooltip named `f12db0c.msp` with the pointer on `da45da.msi`). Keyboard moves and the context menu forget the position, as they clear the hover.
+- **Device pixel ratio changes** (moving the window to a monitor with other scaling) redraw the canvases at the new ratio: a `(resolution: Xdppx)` media query for the current ratio is watched and replaced each time it changes.
 
 ## Visual check
 
-Screenshots of the same states before and after, compared pixel by pixel over the map: a selected tile with another hovered, the selected tile hovered (focus ring and label above the highlight), a keyboard move with its tooltip, a folder opened by double-click, and the window resized afterwards. Every difference is a channel value off by 1 (compositing rounding: 94 to 2,164 pixels per screenshot), except in the resized case's status bar, which shows the scan time. Click, double-click, and context-menu hit testing, Ctrl/Shift selection, and keyboard handling weren't touched: they still read the layout through `hitTest` and the selection props.
+Screenshots of the same states before and after, compared pixel by pixel over the map: a selected tile with another hovered, the selected tile hovered (focus ring and label above the highlight), a keyboard move with its tooltip, a folder opened by double-click, and the window resized afterwards.
+
+- With the third canvas, every difference was a channel value off by 1 (compositing rounding).
+- With the highlight as elements (screen now at 150%), the selection, focus ring, labels, and tooltip still differ by at most 1. The highlight's edges differ by up to one device pixel: at a fractional device position the canvas spread the 2px border over four device pixels with soft edges, and the element draws it as three solid ones.
+
+Click, double-click, and context-menu hit testing, Ctrl/Shift selection, and keyboard handling weren't touched: they still read the layout through `hitTest` and the selection props.
 
 ## Limits
 
-- The two extra canvases cost memory: each is the map's size at the device pixel ratio (about 10 MB each here), mostly transparent.
+- The top canvas costs memory: the map's size at the device pixel ratio (about 10 MB here), mostly transparent.
 - A whole-map draw (layout, selection, colors, theme, size) still costs the same; most of it is filling tiles.
-- The dark theme wasn't switched in the real app, to avoid changing the system setting; the palette, which the theme sets, is an input of both layers' redraws.
+- The dark theme and a pixel-ratio change weren't tried in the real app: the first would change the system setting, and only one monitor was available. The palette, which the theme sets, feeds the canvas redraw and the highlight's colors.

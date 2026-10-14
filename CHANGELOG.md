@@ -26,7 +26,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Exports and snapshots are written to a new file of their own, then renamed into place once complete: a failed export leaves the chosen file as it was, and no other file beside it is ever overwritten or written through a link. Only the file the app wrote can be put in place, even if another program swaps the temporary file for its own (on macOS and Linux, drives and shares without Unix permissions, such as USB sticks, SMB, and NTFS, only get a last-moment check that it is still the same file). Snapshots saved at the same moment, even by two copies of the app, never overwrite one another: each gets its own id, and the usual retention still applies. If the app is closed or crashes mid-export, a hidden `.<name>.….partial` file (on macOS and Linux, a folder holding it) may be left beside the chosen one; it can be deleted. When the file can't be replaced, the message says it may be open in another program or read-only.
 
 ### Map
-- Moving the pointer over the map no longer redraws it: within one tile only the tooltip moves, and entering another tile redraws just the hover highlight.
+- Moving the pointer over the map no longer redraws it: within one tile only the tooltip moves, and entering another tile just moves the hover highlight.
+- When the map changes under a resting pointer (a rescan, resize, or another folder), the highlight and tooltip show the tile now under it, not another one.
+- The map is redrawn sharp after moving the window to a monitor with different scaling.
 
 ### Toolbar
 - The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
