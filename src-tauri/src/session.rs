@@ -194,8 +194,6 @@ impl Session {
 
     /// Computes and encodes the treemap for one request.
     pub fn layout(&self, req: &proto::LayoutRequest) -> Result<Vec<u8>, String> {
-        let progress = self.scan.progress();
-        let finished = progress.state.is_finished();
         let metric = metric(req.metric);
         let params = LayoutParams::new(
             req.width.clamp(0.0, 16_384.0),
@@ -204,6 +202,10 @@ impl Session {
         let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        // Read with the tree's lock held, so the revision sent describes the
+        // tree laid out (see `with_duplicates`).
+        let progress = self.scan.progress();
+        let finished = progress.state.is_finished();
         let view = node(&tree, req.view)?;
         // While scanning, keep sibling order stable; once finished, sort afresh.
         let result = match req.search {
