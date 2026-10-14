@@ -138,7 +138,7 @@
   let perfText = $state("");
 
   /** Paint tracing: on with the overlay, or with `localStorage.sbTrace = "1"`
-   * or `?sbTrace` in the URL. Off, it costs a branch per label. */
+   * or `?sbTrace` in the URL. Off, it costs a branch per measured text. */
   const traceFlag = (() => {
     try {
       return localStorage.getItem("sbTrace") === "1" || new URLSearchParams(location.search).has("sbTrace");
