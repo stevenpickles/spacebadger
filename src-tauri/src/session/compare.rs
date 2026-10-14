@@ -10,8 +10,26 @@ use sb_core::tree::{NodeId, Tree};
 use sb_protocol as proto;
 use sb_scan::ScanState;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, TryLockError, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The error of a quick comparison query (an item's change, the map's
+/// change marks) while another request matches the comparison again after
+/// a delete. Rather than hold a worker of the query runner for as long as
+/// that takes, it gives up; the delete announces its change once the
+/// comparison is matched, and the interface asks again then.
+pub const UPDATING: &str = "The comparison is being updated.";
+
+/// How a request waits while another matches the comparison again.
+#[derive(Clone, Copy, PartialEq)]
+enum Wait {
+    /// Gives up with [`UPDATING`] (quick queries).
+    No,
+    /// Waits, giving up if superseded (lists, which have to answer).
+    Cooperatively,
+    /// Waits (the delete matching it before announcing its change).
+    Blocking,
+}
 
 /// Saves a snapshot of the scan once it completes, on its own thread so
 /// neither the scanner nor the interface waits for the disk.
@@ -200,7 +218,7 @@ impl Session {
     pub fn compare_item(&self, snapshot: &str, id: u32) -> Result<proto::ItemChange, String> {
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let cur = self.current(snapshot, &tree)?;
+        let cur = self.current(snapshot, &tree, Wait::No)?;
         let n = node(&tree, id)?;
         let change = cur.comparison.change(&tree, &cur.snapshot, n);
         Ok(proto::ItemChange {
@@ -219,7 +237,7 @@ impl Session {
         use proto::change_mark as mark;
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let cur = self.current(&req.snapshot, &tree)?;
+        let cur = self.current(&req.snapshot, &tree, Wait::No)?;
         Ok(req
             .nodes
             .iter()
@@ -252,7 +270,7 @@ impl Session {
     pub fn changes(&self, req: &proto::ChangesRequest) -> Result<proto::ChangesPage, String> {
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let cur = self.current(&req.snapshot, &tree)?;
+        let cur = self.current(&req.snapshot, &tree, Wait::Cooperatively)?;
         let folder = node(&tree, req.folder)?;
         let cached = {
             let compare = self
@@ -348,18 +366,33 @@ impl Session {
     /// The comparison with snapshot `id`, matched against `tree` (read
     /// locked by the caller). When the tree changed since (items deleted),
     /// it's matched again without holding the comparison's lock, so other
-    /// requests aren't kept waiting, and swapped in.
-    fn current(&self, id: &str, tree: &Tree) -> Result<Current, String> {
+    /// requests aren't kept waiting, and swapped in. Requests asking
+    /// meanwhile wait as `wait` says.
+    fn current(&self, id: &str, tree: &Tree, wait: Wait) -> Result<Current, String> {
         let revision = self.scan.progress().revision;
         if let Some(current) = self.matched_for(id, revision)? {
             return Ok(current);
         }
         // One request matches again; others asking meanwhile wait for it
-        // and use its result.
-        let _one = self
-            .rematching
-            .lock()
-            .map_err(|_| "comparing is unavailable")?;
+        // and use its result, or give up.
+        let _one = loop {
+            let taken = match wait {
+                Wait::Blocking => self.rematching.lock().map_err(|_| ()),
+                _ => match self.rematching.try_lock() {
+                    Ok(one) => Ok(one),
+                    Err(TryLockError::Poisoned(_)) => Err(()),
+                    Err(TryLockError::WouldBlock) if wait == Wait::No => {
+                        return Err(UPDATING.to_owned());
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        crate::runner::check()?;
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                },
+            };
+            break taken.map_err(|()| "comparing is unavailable")?;
+        };
         if let Some(current) = self.matched_for(id, revision)? {
             return Ok(current);
         }
@@ -407,7 +440,7 @@ impl Session {
         let tree = self.scan.tree();
         if let Ok(tree) = locked("tree", || tree.read()) {
             // Gone means comparing was turned off meanwhile.
-            let _ = self.current(&id, &tree);
+            let _ = self.current(&id, &tree, Wait::Blocking);
         }
     }
 
@@ -602,7 +635,7 @@ mod tests {
         );
 
         // After a delete, the scan is matched again (once, by whichever
-        // request comes first).
+        // request comes first); quick queries asking meanwhile don't wait.
         let logs = find(&second, "logs");
         second
             .scan
@@ -614,10 +647,47 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        assert!(results.iter().any(Result::is_ok));
         for c in results {
-            let c = c.unwrap();
-            assert_eq!((c.kind, c.after), (proto::ChangeKind::Shrunk, 0));
+            match c {
+                Ok(c) => assert_eq!((c.kind, c.after), (proto::ChangeKind::Shrunk, 0)),
+                Err(e) => assert_eq!(e, UPDATING),
+            }
         }
+        let c = second.compare_item(&id, logs).unwrap();
+        assert_eq!((c.kind, c.after), (proto::ChangeKind::Shrunk, 0));
+
+        // While another request matches it again, quick queries give up at
+        // once, and lists wait unless superseded.
+        let tiny = NodeId::from_index(find(&second, "tiny.txt"));
+        let (_, progress) = second.scan.edit_finished(|t| t.remove(tiny)).unwrap();
+        {
+            let _matching = second.rematching.lock().unwrap();
+            assert_eq!(second.compare_item(&id, logs).unwrap_err(), UPDATING);
+            let marks = second.change_marks(&proto::ChangeMarksRequest {
+                generation: second.generation(),
+                snapshot: id.clone(),
+                nodes: vec![logs],
+            });
+            assert_eq!(marks.unwrap_err(), UPDATING);
+            let changes = proto::ChangesRequest {
+                generation: second.generation(),
+                snapshot: id.clone(),
+                folder: 0,
+                files_only: false,
+                offset: 0,
+                limit: 10,
+            };
+            let stopped = crate::runner::as_superseded(|| second.changes(&changes));
+            assert_eq!(stopped.unwrap_err(), proto::SUPERSEDED);
+        }
+        second.rematch();
+        assert!(
+            second
+                .matched_for(&id, progress.revision)
+                .unwrap()
+                .is_some()
+        );
         // A delete matches it again itself, before announcing the change.
         let grows = NodeId::from_index(find(&second, "grows.txt"));
         let (_, progress) = second.scan.edit_finished(|t| t.remove(grows)).unwrap();
