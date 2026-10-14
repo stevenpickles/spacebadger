@@ -116,6 +116,9 @@ pub struct Tree {
     files: Vec<u32>,
     /// Files: last modified, in [`epoch_seconds`] form. Directories: 0.
     modified: Vec<u32>,
+    /// The filesystem object the scan found, as a [`fingerprint`]; 0 when
+    /// unknown. Lets a delete tell the scanned item from a replacement.
+    ids: Vec<u64>,
     /// Hard-link alias → owning node.
     alias_owner: HashMap<u32, u32>,
     dir_count: u64,
@@ -143,6 +146,7 @@ impl Tree {
             unknown: Vec::new(),
             files: Vec::new(),
             modified: Vec::new(),
+            ids: Vec::new(),
             alias_owner: HashMap::new(),
             dir_count: 0,
             changes: Vec::new(),
@@ -195,6 +199,7 @@ impl Tree {
         self.unknown.push(0);
         self.files.push(0);
         self.modified.push(0);
+        self.ids.push(0);
         if parent != NONE {
             let p = parent as usize;
             self.next_sibling[id as usize] = self.first_child[p];
@@ -403,6 +408,18 @@ impl Tree {
         (secs != 0).then_some(secs)
     }
 
+    /// The [`fingerprint`] of the filesystem object the scan found for
+    /// this node, or `None` when the scanner couldn't tell.
+    pub fn id(&self, node: NodeId) -> Option<u64> {
+        let id = self.ids[node.index()];
+        (id != 0).then_some(id)
+    }
+
+    /// Records the [`fingerprint`] of the node's filesystem object.
+    pub fn set_id(&mut self, node: NodeId, id: u64) {
+        self.ids[node.index()] = id;
+    }
+
     /// Files at or under this node.
     pub fn file_count(&self, node: NodeId) -> u32 {
         self.files[node.index()]
@@ -540,7 +557,7 @@ impl Tree {
 
     /// Approximate heap bytes held by the tree.
     pub fn memory_bytes(&self) -> usize {
-        let per_node = 4 * 4 + 2 + 2 + 8 * 2 + 4 * 3;
+        let per_node = 4 * 4 + 2 + 2 + 8 * 3 + 4 * 3;
         self.parent.capacity() * per_node
             + self.names.capacity()
             + self.alias_owner.capacity() * 16
@@ -560,6 +577,18 @@ pub fn epoch_seconds(time: Option<SystemTime>) -> u32 {
         Ok(since) => u32::try_from(since.as_secs()).unwrap_or(u32::MAX).max(1),
         Err(_) => 1,
     }
+}
+
+/// Eight bytes standing for a filesystem object's ID (a file ID with
+/// Windows, an inode number elsewhere), as kept per node; 0 for none. The
+/// fold is exact for IDs that fit 64 bits (NTFS, inodes); a wider ID (ReFS)
+/// keeps its low half and mixes in the rest.
+pub fn fingerprint(id: u128) -> u64 {
+    if id == 0 {
+        return 0;
+    }
+    let folded = (id as u64) ^ ((id >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    folded.max(1)
 }
 
 pub struct Children<'a> {
@@ -833,6 +862,28 @@ mod tests {
         assert_eq!(t.modified(f), Some(1_234_567_890));
         assert_eq!(t.modified(g), None);
         assert_eq!(t.modified(NodeId::ROOT), None);
+    }
+
+    #[test]
+    fn keeps_each_nodes_object_id() {
+        let mut t = Tree::new("/");
+        let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
+        let f = t.add_file(d, "f".as_ref(), sizes(1, 1), None, 0).unwrap();
+        assert_eq!((t.id(d), t.id(f)), (None, None));
+        t.set_id(f, fingerprint(42));
+        assert_eq!(t.id(f), Some(42));
+        assert_eq!(t.id(d), None);
+    }
+
+    #[test]
+    fn fingerprints_keep_64_bit_ids_exact() {
+        assert_eq!(fingerprint(0), 0);
+        assert_eq!(fingerprint(7), 7);
+        assert_eq!(fingerprint(u128::from(u64::MAX)), u64::MAX);
+        // Wider IDs differing only in the high half still differ.
+        assert_ne!(fingerprint(1 << 64 | 5), fingerprint(2 << 64 | 5));
+        assert_ne!(fingerprint(1 << 64 | 5), fingerprint(5));
+        assert_ne!(fingerprint(1 << 64), 0);
     }
 
     #[test]
