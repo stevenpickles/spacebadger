@@ -23,6 +23,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - CSV has full paths, names, sizes in bytes and as shown, file counts, file types, each item's share, and files' modified times in ISO 8601 local time. It opens correctly in Excel, non-English names included, and names that look like formulas stay text.
 - The text report lists totals, the 50 largest folders and files (with modified dates), the filter, and what wasn't counted.
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
+- Exports and snapshots are written to a new file of their own, then renamed into place once complete: a failed export leaves the chosen file as it was, and no other file beside it is ever overwritten or written through a link. If the app is closed or crashes mid-export, a hidden `.<name>.….partial` file may be left beside the chosen one; it can be deleted. When the file can't be replaced, the message says it may be open in another program or read-only.
 
 ### Toolbar
 - The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
@@ -34,6 +35,11 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
+
+### Deleting
+- Only the item that was scanned is moved to the Recycle Bin or Trash: one replaced, modified, or turned into a link since the scan, or under a folder that was replaced, is left alone and reported as changed.
+- The result says what happened to each item: moved, already gone, changed, couldn't be moved, or gone without being confirmed in the Recycle Bin (a warning). Items that were already gone are no longer counted as moved.
+- The confirmation gives the content size, and how much disk space is freed only when that can be known (not with hard links or unmeasured files).
 
 ## [0.2.0] - 2026-10-13
 

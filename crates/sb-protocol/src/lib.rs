@@ -489,6 +489,10 @@ pub struct SelectionSummary {
     pub allocated: u64,
     #[ts(type = "number")]
     pub unknown_allocation_files: u64,
+    /// Some files in the items have other hard-link names, so deleting
+    /// them may free less disk space than they're allocated (none while
+    /// another name remains).
+    pub hardlinked: bool,
     /// Entries left out because they're no longer in the scan.
     pub missing: u32,
     /// The largest items, at most [`SELECTION_SAMPLES`].
@@ -511,29 +515,58 @@ pub struct DeleteRequest {
     pub nodes: Vec<u32>,
 }
 
+/// What happened to one item a delete was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DeleteOutcome {
+    /// Moved to the Recycle Bin or Trash.
+    Recycled,
+    /// Nothing was there any more when its turn came; nothing was moved.
+    AlreadyMissing,
+    /// Not the item the scan found (replaced, modified, or now a link), so
+    /// it was left alone. A rescan shows it as it is now.
+    Changed,
+    /// Couldn't be moved; still where it was.
+    Failed,
+    /// Not confirmed in the Recycle Bin or Trash: some or all of it may
+    /// have been deleted without a copy.
+    Uncertain,
+    /// A duplicate selected itself, kept because it may be the last copy:
+    /// it changed since compared, or no copy that stays was confirmed. The
+    /// message says which.
+    Kept,
+}
+
+/// An item a delete didn't simply recycle, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct DeleteFailure {
+pub struct DeleteItem {
     pub node: u32,
     pub path: String,
+    pub outcome: DeleteOutcome,
+    /// Empty for [`DeleteOutcome::AlreadyMissing`].
     pub message: String,
 }
 
-/// What a delete did. Deleted items are removed from the scan, which moves
-/// to a new revision.
+/// What a delete did. Items no longer where they were are removed from
+/// the scan, which moves to a new revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DeleteReport {
     #[ts(type = "number")]
     pub generation: u64,
-    /// Items now gone from disk and from the scan.
-    pub deleted: Vec<u32>,
-    /// Of those, items that were already gone before the delete.
-    pub already_gone: u32,
-    pub failed: Vec<DeleteFailure>,
-    /// Totals of the deleted items, as scanned.
+    /// Items moved to the Recycle Bin or Trash.
+    pub recycled: Vec<u32>,
+    /// Items taken out of the scan: those recycled, already missing, or
+    /// uncertain with nothing left at their path.
+    pub removed: Vec<u32>,
+    /// Every item not recycled, with what happened to it, in the order
+    /// tried.
+    pub others: Vec<DeleteItem>,
+    /// Totals of the recycled items, as scanned.
     #[ts(type = "number")]
     pub files: u64,
     #[ts(type = "number")]

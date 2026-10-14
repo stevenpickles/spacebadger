@@ -845,29 +845,32 @@
 
   function afterDelete(r: DeleteReport) {
     deletions++;
-    const gone = new Set(r.deleted);
+    const gone = new Set(r.removed);
     // Leave a folder that was deleted along with the items.
     const crumbs = viewDetails?.ancestors ?? [];
     const at = crumbs.findIndex((c) => gone.has(c.node));
     if (at > 0) openFolder(crumbs[at - 1]!.node);
-    // Items that couldn't be deleted stay selected.
-    const failed = r.failed.map((f) => f.node);
-    if (failed.length > 0) {
-      pick({ focus: { node: failed[0]!, other: false }, nodes: failed, mode: "replace", keepAnchor: false });
+    // Items left where they were (changed or failed) stay selected.
+    const kept = r.others.filter((o) => !gone.has(o.node)).map((o) => o.node);
+    if (kept.length > 0) {
+      pick({ focus: { node: kept[0]!, other: false }, nodes: kept, mode: "replace", keepAnchor: false });
     } else {
       pick(null);
     }
-    const total = r.deleted.length + r.failed.length;
-    deleteResult = {
-      moved: r.deleted.length,
-      total,
-      size: r.logical,
-      failures: r.failed.map((f) => ({ path: f.path, message: f.message })),
-    };
+    const total = r.recycled.length + r.others.length;
+    deleteResult = { total, recycled: r.recycled.length, size: r.logical, others: r.others };
+    const count = (o: DeleteReport["others"][number]["outcome"]) => r.others.filter((i) => i.outcome === o).length;
+    const notes = [
+      [count("uncertain"), "not confirmed in the " + trash],
+      [count("changed"), "changed since the scan"],
+      [count("failed"), "couldn't be moved"],
+      [count("alreadyMissing"), "no longer there"],
+    ] as const;
+    const rest = notes.filter(([n]) => n > 0).map(([n, what]) => `${n} ${what}`);
     announce(
-      r.failed.length > 0
-        ? `Moved ${r.deleted.length} of ${total} items to the ${trash}; ${plural(r.failed.length, "item")} couldn't be moved`
-        : `Moved ${plural(r.deleted.length, "item")} (${formatBytes(r.logical)}) to the ${trash}`,
+      rest.length > 0
+        ? `Moved ${r.recycled.length} of ${total} items to the ${trash}; ${rest.join(", ")}`
+        : `Moved ${plural(r.recycled.length, "item")} (${formatBytes(r.logical)}) to the ${trash}`,
     );
   }
 

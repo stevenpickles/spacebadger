@@ -4,10 +4,12 @@
 //! (UI) thread. Every scan-specific request names its generation; requests
 //! for an older generation are refused so stale replies never mix scans.
 
+mod atomic_file;
 mod delete;
 mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
+mod identity;
 #[cfg(windows)]
 mod recycle_windows;
 mod session;
