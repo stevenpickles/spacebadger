@@ -351,6 +351,7 @@ impl Session {
     /// Starts filtering by `query`, replacing any earlier search; an empty
     /// query clears the filter. Examines the tree in steps and gives up early
     /// if a newer search is requested meanwhile.
+    #[cfg(test)]
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
         self.search_set_as(self.search_begin(), query)
     }
@@ -574,10 +575,14 @@ impl Session {
             let mut rankings = locked("rankings", || self.rankings.lock())
                 .map_err(|_| "rankings are unavailable")?;
             let entry = rankings.entry(key);
+            // While scanning, a ranking kept is served rather than waiting
+            // for another request's walk, so pages don't hold workers of
+            // the query runner just waiting.
             let serve_kept = entry.ranking().is_some_and(|r| {
                 r.covers(end)
                     && (r.current(&now, ranking::REFRESH)
-                        || (!now.finished && (waited || walked >= RANK_BUDGET)))
+                        || (!now.finished
+                            && (waited || walked >= RANK_BUDGET || entry.finishing())))
             });
             if serve_kept {
                 drop(search);
@@ -631,17 +636,28 @@ impl Session {
     }
 
     /// Waits while another request finishes a walk for `key`, for at most
-    /// [`RANK_WAIT`]. Takes only the rankings' lock.
+    /// [`RANK_WAIT`], giving up if this request is superseded meanwhile.
+    /// Takes only the rankings' lock.
     fn wait_for_ranking(&self, key: Key) -> Result<(), String> {
         let _wait = metrics::span("rank wait");
-        let rankings = self
+        let until = Instant::now() + RANK_WAIT;
+        let mut rankings = self
             .rankings
             .lock()
             .map_err(|_| "rankings are unavailable")?;
-        let _ = self
-            .ranked
-            .wait_timeout_while(rankings, RANK_WAIT, |r| r.finishing(key))
-            .map_err(|_| "rankings are unavailable")?;
+        while rankings.finishing(key) {
+            crate::runner::check()?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // Short slices, so a superseded page lets its worker go soon.
+            rankings = self
+                .ranked
+                .wait_timeout(rankings, left.min(Duration::from_millis(10)))
+                .map_err(|_| "rankings are unavailable")?
+                .0;
+        }
         Ok(())
     }
 
