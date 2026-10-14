@@ -2,17 +2,18 @@
 //! of entries, scanned through the real engine. Measures what a single huge
 //! listing costs: peak memory, how long the tree stays locked against
 //! readers (a thread takes the read lock every millisecond, as the interface
-//! does for layouts), and how soon a cancel is acknowledged once the
+//! does for layouts), how long each of the scanner's write-lock holds lasts
+//! as the tree grows, and how soon a cancel is acknowledged once the
 //! listing's entries are being added to the tree.
 
 use crate::{memory, mib, ms};
 use sb_scan::{
-    BATCH_ENTRIES, Entry, EntryKind, FsAdapter, Identity, Measured, NativeFs, RootKind, Scan,
-    ScanConfig, ScanError, Sink, batched,
+    BATCH_ENTRIES, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured, NativeFs, RootKind,
+    Scan, ScanConfig, ScanError, Sink, batched,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// A synthetic folder of `entries` entries at the root: files with
@@ -115,9 +116,62 @@ fn watch_readers(tree: Arc<RwLock<sb_core::tree::Tree>>, done: Arc<AtomicBool>) 
     waits
 }
 
+/// The scanner's write-lock holds, longest and 99th percentile, overall and
+/// by the tree's size when they ended (in bands doubling from 256K nodes),
+/// with the longest few.
+fn report_holds(mut holds: Vec<(Duration, usize)>) {
+    if holds.is_empty() {
+        return;
+    }
+    let summary = |holds: &mut Vec<Duration>| {
+        holds.sort();
+        let p99 = holds[((holds.len() - 1) as f64 * 0.99) as usize];
+        format!(
+            "{} holds, longest {}, p99 {}",
+            holds.len(),
+            ms(*holds.last().unwrap()),
+            ms(p99)
+        )
+    };
+    let mut all: Vec<Duration> = holds.iter().map(|h| h.0).collect();
+    println!("writes:  {}", summary(&mut all));
+    let largest = holds.iter().map(|h| h.1).max().unwrap_or(0);
+    let (mut low, mut high) = (0, 1 << 18);
+    while low <= largest {
+        let mut band: Vec<Duration> = holds
+            .iter()
+            .filter(|h| (low..high).contains(&h.1))
+            .map(|h| h.0)
+            .collect();
+        if !band.is_empty() {
+            println!(
+                "         {:>4}K-{:>4}K nodes: {}",
+                low >> 10,
+                high >> 10,
+                summary(&mut band)
+            );
+        }
+        (low, high) = (high, high * 2);
+    }
+    holds.sort_by_key(|h| std::cmp::Reverse(h.0));
+    let longest: Vec<String> = holds
+        .iter()
+        .take(5)
+        .map(|(held, nodes)| format!("{} at {}K", ms(*held), nodes >> 10))
+        .collect();
+    println!("         longest: {}", longest.join(", "));
+}
+
 fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) {
     println!("\n== {label} ==");
-    let config = ScanConfig::default();
+    let holds = Arc::new(Mutex::new(Vec::new()));
+    let config = ScanConfig {
+        write_holds: Some({
+            let holds = Arc::clone(&holds);
+            HoldProbe::new(move |held, nodes| holds.lock().unwrap().push((held, nodes)))
+        }),
+        ..ScanConfig::default()
+    };
     let before = memory::current();
     let delivered = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
@@ -161,6 +215,7 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
         ms(pct(0.99)),
         ms(pct(0.5))
     );
+    report_holds(std::mem::take(&mut *holds.lock().unwrap()));
     println!(
         "memory:  peak working set {}; grew by {} at peak; tree estimate {}",
         memory::peak().map_or("unknown".into(), mib),
@@ -178,7 +233,10 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
             inner: adapter(),
             delivered: Arc::clone(&delivered),
         },
-        config,
+        ScanConfig {
+            write_holds: None,
+            ..config
+        },
         |_| {},
     );
     while !delivered.load(Ordering::Relaxed) {
