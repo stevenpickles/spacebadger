@@ -8,7 +8,7 @@ An architecture review found that `fill` collected and sorted every child of a f
 
 Whether a child is merged depends only on its own weight: its area, weight × rect area ÷ folder weight, is below `min_area`. It doesn't depend on order, squarifying, or other siblings, so `fill` now decides it per child in one pass, summing the weight and count of the merged ones, and orders only the rest, which can't number more than the area over `min_area` (about 170,000 at 1920 × 1080, 690,000 at 4K). The comparison is the same expression as before, so the boundary case (area exactly `min_area`, drawn) is unchanged. No partial selection is needed: every child above the threshold is drawn, and the rectangle budget applies between folders, as before.
 
-The order cache remembers only the drawn children, as a sorted array of (child, rank) per folder, 8 bytes per child, and holds at most 2^20 children (8 MiB) in all, each folder's own entry counting as four. Past that it forgets the least recently used folders, down to three quarters of the limit so evictions are rare. A folder with nothing drawn on its own isn't remembered, and one with more drawn children than the whole budget is sorted afresh each time. Node IDs are never reused within a scan, and each scan and each filter has its own cache, as before.
+The order cache remembers only the drawn children, as a sorted array of (child, rank) per folder, 8 bytes per child, and holds at most 2^20 children in all, each folder's own entry (its map slot with spare capacity, and its allocation's overhead) counting as twelve. Past that it forgets the least recently used folders, down to three quarters of the limit so evictions are rare, and shrinks the map. A folder with nothing drawn on its own isn't remembered, and one costing more than half the limit (about 520,000 drawn children) is sorted afresh each time, so remembering one folder always leaves at least a quarter of the cache to the others and never evicts the view root's order. Measured at the bound (below), the cache stays under 9 MiB. Node IDs are never reused within a scan, and each scan and each filter has its own cache, as before.
 
 ## Benchmark
 
@@ -16,7 +16,7 @@ The order cache remembers only the drawn children, as a sorted array of (child, 
 cargo run --release -p sb-bench -- --lod 2000000 --lod 5000000
 ```
 
-`--lod N` builds a folder of N files of 4 KiB beside eight large files, and a synthetic mixed tree of N nodes, and lays them out at 1920 × 1080. Cache memory is measured exactly with a counting allocator: the live heap bytes added by layouts into one cache, with the layouts themselves dropped. "2,001 views" lays out the root and then the 2,000 folders with the most children into one cache, as a user browsing would. Two runs each, alternating before and after; ranges where they differ.
+`--lod N` builds a folder of N files of 4 KiB beside eight large files, and a synthetic mixed tree of N nodes, and lays them out at 1920 × 1080. Cache memory is measured exactly with a counting allocator: the live heap bytes added by layouts into one cache, with the layouts themselves dropped. "2,001 views" lays out the root and then the 2,000 folders with the most children into one cache, as a user browsing would. "Full cache" lays out each of many folders as a view into one cache, past its bound: folders of one file each, where folder entries dominate, and folders of 500 files. The counting allocator is the bench's global allocator, but counts only once this case starts, so other cases' threads don't contend on it. Two runs each, alternating before and after; ranges where they differ.
 
 | Case | Measure | Before | After |
 |---|---|---|---|
@@ -33,13 +33,24 @@ cargo run --release -p sb-bench -- --lod 2000000 --lod 5000000
 | | Order cache after one layout | 7 MiB | 163 KiB (4,086 children) |
 | | 2,001 views | 161–187 ms, cache 27 MiB | 44–64 ms, cache 6 MiB (746,225 children) |
 
+At the bound (after only):
+
+| Case | Held at the end | Most held at any point |
+|---|---|---|
+| 1M folders of 1 file | 5 MiB (72,364 children) | 9 MiB |
+| 2,000 folders of 500 files | 8 MiB (1,000,000 children) | 8 MiB |
+| 2.5M folders of 1 file | 5 MiB (80,080 children) | 9 MiB |
+| 5,000 folders of 500 files | 7 MiB (961,000 children) | 8 MiB |
+
+The most held includes the eviction's own working list.
+
 What remains per layout is reading each child's weight once; for the 5M folder that's the 8 ms above.
 
 ## Same output
 
 `crates/sb-core/src/layout.rs` keeps the previous implementation as a test-only reference (`tests::reference`) and compares whole layouts, every rectangle's position, size, flags, weight, and count, for equality:
 
-- `final_layouts_match_the_reference`: 40 random trees, each with nested folders in every state (pending, failed, not scanned, listed, partly read), cloud and hard-linked flags, unknown allocations, zero sizes, many ties, and wide folders of 2,000–5,000 equal files; each with no filter and five filters (patterns, exclusions, `dir:`, size, and one matching nothing), both metrics, and random views and parameters (including empty and tiny views, `min_area` of 0 to 300, and budgets that truncate). For each, a fresh stable layout and two final layouts must match. A final layout sorts afresh, so it is identical by construction: filtering a sorted list keeps its order.
+- `final_and_fresh_layouts_match_the_reference`: 40 random trees, each with nested folders in every state (pending, failed, not scanned, listed, partly read), cloud and hard-linked flags, unknown allocations, zero sizes, many ties, and wide folders of 2,000–5,000 equal files; each with no filter and five filters (patterns, exclusions, `dir:`, size, and one matching nothing), both metrics, and random views and parameters (including empty and tiny views, `min_area` of 0 to 300, and budgets that truncate). For each, a fresh stable layout and two final layouts must match. A final layout sorts afresh, so it is identical by construction: filtering a sorted list keeps its order.
 - `stable_layouts_match_the_reference_when_every_child_is_drawn`: 30 random trees grown step by step, as a scan does, with stable layouts in between and a final one at the end, must match at every step when no child is small.
 - `a_child_of_exactly_the_minimum_area_is_drawn_as_before` and `a_wide_folder_of_equal_files_orders_only_what_is_drawn` (200,000 equal files: identical output, and the cache holds the root's two children).
 
@@ -55,3 +66,4 @@ While scanning, the reorder hysteresis used to compare every sibling, drawn or n
 
 - `small_children` (the list of merged items in the details) still sorts all of a folder's children, but only when asked, for one folder.
 - Each layout still reads every child's weight in each folder it fills; a folder of 5M files costs about 8 ms.
+- A folder drawing more than about 520,000 children of its own (possible only in a view of over 6 million CSS pixels filled with equal minimum-size items) isn't remembered, so its order isn't kept stable while scanning. Before, it was remembered, at the cost of the rest of the cache.
