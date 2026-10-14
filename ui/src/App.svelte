@@ -1191,14 +1191,6 @@
             title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
           >
         {/if}
-        <button
-          type="button"
-          disabled={scanning}
-          title={scanning
-            ? duplicatesBlocked
-            : "Look for files with the same contents in the folder in view, matching the filter if one is on. This reads the files; cloud files are skipped."}
-          onclick={() => findDuplicates(view)}>Find duplicates</button
-        >
         {#if snapshots.length > 0 || comparison}
           <CompareControl
             {snapshots}
@@ -1354,12 +1346,21 @@
           >
         </span>
       {/if}
-      <!-- Beside the path of the folder it exports; the toolbar is full at
-           1280 px. -->
+      <!-- Actions on the folder in the map sit beside its path; the toolbar
+           is full at 1280 px. -->
       <button
         type="button"
-        class="export"
+        class="folder-action"
         class:alone={!filterError && !search}
+        disabled={scanning}
+        title={scanning
+          ? duplicatesBlocked
+          : "Look for files with the same contents in the folder in the map, matching the filter if one is on. This reads the files; cloud files are skipped."}
+        onclick={() => findDuplicates(view)}>Find duplicates</button
+      >
+      <button
+        type="button"
+        class="folder-action"
         disabled={exporting !== null}
         title="Save the folder in the map as a CSV file or a text report"
         onclick={() => askExport(view)}>Export…</button
@@ -1786,13 +1787,13 @@
     min-height: 28px;
     border-bottom: 1px solid var(--line);
   }
-  .crumbs .export {
+  .crumbs .folder-action {
     flex: none;
     margin-left: var(--space-2);
     padding: 1px 8px;
     font-size: var(--fs-sm);
   }
-  .crumbs .export.alone {
+  .crumbs .folder-action.alone {
     margin-left: auto;
   }
   .filtered {

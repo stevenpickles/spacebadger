@@ -24,8 +24,11 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The text report lists totals, the 50 largest folders and files (with modified dates), the filter, and what wasn't counted.
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
 
+### Toolbar
+- The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
+
 ### Duplicates
-- Find duplicates, in the toolbar or a folder's menu, finds files with the same contents in the folder in view, among the files the filter matches: `is:video` then Find duplicates finds duplicate videos. It's the only feature that reads file contents, and only when asked. Cloud files are never read, so nothing is downloaded, and two names of one hard-linked file don't count.
+- Find duplicates, beside Export… at the end of the breadcrumbs or in a folder's menu, finds files with the same contents in the folder in view, among the files the filter matches: `is:video` then Find duplicates finds duplicate videos. It's the only feature that reads file contents, and only when asked. Cloud files are never read, so nothing is downloaded, and two names of one hard-linked file don't count.
 - The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at, from 1 KB to 100 MB (1 MB to start).
 - Select duplicates like any other items, or use "Select all but the first" to select every copy except the one with the shortest path in each group. Deleting still goes through the guarded delete, which warns if a group would lose every copy, and deleted files leave their groups.
 

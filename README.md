@@ -85,7 +85,7 @@ With a filter on, only matching files are exported, with the folders that contai
 
 An export taken while scanning holds what had been scanned so far. Sizes are as of the moment each row was written, shares are of the folder's size at that moment, and each folder's contents are ordered largest first as they were when the export reached that folder, so later rows may be larger than earlier ones.
 
-**Find duplicates** in the toolbar (or **Find duplicates here** on a folder's menu) looks for files with the same contents in the folder in view, among the files the filter matches if one is on: `is:video` then Find duplicates finds duplicate videos. It is the one feature that reads what's inside files, and only when you ask:
+**Find duplicates**, beside **Export…** at the right end of the breadcrumbs (or **Find duplicates here** on a folder's menu), looks for files with the same contents in the folder in view, among the files the filter matches if one is on: `is:video` then Find duplicates finds duplicate videos. It is the one feature that reads what's inside files, and only when you ask:
 
 - Only files that share their size with another are read. Each is compared by a hash of its first and last 64 KB, and those still alike by a hash of their whole contents (BLAKE3).
 - Cloud files are never read, so nothing is downloaded. A file is only read if it is still a plain file of the size the scan saw, never through a link it has become; files stored in a special way (deduplicated or tiered) are left out too, since reading them raw would get them wrong. Files that are gone, changed, or in use are left out and counted.
