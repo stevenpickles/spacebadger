@@ -469,7 +469,8 @@ mod tests {
             (&fresh, false),
             (&taken, false),
         ] {
-            let f = File::create(path).unwrap();
+            let mut f = File::create(path).unwrap();
+            f.write_all(b"not ours").unwrap();
             if aged {
                 f.set_modified(hour_ago).unwrap();
             }
@@ -489,7 +490,8 @@ mod tests {
                 "5000.sbsnap"
             ]
         );
-        assert_eq!(fs::metadata(&taken).unwrap().len(), 0);
+        assert_eq!(fs::read(&taken).unwrap(), b"not ours");
+        assert_eq!(fs::read(&fresh).unwrap(), b"not ours");
     }
 
     #[test]
