@@ -313,6 +313,7 @@ fn omission_label(reason: OmissionReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atomic_file::retry_while_held;
     use sb_core::export::{SYSTEM_KILO, format_bytes};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -535,7 +536,14 @@ mod tests {
         std::thread::scope(|s| {
             for req in [&csv, &report, &csv, &report] {
                 let (session, path) = (&session, &path);
-                s.spawn(move || session.export(req, path, || true, |_| {}).unwrap());
+                // As in `atomic_file`, another program may hold the file.
+                let export = || session.export(req, path, || true, |_| {});
+                s.spawn(move || {
+                    retry_while_held(export, |e: &String| {
+                        cfg!(windows) && e.starts_with("Couldn't replace ")
+                    })
+                    .unwrap()
+                });
             }
         });
         let text = std::fs::read_to_string(&path).unwrap();
