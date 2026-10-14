@@ -255,9 +255,11 @@ impl Drop for Span {
 }
 
 /// A lock guard that records how long it was held when dropped. Derefs to
-/// what the guard derefs to, so it stands in for the guard.
+/// what the guard derefs to, so it stands in for the guard. The lock is
+/// released before the time is recorded, so recording never extends it.
 pub struct Held<G> {
-    guard: G,
+    /// Always `Some` until dropped.
+    guard: Option<G>,
     lock: &'static str,
     since: Option<Instant>,
 }
@@ -267,19 +269,19 @@ pub struct Held<G> {
 pub fn locked<G, E>(lock: &'static str, take: impl FnOnce() -> Result<G, E>) -> Result<Held<G>, E> {
     if !enabled() {
         return take().map(|guard| Held {
-            guard,
+            guard: Some(guard),
             lock,
             since: None,
         });
     }
     let asked = Instant::now();
     let guard = take()?;
-    let since = Instant::now();
-    record(lock, Kind::Wait, nanos(since - asked));
+    record(lock, Kind::Wait, nanos(asked.elapsed()));
+    // The hold is counted from here, so it leaves out recording the wait.
     Ok(Held {
-        guard,
+        guard: Some(guard),
         lock,
-        since: Some(since),
+        since: Some(Instant::now()),
     })
 }
 
@@ -287,20 +289,22 @@ impl<G: Deref> Deref for Held<G> {
     type Target = G::Target;
 
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        self.guard.as_ref().expect("held until dropped")
     }
 }
 
 impl<G: DerefMut> DerefMut for Held<G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        self.guard.as_mut().expect("held until dropped")
     }
 }
 
 impl<G> Drop for Held<G> {
     fn drop(&mut self) {
-        if let Some(t) = self.since {
-            record(self.lock, Kind::Hold, nanos(t.elapsed()));
+        let held = self.since.map(|t| t.elapsed());
+        drop(self.guard.take());
+        if let Some(held) = held {
+            record(self.lock, Kind::Hold, nanos(held));
         }
     }
 }
