@@ -301,6 +301,19 @@
     return () => observer.disconnect();
   });
 
+  /** Device pixels per CSS pixel. Moving to a monitor with other scaling can
+   * change it without resizing the map, so it's watched for a redraw. */
+  let dpr = $state(window.devicePixelRatio || 1);
+
+  $effect(() => {
+    // Matches only the current ratio, so it changes once the ratio does;
+    // re-armed for the new ratio each time.
+    const query = window.matchMedia(`(resolution: ${dpr}dppx)`);
+    const changed = () => (dpr = window.devicePixelRatio || 1);
+    query.addEventListener("change", changed);
+    return () => query.removeEventListener("change", changed);
+  });
+
   // ---- drawing ---------------------------------------------------------
 
   function fillFor(l: DecodedLayout, i: number): string {
@@ -365,12 +378,12 @@
   function cleared(c: HTMLCanvasElement | undefined): CanvasRenderingContext2D | null {
     const ctx = c?.getContext("2d");
     if (!c || !ctx) return null;
-    const dpr = window.devicePixelRatio || 1;
-    if (c.width !== Math.round(width * dpr) || c.height !== Math.round(height * dpr)) {
-      c.width = Math.round(width * dpr);
-      c.height = Math.round(height * dpr);
+    const ratio = window.devicePixelRatio || 1;
+    if (c.width !== Math.round(width * ratio) || c.height !== Math.round(height * ratio)) {
+      c.width = Math.round(width * ratio);
+      c.height = Math.round(height * ratio);
     }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, width, height);
     return ctx;
   }
@@ -542,7 +555,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, marks, selection, selected, palette, colors, width, height];
+    void [layout, marks, selection, selected, palette, colors, width, height, dpr];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
