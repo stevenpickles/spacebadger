@@ -180,27 +180,44 @@
     for (const p of visiblePages()) {
       if (loaded.has(p)) continue;
       loaded.add(p);
-      fetchPage(p * PAGE).then(
-        (page) => {
-          if (!sets.current(set.ticket)) return;
-          if (set.revision === null) set.revision = page.revision;
-          if (page.revision === set.revision) {
-            addPage(page);
-            return;
-          }
-          // Ranked at another revision: not part of this set. A newer
-          // one means the set is behind, so refresh it.
-          loaded.delete(p);
-          if (page.revision > set.revision) refreshes.run(refresh);
-        },
-        (e: unknown) => {
-          if (!sets.current(set.ticket)) return;
-          loaded.delete(p);
-          error = errorText(e);
-        },
-      );
+      loadPage(set, p, ATTEMPTS);
     }
   });
+
+  /** Fetches page `p` into `set`, if it's still shown and the page was
+   * ranked at its revision; `tries` bounds asking again for a page ranked
+   * before it. */
+  function loadPage(set: { ticket: Ticket; revision: number | null }, p: number, tries: number) {
+    fetchPage(p * PAGE).then(
+      (page) => {
+        if (!sets.current(set.ticket)) return;
+        if (set.revision === null) {
+          set.revision = page.revision;
+          // A status newer than the page may already have come; it won't
+          // come again, so catch up now.
+          if (page.revision < untrack(() => revision)) refreshes.run(refresh);
+        }
+        if (page.revision === set.revision) {
+          addPage(page);
+          return;
+        }
+        // Ranked at another revision: not part of this set. One ranked
+        // before it (a page fetched alongside overtook it) is asked for
+        // again; a newer one means the set is behind, so refresh it.
+        if (page.revision < set.revision && tries > 1) {
+          loadPage(set, p, tries - 1);
+          return;
+        }
+        loaded.delete(p);
+        if (page.revision > set.revision) refreshes.run(refresh);
+      },
+      (e: unknown) => {
+        if (!sets.current(set.ticket)) return;
+        loaded.delete(p);
+        error = errorText(e);
+      },
+    );
+  }
 
   function addPage(page: Page) {
     const next = new Map(rows);
