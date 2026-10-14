@@ -220,7 +220,15 @@ mod tests {
         drop(reread);
         std::fs::remove_file(&other).unwrap();
         drop(held);
-        std::fs::write(&kept, b"HELLO").unwrap();
+        // Written at another time: a write within the same clock tick
+        // keeps the time, which only reading the contents tells.
+        let f = std::fs::OpenOptions::new().write(true).open(&kept).unwrap();
+        std::io::Write::write_all(&mut &f, b"HELLO").unwrap();
+        f.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+        )
+        .unwrap();
+        drop(f);
 
         // Changed since compared, or open to write elsewhere: not held.
         assert_eq!(
