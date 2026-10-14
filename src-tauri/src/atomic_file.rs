@@ -17,8 +17,11 @@
 //!   folder (mode 0700) holding the file, and the folder and the
 //!   destination's folder are held open: the file is created and renamed
 //!   relative to them (`openat`, `renameat`), so swapping either folder
-//!   for another changes nothing, and only this user (or an administrator)
-//!   can change what's inside the private one. The file is also checked to
+//!   for another changes nothing, and normally only this user (or an
+//!   administrator) can change what's inside the private one; exceptions
+//!   are an ACL inherited from the destination's folder on macOS, and
+//!   shares (such as macOS smbfs) whose server decides access whatever
+//!   the mode says. The file is also checked to
 //!   be the one written, by device and inode, just before the rename.
 //!   File systems without Unix modes or owners of their own (FAT and exFAT
 //!   drives, NTFS, SMB shares, NFS mapping users) can't make a private
@@ -81,13 +84,15 @@ impl TempFile {
     pub fn new_in(dir: &Path, name: &str) -> io::Result<Self> {
         let short = shortened(name);
         let mut last = None;
+        // Cleared outside Windows once a private folder proves impossible here.
+        let mut try_private = true;
         for _ in 0..ATTEMPTS {
             let entry = format!(
                 ".{short}.{}-{:016x}.{EXTENSION}",
                 std::process::id(),
                 unique()
             );
-            match sys::Staged::create(dir, &entry) {
+            match sys::Staged::create(dir, &entry, &mut try_private) {
                 Ok((staged, file)) => {
                     return Ok(Self {
                         name: name.into(),
@@ -202,7 +207,12 @@ mod sys {
 
     impl Staged {
         /// Creates the file `entry` in `dir`, only if nothing has that name.
-        pub fn create(dir: &Path, entry: &str) -> io::Result<(Self, File)> {
+        /// (`_try_private` matters only on other systems.)
+        pub fn create(
+            dir: &Path,
+            entry: &str,
+            _try_private: &mut bool,
+        ) -> io::Result<(Self, File)> {
             // Resolved now, so a later change of working folder can't move
             // the destination.
             let dir = std::path::absolute(dir)?;
@@ -431,21 +441,31 @@ mod sys {
     impl Staged {
         /// Makes the private folder `entry` in `dir`, only if nothing has
         /// that name, and the file in it. Where the folder can't be made
-        /// private, the file is `entry` itself.
-        pub fn create(dir: &Path, entry: &str) -> io::Result<(Self, File)> {
+        /// private, the file is `entry` itself, and `try_private` is cleared
+        /// so later names for this file don't try again: a folder that
+        /// couldn't be removed leaves the name taken, and each try would
+        /// leave another.
+        pub fn create(dir: &Path, entry: &str, try_private: &mut bool) -> io::Result<(Self, File)> {
             let dir = Dir::open(dir)?;
             let entry = PathBuf::from(entry);
             let (holder, file) = {
                 let (at, path) = dir.at(&entry);
-                // Fails on any existing name, links included.
-                rustix::fs::mkdirat(at, &*path, Mode::RWXU)?;
-                match private(at, &path) {
-                    Ok(Some(made)) => made,
-                    Ok(None) => (Holder::Plain, create_file(at, &path)?),
-                    Err(e) => {
-                        // Only ever removes an empty folder.
-                        let _ = rustix::fs::unlinkat(at, &*path, AtFlags::REMOVEDIR);
-                        return Err(e);
+                if !*try_private {
+                    (Holder::Plain, create_file(at, &path)?)
+                } else {
+                    // Fails on any existing name, links included.
+                    rustix::fs::mkdirat(at, &*path, Mode::RWXU)?;
+                    match private(at, &path) {
+                        Ok(Some(made)) => made,
+                        Ok(None) => {
+                            *try_private = false;
+                            (Holder::Plain, create_file(at, &path)?)
+                        }
+                        Err(e) => {
+                            // Only ever removes an empty folder.
+                            let _ = rustix::fs::unlinkat(at, &*path, AtFlags::REMOVEDIR);
+                            return Err(e);
+                        }
                     }
                 }
             };
@@ -529,10 +549,11 @@ mod sys {
     }
 
     /// Opens the folder just made at `path` and the file in it, if the
-    /// folder is private. File systems without Unix modes or owners of their
-    /// own (FAT, NTFS, SMB, NFS mapping users) can't make one, or another
-    /// user may have swapped in a folder of theirs; then the folder is
-    /// removed if it's ours, and it's `None`.
+    /// folder is private. Otherwise it's `None`: file systems without Unix
+    /// modes or owners of their own (FAT, NTFS, SMB, NFS mapping users)
+    /// can't make one, and the folder, ours, is removed; or another user
+    /// swapped in a folder of theirs, which is left alone, so the name stays
+    /// taken and another is tried.
     fn private(at: BorrowedFd<'_>, path: &Path) -> io::Result<Option<(Holder, File)>> {
         let stage = rustix::fs::openat(
             at,
@@ -858,7 +879,7 @@ mod tests {
         let tmp = temp("links");
         let target = tmp.0.join("target.txt");
         fs::write(&target, "keep").unwrap();
-        let create = |name: &str| sys::Staged::create(&tmp.0, name).map(|_| ());
+        let create = |name: &str| sys::Staged::create(&tmp.0, name, &mut true).map(|_| ());
         // Each kind of name already there is refused, not opened.
         assert_eq!(
             create("target.txt").unwrap_err().kind(),
