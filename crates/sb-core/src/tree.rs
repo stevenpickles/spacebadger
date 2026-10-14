@@ -579,6 +579,24 @@ pub fn epoch_seconds(time: Option<SystemTime>) -> u32 {
     }
 }
 
+/// The ID of an object on Linux or macOS: its inode number, with its birth
+/// time (whole seconds since the Unix epoch) above it where the filesystem
+/// keeps one, so an inode number reused by a new object doesn't match.
+pub fn unix_object_id(inode: u64, birth_secs: Option<i64>) -> u128 {
+    (u128::from(birth_secs.unwrap_or(0) as u64) << 64) | u128::from(inode)
+}
+
+/// A file's birth time in whole seconds since the Unix epoch, where the
+/// platform and filesystem keep one (`statx` on Linux, `st_birthtime` on
+/// macOS), for [`unix_object_id`].
+pub fn birth_secs(meta: &std::fs::Metadata) -> Option<i64> {
+    let created = meta.created().ok()?;
+    Some(match created.duration_since(UNIX_EPOCH) {
+        Ok(after) => after.as_secs() as i64,
+        Err(before) => -(before.duration().as_secs_f64().ceil() as i64),
+    })
+}
+
 /// Eight bytes standing for a filesystem object's ID (a file ID with
 /// Windows, an inode number elsewhere), as kept per node; 0 for none. The
 /// fold is exact for IDs that fit 64 bits (NTFS, inodes); a wider ID (ReFS)

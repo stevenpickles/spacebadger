@@ -13,6 +13,7 @@ use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
 use crate::duplicates::Skip;
+use sb_core::tree::{birth_secs, unix_object_id};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -145,7 +146,7 @@ impl FsAdapter for UnixFs {
                     Identity::Unique
                 },
                 // The device is the scan's, checked at delete time.
-                id: u128::from(meta.ino()),
+                id: unix_object_id(meta.ino(), birth_secs(&meta)),
                 cloud: is_cloud(&meta),
                 modified: meta.modified().ok(),
             });
