@@ -472,3 +472,76 @@ fn cancel_during_a_wide_listing_is_prompt_and_keeps_applied_batches() {
     let tree = tree.read().unwrap();
     assert_eq!(tree.dir_state(find(&tree, "wide")), DirState::NotScanned);
 }
+
+#[test]
+fn a_cancel_that_stops_the_last_listing_is_reported_as_cancelled() {
+    let fs = FakeFs::new();
+    wide(&fs, "wide", 3 * BATCH_ENTRIES);
+    let gate = fs.gate_dir_after("wide", 2 * BATCH_ENTRIES);
+
+    let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (s.progress().files as usize) < BATCH_ENTRIES {
+        assert!(Instant::now() < deadline, "the first batch never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tree = s.tree();
+    s.cancel();
+    // The listing sees the cancel and stops while it's the only work left,
+    // before the scan has noticed the cancel itself.
+    gate.release();
+    let progress = s.wait();
+
+    assert_eq!(progress.state, ScanState::Cancelled);
+    let tree = tree.read().unwrap();
+    assert_eq!(tree.dir_state(find(&tree, "wide")), DirState::NotScanned);
+}
+
+/// No folder is left pending once a scan has finished, and a cancelled scan
+/// never reports that it completed, wherever the cancel lands.
+#[test]
+fn cancels_at_any_moment_leave_a_consistent_tree() {
+    let fs = FakeFs::new();
+    wide(&fs, "wide", 2 * BATCH_ENTRIES + 10);
+    for d in 0..40 {
+        for f in 0..20 {
+            fs.file(&format!("d{d}/s{}/f{f}", d % 3), 10, 4096);
+        }
+    }
+    // Deterministic spread of delays, from before the first listing to
+    // after the last.
+    let mut seed = 0x9e37_79b9_u64;
+    for _ in 0..40 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let delay = Duration::from_micros(seed % 20_000);
+        let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+        let tree = s.tree();
+        std::thread::sleep(delay);
+        s.cancel();
+        let progress = s.wait();
+        assert!(
+            matches!(
+                progress.state,
+                ScanState::Cancelled | ScanState::Complete | ScanState::CompleteWithOmissions
+            ),
+            "{:?}",
+            progress.state
+        );
+        let tree = tree.read().unwrap();
+        let mut unscanned = 0;
+        for i in 0..tree.len() as u32 {
+            let node = NodeId::from_index(i);
+            if tree.is_dir(node) {
+                let state = tree.dir_state(node);
+                assert_ne!(state, DirState::Pending, "after {delay:?}");
+                unscanned += usize::from(state == DirState::NotScanned);
+            }
+        }
+        if progress.state != ScanState::Cancelled {
+            assert_eq!(unscanned, 0, "a completed scan listed everything");
+            assert_eq!(progress.files as usize, 2 * BATCH_ENTRIES + 10 + 800);
+        }
+    }
+}

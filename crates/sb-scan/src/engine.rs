@@ -493,6 +493,11 @@ impl<A: FsAdapter> Aggregator<A> {
             if self.stop.is_some() {
                 continue;
             }
+            // A cancel that arrived while the last outcome was applied may
+            // have cut work short; the top of the loop reports it.
+            if self.cancelled() {
+                continue;
+            }
             if self.outstanding == 0 {
                 self.queue.close();
                 let state = if self.omissions.total() == 0 {
@@ -645,9 +650,12 @@ impl<A: FsAdapter> Aggregator<A> {
                 self.revision += 1;
             }
             Outcome::Stopped { dir } => {
-                // Left pending, so it ends up as not scanned.
+                // Left pending, so it ends up as not scanned. Work dropped
+                // for a cancel means the scan is cancelled, even if this was
+                // the last of it.
                 self.pending_dirs -= 1;
                 self.partial.remove(&dir);
+                self.stop.get_or_insert(ScanState::Cancelled);
             }
             Outcome::Measured { file, result } => {
                 // A failed re-measure keeps the listing's values.
@@ -660,7 +668,9 @@ impl<A: FsAdapter> Aggregator<A> {
                     self.revision += 1;
                 }
             }
-            Outcome::Skipped => {}
+            Outcome::Skipped => {
+                self.stop.get_or_insert(ScanState::Cancelled);
+            }
         }
     }
 
