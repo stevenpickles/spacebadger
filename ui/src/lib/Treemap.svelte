@@ -97,7 +97,11 @@
   let height = $state(0);
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
-  let hover = $state<{ index: number; x: number; y: number } | null>(null);
+  /** The rectangle under the pointer, or -1. Only a change of rectangle
+   * redraws the map; moves within one only move the tooltip. */
+  let hoverIndex = $state(-1);
+  /** Where the pointer is over the map, for the tooltip. */
+  let pointer = $state<{ x: number; y: number } | null>(null);
   /** Details for the tooltip's item, fetched shortly after it changes. */
   let tipDetails = $state.raw<NodeDetails | null>(null);
   /** The tooltip follows the keyboard selection until the mouse moves. */
@@ -406,7 +410,7 @@
     }
 
     // Hover: a slight lighten and a 2px line, quieter than the selection.
-    const hi = hover ? hover.index : -1;
+    const hi = hoverIndex;
     if (hi >= 0 && hi < l.count) {
       ctx.globalAlpha = dark ? 0.1 : 0.22;
       ctx.fillStyle = p.textLight;
@@ -505,7 +509,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, marks, selection, selected, hover, palette, colors, width, height];
+    void [layout, marks, selection, selected, hoverIndex, palette, colors, width, height];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -538,12 +542,14 @@
     const [x, y] = point(e);
     const index = hitTest(l, x, y);
     if (trace.on) trace.moves++;
-    hover = index >= 0 ? { index, x, y } : null;
+    hoverIndex = index;
+    pointer = index >= 0 ? { x, y } : null;
     keyTip = false;
   }
 
   function onLeave() {
-    hover = null;
+    hoverIndex = -1;
+    pointer = null;
   }
 
   /** Replaces the selection with the item at rectangle `i`. */
@@ -715,7 +721,8 @@
       if (i >= 0) {
         onpick(only(i));
         keyTip = true;
-        hover = null;
+        hoverIndex = -1;
+        pointer = null;
         announceAt(i);
       }
     } else if (e.key === "Enter") {
@@ -742,8 +749,8 @@
   /** Zoom-in over what double-click opens: folders and small items. */
   const cursor = $derived.by(() => {
     const l = layout;
-    if (!l || !hover || hover.index >= l.count) return "default";
-    const i = hover.index;
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return "default";
     return l.kind[i] !== KIND_FILE && l.node[i] !== view ? "zoom-in" : "default";
   });
 
@@ -753,7 +760,7 @@
   const tipIndex = $derived.by(() => {
     const l = layout;
     if (!l) return -1;
-    if (hover) return hover.index < l.count ? hover.index : -1;
+    if (hoverIndex >= 0) return hoverIndex < l.count ? hoverIndex : -1;
     return keyTip ? selectedIndex(l, selection) : -1;
   });
 
@@ -829,8 +836,9 @@
   const tipAnchor = $derived.by(() => {
     const l = layout;
     if (!l || tipIndex < 0) return null;
-    if (hover) {
-      return { right: hover.x + 12, left: hover.x - 12, below: hover.y + 12, above: hover.y - 12 };
+    if (hoverIndex >= 0 && pointer) {
+      const { x, y } = pointer;
+      return { right: x + 12, left: x - 12, below: y + 12, above: y - 12 };
     }
     // Keyboard: under small tiles, just inside the top of big ones.
     const x = l.x[tipIndex]!;
