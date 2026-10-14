@@ -200,7 +200,7 @@
         `labels: ${trace.labels.summary()}`,
         `hover draw: ${trace.hover.summary()}`,
         `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
-        `draws/s: ${perSecond} · draws ${trace.draws} · hover draws ${trace.hoverDraws} · moves ${trace.moves}`,
+        `moves ${trace.moves} · draws ${trace.draws} · hover draws ${trace.hoverDraws} · draws/s ${perSecond}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
