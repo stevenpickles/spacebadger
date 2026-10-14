@@ -583,6 +583,7 @@ impl Session {
             path: display_path(&tree.path(n)),
             folder: is_dir.then(|| match tree.dir_state(n) {
                 DirState::Pending => proto::FolderState::Pending,
+                DirState::Listed if !tree.fully_listed(n) => proto::FolderState::Partial,
                 DirState::Listed => proto::FolderState::Listed,
                 DirState::Failed => proto::FolderState::Failed,
                 DirState::NotScanned => proto::FolderState::NotScanned,

@@ -82,6 +82,7 @@
   const folderStates: Record<FolderState, string> = {
     pending: "Still being scanned",
     listed: "Scanned",
+    partial: "Partly read; some of its contents couldn't be read",
     failed: "Couldn't be read; contents unknown",
     notScanned: "Not scanned (scan cancelled)",
   };

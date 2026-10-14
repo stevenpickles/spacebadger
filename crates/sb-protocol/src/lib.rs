@@ -161,6 +161,9 @@ pub enum FolderState {
     /// Still being listed.
     Pending,
     Listed,
+    /// Listed, but some entries couldn't be read (the listing failed part
+    /// way, or entries vanished or couldn't be measured).
+    Partial,
     /// Listing failed; contents are unknown.
     Failed,
     /// Not listed because the scan was cancelled.
