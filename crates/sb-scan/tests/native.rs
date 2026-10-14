@@ -235,3 +235,17 @@ fn records_modified_times_from_the_listing() {
     assert_eq!(tree.modified(find(&tree, "sub/new.txt")), Some(secs as u32));
     assert_eq!(tree.modified(find(&tree, "sub")), None, "folders have none");
 }
+
+#[test]
+fn records_an_id_for_every_file_and_folder() {
+    let tmp = TempDir::new("ids");
+    write(&tmp.0.join("a.txt"), 3);
+    write(&tmp.0.join("sub/b.txt"), 3);
+    let (_, tree) = scan(&tmp.0);
+    let tree = tree.read().unwrap();
+    let ids: Vec<_> = ["a.txt", "sub", "sub/b.txt"]
+        .iter()
+        .map(|p| tree.id(find(&tree, p)).expect("an id"))
+        .collect();
+    assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+}

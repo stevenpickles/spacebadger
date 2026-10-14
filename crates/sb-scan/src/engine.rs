@@ -14,7 +14,7 @@ use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
 use sb_core::size::Allocated;
-use sb_core::tree::{DirState, FileSizes, NodeId, Tree, flags};
+use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -603,6 +603,7 @@ impl<A: FsAdapter> Aggregator<A> {
             }
             let added = if entry.kind == EntryKind::Directory {
                 tree.add_dir(dir, &entry.name).map(|id| {
+                    tree.set_id(id, fingerprint(entry.id));
                     subdirs.push((id, path.join(&entry.name)));
                 })
             } else {
@@ -613,6 +614,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 let extra = if entry.cloud { flags::CLOUD } else { 0 };
                 tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
                     .map(|id| {
+                        tree.set_id(id, fingerprint(entry.id));
                         if let Identity::MaybeShared { key } = entry.identity {
                             match self.owners.entry(key) {
                                 MapEntry::Vacant(v) => {

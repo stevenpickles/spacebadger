@@ -15,6 +15,12 @@ items: number, folders: number,
  */
 files: number, logical: number, allocated: number, unknownAllocationFiles: number, 
 /**
+ * Some files in the items have other hard-link names, so deleting
+ * them may free less disk space than they're allocated (none while
+ * another name remains).
+ */
+hardlinked: boolean, 
+/**
  * Entries left out because they're no longer in the scan.
  */
 missing: number, 

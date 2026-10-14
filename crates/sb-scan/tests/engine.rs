@@ -1,5 +1,5 @@
 use sb_core::size::Allocated;
-use sb_core::tree::{DirState, NodeId, Tree, flags};
+use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
 use sb_scan::fake::FakeFs;
 use sb_scan::{
     EntryKind, ErrorKind, OmissionReason, Progress, RootKind, Scan, ScanConfig, ScanState,
@@ -106,6 +106,16 @@ fn hard_links_count_allocation_once_and_remeasure() {
     };
     assert_eq!(tree.alias_owner(alias), Some(owner));
     assert_eq!(tree.allocated(tree.parent(alias).unwrap()), 0);
+}
+
+#[test]
+fn records_each_entrys_object_id() {
+    let fs = FakeFs::new();
+    fs.linked_file("a/one.bin", 1, 1, 42).file("b.bin", 1, 1);
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert_eq!(tree.id(find(&tree, "a/one.bin")), Some(fingerprint(42)));
+    assert_eq!(tree.id(find(&tree, "b.bin")), None, "the listing gave none");
 }
 
 #[test]

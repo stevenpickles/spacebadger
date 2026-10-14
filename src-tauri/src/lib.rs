@@ -9,6 +9,7 @@ mod delete;
 mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
+mod identity;
 #[cfg(windows)]
 mod recycle_windows;
 mod session;

@@ -36,6 +36,11 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
 
+### Deleting
+- Only the item that was scanned is moved to the Recycle Bin or Trash: one replaced, modified, or turned into a link since the scan, or under a folder that was replaced, is left alone and reported as changed.
+- The result says what happened to each item: moved, already gone, changed, couldn't be moved, or gone without being confirmed in the Recycle Bin (a warning). Items that were already gone are no longer counted as moved.
+- The confirmation gives the content size, and how much disk space is freed only when that can be known (not with hard links or unmeasured files).
+
 ## [0.2.0] - 2026-10-13
 
 A redesigned interface, a much more capable filter, and sizes in familiar units.
