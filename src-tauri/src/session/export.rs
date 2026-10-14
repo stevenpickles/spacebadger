@@ -6,20 +6,21 @@
 //! the lists carry on in between, and memory stays bounded however many
 //! rows there are.
 //!
-//! The file is first written beside the target as `.<name>.partial` and
-//! renamed over it only once complete, so a failed export never destroys a
-//! file the user chose to replace. Between steps the export stops if a new
+//! The file is first written to a new temporary file beside the target
+//! (see [`crate::atomic_file`]) and renamed over it only once complete, so
+//! a failed export never destroys the file the user chose to replace, and
+//! never touches any other. Between steps the export stops if a new
 //! scan has replaced this one, or if the filter it started with is gone;
 //! re-applying the same filter text doesn't count as a change.
 
 use super::{ActiveSearch, Session, display_path, metric, node};
+use crate::atomic_file::TempFile;
 use chrono::{SecondsFormat, TimeZone};
 use sb_core::export::{Csv, Report, ReportInfo, Scope, iso_utc, short_utc};
 use sb_core::search::Search;
 use sb_core::tree::{NodeId, Tree};
 use sb_protocol as proto;
 use sb_scan::{OmissionReason, Progress, ScanState};
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -75,38 +76,32 @@ impl Session {
             current: &current,
         };
         let shown = display_path(path);
-        let name = path
-            .file_name()
-            .ok_or_else(|| format!("{shown} isn't a file name."))?;
-        let temp = path.with_file_name(format!(".{}.partial", name.to_string_lossy()));
+        if path.file_name().is_none() {
+            return Err(format!("{shown} isn't a file name."));
+        }
         let failed = |e: std::io::Error| format!("Couldn't write {shown}: {e}");
-        let file = File::create(&temp).map_err(|e| format!("Couldn't create {shown}: {e}"))?;
+        // Removed when dropped unless persisted, however the export ends.
+        let temp = TempFile::beside(path).map_err(|e| format!("Couldn't create {shown}: {e}"))?;
         progress(0);
-        let mut out = BufWriter::new(file);
-        let written = match req.format {
+        let mut out = BufWriter::new(temp.file());
+        let rows = match req.format {
             proto::ExportFormat::Csv => self.export_csv(&job, &mut out, &progress, &failed),
             proto::ExportFormat::Report => self.export_report(&job, &mut out, &progress, &failed),
-        }
-        .and_then(|rows| {
-            // The file must be closed before it can be renamed on Windows.
-            let file = out.into_inner().map_err(|e| failed(e.into_error()))?;
-            file.sync_all().map_err(failed)?;
-            drop(file);
-            std::fs::rename(&temp, path).map_err(failed)?;
-            Ok(rows)
-        });
-        match written {
-            Ok(rows) => Ok(proto::ExportReport {
-                generation: self.generation(),
-                path: shown,
-                format: req.format,
-                rows,
-            }),
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp);
-                Err(e)
+        }?;
+        out.into_inner().map_err(|e| failed(e.into_error()))?;
+        temp.persist(path).map_err(|e| match e.kind() {
+            // Typically Windows refusing to replace a file in use.
+            std::io::ErrorKind::PermissionDenied => {
+                format!("Couldn't replace {shown}: it may be open in another program or read-only.")
             }
-        }
+            _ => failed(e),
+        })?;
+        Ok(proto::ExportReport {
+            generation: self.generation(),
+            path: shown,
+            format: req.format,
+            rows,
+        })
     }
 
     /// The name to suggest in the save dialog: only the last part of what
@@ -510,6 +505,46 @@ mod tests {
     }
 
     #[test]
+    fn files_beside_the_target_are_left_alone() {
+        let (tmp, session) = scanned("beside");
+        let out = tmp.0.join("out");
+        let path = out.join("all.csv");
+        // The name earlier versions wrote to first, as someone else's file.
+        let old_temp = out.join(".all.csv.partial");
+        std::fs::write(&old_temp, "not ours").unwrap();
+        let req = request(&session, proto::ExportFormat::Csv);
+        session.export(&req, &path, || true, |_| {}).unwrap();
+        assert_eq!(std::fs::read_to_string(&old_temp).unwrap(), "not ours");
+        assert!(std::fs::read_to_string(&path).unwrap().contains(",a.log,"));
+        let err = session.export(&req, &path, || false, |_| {}).unwrap_err();
+        assert_eq!(err, REPLACED);
+        assert_eq!(std::fs::read_to_string(&old_temp).unwrap(), "not ours");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_exports_to_one_file_both_finish() {
+        let (tmp, session) = scanned("concurrent");
+        let path = tmp.0.join("out").join("same.txt");
+        let csv = request(&session, proto::ExportFormat::Csv);
+        let report = request(&session, proto::ExportFormat::Report);
+        std::thread::scope(|s| {
+            for req in [&csv, &report, &csv, &report] {
+                let (session, path) = (&session, &path);
+                s.spawn(move || session.export(req, path, || true, |_| {}).unwrap());
+            }
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        let csv_whole = text.starts_with('\u{feff}') && text.matches("Path,Name,").count() == 1;
+        let report_whole = text.starts_with("SpaceBadger report") && text.ends_with('\n');
+        assert!(
+            csv_whole || report_whole,
+            "one export's whole file:\n{text}"
+        );
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 1);
+    }
+
+    #[test]
     fn suggested_names_are_plain_file_names() {
         use proto::ExportFormat::{Csv, Report};
         let name = Session::export_file_name;
@@ -551,6 +586,33 @@ mod tests {
             assert!(text.contains(&expected), "missing {expected:?} in\n{text}");
         }
         assert!(!text.contains("keep.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_use_is_reported_plainly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (tmp, session) = scanned("in-use");
+        let path = tmp.0.join("out").join("open.csv");
+        std::fs::write(&path, "in use").unwrap();
+        // As a spreadsheet holds a file open: no sharing.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let req = request(&session, proto::ExportFormat::Csv);
+        let err = session.export(&req, &path, || true, |_| {}).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "Couldn't replace {}: it may be open in another program or read-only.",
+                display_path(&path)
+            )
+        );
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "in use");
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 1);
     }
 
     #[test]
