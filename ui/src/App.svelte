@@ -2,10 +2,7 @@
   import { untrack } from "svelte";
   import {
     appInfo,
-    deleteItems,
     duplicatesCancel,
-    duplicatesCheck,
-    duplicatesRecheckCancel,
     duplicatesStart,
     duplicatesStatus,
     errorText,
@@ -13,7 +10,6 @@
     exportSave,
     fileManagerName,
     nodeDetails,
-    onDuplicatesRecheck,
     onDuplicatesStatus,
     onExportProgress,
     scanChoose,
@@ -24,7 +20,6 @@
     searchSet,
     searchSummary,
     selectionSummary,
-    setDeleteAllowed,
     trashName,
     volumeInfo,
   } from "./lib/api";
@@ -36,8 +31,9 @@
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import { ComparisonController } from "./lib/controllers/comparison.svelte";
+  import { DeletionController } from "./lib/controllers/deletion.svelte";
   import { ScanController } from "./lib/controllers/scan.svelte";
-  import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
+  import DeleteDialog from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Duplicates from "./lib/Duplicates.svelte";
   import ExportDialog, { exportFileName, localTime, type ExportChoice } from "./lib/ExportDialog.svelte";
@@ -50,8 +46,6 @@
   import Omissions from "./lib/Omissions.svelte";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
-  import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
-  import type { DuplicatesRecheck } from "./lib/protocol/DuplicatesRecheck";
   import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { ExportReport } from "./lib/protocol/ExportReport";
   import type { Metric } from "./lib/protocol/Metric";
@@ -117,25 +111,17 @@
   let showVolume = $state(saved("volume") === "on");
   let fileManager = $state(fileManagerName(""));
   let trash = $state(trashName(""));
-  /** Deleting is turned on. Never saved: every start begins with it off. */
-  let allowDelete = $state(false);
-  let confirmDelete = $state.raw<{
-    nodes: number[];
-    summary: SelectionSummary;
-    /** Groups of duplicates the delete would leave with no copy. */
-    duplicates: DuplicatesCheck | "unknown" | null;
-  } | null>(null);
-  let deleting = $state(false);
-  /** How far the running delete has got reading copies of duplicates
-   * that would stay, before moving anything. */
-  let recheck = $state.raw<DuplicatesRecheck | null>(null);
-  /** What the last delete did, shown in the dialog until it's closed. */
-  let deleteResult = $state.raw<DeleteResult | null>(null);
+  const deletion = new DeletionController(
+    { scan, targets: deleteTargets, duplicatesJob: () => dupes?.job, trash: () => trash },
+    { onnotice: flash, onerror: (message) => (problem = message), ondeleted: afterDelete },
+  );
+  const allowDelete = $derived(deletion.allowed);
+  const confirmDelete = $derived(deletion.confirm);
+  const deleting = $derived(deletion.running);
+  const askDelete = () => deletion.ask();
   let detailsError = $state<string | null>(null);
   let detailsRetry = $state(0);
   let multiUpdating = $state(false);
-  /** Counts completed deletes, which change free space. */
-  let deletions = $state(0);
   let menu = $state.raw<{ x: number; y: number; items: MenuItem[]; heading?: string } | null>(null);
   /** What's typed in the filter box. */
   let query = $state("");
@@ -172,9 +158,7 @@
       elevating = false;
     }
   }
-  const deleteBlocked = $derived(
-    !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
-  );
+  const deleteBlocked = $derived(deletion.blocked);
 
   appInfo().then(
     (info) => {
@@ -242,7 +226,7 @@
   const finished = $derived(scan.finished);
   $effect(() => {
     const gen = generation;
-    void [finished, deletions];
+    void [finished, deletion.count];
     if (gen === null) return;
     volumeInfo(gen).then(
       (v) => {
@@ -447,13 +431,6 @@
     return () => void unlisten.then((f) => f());
   });
 
-  $effect(() => {
-    const unlisten = onDuplicatesRecheck((p) => {
-      if (p.generation === generation && deleting) recheck = p;
-    });
-    return () => void unlisten.then((f) => f());
-  });
-
   /** The duplicate search shown, as a plain number so that status updates
    * (new objects) don't rerun what depends on it. */
   const dupesJob = $derived(dupes?.job);
@@ -650,75 +627,8 @@
     return name;
   }
 
-  async function changeAllowDelete(on: boolean) {
-    try {
-      allowDelete = await setDeleteAllowed(on);
-    } catch (e) {
-      allowDelete = false;
-      problem = `Couldn't change the delete setting: ${String(e)}`;
-    }
-  }
-
-  /** How long the delete dialog waits for the duplicates check, which
-   * looks at files on disk and can be slow on a network share. */
-  const DUPLICATES_CHECK_WAIT = 2000;
-
-  /** Whether deleting `nodes` loses every copy of some duplicates;
-   * "unknown" if that couldn't be told in time. */
-  function checkDuplicates(gen: number, job: number, nodes: number[]): Promise<DuplicatesCheck | "unknown" | null> {
-    const late = new Promise<"unknown">((resolve) => setTimeout(() => resolve("unknown"), DUPLICATES_CHECK_WAIT));
-    const check = duplicatesCheck({ generation: gen, job, nodes }).catch(() => "unknown" as const);
-    return Promise.race([check, late]);
-  }
-
-  async function askDelete() {
-    const gen = generation;
-    const nodes = deleteTargets();
-    if (gen === null || nodes.length === 0 || confirmDelete) return;
-    if (!allowDelete) {
-      flash(`Turn on “Allow deleting” in the toolbar to move items to the ${trash}.`, 3000);
-      return;
-    }
-    if (deleteBlocked) {
-      flash(deleteBlocked);
-      return;
-    }
-    try {
-      // Duplicates found may be deleted all at once, or the copy meant to
-      // stay may have gone meanwhile; the dialog says so.
-      const job = dupes?.job;
-      const [summary, duplicates] = await Promise.all([
-        selectionSummary({ generation: gen, nodes }),
-        job === undefined ? null : checkDuplicates(gen, job, nodes),
-      ]);
-      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary, duplicates };
-    } catch (e) {
-      problem = `Couldn't prepare the delete: ${String(e)}`;
-    }
-  }
-
-  async function confirmed() {
-    const c = confirmDelete;
-    const gen = generation;
-    if (!c || gen === null || deleting) return;
-    deleting = true;
-    recheck = null;
-    try {
-      const report = await deleteItems({ generation: gen, nodes: c.nodes });
-      // The dialog stays open on its result screen until closed.
-      if (gen === generation) afterDelete(report);
-      else confirmDelete = null;
-    } catch (e) {
-      confirmDelete = null;
-      problem = `Couldn't move to the ${trash}: ${errorText(e)}`;
-    } finally {
-      deleting = false;
-      recheck = null;
-    }
-  }
-
+  /** Leaves a folder deleted with the items; what stayed stays selected. */
   function afterDelete(r: DeleteReport) {
-    deletions++;
     const gone = new Set(r.removed);
     // Leave a folder that was deleted along with the items.
     const crumbs = viewDetails?.ancestors ?? [];
@@ -731,22 +641,6 @@
     } else {
       pick(null);
     }
-    const total = r.recycled.length + r.others.length;
-    deleteResult = { total, recycled: r.recycled.length, size: r.logical, others: r.others };
-    const count = (o: DeleteReport["others"][number]["outcome"]) => r.others.filter((i) => i.outcome === o).length;
-    const notes = [
-      [count("uncertain"), "not confirmed in the " + trash],
-      [count("kept"), "kept as possibly the last copy"],
-      [count("changed"), "changed since the scan"],
-      [count("failed"), "couldn't be moved"],
-      [count("alreadyMissing"), "no longer there"],
-    ] as const;
-    const rest = notes.filter(([n]) => n > 0).map(([n, what]) => `${n} ${what}`);
-    announce(
-      rest.length > 0
-        ? `Moved ${r.recycled.length} of ${total} items to the ${trash}; ${rest.join(", ")}`
-        : `Moved ${plural(r.recycled.length, "item")} (${formatBytes(r.logical)}) to the ${trash}`,
-    );
   }
 
   /** What a folder adds up to in the map: its matching files when filtered. */
@@ -1190,7 +1084,7 @@
         <input
           type="checkbox"
           checked={allowDelete}
-          onchange={(e) => changeAllowDelete(e.currentTarget.checked)}
+          onchange={(e) => deletion.setAllowed(e.currentTarget.checked)}
         />
         Allow deleting
       </label>
@@ -1507,17 +1401,12 @@
       {privileged}
       duplicates={confirmDelete.duplicates}
       busy={deleting}
-      {recheck}
-      onstoprecheck={() => {
-        if (generation !== null) duplicatesRecheckCancel(generation).catch(() => {});
-      }}
-      result={deleteResult}
-      onconfirm={confirmed}
-      oncancel={() => (confirmDelete = null)}
-      onclose={() => {
-        confirmDelete = null;
-        deleteResult = null;
-      }}
+      recheck={deletion.recheck}
+      onstoprecheck={() => deletion.stopRecheck()}
+      result={deletion.result}
+      onconfirm={() => deletion.confirmed()}
+      oncancel={() => (deletion.confirm = null)}
+      onclose={() => deletion.close()}
     />
   {/if}
   {#if exportOf}
