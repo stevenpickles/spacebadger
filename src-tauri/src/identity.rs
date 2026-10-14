@@ -176,10 +176,28 @@ mod imp {
         }
     }
 
-    /// NUL-terminated wide path in the `\\?\` form so long paths work.
+    /// NUL-terminated wide path in the `\\?\` form, so long paths work and
+    /// the path names exactly the item: an absolute path is used as it is,
+    /// since making it absolute again (`GetFullPathNameW`) would strip a
+    /// trailing dot or space from a name and reach a different item. Only a
+    /// relative path is made absolute first.
     fn wide(path: &Path) -> Vec<u16> {
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let text: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+        };
+        let text: Vec<u16> = absolute
+            .as_os_str()
+            .encode_wide()
+            .map(|c| {
+                if c == u16::from(b'/') {
+                    u16::from(b'\\')
+                } else {
+                    c
+                }
+            })
+            .collect();
         let starts = |prefix: &str| text.starts_with(&prefix.encode_utf16().collect::<Vec<_>>());
         let mut out: Vec<u16> = if starts(r"\\?\") || starts(r"\\.\") {
             text
@@ -367,6 +385,7 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::{Found, Held, Kind, fingerprint};
+    use sb_core::tree::{birth_secs, unix_object_id};
     use std::io;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -386,7 +405,12 @@ mod imp {
         let found = Found {
             kind,
             volume: meta.dev(),
-            ids: [fingerprint(u128::from(meta.ino())), 0],
+            // With the birth time as the scan recorded it, and without, for
+            // a scan made where it wasn't available.
+            ids: [
+                fingerprint(unix_object_id(meta.ino(), birth_secs(&meta))),
+                fingerprint(unix_object_id(meta.ino(), None)),
+            ],
             len: meta.len(),
             modified: meta.modified().ok(),
         };
