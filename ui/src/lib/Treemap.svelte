@@ -128,12 +128,45 @@
   let showPerf = $state(false);
   let perfText = $state("");
 
+  /** Paint tracing: on with the overlay, or with `localStorage.sbTrace = "1"`
+   * or `?sbTrace` in the URL. Off, it costs a branch per label. */
+  const traceFlag = (() => {
+    try {
+      return localStorage.getItem("sbTrace") === "1" || new URLSearchParams(location.search).has("sbTrace");
+    } catch {
+      return false;
+    }
+  })();
+  const trace = {
+    on: traceFlag,
+    labels: new Samples(),
+    measures: new Samples(),
+    /** measureText calls in the draw under way. */
+    measuring: 0,
+    draws: 0,
+    moves: 0,
+    /** When recent draws happened, for draws per second. */
+    recent: [] as number[],
+  };
+
+  /** ctx.measureText, counted while tracing. */
+  function measure(ctx: CanvasRenderingContext2D, text: string): number {
+    if (trace.on) trace.measuring++;
+    return ctx.measureText(text).width;
+  }
+
   $effect(() => {
+    trace.on = traceFlag || showPerf;
     if (!showPerf) return;
     const update = () => {
+      const now = performance.now();
+      const perSecond = trace.recent.filter((t) => now - t <= 1000).length;
       perfText = [
         `layout round trip: ${stats.layout.summary()}`,
         `draw: ${stats.draw.summary()}`,
+        `labels: ${trace.labels.summary()}`,
+        `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
+        `draws/s: ${perSecond} · draws ${trace.draws} · moves ${trace.moves}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
@@ -261,12 +294,12 @@
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
-    if (ctx.measureText(text).width <= max) return text;
+    if (measure(ctx, text) <= max) return text;
     let lo = 0;
     let hi = text.length;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (ctx.measureText(text.slice(0, mid) + "…").width <= max) lo = mid;
+      if (measure(ctx, text.slice(0, mid) + "…") <= max) lo = mid;
       else hi = mid - 1;
     }
     return lo === 0 ? "" : text.slice(0, lo) + "…";
@@ -287,9 +320,16 @@
 
   function draw() {
     const started = performance.now();
+    trace.measuring = 0;
     paint();
     const now = performance.now();
     stats.draw.add(now - started);
+    if (trace.on) {
+      trace.draws++;
+      trace.measures.add(trace.measuring);
+      trace.recent.push(now);
+      while (trace.recent.length > 0 && now - trace.recent[0]! > 1000) trace.recent.shift();
+    }
     if (inputAt !== null) {
       stats.input.add(now - inputAt);
       inputAt = null;
@@ -390,7 +430,9 @@
 
     // Labels go last, so tints and frames never hide them.
     // Labels go inside the frames of selected and focused tiles.
+    const labelsAt = trace.on ? performance.now() : 0;
     for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    if (trace.on) trace.labels.add(performance.now() - labelsAt);
   }
 
   function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
@@ -420,13 +462,13 @@
       // Shorter wordings as the region narrows.
       const n = formatCount(l.items[i]!);
       const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
-        (t) => ctx.measureText(t).width <= room,
+        (t) => measure(ctx, t) <= room,
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
     } else {
       // The size in full, or none where it doesn't fit.
       const size = formatBytes(l.weight[i]!);
-      const sizeWidth = ctx.measureText(size).width;
+      const sizeWidth = measure(ctx, size);
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
         label(ctx, name!, x + 4, y + line1, room);
@@ -495,6 +537,7 @@
     if (!l) return;
     const [x, y] = point(e);
     const index = hitTest(l, x, y);
+    if (trace.on) trace.moves++;
     hover = index >= 0 ? { index, x, y } : null;
     keyTip = false;
   }
