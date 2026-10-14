@@ -2,9 +2,6 @@
   import { untrack } from "svelte";
   import {
     appInfo,
-    compareItem,
-    compareSet,
-    compareSnapshots,
     deleteItems,
     duplicatesCancel,
     duplicatesCheck,
@@ -33,12 +30,12 @@
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
   import Changes from "./lib/Changes.svelte";
-  import { formatWhen } from "./lib/compare";
   import CompareControl from "./lib/CompareControl.svelte";
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
+  import { ComparisonController } from "./lib/controllers/comparison.svelte";
   import { ScanController } from "./lib/controllers/scan.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
@@ -51,14 +48,12 @@
   import { formatBytes, KILO, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
-  import type { CompareSummary } from "./lib/protocol/CompareSummary";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
   import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
   import type { DuplicatesRecheck } from "./lib/protocol/DuplicatesRecheck";
   import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { ExportReport } from "./lib/protocol/ExportReport";
-  import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
@@ -66,7 +61,6 @@
   import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
-  import type { SnapshotInfo } from "./lib/protocol/SnapshotInfo";
   import SearchResults from "./lib/SearchResults.svelte";
   import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
@@ -229,9 +223,6 @@
 
   /** A newer scan is shown; view and selection start over at its root. */
   function adopted(previous: ScanStatus | null) {
-    // Rescanning the same folder goes on comparing with the same earlier
-    // scan once the new one completes.
-    carried = comparison && previous ? { snapshot: comparison.snapshot, root: previous.root } : null;
     view = ROOT;
     pick(null);
     viewDetails = null;
@@ -241,8 +232,7 @@
     search = null;
     volume = null;
     dupes = null;
-    snapshots = [];
-    endComparison();
+    compare.restart(previous);
     // Keep the filter across Refresh and new roots.
     if (query) applySearch(query);
   }
@@ -264,120 +254,31 @@
 
   // ---- comparing with an earlier scan -------------------------------------
 
-  /** Earlier scans of this root, newest first, offered once a scan completes. */
-  let snapshots = $state.raw<SnapshotInfo[]>([]);
-  /** The comparison that's on. Nothing about it is remembered across restarts. */
-  let comparison = $state.raw<CompareSummary | null>(null);
-  let comparing = $state(false);
+  const compare = new ComparisonController(
+    { scan, selected: () => (selection && !selection.other ? selection.node : null), view: () => view },
+    {
+      onstart: (_, again) => {
+        if (colors !== "change") colorsBefore = colors;
+        colors = "change";
+        if (!again) tab = "changes";
+      },
+      onend: () => {
+        if (colors === "change") colors = colorsBefore;
+      },
+      onerror: (message) => (problem = message),
+    },
+  );
+  const snapshots = $derived(compare.snapshots);
+  const comparison = $derived(compare.comparison);
+  const comparing = $derived(compare.busy);
+  const selectedChange = $derived(compare.selectedChange);
+  const viewChange = $derived(compare.viewChange);
+  const compareId = $derived(compare.id);
+  const since = $derived(compare.since);
   /** The colors to go back to when comparing stops. */
   let colorsBefore: ColorMode = "depth";
   /** List folders in the Changes tab, not only files. */
   let changesFolders = $state(true);
-  let selectedChange = $state.raw<ItemChange | null>(null);
-  let viewChange = $state.raw<ItemChange | null>(null);
-  const compareId = $derived(comparison?.snapshot.id ?? null);
-  const since = $derived(comparison ? formatWhen(comparison.snapshot.createdMs) : "");
-  const completed = $derived(scan.completed);
-
-  $effect(() => {
-    const gen = generation;
-    if (gen === null || !completed) return;
-    compareSnapshots(gen).then(
-      (list) => {
-        if (gen === generation) snapshots = list;
-      },
-      () => {},
-    );
-  });
-
-  /** The comparison to take up again after a rescan of the same folder. */
-  let carried: { snapshot: SnapshotInfo; root: string } | null = null;
-
-  $effect(() => {
-    const gen = generation;
-    if (gen === null || !completed || !status) return;
-    const root = status.root;
-    untrack(() => {
-      const c = carried;
-      carried = null;
-      // Quietly: the earlier scan may have been pruned meanwhile.
-      if (c && c.root === root) void startComparison(c.snapshot, true);
-    });
-  });
-
-  async function startComparison(s: SnapshotInfo, again = false) {
-    const gen = generation;
-    if (gen === null || comparing) return;
-    comparing = true;
-    try {
-      const summary = await compareSet(gen, s.id);
-      if (gen !== generation || !summary) return;
-      comparison = summary;
-      if (colors !== "change") colorsBefore = colors;
-      colors = "change";
-      if (!again) tab = "changes";
-      announce(`Comparing with the scan of ${formatWhen(s.createdMs)}`);
-    } catch (e) {
-      if (!again) problem = `Couldn't compare: ${errorText(e)}`;
-    } finally {
-      comparing = false;
-    }
-  }
-
-  function stopComparison() {
-    const gen = generation;
-    if (gen !== null) compareSet(gen, null).catch(() => {});
-    endComparison();
-  }
-
-  function endComparison() {
-    comparison = null;
-    selectedChange = null;
-    viewChange = null;
-    if (colors === "change") colors = colorsBefore;
-  }
-
-  // How the selected item and the viewed folder changed, for the details.
-  // Only the newest request counts: selecting A then B must not show A's
-  // change beside B when A's reply comes last.
-  const selectedChangeRequest = latest();
-  const viewChangeRequest = latest();
-  $effect(() => {
-    const gen = generation;
-    const cmp = compareId;
-    const node = selection && !selection.other ? selection.node : null;
-    const revision = status?.revision;
-    if (gen === null || cmp === null || node === null) {
-      selectedChangeRequest.cancel();
-      selectedChange = null;
-      return;
-    }
-    selectedChangeRequest.run(
-      queryKey(gen, revision, cmp, node),
-      () => compareItem(gen, cmp, node),
-      (c) => {
-        if (c.generation === gen && c.node === node) selectedChange = c;
-      },
-    );
-  });
-  $effect(() => {
-    const gen = generation;
-    const cmp = compareId;
-    const node = view;
-    const revision = status?.revision;
-    if (gen === null || cmp === null) {
-      viewChangeRequest.cancel();
-      viewChange = null;
-      return;
-    }
-    viewChangeRequest.run(
-      queryKey(gen, revision, cmp, node),
-      () => compareItem(gen, cmp, node),
-      (c) => {
-        if (c.generation === gen && c.node === node) viewChange = c;
-      },
-    );
-  });
 
   // ---- filename search ------------------------------------------------
 
@@ -1207,8 +1108,8 @@
             current={comparison?.snapshot ?? null}
             now={status?.logical ?? 0}
             busy={comparing}
-            onchoose={startComparison}
-            onstop={stopComparison}
+            onchoose={(s) => compare.start(s)}
+            onstop={() => compare.stop()}
           />
         {/if}
       {/if}
