@@ -365,10 +365,21 @@ impl Tree {
             self.ids.grow(0);
         }
         self.len += 1;
+        // Every slot is set, so nothing written past the end before (which
+        // `Tree::checked` refuses) could leak into the new node.
         self.parent[i] = parent;
+        self.first_child[i] = NONE;
+        self.next_sibling[i] = NONE;
         self.name_start[i] = start;
         self.name_len[i] = len;
         self.flags[i] = node_flags;
+        self.dir_state[i] = DirState::Pending as u8;
+        self.logical[i] = 0;
+        self.allocated[i] = 0;
+        self.unknown[i] = 0;
+        self.files[i] = 0;
+        self.modified[i] = 0;
+        self.ids[i] = 0;
         if let Some(p) = parent_slot {
             self.next_sibling[i] = self.first_child[p];
             self.first_child[p] = id;
