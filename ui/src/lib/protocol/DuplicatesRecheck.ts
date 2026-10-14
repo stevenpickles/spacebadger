@@ -2,8 +2,8 @@
 
 /**
  * How far a delete has got reading the copies of duplicates that would
- * stay, before it moves anything. Files whose copy can't be confirmed are
- * kept and reported as failures.
+ * stay, before it moves anything. Selected duplicates that changed, or
+ * whose copy can't be confirmed, are kept and reported as failures.
  */
 export type DuplicatesRecheck = { generation: number, 
 /**

@@ -2,29 +2,31 @@
 
 /**
  * Groups of duplicates a delete would leave with no copy, as far as can be
- * told before it's confirmed. Provisional: the delete checks the copies
- * that would stay again, contents included, and keeps files whose copy it
- * can't confirm.
+ * told before it's confirmed. Provisional: for files selected themselves
+ * (not with a folder), the delete checks the copies that would stay again,
+ * contents included, and keeps those files if no copy is confirmed.
  */
 export type DuplicatesCheck = { 
 /**
- * Groups whose every file would be deleted.
+ * Groups whose every file would be deleted, selected or in a selected
+ * folder.
  */
 allSelected: number, 
 /**
- * Groups whose files that would stay are gone from disk or have
- * changed since they were compared: another file, length, or
- * modified time.
+ * Groups with files selected themselves whose files that would stay
+ * (as many as were looked at) are gone from disk or have changed since
+ * they were compared: another file, length, or modified time. The
+ * delete may keep those selected files.
  */
 keptGone: number, 
 /**
- * Groups that would lose some files and keep others, whose copies
- * staying the delete reads again first.
+ * Groups with files selected themselves and others staying, whose
+ * copies staying the delete reads again first.
  */
 toRecheck: number, 
 /**
- * Groups with copies that would stay, which weren't looked for on disk
- * because there were too many to check quickly.
+ * Of those, groups whose copies weren't looked for on disk because
+ * there were too many to check quickly.
  */
 unchecked: number, 
 /**

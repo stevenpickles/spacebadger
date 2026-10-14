@@ -167,24 +167,26 @@ pub struct DuplicatesCheckRequest {
 }
 
 /// Groups of duplicates a delete would leave with no copy, as far as can be
-/// told before it's confirmed. Provisional: the delete checks the copies
-/// that would stay again, contents included, and keeps files whose copy it
-/// can't confirm.
+/// told before it's confirmed. Provisional: for files selected themselves
+/// (not with a folder), the delete checks the copies that would stay again,
+/// contents included, and keeps those files if no copy is confirmed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DuplicatesCheck {
-    /// Groups whose every file would be deleted.
+    /// Groups whose every file would be deleted, selected or in a selected
+    /// folder.
     pub all_selected: u32,
-    /// Groups whose files that would stay are gone from disk or have
-    /// changed since they were compared: another file, length, or
-    /// modified time.
+    /// Groups with files selected themselves whose files that would stay
+    /// (as many as were looked at) are gone from disk or have changed since
+    /// they were compared: another file, length, or modified time. The
+    /// delete may keep those selected files.
     pub kept_gone: u32,
-    /// Groups that would lose some files and keep others, whose copies
-    /// staying the delete reads again first.
+    /// Groups with files selected themselves and others staying, whose
+    /// copies staying the delete reads again first.
     pub to_recheck: u32,
-    /// Groups with copies that would stay, which weren't looked for on disk
-    /// because there were too many to check quickly.
+    /// Of those, groups whose copies weren't looked for on disk because
+    /// there were too many to check quickly.
     pub unchecked: u32,
     /// A file that would be deleted from some of those groups, at most
     /// [`DUPLICATE_CHECK_EXAMPLES`].
@@ -198,8 +200,8 @@ pub const DUPLICATE_CHECK_EXAMPLES: usize = 5;
 pub const DUPLICATES_RECHECK_EVENT: &str = "duplicates-recheck";
 
 /// How far a delete has got reading the copies of duplicates that would
-/// stay, before it moves anything. Files whose copy can't be confirmed are
-/// kept and reported as failures.
+/// stay, before it moves anything. Selected duplicates that changed, or
+/// whose copy can't be confirmed, are kept and reported as failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]

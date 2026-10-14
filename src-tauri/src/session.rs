@@ -680,22 +680,24 @@ impl Session {
                 .collect();
             (targets, job.map(|j| j.retained(&tree, nodes)))
         };
-        // Duplicates: items whose copy that stays can't be confirmed are
-        // kept, read with no lock held. (An outcome of its own once
-        // deletes report one per item.)
-        let kept = match retained {
+        // Duplicates selected themselves are kept unless they still match
+        // and a copy that stays is confirmed, read with no lock held; the
+        // confirmed copies are held until the moves are done. (An outcome
+        // of its own once deletes report one per item.)
+        let verified = match retained {
             Some(r) if !r.is_empty() => self.recheck(r, on_recheck),
-            _ => duplicates::Verdicts::new(),
+            _ => duplicates::Verified::keeping(duplicates::Verdicts::new()),
         };
         let mut gone = Vec::new();
         let mut already_gone = 0;
         let mut failed = Vec::new();
         for (n, path, folder) in targets {
-            if let Some(why) = kept.get(&n) {
+            if let Some(why) = verified.verdicts.get(&n) {
+                let name = path.file_name().unwrap_or(path.as_os_str());
                 failed.push(proto::DeleteFailure {
                     node: n.index() as u32,
                     path: display_path(&path),
-                    message: why.message().into(),
+                    message: why.message(&name.to_string_lossy()),
                 });
                 continue;
             }
@@ -712,6 +714,8 @@ impl Session {
                 }),
             }
         }
+        // The moves are done: release the copies held.
+        drop(verified);
         let mut report = proto::DeleteReport {
             generation: self.generation(),
             deleted: Vec::new(),
@@ -844,27 +848,34 @@ impl Session {
         Ok(())
     }
 
-    /// Reads the copies of duplicates a delete would keep, reporting
-    /// progress every so often, and returns the selected items to keep.
+    /// Checks the selected duplicates and reads the copies a delete would
+    /// keep, reporting progress every so often; returns the selected files
+    /// to keep, and holds the confirmed copies until it's dropped.
     fn recheck(
         &self,
         retained: duplicates::Retained,
         on_recheck: &(dyn Fn(proto::DuplicatesRecheck) + Sync),
-    ) -> duplicates::Verdicts {
+    ) -> duplicates::Verified {
         self.recheck_cancel.store(false, Ordering::SeqCst);
-        let counters = sb_scan::duplicates::Counters::default();
-        let total = retained.bytes();
+        let progress = sb_scan::duplicates::ConfirmProgress::default();
+        progress.total.store(retained.bytes(), Ordering::Relaxed);
         let report = |finished| {
+            let total = progress.total.load(Ordering::Relaxed);
             on_recheck(proto::DuplicatesRecheck {
                 generation: self.generation(),
-                done_bytes: counters.read.load(Ordering::Relaxed),
+                done_bytes: if finished {
+                    total
+                } else {
+                    progress.done().min(total)
+                },
                 total_bytes: total,
                 finished,
             })
         };
         report(false);
-        // A panic while reading confirms nothing: every item is kept.
-        let unread = retained.keep_all(duplicates::Unconfirmed::Unknown);
+        // A panic while reading confirms nothing: every file is kept.
+        let unread =
+            duplicates::Verified::keeping(retained.keep_all(duplicates::Unconfirmed::Unknown));
         let done = AtomicBool::new(false);
         let verdicts = std::thread::scope(|s| {
             s.spawn(|| {
@@ -876,7 +887,7 @@ impl Session {
                 }
             });
             let verdicts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                retained.verify(&native::NativeContents, &self.recheck_cancel, &counters)
+                retained.verify(&native::NativeContents, &self.recheck_cancel, &progress)
             }));
             done.store(true, Ordering::Relaxed);
             verdicts
@@ -1544,18 +1555,15 @@ mod tests {
         assert_eq!(report.failed[0].node, e1);
         assert_eq!(
             report.failed[0].message,
-            duplicates::Unconfirmed::Changed.message()
+            duplicates::Unconfirmed::Changed.message("extra.bin")
         );
         assert!(extra.exists() && !extra2.exists() && kept.exists());
         let progress = progress.into_inner().unwrap();
         let last = progress.last().unwrap();
         assert!(last.finished);
         assert_eq!(last.total_bytes, 2 * copy.len() as u64);
-        assert_eq!(
-            last.done_bytes,
-            copy.len() as u64,
-            "the changed copy wasn't read"
-        );
+        assert_eq!(last.done_bytes, last.total_bytes);
+        assert!(progress.iter().all(|p| p.done_bytes <= p.total_bytes));
 
         // An unchanged copy that can't be read leaves it unknown, which is
         // never taken as proof.
@@ -1571,13 +1579,41 @@ mod tests {
             assert!(report.deleted.is_empty());
             assert_eq!(
                 report.failed[0].message,
-                duplicates::Unconfirmed::Unknown.message()
+                duplicates::Unconfirmed::Unknown.message("extra3.txt")
             );
             drop(locked);
             assert!(extra3.exists());
         }
-        let report = session.delete_using(&[e3], &|_| {}, remove).unwrap();
+        // Confirmed, the copy that stays is held until the moves are done
+        // (on Windows), without keeping the selected file from going.
+        let report = session
+            .delete_using(&[e3], &|_| {}, |path, folder| {
+                let write = std::fs::File::options().append(true).open(&kept3);
+                assert_eq!(write.is_err(), cfg!(windows), "{write:?}");
+                remove(path, folder)
+            })
+            .unwrap();
         assert_eq!(report.deleted, [e3]);
         assert!(!extra3.exists() && kept3.exists());
+        std::fs::File::options()
+            .append(true)
+            .open(&kept3)
+            .expect("released after the moves");
+
+        // A selected file that changed itself no longer matches its copies.
+        std::fs::write(&kept, &copy).unwrap();
+        std::fs::write(&extra, &edited).unwrap();
+        let report = session.delete_using(&[e1], &|_| {}, remove).unwrap();
+        assert_eq!(
+            report.failed[0].message,
+            duplicates::Unconfirmed::NoLongerMatches.message("extra.bin")
+        );
+
+        // Duplicates in a selected folder go with it: only files selected
+        // themselves are kept.
+        let old = id(&tmp.0.join("old"));
+        let report = session.delete_using(&[old], &|_| {}, remove).unwrap();
+        assert_eq!(report.deleted, [old]);
+        assert!(!extra.exists() && kept.exists());
     }
 }

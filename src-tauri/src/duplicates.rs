@@ -12,7 +12,8 @@ use sb_core::selection;
 use sb_core::tree::{NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::{
-    self, Contents, Counters, Digest, Event, Fingerprint, Group, Plan, Recheck, Skip,
+    self, Confirm, ConfirmProgress, Confirmed, Contents, Counters, Digest, Event, Fingerprint,
+    Group, Held, Plan, Skip,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -247,23 +248,25 @@ const CHECK_COPIES: usize = 8;
 /// holding any lock.
 pub struct PendingCheck {
     check: proto::DuplicatesCheck,
-    /// Per group: a file that would go, the size, and copies that would
-    /// stay with their fingerprints as compared.
+    /// Per group: a selected file that would go, the size, and copies that
+    /// would stay with their fingerprints as compared.
     on_disk: Vec<(String, u64, Vec<Staying>)>,
 }
 
 /// A copy that would stay: its path, and its fingerprint as compared.
 type Staying = (PathBuf, Fingerprint);
 
-/// One group's files a delete would take, by the selected item each goes
-/// with, and the files that would stay.
+/// One group's files a delete would take, and the files that would stay.
 struct Split {
-    going: Vec<(NodeId, NodeId)>,
+    /// Files selected themselves, with their fingerprints as compared.
+    selected: Vec<(NodeId, Fingerprint)>,
+    /// Files going with a selected folder.
+    inside: Vec<NodeId>,
     staying: Vec<(NodeId, Fingerprint)>,
 }
 
-/// The selected items, to tell which item takes a file: itself or a
-/// selected folder above it.
+/// The selected items, to tell whether a file is selected itself or goes
+/// with a selected folder.
 struct Items(HashSet<NodeId>);
 
 impl Items {
@@ -276,30 +279,34 @@ impl Items {
         )
     }
 
-    fn of(&self, tree: &Tree, n: NodeId) -> Option<NodeId> {
-        let mut cur = Some(n);
+    fn in_folder(&self, tree: &Tree, n: NodeId) -> bool {
+        let mut cur = tree.parent(n);
         while let Some(c) = cur {
             if self.0.contains(&c) {
-                return Some(c);
+                return true;
             }
             cur = tree.parent(c);
         }
-        None
+        false
     }
 
-    /// Splits a group's files still in the scan into going and staying.
+    /// Splits a group's files still in the scan.
     fn split(&self, tree: &Tree, g: &Group) -> Split {
         let mut split = Split {
-            going: Vec::new(),
+            selected: Vec::new(),
+            inside: Vec::new(),
             staying: Vec::new(),
         };
         for (&n, &print) in g.files.iter().zip(&g.prints) {
             if !tree.contains(n) || tree.is_removed(n) {
                 continue;
             }
-            match self.of(tree, n) {
-                Some(item) => split.going.push((n, item)),
-                None => split.staying.push((n, print)),
+            if self.0.contains(&n) {
+                split.selected.push((n, print));
+            } else if self.in_folder(tree, n) {
+                split.inside.push(n);
+            } else {
+                split.staying.push((n, print));
             }
         }
         split
@@ -308,10 +315,11 @@ impl Items {
 
 impl Job {
     /// Starts checking which groups deleting `selected` (with everything in
-    /// selected folders) would leave with no copy: every remaining file
-    /// selected, or the ones that would stay gone or changed since they
-    /// were compared (by fingerprint; contents are read only by
-    /// [`Job::retained`]). Groups already down to one file count too.
+    /// selected folders) would leave with no copy, and which selected files
+    /// the delete may keep because the copies that would stay are gone or
+    /// changed since they were compared (by fingerprint; contents are read
+    /// only by [`Job::retained`]). Groups already down to one file count
+    /// too.
     pub fn check(&self, tree: &Tree, selected: &[u32]) -> PendingCheck {
         let items = Items::new(tree, selected);
         let mut pending = PendingCheck {
@@ -327,15 +335,19 @@ impl Job {
         let found = self.found.lock().unwrap();
         for g in &found.groups {
             let split = items.split(tree, g);
-            let Some(&(example, _)) = split.going.first() else {
-                continue;
-            };
-            let example = display_path(&tree.path(example));
             if split.staying.is_empty() {
-                pending.check.all_selected += 1;
-                pending.example(example);
+                let going = split.selected.first().map(|&(n, _)| n);
+                if let Some(example) = going.or(split.inside.first().copied()) {
+                    pending.check.all_selected += 1;
+                    pending.example(display_path(&tree.path(example)));
+                }
                 continue;
             }
+            // Files going with a folder go regardless; only files selected
+            // themselves are kept when no copy staying is confirmed.
+            let Some(&(example, _)) = split.selected.first() else {
+                continue;
+            };
             pending.check.to_recheck += 1;
             if pending.on_disk.len() < CHECK_GROUPS {
                 let copies = split
@@ -344,7 +356,9 @@ impl Job {
                     .take(CHECK_COPIES)
                     .map(|&(n, print)| (tree.path(n), print))
                     .collect();
-                pending.on_disk.push((example, g.size, copies));
+                pending
+                    .on_disk
+                    .push((display_path(&tree.path(example)), g.size, copies));
             } else {
                 pending.check.unchecked += 1;
             }
@@ -378,35 +392,61 @@ impl PendingCheck {
     }
 }
 
-/// Why a selected item is kept rather than deleted: no copy of some
-/// duplicates in it that would stay could be confirmed.
+/// Why a selected file of a group of duplicates is kept rather than
+/// deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unconfirmed {
+    /// The file itself changed since it was compared.
+    NoLongerMatches,
+    /// The file itself couldn't be looked at to tell.
+    Unchecked,
     /// Every copy that would stay is gone or has changed since compared.
     Changed,
-    /// Some copy couldn't be read to tell.
+    /// Some copy that would stay couldn't be read or held to tell.
     Unknown,
     /// Checking was stopped first.
     Stopped,
 }
 
 impl Unconfirmed {
-    /// The outcome reported for the item.
-    pub fn message(self) -> &'static str {
-        match self {
+    /// The outcome reported for the file called `name`.
+    pub fn message(self, name: &str) -> String {
+        let why = match self {
+            Self::NoLongerMatches => {
+                "it no longer matches its copies: it changed since they were compared"
+            }
+            Self::Unchecked => "couldn't check that it still matches its copies",
             Self::Changed => {
-                "Kept: the other copies have changed or gone since they were compared, so this may be the last one."
+                "its other copies have changed or gone since they were compared, so it may be the last one"
             }
             Self::Unknown => {
-                "Kept: couldn't confirm that another copy still exists, since the other copies couldn't be read."
+                "couldn't confirm that another copy still exists: the other copies couldn't be read or held"
             }
-            Self::Stopped => "Kept: checking that another copy still exists was stopped.",
-        }
+            Self::Stopped => "checking that another copy still exists was stopped",
+        };
+        format!("Kept “{name}”: {why}.")
     }
 }
 
-/// Selected items to keep, and why.
+/// Selected files to keep, and why.
 pub type Verdicts = HashMap<NodeId, Unconfirmed>;
+
+/// What [`Retained::verify`] found: the files to keep, and the confirmed
+/// copies, held unchanged until this is dropped.
+pub struct Verified {
+    pub verdicts: Verdicts,
+    _held: Vec<Held>,
+}
+
+impl Verified {
+    /// Keeping these files, with no copies held.
+    pub fn keeping(verdicts: Verdicts) -> Self {
+        Self {
+            verdicts,
+            _held: Vec::new(),
+        }
+    }
+}
 
 /// The copies a delete must confirm before moving anything, read without
 /// holding any lock.
@@ -414,19 +454,20 @@ pub struct Retained {
     groups: Vec<Retaining>,
 }
 
-/// One group that would lose files and keep others.
+/// One group with files selected themselves while others stay.
 struct Retaining {
-    /// The selected items taking its files.
-    items: Vec<NodeId>,
+    /// The selected files, with their paths and fingerprints as compared.
+    selected: Vec<(NodeId, PathBuf, Fingerprint)>,
     size: u64,
     digest: Digest,
-    /// The copies that would stay, with their fingerprints as compared.
+    /// The copies that would stay.
     staying: Vec<Staying>,
 }
 
 impl Job {
-    /// The groups deleting `selected` would take files from while others
-    /// stay, for [`Retained::verify`]. Groups losing every file aren't
+    /// The groups with files selected themselves (as from the Duplicates
+    /// tab) while others stay, for [`Retained::verify`]. Files going with a
+    /// selected folder go regardless, and groups losing every file aren't
     /// included: the dialog warned of those, and the user confirmed.
     pub fn retained(&self, tree: &Tree, selected: &[u32]) -> Retained {
         let items = Items::new(tree, selected);
@@ -436,20 +477,22 @@ impl Job {
             .iter()
             .filter_map(|g| {
                 let split = items.split(tree, g);
-                if split.going.is_empty() || split.staying.is_empty() {
+                if split.selected.is_empty() || split.staying.is_empty() {
                     return None;
                 }
-                let mut taking: Vec<NodeId> = split.going.iter().map(|&(_, i)| i).collect();
-                taking.sort_unstable();
-                taking.dedup();
+                let paths = |files: &[(NodeId, Fingerprint)]| {
+                    files
+                        .iter()
+                        .map(|&(n, print)| (n, tree.path(n), print))
+                        .collect::<Vec<_>>()
+                };
                 Some(Retaining {
-                    items: taking,
+                    selected: paths(&split.selected),
                     size: g.size,
                     digest: g.digest,
-                    staying: split
-                        .staying
-                        .iter()
-                        .map(|&(n, print)| (tree.path(n), print))
+                    staying: paths(&split.staying)
+                        .into_iter()
+                        .map(|(_, path, print)| (path, print))
                         .collect(),
                 })
             })
@@ -469,48 +512,74 @@ impl Retained {
         self.groups.iter().map(|g| g.size).sum()
     }
 
-    /// Every item taking files from these groups, kept for `why`.
+    /// Every selected file of these groups, kept for `why`.
     pub fn keep_all(&self, why: Unconfirmed) -> Verdicts {
         self.groups
             .iter()
-            .flat_map(|g| g.items.iter().map(move |&i| (i, why)))
+            .flat_map(|g| g.selected.iter().map(move |&(n, _, _)| (n, why)))
             .collect()
     }
 
-    /// Reads the copies that would stay, group by group, until one is
-    /// confirmed unchanged with the group's contents. Items taking files
-    /// from a group with none confirmed are kept: an unreadable copy or a
-    /// stop leaves it unknown, which is never taken as proof.
+    /// Looks at each selected file, which must be unchanged since it was
+    /// compared, then holds and reads the copies that would stay (see
+    /// [`duplicates::confirm`]) until one per group is confirmed unchanged
+    /// with the group's contents. Selected files of a group with none
+    /// confirmed are kept: an unreadable copy or a stop leaves it unknown,
+    /// which is never taken as proof.
     pub fn verify(
         self,
         contents: &impl Contents,
         cancel: &AtomicBool,
-        counters: &Counters,
-    ) -> Verdicts {
+        progress: &ConfirmProgress,
+    ) -> Verified {
         let mut verdicts = Verdicts::new();
+        let mut confirming = Vec::new();
+        let mut waiting = Vec::new();
         for g in self.groups {
-            let mut verdict = Some(Unconfirmed::Changed);
-            for (path, print) in &g.staying {
-                match duplicates::recheck(contents, path, print, &g.digest, cancel, counters) {
-                    Recheck::Same => {
-                        verdict = None;
-                        break;
+            let mut still = Vec::new();
+            for (n, path, print) in g.selected {
+                match contents.examine(&path, g.size) {
+                    Ok(now) if print.unchanged(&now) => still.push(n),
+                    // Gone already: the delete says so.
+                    Err(Skip::Vanished) => {}
+                    Ok(_) | Err(Skip::Changed | Skip::Changing) => {
+                        verdicts.insert(n, Unconfirmed::NoLongerMatches);
                     }
-                    Recheck::Changed => {}
-                    Recheck::Unknown(_) => verdict = Some(Unconfirmed::Unknown),
-                    Recheck::Cancelled => {
-                        verdict = Some(Unconfirmed::Stopped);
-                        break;
+                    Err(_) => {
+                        verdicts.insert(n, Unconfirmed::Unchecked);
                     }
                 }
             }
-            if let Some(why) = verdict {
-                for item in g.items {
-                    verdicts.entry(item).or_insert(why);
-                }
+            if !still.is_empty() {
+                waiting.push(still);
+                confirming.push(Confirm {
+                    size: g.size,
+                    digest: g.digest,
+                    copies: g.staying,
+                });
             }
         }
-        verdicts
+        let found =
+            duplicates::confirm(contents, &confirming, duplicates::READERS, cancel, progress);
+        let mut held = Vec::new();
+        for (confirmed, files) in found.into_iter().zip(waiting) {
+            let why = match confirmed {
+                Confirmed::Copy(_, h) => {
+                    held.push(h);
+                    continue;
+                }
+                Confirmed::Changed => Unconfirmed::Changed,
+                Confirmed::Unknown => Unconfirmed::Unknown,
+                Confirmed::Cancelled => Unconfirmed::Stopped,
+            };
+            for n in files {
+                verdicts.insert(n, why);
+            }
+        }
+        Verified {
+            verdicts,
+            _held: held,
+        }
     }
 }
 
@@ -590,26 +659,52 @@ mod tests {
     }
 
     #[test]
-    fn stopping_keeps_the_files_not_yet_confirmed() {
+    fn selected_files_are_examined_and_a_stop_keeps_them() {
         let dir = std::env::temp_dir().join(format!("sb-retained-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("copy");
-        std::fs::write(&path, vec![7; 4096]).unwrap();
         let contents = sb_scan::native::NativeContents;
-        let print = contents.examine(&path, 4096).unwrap();
+        let file = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![7; 4096]).unwrap();
+            let print = contents.examine(&path, 4096).unwrap();
+            (path, print)
+        };
+        let (kept, kept_print) = file("kept");
+        let (mine, mine_print) = file("mine");
+        let (edited, edited_print) = file("edited");
+        let (gone, gone_print) = file("gone");
+        std::fs::write(&edited, vec![8; 4096]).unwrap();
+        let f = std::fs::File::options().write(true).open(&edited).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(f);
+        std::fs::remove_file(&gone).unwrap();
+        let n = NodeId::from_index;
         let retained = Retained {
             groups: vec![Retaining {
-                items: vec![NodeId::from_index(5)],
+                selected: vec![
+                    (n(1), mine, mine_print),
+                    (n(2), edited, edited_print),
+                    (n(3), gone, gone_print),
+                ],
                 size: 4096,
                 digest: [0; 32],
-                staying: vec![(path.clone(), print)],
+                staying: vec![(kept, kept_print)],
             }],
         };
-        let counters = Counters::default();
         let stop = AtomicBool::new(true);
+        let verified = retained.verify(&contents, &stop, &ConfirmProgress::default());
         assert_eq!(
-            retained.verify(&contents, &stop, &counters),
-            Verdicts::from([(NodeId::from_index(5), Unconfirmed::Stopped)])
+            verified.verdicts,
+            Verdicts::from([
+                (n(1), Unconfirmed::Stopped),
+                (n(2), Unconfirmed::NoLongerMatches),
+            ]),
+            "one gone already is left to the delete"
+        );
+        assert_eq!(
+            Unconfirmed::NoLongerMatches.message("b.bin"),
+            "Kept “b.bin”: it no longer matches its copies: it changed since they were compared."
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
