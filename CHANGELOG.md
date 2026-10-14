@@ -36,6 +36,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Scanning
 - Folders holding hundreds of thousands of files are read a few thousand at a time: the map stays responsive while they're read, Cancel takes effect at once, and they take about half the memory they did.
+- The map is drawn quickly however many files a folder holds: files too small to see are only added up, not sorted, so a folder of 5 million small files lays out in about 10 ms instead of over half a second, and the map's memory of sibling order stays small (under 9 MiB).
 
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
@@ -46,6 +47,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The confirmation gives the content size, and how much disk space is freed only when that can be known (not with hard links or unmeasured files).
 - On Windows, an item is left alone if any name in its full path, the scanned folder, the folders above it, and a network server and share included, would be read differently by the Recycle Bin: one ending with a dot or a space (`root.` would be taken for `root`), a reserved device name such as `NUL` or `COM1`, a special shell folder name ending in `.{…}`, or anything else Windows would rewrite. The result says which name, and nothing is moved.
 - On Windows, the item Windows Explorer finds at the path must be the very one just checked, by name as well as by file (another hard-link name of the same file doesn't count). A special shell folder or a folder shortcut in the path (by its name or its `desktop.ini`) can lead Explorer to another place, such as your profile, the Recycle Bin, or the shortcut's target; such items are left alone with a message saying so.
+
+### Fixed
+- With Folders unchecked, the Contents tab could still list files just deleted, at no size, if it refreshed as the delete finished.
 
 ## [0.2.0] - 2026-10-13
 
