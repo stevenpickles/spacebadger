@@ -212,11 +212,10 @@
       {#if uncertain.length > 0}
         <p class="warning">
           {plural(uncertain.length, "item")}
-          {one(uncertain.length, "is", "are")} gone from where {one(uncertain.length, "it was", "they were")}, but
-          {one(uncertain.length, "isn't", "aren't")} confirmed to be in the {trashName}: {one(
+          {one(uncertain.length, "isn't", "aren't")} confirmed to be in the {trashName}: some or all of {one(
             uncertain.length,
             "it",
-            "they",
+            "them",
           )} may have been deleted without a copy.
         </p>
         {@render items(uncertain)}

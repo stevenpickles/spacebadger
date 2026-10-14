@@ -29,6 +29,9 @@ pub struct Scanned {
     pub len: u64,
     /// A file's modified time, in [`epoch_seconds`] form.
     pub modified: Option<u32>,
+    /// A file with other hard-link names, whose listed modified time may be
+    /// stale (NTFS updates it only for the name it was written through).
+    pub hardlinked: bool,
 }
 
 /// One item to delete, with the folders above it.
@@ -56,9 +59,10 @@ pub enum Outcome {
     Changed(String),
     /// Still where it was.
     Failed(String),
-    /// Gone from where it was, but not confirmed in the Recycle Bin or
-    /// Trash.
-    Uncertain(String),
+    /// Not confirmed in the Recycle Bin or Trash: some or all of it may have
+    /// been deleted without a copy. `gone` says whether anything is left at
+    /// its path, which decides whether it leaves the scan.
+    Uncertain { reason: String, gone: bool },
 }
 
 /// Why a move to the Recycle Bin or Trash didn't go as asked.
@@ -83,6 +87,10 @@ impl RecycleError {
 }
 
 pub const UNRECYCLED: &str = "Windows deleted it without keeping a copy in the Recycle Bin.";
+
+/// Why a folder without an ID is refused.
+pub const UNCONFIRMED: &str =
+    "can't be confirmed to be the one scanned (this drive gives folders no file ID)";
 
 const BIN: &str = if cfg!(windows) {
     "Recycle Bin"
@@ -120,39 +128,78 @@ pub fn delete(target: &Target) -> Outcome {
 
 /// [`delete`] into the given bin.
 pub fn delete_with(target: &Target, bin: &impl Bin) -> Outcome {
-    let Some((item, above)) = target.chain.split_last() else {
-        return Outcome::Failed("Nothing to delete.".into());
+    let (result, place) = match checked_move(target, bin) {
+        Ok(moved) => moved,
+        Err(outcome) => return outcome,
     };
+    // Read by the exact path, as the checks were.
+    let present = !matches!(
+        identity::hold(target.path(), false),
+        Err(e) if e.kind() == ErrorKind::NotFound
+    );
+    settle(result, present, place)
+}
+
+/// Checks the item and the folders above it, then moves it while holding
+/// them (until this returns, on Windows). `Err` is the outcome when it
+/// wasn't moved.
+fn checked_move(
+    target: &Target,
+    bin: &impl Bin,
+) -> Result<(Result<(), RecycleError>, Place), Outcome> {
+    let Some((item, above)) = target.chain.split_last() else {
+        return Err(Outcome::Failed("Nothing to delete.".into()));
+    };
+    if cfg!(windows) && below_root_ends_badly(target) {
+        // The shell parses paths the way Win32 does, dropping a trailing dot
+        // or space, so it would reach a different item.
+        return Err(Outcome::Failed(
+            "Its name, or a folder name above it, ends with a dot or a space, which the Recycle Bin can't handle safely.".into(),
+        ));
+    }
     let mut folders = Vec::with_capacity(above.len());
-    for folder in above {
+    for (i, folder) in above.iter().enumerate() {
+        let name = display(&folder.path);
         match identity::hold(&folder.path, true) {
             Ok((found, held)) => {
-                if let Some(why) = changed(folder, &found, target.volume) {
-                    return Outcome::Changed(format!(
-                        "The folder {} above it {why}.",
-                        display(&folder.path)
-                    ));
+                match check(folder, &found, target.volume) {
+                    Ok(()) => {}
+                    Err(Refusal::Changed(why)) => {
+                        return Err(Outcome::Changed(format!(
+                            "The folder {name} above it {why}."
+                        )));
+                    }
+                    Err(Refusal::Unconfirmed) => {
+                        return Err(Outcome::Failed(format!(
+                            "The folder {name} above it {UNCONFIRMED}."
+                        )));
+                    }
                 }
                 folders.push(held);
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => return Outcome::AlreadyMissing,
+            // Gone from a folder held just now, so the item is gone too.
+            Err(e) if e.kind() == ErrorKind::NotFound && i > 0 => {
+                return Err(Outcome::AlreadyMissing);
+            }
             Err(e) => {
-                return Outcome::Failed(format!(
-                    "Couldn't reach the folder {} above it: {e}.",
-                    display(&folder.path)
-                ));
+                return Err(Outcome::Failed(format!(
+                    "Couldn't reach the folder {name} above it: {e}."
+                )));
             }
         }
     }
     let held = match identity::hold(&item.path, false) {
-        Ok((found, held)) => {
-            if let Some(why) = changed(item, &found, target.volume) {
-                return Outcome::Changed(format!("It {why}."));
+        Ok((found, held)) => match check(item, &found, target.volume) {
+            Ok(()) => held,
+            Err(Refusal::Changed(why)) => return Err(Outcome::Changed(format!("It {why}."))),
+            Err(Refusal::Unconfirmed) => {
+                return Err(Outcome::Failed(format!("It {UNCONFIRMED}.")));
             }
-            held
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound && !above.is_empty() => {
+            return Err(Outcome::AlreadyMissing);
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => return Outcome::AlreadyMissing,
-        Err(e) => return Outcome::Failed(format!("Couldn't reach it: {e}.")),
+        Err(e) => return Err(Outcome::Failed(format!("Couldn't reach it: {e}."))),
     };
     let result = bin.recycle(&item.path);
     let place = match held.whereabouts() {
@@ -162,40 +209,61 @@ pub fn delete_with(target: &Target, bin: &impl Bin) -> Outcome {
         Whereabouts::Deleted => Place::Deleted,
         Whereabouts::Unknown => Place::Unknown,
     };
-    drop(held);
-    drop(folders);
-    let present = !matches!(
-        std::fs::symlink_metadata(&item.path),
-        Err(e) if e.kind() == ErrorKind::NotFound
-    );
-    settle(result, present, place)
+    Ok((result, place))
 }
 
-/// How what is on disk differs from what the scan found, if it does.
-fn changed(scanned: &Scanned, found: &Found, volume: Option<u64>) -> Option<&'static str> {
+/// Whether a name below the scan root ends with a dot or a space.
+fn below_root_ends_badly(target: &Target) -> bool {
+    target.chain.iter().skip(1).any(|s| {
+        s.path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .is_some_and(|n| n.ends_with('.') || n.ends_with(' '))
+    })
+}
+
+/// Why an item or a folder above it is left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// It differs from what the scan found, in this way.
+    Changed(&'static str),
+    /// A folder with no recorded ID, which can't be told from a replacement.
+    Unconfirmed,
+}
+
+/// Whether what is on disk is what the scan found.
+fn check(scanned: &Scanned, found: &Found, volume: Option<u64>) -> Result<(), Refusal> {
     match (found.kind, scanned.folder) {
-        (Kind::Link, _) => return Some("is now a link"),
-        (Kind::Folder, false) => return Some("is now a folder"),
-        (Kind::File, true) => return Some("is now a file"),
-        (Kind::Other, _) => return Some("is now a different kind of item"),
+        (Kind::Link, _) => return Err(Refusal::Changed("is now a link")),
+        (Kind::Folder, false) => return Err(Refusal::Changed("is now a folder")),
+        (Kind::File, true) => return Err(Refusal::Changed("is now a file")),
+        (Kind::Other, _) => return Err(Refusal::Changed("is now a different kind of item")),
         _ => {}
     }
     if volume.is_some_and(|v| v != found.volume) {
-        return Some("is now on a different drive");
+        return Err(Refusal::Changed("is now on a different drive"));
     }
-    let recorded = scanned.ids.iter().filter(|&&id| id != 0);
-    if recorded.clone().next().is_some() && !recorded.clone().any(|&id| found.has_id(id)) {
-        return Some("was replaced since the scan");
+    let mut recorded = scanned.ids.iter().filter(|&&id| id != 0).peekable();
+    if recorded.peek().is_none() {
+        // A file still has its size and modified time to go by.
+        if scanned.folder {
+            return Err(Refusal::Unconfirmed);
+        }
+    } else if !recorded.any(|&id| found.has_id(id)) {
+        return Err(Refusal::Changed("was replaced since the scan"));
     }
     if !scanned.folder {
-        let modified = scanned.modified.zip(found.modified);
+        let modified = scanned
+            .modified
+            .zip(found.modified)
+            .filter(|_| !scanned.hardlinked);
         if found.len != scanned.len
             || modified.is_some_and(|(then, now)| then != epoch_seconds(Some(now)))
         {
-            return Some("was modified since the scan");
+            return Err(Refusal::Changed("was modified since the scan"));
         }
     }
-    None
+    Ok(())
 }
 
 /// Where the item held open during a move ended up.
@@ -211,30 +279,36 @@ enum Place {
 
 /// The outcome from what the move returned, whether something is still at
 /// the item's path, and where the item held open went. The filesystem is
-/// trusted over the move's result, and an error is never dropped.
+/// trusted over the move's result, and an error is never dropped: a delete
+/// without a copy is always reported, whatever is left.
 fn settle(result: Result<(), RecycleError>, present: bool, place: Place) -> Outcome {
+    let uncertain = |reason: String| Outcome::Uncertain {
+        reason,
+        gone: !present,
+    };
     let deleted = || {
         format!(
             "It's gone, but it didn't go to the {BIN}: it may have been deleted without a copy."
         )
     };
     match (result, place) {
-        (Err(RecycleError::Unrecycled), _) if !present || place == Place::Deleted => {
-            Outcome::Uncertain(UNRECYCLED.into())
+        (Err(RecycleError::Unrecycled), _) if present => {
+            uncertain(format!("{UNRECYCLED} Some of it is still where it was."))
         }
+        (Err(RecycleError::Unrecycled), _) => uncertain(UNRECYCLED.into()),
         // Whatever else happened, the scanned item is in the bin; anything
         // at its path now came after.
         (_, Place::Bin) => Outcome::Recycled,
-        (Ok(()), Place::Deleted) => Outcome::Uncertain(deleted()),
+        (Ok(()), Place::Deleted) => uncertain(deleted()),
         // Gone, though still at its path when last seen: deleted, not moved.
-        (Ok(()), Place::Unmoved) if !present => Outcome::Uncertain(deleted()),
-        (Ok(()), Place::Elsewhere) => Outcome::Uncertain(format!(
+        (Ok(()), Place::Unmoved) if !present => uncertain(deleted()),
+        (Ok(()), Place::Elsewhere) => uncertain(format!(
             "It was moved elsewhere during the delete, so whatever was in its place may be in the {BIN} instead."
         )),
         (Ok(()), _) if !present => Outcome::Recycled,
         (Ok(()), _) => Outcome::Failed("It is still there after deleting.".into()),
         (Err(e), _) if present && place != Place::Deleted => Outcome::Failed(e.message()),
-        (Err(e), _) => Outcome::Uncertain(format!(
+        (Err(e), _) => uncertain(format!(
             "{} It's no longer where it was, so it may have been deleted without a copy in the {BIN}.",
             e.message()
         )),
@@ -367,6 +441,7 @@ pub mod tests {
                 found.len
             },
             modified: Some(epoch_seconds(found.modified)),
+            hardlinked: false,
         }
     }
 
@@ -422,7 +497,7 @@ pub mod tests {
         write(&file, "x");
         let outcome = delete_with(&target(&tmp.0, &file), &Fake(permanently));
         if cfg!(windows) {
-            assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+            assert!(matches!(outcome, Outcome::Uncertain { .. }), "{outcome:?}");
         } else {
             assert_eq!(outcome, Outcome::Recycled);
         }
@@ -488,6 +563,85 @@ pub mod tests {
         let t = target(&tmp.0, &file);
         std::fs::remove_dir_all(tmp.0.join("dir")).unwrap();
         assert_eq!(delete_with(&t, &TestBin::new()), Outcome::AlreadyMissing);
+    }
+
+    /// A hard-linked file's listed modified time can be stale, so only its
+    /// ID and size are compared.
+    #[test]
+    fn a_hard_linked_files_time_is_not_compared() {
+        let tmp = TempDir::new("hardlinked");
+        let file = tmp.0.join("a.txt");
+        write(&file, "x");
+        let mut t = target(&tmp.0, &file);
+        let item = t.chain.last_mut().unwrap();
+        item.modified = Some(1);
+        assert!(matches!(
+            delete_with(&t, &TestBin::new()),
+            Outcome::Changed(_)
+        ));
+        t.chain.last_mut().unwrap().hardlinked = true;
+        assert_eq!(delete_with(&t, &TestBin::new()), Outcome::Recycled);
+    }
+
+    #[test]
+    fn folders_without_an_id_are_refused() {
+        let tmp = TempDir::new("noid");
+        let file = tmp.0.join("dir/a.txt");
+        write(&file, "x");
+        let mut t = target(&tmp.0, &file);
+        t.chain[1].ids = [0; 2];
+        assert_eq!(
+            delete_with(&t, &TestBin::new()),
+            Outcome::Failed(format!("The folder “dir” above it {UNCONFIRMED}."))
+        );
+        // A file without one still has its size and time to go by.
+        let mut t = target(&tmp.0, &file);
+        t.chain.last_mut().unwrap().ids = [0; 2];
+        assert_eq!(delete_with(&t, &TestBin::new()), Outcome::Recycled);
+    }
+
+    /// The scan root missing is a problem to report, not a delete done.
+    #[test]
+    fn a_missing_scan_root_is_a_failure() {
+        let tmp = TempDir::new("noroot");
+        let root = tmp.0.join("root");
+        let file = root.join("a.txt");
+        write(&file, "x");
+        let t = target(&root, &file);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(
+            delete_with(&t, &TestBin::new()),
+            Outcome::Failed(m) if m.starts_with("Couldn't reach the folder “root”")
+        ));
+    }
+
+    /// Names ending with a dot or a space are read exactly, never as the
+    /// name without it, and are left alone since the shell would mistake
+    /// them.
+    #[cfg(windows)]
+    #[test]
+    fn names_ending_with_a_dot_or_space_are_never_mistaken() {
+        let tmp = TempDir::new("dots");
+        let verbatim = |name: &str| PathBuf::from(format!(r"\\?\{}\{name}", tmp.0.display()));
+        write(&tmp.0.join("a"), "plain a");
+        write(&tmp.0.join("b"), "plain b");
+        for name in ["a.", "b "] {
+            let path = verbatim(name);
+            std::fs::write(&path, "trailing").unwrap();
+            let (found, _) = identity::hold(&path, false).unwrap();
+            assert_eq!(found.len, 8, "{name:?} read as itself");
+            let t = target(&verbatim(""), &path);
+            assert!(
+                matches!(delete_with(&t, &TestBin::new()), Outcome::Failed(m) if m.contains("ends with a dot or a space")),
+                "{name:?}"
+            );
+            assert!(std::fs::metadata(&path).is_ok());
+        }
+        assert!(tmp.0.join("a").exists() && tmp.0.join("b").exists());
+        // Removed through the verbatim path, which TempDir's cleanup can't.
+        for name in ["a.", "b "] {
+            std::fs::remove_file(verbatim(name)).unwrap();
+        }
     }
 
     #[test]
@@ -570,7 +724,7 @@ pub mod tests {
         );
         assert_eq!(renamed.get(), Some(false));
         // This fake bin doesn't recognise its own folder.
-        assert!(matches!(outcome, Outcome::Uncertain(_)), "{outcome:?}");
+        assert!(matches!(outcome, Outcome::Uncertain { .. }), "{outcome:?}");
         assert!(!file.exists());
     }
 
@@ -609,16 +763,21 @@ pub mod tests {
         );
         assert!(matches!(
             settle(failed(), false, unknown),
-            Outcome::Uncertain(m) if m.starts_with("Access is denied. It's no longer where it was")
+            Outcome::Uncertain { reason, gone: true }
+                if reason.starts_with("Access is denied. It's no longer where it was")
         ));
+        let gone = || Outcome::Uncertain {
+            reason: UNRECYCLED.into(),
+            gone: true,
+        };
         assert_eq!(
             settle(Err(RecycleError::Unrecycled), false, unknown),
-            Outcome::Uncertain(UNRECYCLED.into())
+            gone()
         );
         // Even when the held item says it reached the Recycle Bin.
         assert_eq!(
             settle(Err(RecycleError::Unrecycled), false, Place::Bin),
-            Outcome::Uncertain(UNRECYCLED.into())
+            gone()
         );
         assert!(matches!(
             settle(
@@ -630,6 +789,23 @@ pub mod tests {
         ));
     }
 
+    /// Something was deleted without a copy (such as part of a folder),
+    /// so it's reported however much is left; what's left stays in the scan.
+    #[test]
+    fn a_delete_without_a_copy_is_reported_whatever_is_left() {
+        let partly = Outcome::Uncertain {
+            reason: format!("{UNRECYCLED} Some of it is still where it was."),
+            gone: false,
+        };
+        for place in [Place::Bin, Place::Unmoved, Place::Unknown, Place::Deleted] {
+            assert_eq!(
+                settle(Err(RecycleError::Unrecycled), true, place),
+                partly,
+                "{place:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_held_item_decides_what_was_recycled() {
         assert_eq!(settle(Ok(()), false, Place::Bin), Outcome::Recycled);
@@ -637,11 +813,11 @@ pub mod tests {
         assert_eq!(settle(Ok(()), true, Place::Bin), Outcome::Recycled);
         assert!(matches!(
             settle(Ok(()), false, Place::Elsewhere),
-            Outcome::Uncertain(_)
+            Outcome::Uncertain { .. }
         ));
         assert!(matches!(
             settle(Ok(()), false, Place::Unmoved),
-            Outcome::Uncertain(_)
+            Outcome::Uncertain { .. }
         ));
     }
 }

@@ -12,7 +12,7 @@ export type DeleteReport = { generation: number,
 recycled: Array<number>, 
 /**
  * Items taken out of the scan: those recycled, already missing, or
- * uncertain.
+ * uncertain with nothing left at their path.
  */
 removed: Array<number>, 
 /**

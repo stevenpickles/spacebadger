@@ -529,8 +529,8 @@ pub enum DeleteOutcome {
     Changed,
     /// Couldn't be moved; still where it was.
     Failed,
-    /// Gone from where it was, but not confirmed in the Recycle Bin or
-    /// Trash: it may have been deleted without a copy.
+    /// Not confirmed in the Recycle Bin or Trash: some or all of it may
+    /// have been deleted without a copy.
     Uncertain,
 }
 
@@ -557,7 +557,7 @@ pub struct DeleteReport {
     /// Items moved to the Recycle Bin or Trash.
     pub recycled: Vec<u32>,
     /// Items taken out of the scan: those recycled, already missing, or
-    /// uncertain.
+    /// uncertain with nothing left at their path.
     pub removed: Vec<u32>,
     /// Every item not recycled, with what happened to it, in the order
     /// tried.

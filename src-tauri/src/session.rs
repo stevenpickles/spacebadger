@@ -694,9 +694,12 @@ impl Session {
                     removed.push(n);
                     (proto::DeleteOutcome::AlreadyMissing, String::new())
                 }
-                Outcome::Uncertain(message) => {
-                    removed.push(n);
-                    (proto::DeleteOutcome::Uncertain, message)
+                Outcome::Uncertain { reason, gone } => {
+                    // What's left at its path stays in the scan.
+                    if gone {
+                        removed.push(n);
+                    }
+                    (proto::DeleteOutcome::Uncertain, reason)
                 }
                 Outcome::Changed(message) => (proto::DeleteOutcome::Changed, message),
                 Outcome::Failed(message) => (proto::DeleteOutcome::Failed, message),
@@ -744,6 +747,7 @@ impl Session {
                 ids,
                 len: tree.logical(n),
                 modified: tree.modified(n),
+                hardlinked: tree.flags(n) & (flags::HARDLINKED | flags::HARDLINK_ALIAS) != 0,
             });
             at = tree.parent(n);
         }
@@ -1422,6 +1426,7 @@ mod tests {
             "a selected folder takes the copies in it"
         );
         let kept = tmp.0.join("copy.bin");
+        let scanned_time = std::fs::metadata(&kept).unwrap().modified().unwrap();
         std::fs::write(&kept, b"changed").unwrap();
         let risky = check(&nodes[1..]);
         assert_eq!((risky.all_selected, risky.kept_gone), (0, 1));
@@ -1430,6 +1435,13 @@ mod tests {
             [display_path(&tmp.0.join("old").join("copy-2.bin"))]
         );
         std::fs::write(&kept, &copy).unwrap();
+        // As scanned again, so it can be deleted below.
+        std::fs::File::options()
+            .write(true)
+            .open(&kept)
+            .unwrap()
+            .set_modified(scanned_time)
+            .unwrap();
 
         // With a filter, only matching files count.
         let search = session.search_set("*.bin").unwrap().unwrap().search;
