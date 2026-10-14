@@ -5,9 +5,11 @@
 //! absolute path (compared as the file system compares names), holding
 //! `<finished ms>.sbsnap` files in the format of `sb_core::snapshot`. A
 //! snapshot is written to a new temporary file (see [`crate::atomic_file`])
-//! and renamed into place, so a crash leaves either the whole file or none,
-//! and saves at once never write into each other's files. Temporary files a
-//! crash left behind are removed by a later prune once an hour old.
+//! and renamed into place without replacing anything, so a crash leaves
+//! either the whole file or none, and saves at once never write into or
+//! over each other's files: one that finds its id taken as it renames takes
+//! the next (`<ms>-1`, `<ms>-2`, ...). Temporary files a crash left behind
+//! are removed by a later prune once an hour old.
 //!
 //! After each save, a root keeps its newest [`KEEP_NEWEST`] snapshots, the
 //! first of every other day (UTC), and always its first, so rescanning a
@@ -33,6 +35,10 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const EXTENSION: &str = "sbsnap";
 /// Temporary files of earlier versions.
 const OLD_TEMP_EXTENSION: &str = "tmp";
+
+/// Ids a save tries for snapshots of one root finished in the same
+/// millisecond before giving up.
+const MAX_SAME_TIME: usize = 10_000;
 
 /// Temporary files older than this are left over from a crash.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
@@ -84,24 +90,35 @@ impl Store {
         // Another save's prune may remove the folder while it's empty, just
         // after it was made here; then it's made again.
         let mut retried = false;
-        let (id, temp) = loop {
+        let mut temp = loop {
             fs::create_dir_all(&dir)?;
-            let mut id = base.clone();
-            let mut n = 1;
-            while dir.join(format!("{id}.{EXTENSION}")).exists() {
-                id = format!("{base}-{n}");
-                n += 1;
-            }
-            match TempFile::new_in(&dir, &format!("{id}.{EXTENSION}")) {
-                Ok(temp) => break (id, temp),
+            match TempFile::new_in(&dir, &format!("{base}.{EXTENSION}")) {
+                Ok(temp) => break temp,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !retried => retried = true,
                 Err(e) => return Err(e),
             }
         };
-        let path = dir.join(format!("{id}.{EXTENSION}"));
         // Removed when dropped unless persisted.
         temp.file().write_all(&bytes)?;
-        temp.persist(&path)?;
+        // The first free id, claimed only if it's still free as the file is
+        // renamed into place: saves at once, in this app or another copy of
+        // it, each keep a snapshot of their own.
+        let mut n = 0;
+        while dir
+            .join(format!("{}.{EXTENSION}", numbered(&base, n)))
+            .exists()
+        {
+            n += 1;
+        }
+        let id = loop {
+            let id = numbered(&base, n);
+            match temp.persist_new(&format!("{id}.{EXTENSION}")) {
+                Ok(()) => break id,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < MAX_SAME_TIME => n += 1,
+                Err(e) => return Err(e),
+            }
+        };
+        let path = dir.join(format!("{id}.{EXTENSION}"));
         let mut keep = vec![path];
         keep.extend(protect.map(|p| dir.join(format!("{p}.{EXTENSION}"))));
         self.prune(&keep);
@@ -236,9 +253,27 @@ fn remove_stale_temps(dir: &Path) {
             .ok()
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .is_some_and(|age| age > STALE_TEMP);
-        if old {
+        if !old {
+            continue;
+        }
+        // Outside Windows a temporary file is in a private folder of that
+        // name. The entry's type is its own, never a link's target, and
+        // removing a folder never follows links inside it.
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(path);
+        } else {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+/// The id of the `n`th snapshot of a root finished at `base`: `base`, then
+/// `base-1`, `base-2`, and so on.
+fn numbered(base: &str, n: usize) -> String {
+    if n == 0 {
+        base.to_owned()
+    } else {
+        format!("{base}-{n}")
     }
 }
 
@@ -463,6 +498,16 @@ mod tests {
         // A fixed name the new snapshot's temporary file might once have had.
         let taken = dir.join(".5000.sbsnap.partial");
         let hour_ago = SystemTime::now() - STALE_TEMP - Duration::from_secs(60);
+        // Private folders holding a temporary file, as made outside Windows.
+        let stale_folder = dir.join(".6000.sbsnap.1-0.partial");
+        let fresh_folder = dir.join(".7000.sbsnap.1-0.partial");
+        for (folder, aged) in [(&stale_folder, true), (&fresh_folder, false)] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join("data"), "not ours").unwrap();
+            if aged {
+                open_folder(folder).set_modified(hour_ago).unwrap();
+            }
+        }
         for (path, aged) in [
             (&stale, true),
             (&old, true),
@@ -486,12 +531,55 @@ mod tests {
             [
                 ".4000.sbsnap.1-0.partial",
                 ".5000.sbsnap.partial",
+                ".7000.sbsnap.1-0.partial",
                 "1000.sbsnap",
                 "5000.sbsnap"
             ]
         );
         assert_eq!(fs::read(&taken).unwrap(), b"not ours");
         assert_eq!(fs::read(&fresh).unwrap(), b"not ours");
+        assert_eq!(fs::read(fresh_folder.join("data")).unwrap(), b"not ours");
+    }
+
+    /// A folder opened to change its times.
+    fn open_folder(path: &Path) -> File {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS opens a folder; FILE_WRITE_ATTRIBUTES
+            // sets its times.
+            options.custom_flags(0x0200_0000).access_mode(0x100);
+        }
+        options.open(path).unwrap()
+    }
+
+    #[test]
+    fn concurrent_saves_at_one_time_each_keep_their_own() {
+        let tmp = temp("concurrent");
+        let store = Store::with_limits(tmp.0.clone(), 100, u64::MAX);
+        let a = Path::new("/data/a");
+        let ids: Vec<(u64, String)> = std::thread::scope(|s| {
+            let saves: Vec<_> = (1..=32u64)
+                .map(|logical| {
+                    let store = &store;
+                    s.spawn(move || {
+                        let id = store.save(a, &snap("/data/a", 1000, logical), None);
+                        (logical, id.unwrap())
+                    })
+                })
+                .collect();
+            saves.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let distinct: HashSet<&String> = ids.iter().map(|(_, id)| id).collect();
+        assert_eq!(distinct.len(), 32, "{ids:?}");
+        for (logical, id) in &ids {
+            assert_eq!(store.load(a, id).unwrap().header().logical, *logical);
+        }
+        assert_eq!(store.list(a).len(), 32);
+        let left = fs::read_dir(store.root_dir(a)).unwrap().count();
+        assert_eq!(left, 32, "no temporary files left");
     }
 
     #[test]

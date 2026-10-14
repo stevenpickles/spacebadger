@@ -42,6 +42,8 @@ windows-core = "=0.62.2"
 
 [target.'cfg(not(windows))'.dependencies]
 trash.workspace = true
+# Staging and renaming relative to open folders, for exports and snapshots.
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
 
 [lints]
 workspace = true
