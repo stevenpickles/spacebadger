@@ -19,11 +19,8 @@
     onDuplicatesRecheck,
     onDuplicatesStatus,
     onExportProgress,
-    onScanStatus,
-    scanCancel,
     scanChoose,
     scanRefresh,
-    scanStatus,
     restartElevated,
     reveal,
     revealExport,
@@ -42,6 +39,7 @@
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
+  import { ScanController } from "./lib/controllers/scan.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
   import Duplicates from "./lib/Duplicates.svelte";
@@ -63,7 +61,6 @@
   import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
-  import type { ScanStarted } from "./lib/protocol/ScanStarted";
   import type { ScanStatus } from "./lib/protocol/ScanStatus";
   import type { SearchRow } from "./lib/protocol/SearchRow";
   import type { SmallItem } from "./lib/protocol/SmallItem";
@@ -98,10 +95,9 @@
     ["*.iso; size:>1GB; older:1y", "disk images over 1 GB, untouched for a year"],
   ];
 
-  let generation = $state<number | null>(null);
-  let status = $state.raw<ScanStatus | null>(null);
-  let statusAt = $state(0);
-  let now = $state(performance.now());
+  const scan = new ScanController({ onadopt: adopted, onerror: (message) => (problem = message) });
+  const generation = $derived(scan.generation);
+  const status = $derived(scan.status);
   let view = $state(ROOT);
   /** The focused item: its details are shown and arrow keys start there. */
   let selection = $state<Selection | null>(null);
@@ -166,7 +162,7 @@
   /** Smallest file size the duplicate search looks at. */
   let dupesMinSize = $state(Math.max(KILO, Number(saved("duplicates-min-size")) || KILO ** 2));
 
-  const scanning = $derived(status?.phase.kind === "scanning");
+  const scanning = $derived(scan.scanning);
   /** Restarting with administrator rights is offered on Windows only. */
   const canElevate = $derived(os === "windows" && !privileged);
 
@@ -184,9 +180,6 @@
   }
   const deleteBlocked = $derived(
     !status || scanning ? "Deleting is available once the scan finishes or is cancelled." : null,
-  );
-  const elapsedMs = $derived(
-    status ? status.elapsedMs + (scanning ? Math.max(0, now - statusAt) : 0) : 0,
   );
 
   appInfo().then(
@@ -234,14 +227,11 @@
   let contentsFolders = $state(saved("contents-folders") !== "off");
   $effect(() => remember("contents-folders", contentsFolders ? "on" : "off"));
 
-  /** Switches to a newer scan; view and selection start over at its root. */
-  function adopt(next: number) {
-    if (generation !== null && next <= generation) return;
+  /** A newer scan is shown; view and selection start over at its root. */
+  function adopted(previous: ScanStatus | null) {
     // Rescanning the same folder goes on comparing with the same earlier
     // scan once the new one completes.
-    carried = comparison && status ? { snapshot: comparison.snapshot, root: status.root } : null;
-    generation = next;
-    status = null;
+    carried = comparison && previous ? { snapshot: comparison.snapshot, root: previous.root } : null;
     view = ROOT;
     pick(null);
     viewDetails = null;
@@ -257,43 +247,9 @@
     if (query) applySearch(query);
   }
 
-  function receive(s: ScanStatus) {
-    adopt(s.generation);
-    if (s.generation !== generation) return;
-    if (status && s.revision < status.revision && s.phase.kind === "scanning") return;
-    status = s;
-    statusAt = performance.now();
-  }
-
-  $effect(() => {
-    const unlisten = onScanStatus(receive);
-    scanStatus().then((s) => s && receive(s), () => {});
-    return () => void unlisten.then((f) => f());
-  });
-
-  // Local clock so elapsed time keeps moving between coalesced updates.
-  $effect(() => {
-    if (!scanning) return;
-    const timer = setInterval(() => (now = performance.now()), 250);
-    return () => clearInterval(timer);
-  });
-
-  async function run(action: () => Promise<ScanStarted | null>) {
-    try {
-      const started = await action();
-      if (started) adopt(started.generation);
-    } catch (e) {
-      problem = String(e);
-    }
-  }
-
-  function cancel() {
-    if (generation !== null) scanCancel(generation).catch((e: unknown) => (problem = String(e)));
-  }
-
   // Volume capacity, read when a scan starts and again when it ends, since
   // free space may have changed meanwhile.
-  const finished = $derived(status !== null && status.phase.kind !== "scanning");
+  const finished = $derived(scan.finished);
   $effect(() => {
     const gen = generation;
     void [finished, deletions];
@@ -321,8 +277,7 @@
   let viewChange = $state.raw<ItemChange | null>(null);
   const compareId = $derived(comparison?.snapshot.id ?? null);
   const since = $derived(comparison ? formatWhen(comparison.snapshot.createdMs) : "");
-  /** Only a completed scan is saved, and only it can be compared. */
-  const completed = $derived(status?.phase.kind === "complete" || status?.phase.kind === "completeWithOmissions");
+  const completed = $derived(scan.completed);
 
   $effect(() => {
     const gen = generation;
@@ -1233,16 +1188,16 @@
 <div class="app">
   <div class="toolbar">
     <div class="group">
-      <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
+      <button type="button" class="primary" onclick={() => scan.run(scanChoose)}>Choose folder or drive…</button>
       {#if generation !== null}
         <!-- One place for both, so the toolbar stays on one row: a scan can
              be cancelled while it runs and repeated once it's done. -->
         {#if scanning}
-          <button type="button" onclick={cancel}>Cancel</button>
+          <button type="button" onclick={() => scan.cancel()}>Cancel</button>
         {:else}
           <button
             type="button"
-            onclick={() => run(scanRefresh)}
+            onclick={() => scan.run(scanRefresh)}
             title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
           >
         {/if}
@@ -1429,7 +1384,7 @@
         <div class="placeholder">
           <h1>See what's using your disk space</h1>
           <p>Choose a folder or a whole drive. The map fills in while it scans: bigger boxes are bigger files.</p>
-          <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
+          <button type="button" class="primary" onclick={() => scan.run(scanChoose)}>Choose folder or drive…</button>
           <p class="small">
             Press <kbd>?</kbd> for keyboard and mouse shortcuts.
           </p>
@@ -1627,10 +1582,10 @@
 
   <StatusBar
     {status}
-    {elapsedMs}
+    elapsedMs={scan.elapsedMs}
     {showOmissions}
     ontoggleomissions={() => (showOmissions = !showOmissions)}
-    oncancel={cancel}
+    oncancel={() => scan.cancel()}
   />
 
   {#if menu}
