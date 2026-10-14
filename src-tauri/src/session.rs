@@ -20,7 +20,7 @@ use sb_scan::duplicates::plan;
 use sb_scan::{FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 mod compare;
@@ -46,11 +46,16 @@ const RANK_STEP: usize = 100_000;
 /// before it serves the one kept instead; the next request goes on.
 const RANK_BUDGET: usize = 4 * RANK_STEP;
 
+/// Longest a request waits at once for another to finish a ranking it
+/// needs, before looking again.
+const RANK_WAIT: Duration = Duration::from_millis(250);
+
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
 // Lock order: `deleting` first, `search` and `compare` before the tree,
-// then `rankings`, and `order` last. `rematching` is taken with the
-// tree read-locked, and `compare` briefly inside it.
+// then `rankings`, and `order` last; waiting on `ranked` holds only
+// `rankings`. `rematching` is taken with the tree read-locked, and
+// `compare` briefly inside it.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -64,6 +69,8 @@ pub struct Session {
     /// The Contents list's rankings: folders' items, or the files under
     /// them, by size.
     rankings: Mutex<Rankings>,
+    /// Signalled when a walk taken to be finished is kept or given up.
+    ranked: Condvar,
     /// Folder names and extensions for the filter's completion.
     names: Mutex<Option<Names>>,
     /// The latest search for duplicate files.
@@ -99,6 +106,24 @@ struct Names {
 
 /// While scanning, the completion index is rebuilt at most this often.
 const NAMES_REFRESH: Duration = Duration::from_secs(5);
+
+/// A walk taken to be finished by [`Session::ranked`]. Dropping it ends
+/// the walk's finishing if its ranking wasn't kept (an edit came first, or
+/// an error), and wakes the requests waiting for it.
+struct Finishing<'a> {
+    session: &'a Session,
+    key: Key,
+    walk: u64,
+}
+
+impl Drop for Finishing<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut rankings) = self.session.rankings.lock() {
+            rankings.give_up(self.key, self.walk);
+        }
+        self.session.ranked.notify_all();
+    }
+}
 
 struct ActiveSearch {
     id: u32,
@@ -173,6 +198,7 @@ impl Session {
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
             rankings: Mutex::new(Rankings::default()),
+            ranked: Condvar::new(),
             names: Mutex::new(None),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
@@ -467,6 +493,10 @@ impl Session {
     /// if there is one, so a large folder is ranked again across several
     /// requests; after the scan, a request walks until it's done, so it
     /// never serves a ranking from before an edit such as a delete.
+    ///
+    /// Requests for the same key share a walk: they step the same one, and
+    /// while one of them finishes it the others wait for its ranking (the
+    /// Contents tab asks for several pages at once).
     fn ranked<R>(
         &self,
         key: Key,
@@ -475,6 +505,8 @@ impl Session {
     ) -> Result<R, String> {
         let tree_lock = self.scan.tree();
         let mut walked = 0;
+        // Waited for another request's walk, whose ranking then does.
+        let mut waited = false;
         loop {
             let mut search = match key.search {
                 Some(_) => Some(
@@ -504,11 +536,17 @@ impl Session {
             let serve_kept = entry.ranking().is_some_and(|r| {
                 r.covers(end)
                     && (r.current(&now, ranking::REFRESH)
-                        || (!now.finished && walked >= RANK_BUDGET))
+                        || (!now.finished && (waited || walked >= RANK_BUDGET)))
             });
             if serve_kept {
                 drop(search);
                 return Ok(serve(&tree, entry.ranking().expect("checked above")));
+            }
+            if entry.finishing() {
+                drop((rankings, tree, search));
+                self.wait_for_ranking(key)?;
+                waited = true;
+                continue;
             }
             let done = {
                 let _rank = metrics::span("rank");
@@ -519,6 +557,12 @@ impl Session {
                 continue;
             }
             let walk = entry.take_walk().expect("a walk was just stepped");
+            // Declared before the locks below, so it's dropped after them.
+            let _finishing = Finishing {
+                session: self,
+                key,
+                walk: walk.id(),
+            };
             drop((rankings, tree, search));
             let ranking = {
                 let _rank = metrics::span("rank");
@@ -543,6 +587,21 @@ impl Session {
             rankings.trim(key);
             return Ok(page);
         }
+    }
+
+    /// Waits while another request finishes a walk for `key`, for at most
+    /// [`RANK_WAIT`]. Takes only the rankings' lock.
+    fn wait_for_ranking(&self, key: Key) -> Result<(), String> {
+        let _wait = metrics::span("rank wait");
+        let rankings = self
+            .rankings
+            .lock()
+            .map_err(|_| "rankings are unavailable")?;
+        let _ = self
+            .ranked
+            .wait_timeout_while(rankings, RANK_WAIT, |r| r.finishing(key))
+            .map_err(|_| "rankings are unavailable")?;
+        Ok(())
     }
 
     /// Folder names or extensions for the filter's completion, largest
@@ -1527,6 +1586,70 @@ mod tests {
         let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["b.log", "keep.txt"]);
         assert_eq!(session.folder_files(&request).unwrap().total, 2);
+    }
+
+    #[test]
+    fn contents_pages_asked_for_together_share_one_walk() {
+        let session = load::synthetic(8, 2_000);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !session.scan.progress().state.is_finished() {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let nodes = session.scan.tree().read().unwrap().len();
+        assert!(nodes > 2 * RANK_STEP, "a walk takes several steps: {nodes}");
+        let generation = session.generation();
+        let request = move |offset| proto::FolderFilesRequest {
+            generation,
+            folder: 0,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset,
+            limit: 200,
+        };
+
+        // Four pages at once, as the Contents tab asks after the scan.
+        let start = std::sync::Barrier::new(4);
+        let pages: Vec<_> = std::thread::scope(|s| {
+            let asked: Vec<_> = (0..4)
+                .map(|p| {
+                    let (start, session) = (&start, &session);
+                    s.spawn(move || {
+                        start.wait();
+                        session.folder_files(&request(p * 200)).unwrap()
+                    })
+                })
+                .collect();
+            asked.into_iter().map(|a| a.join().unwrap()).collect()
+        });
+        let key = Key {
+            scope: Scope::Files,
+            folder: NodeId::ROOT,
+            metric: layout::Metric::Logical,
+            search: None,
+        };
+        {
+            let mut rankings = session.rankings.lock().unwrap();
+            let entry = rankings.entry(key);
+            assert_eq!(entry.walks(), 1, "one walk, shared");
+            assert!(!entry.finishing());
+        }
+
+        // The pages fit together into a full sort, from one revision.
+        let tree = session.scan.tree();
+        let tree = tree.read().unwrap();
+        let (files, _) = layout::files_under(&tree, NodeId::ROOT, key.metric, None);
+        let mut all: Vec<_> = files
+            .into_iter()
+            .map(|f| (f.index() as u32, tree.logical(f)))
+            .collect();
+        all.sort_unstable_by_key(|&(n, w)| (std::cmp::Reverse(w), n));
+        for (p, page) in pages.iter().enumerate() {
+            assert_eq!(page.revision, session.scan.progress().revision);
+            assert_eq!(page.total as usize, all.len());
+            let got: Vec<_> = page.files.iter().map(|f| (f.node, f.weight)).collect();
+            assert_eq!(got, all[p * 200..(p + 1) * 200], "page {p}");
+        }
     }
 
     #[test]
