@@ -40,11 +40,11 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
     FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdBothDirectoryInfo,
-    FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationW,
-    GetVolumePathNameW, OPEN_EXISTING,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
+    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -154,12 +154,26 @@ fn open_with(
     access: u32,
     flags: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> windows::core::Result<OwnedHandle> {
+    open_shared(
+        path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        flags,
+    )
+}
+
+fn open_shared(
+    path: &Path,
+    access: u32,
+    share: FILE_SHARE_MODE,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> windows::core::Result<OwnedHandle> {
     let path = wide(path);
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share,
             None,
             OPEN_EXISTING,
             flags,
@@ -210,6 +224,34 @@ pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprin
     check_contents(&handle, len)?;
     let print = fingerprint(&handle)?;
     Ok((std::fs::File::from(handle), print))
+}
+
+/// Opens the file at `path` for reading while sharing only reading, so
+/// until the handle is closed no one can write to, rename, replace, or
+/// delete it, and checks it's the file `print` describes. Refused (as in
+/// use) while another program has it open to write or delete. Checked
+/// first with an attributes-only open, as [`open_contents`] does, so a
+/// cloud file is never opened for its data.
+pub fn hold_contents(path: &Path, print: &Fingerprint) -> Result<OwnedHandle, Skip> {
+    let probe = probe_contents(path)?;
+    let compressed = check_contents(&probe, print.len)?;
+    drop(probe);
+    let mut flags = FILE_FLAG_OPEN_NO_RECALL;
+    if !compressed {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let handle = open_shared(
+        path,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ,
+        flags,
+    )
+    .map_err(|e| Skip::of(&io_error(&e)))?;
+    check_contents(&handle, print.len)?;
+    if !print.unchanged(&fingerprint(&handle)?) {
+        return Err(Skip::Changed);
+    }
+    Ok(handle)
 }
 
 /// The fingerprint of the file at `path`, read with the attributes-only

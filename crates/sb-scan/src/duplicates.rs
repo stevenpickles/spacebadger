@@ -19,7 +19,8 @@
 //! was last written) as it's opened and again once read, through the same
 //! handle; a file that changed in between is left out. A group keeps its
 //! contents' hash and each file's fingerprint, so a copy can be checked
-//! again later, contents included, with [`recheck`].
+//! again later, contents included, with [`recheck`], or held and checked
+//! by a pool of readers with [`confirm`].
 
 use sb_core::layout::{self, Metric};
 use sb_core::search::Search;
@@ -126,7 +127,21 @@ pub trait Contents: Sync {
     /// what [`Contents::open`] refuses. Much cheaper than opening it to
     /// read, which virus scanners look at.
     fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip>;
+
+    /// Keeps the file at `path`, which must still be the one `print`
+    /// describes, from being written to, replaced, or deleted until the
+    /// returned value is dropped, where the platform allows it (Windows);
+    /// elsewhere this only checks it. Other programs may still read it.
+    fn hold(&self, path: &Path, print: &Fingerprint) -> Result<Held, Skip> {
+        match self.examine(path, print.len)? {
+            now if print.unchanged(&now) => Ok(Box::new(())),
+            _ => Err(Skip::Changed),
+        }
+    }
 }
+
+/// What [`Contents::hold`] holds on to.
+pub type Held = Box<dyn Send>;
 
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -267,12 +282,7 @@ pub fn run<C: Contents>(
     std::thread::scope(|s| {
         for _ in 0..readers {
             s.spawn(|| {
-                let mut reader = Reader {
-                    contents,
-                    cancel,
-                    counters,
-                    buf: vec![0; BUFFER],
-                };
+                let mut reader = Reader::new(contents, cancel, counters);
                 while let Some(task) = work.next(plan, cancel) {
                     // Hands the task back even if reading panics, so the
                     // other readers don't wait for it forever.
@@ -320,23 +330,169 @@ pub fn recheck<C: Contents>(
     cancel: &AtomicBool,
     counters: &Counters,
 ) -> Recheck {
-    // Written to since is told before reading.
-    match contents.examine(path, print.len) {
-        Ok(now) if print.unchanged(&now) => {}
-        Ok(_) | Err(Skip::Vanished | Skip::Changed) => return Recheck::Changed,
-        Err(why) => return Recheck::Unknown(why),
+    Reader::new(contents, cancel, counters).recheck(path, print, digest)
+}
+
+/// One group's copies to confirm before a delete relies on them: any one
+/// still unchanged with the group's contents will do.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub size: u64,
+    pub digest: Digest,
+    /// Paths and fingerprints as compared, in the order to try them.
+    pub copies: Vec<(PathBuf, Fingerprint)>,
+}
+
+/// What [`confirm`] found for a group.
+pub enum Confirmed {
+    /// This copy is unchanged, and held (see [`Contents::hold`]) until the
+    /// value is dropped.
+    Copy(usize, Held),
+    /// Every copy is gone or has changed.
+    Changed,
+    /// Some copy couldn't be read or held to tell.
+    Unknown,
+    /// `cancel` was set first.
+    Cancelled,
+}
+
+/// How far [`confirm`] has got, readable while it runs.
+#[derive(Debug, Default)]
+pub struct ConfirmProgress {
+    /// Bytes read so far (only `read` is used).
+    pub counters: Counters,
+    /// Bytes of copies tried or still to try; grows when a copy isn't
+    /// confirmed and the next is tried.
+    pub total: AtomicU64,
+    /// Bytes of copies dealt with without being read whole.
+    unread: AtomicU64,
+}
+
+impl ConfirmProgress {
+    /// Bytes dealt with, never more than [`ConfirmProgress::total`].
+    pub fn done(&self) -> u64 {
+        self.counters.read.load(Ordering::Relaxed) + self.unread.load(Ordering::Relaxed)
     }
-    let mut reader = Reader {
-        contents,
-        cancel,
-        counters,
-        buf: vec![0; BUFFER],
-    };
-    match reader.read(path, print.len, false) {
-        Err(Cancelled) => Recheck::Cancelled,
-        Ok(Ok((d, now))) if print.unchanged(&now) && d == *digest => Recheck::Same,
-        Ok(Ok(_) | Err(Skip::Vanished | Skip::Changed | Skip::Changing)) => Recheck::Changed,
-        Ok(Err(why)) => Recheck::Unknown(why),
+}
+
+/// Holds and reads again, by `readers` threads, a copy of each group until
+/// one is confirmed unchanged, trying a group's next copy only when one
+/// isn't; at most [`STREAMS`] large files are read at once. Each copy is
+/// held before it's read, so a confirmed copy can't change until its
+/// [`Confirmed::Copy`] is dropped.
+pub fn confirm<C: Contents>(
+    contents: &C,
+    groups: &[Confirm],
+    readers: usize,
+    cancel: &AtomicBool,
+    progress: &ConfirmProgress,
+) -> Vec<Confirmed> {
+    progress.total.store(
+        groups
+            .iter()
+            .filter(|g| !g.copies.is_empty())
+            .map(|g| g.size)
+            .sum(),
+        Ordering::Relaxed,
+    );
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let streams = (Mutex::new(0usize), Condvar::new());
+    let results: Vec<Mutex<Option<Confirmed>>> = groups.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..readers.clamp(1, groups.len().max(1)) {
+            s.spawn(|| {
+                let mut reader = Reader::new(contents, cancel, &progress.counters);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(g) = groups.get(i) else { break };
+                    let found = confirm_group(&mut reader, g, &streams, progress);
+                    *results[i].lock().unwrap() = Some(found);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.into_inner().unwrap().unwrap_or(Confirmed::Cancelled))
+        .collect()
+}
+
+/// Tries a group's copies in order; see [`confirm`].
+fn confirm_group<C: Contents>(
+    reader: &mut Reader<'_, C>,
+    g: &Confirm,
+    (taken, freed): &(Mutex<usize>, Condvar),
+    progress: &ConfirmProgress,
+) -> Confirmed {
+    let mut found = Confirmed::Changed;
+    for (i, (path, print)) in g.copies.iter().enumerate() {
+        if i > 0 {
+            progress.total.fetch_add(g.size, Ordering::Relaxed);
+        }
+        if reader.cancel.load(Ordering::Relaxed) {
+            return Confirmed::Cancelled;
+        }
+        let held = match reader.contents.hold(path, print) {
+            Ok(held) => held,
+            Err(why) => {
+                progress.unread.fetch_add(g.size, Ordering::Relaxed);
+                if !matches!(why, Skip::Vanished | Skip::Changed) {
+                    found = Confirmed::Unknown;
+                }
+                continue;
+            }
+        };
+        let large = g.size > LARGE;
+        if large {
+            let mut n = freed
+                .wait_while(taken.lock().unwrap(), |n| *n >= STREAMS)
+                .unwrap();
+            *n += 1;
+        }
+        let checked = reader.recheck(path, print, &g.digest);
+        if large {
+            *taken.lock().unwrap() -= 1;
+            freed.notify_one();
+        }
+        progress
+            .unread
+            .fetch_add(g.size - reader.last, Ordering::Relaxed);
+        match checked {
+            Recheck::Same => return Confirmed::Copy(i, held),
+            Recheck::Changed => {}
+            Recheck::Unknown(_) => found = Confirmed::Unknown,
+            Recheck::Cancelled => return Confirmed::Cancelled,
+        }
+    }
+    found
+}
+
+impl<'a, C: Contents> Reader<'a, C> {
+    fn new(contents: &'a C, cancel: &'a AtomicBool, counters: &'a Counters) -> Self {
+        Self {
+            contents,
+            cancel,
+            counters,
+            buf: vec![0; BUFFER],
+            last: 0,
+        }
+    }
+
+    /// See [`recheck`].
+    fn recheck(&mut self, path: &Path, print: &Fingerprint, digest: &Digest) -> Recheck {
+        self.last = 0;
+        // Written to since is told before reading.
+        match self.contents.examine(path, print.len) {
+            Ok(now) if print.unchanged(&now) => {}
+            Ok(_) | Err(Skip::Vanished | Skip::Changed) => return Recheck::Changed,
+            Err(why) => return Recheck::Unknown(why),
+        }
+        match self.read(path, print.len, false) {
+            Err(Cancelled) => Recheck::Cancelled,
+            Ok(Ok((d, now))) if print.unchanged(&now) && d == *digest => Recheck::Same,
+            Ok(Ok(_) | Err(Skip::Vanished | Skip::Changed | Skip::Changing)) => Recheck::Changed,
+            Ok(Err(why)) => Recheck::Unknown(why),
+        }
     }
 }
 
@@ -567,6 +723,8 @@ struct Reader<'a, C> {
     cancel: &'a AtomicBool,
     counters: &'a Counters,
     buf: Vec<u8>,
+    /// Bytes the last read hashed.
+    last: u64,
 }
 
 /// A file's digest with its fingerprint once read, or why it couldn't be
@@ -590,6 +748,7 @@ impl<C: Contents> Reader<'_, C> {
     /// Hashes the file's first and last [`SAMPLE`] bytes, or all of it,
     /// failing if it was written to meanwhile.
     fn read(&mut self, path: &Path, size: u64, sample: bool) -> Result<Hashed, Cancelled> {
+        self.last = 0;
         let (mut file, opened) = match self.contents.open(path, size) {
             Ok(opened) => opened,
             Err(why) => return Ok(Err(why)),
@@ -645,6 +804,7 @@ impl<C: Contents> Reader<'_, C> {
             }
             hasher.update(&self.buf[..n]);
             self.counters.read.fetch_add(n as u64, Ordering::Relaxed);
+            self.last += n as u64;
             left -= n as u64;
         }
         Ok(Ok(()))
@@ -1117,6 +1277,66 @@ mod tests {
         let contents = written.0;
         contents.written.lock().unwrap().clear();
         assert_eq!(recheck_with(&contents, &pb, 1), Recheck::Cancelled);
+    }
+
+    #[test]
+    fn confirming_tries_another_copy_only_when_needed() {
+        let mut f = Fixture::new();
+        let names = ["a1", "a2", "a3", "b1", "b2", "c1", "c2"];
+        let nodes: Vec<NodeId> = names
+            .iter()
+            .map(|n| {
+                let seed = n.as_bytes()[0];
+                let len = BIG + usize::from(seed - b'a');
+                f.file(n, bytes(len, seed))
+            })
+            .collect();
+        let (groups, _, _) = f.run(0);
+        assert_eq!(groups.len(), 3);
+        // Each group as a delete would keep it: every copy, plan order.
+        let confirming = |g: &Group| Confirm {
+            size: g.size,
+            digest: g.digest,
+            copies: g
+                .files
+                .iter()
+                .zip(&g.prints)
+                .map(|(&n, &p)| (f.tree.path(n), p))
+                .collect(),
+        };
+        let mut groups: Vec<Confirm> = groups.iter().map(confirming).collect();
+        groups.sort_by_key(|g| g.size);
+        let path = |i: usize| f.tree.path(nodes[i]);
+        // a1 is edited, so a2 is tried; b1 can't be read and b2 is gone;
+        // c1 is fine.
+        let mut edited = bytes(BIG, b'a');
+        edited[7] ^= 1;
+        f.contents.files.insert(path(0), Ok(edited));
+        f.contents.files.insert(path(3), Err(Skip::InUse));
+        f.contents.files.remove(&path(4));
+        f.contents.opened.lock().unwrap().clear();
+
+        let progress = ConfirmProgress::default();
+        let found = confirm(&f.contents, &groups, 3, &AtomicBool::new(false), &progress);
+        assert!(matches!(found[0], Confirmed::Copy(1, _)), "a2");
+        assert!(
+            matches!(found[1], Confirmed::Unknown),
+            "unreadable is no proof"
+        );
+        assert!(matches!(found[2], Confirmed::Copy(0, _)), "c1");
+        let opened = f.contents.opened.lock().unwrap().clone();
+        assert!(!opened.contains(&path(2)), "a3 was never needed");
+        assert!(!opened.contains(&path(6)), "nor c2");
+        let total = progress.total.load(Ordering::Relaxed);
+        assert_eq!(
+            total,
+            groups.iter().map(|g| g.size).sum::<u64>() + groups[0].size + groups[1].size
+        );
+        assert_eq!(progress.done(), total, "every copy tried is dealt with");
+
+        let stop = AtomicBool::new(true);
+        let found = confirm(&f.contents, &groups, 2, &stop, &ConfirmProgress::default());
+        assert!(found.iter().all(|c| matches!(c, Confirmed::Cancelled)));
     }
 
     #[test]

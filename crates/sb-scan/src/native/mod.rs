@@ -1,5 +1,7 @@
 //! Native filesystem adapters. [`NativeFs`] is the adapter for the current OS.
 
+#[cfg(windows)]
+use crate::duplicates::Held;
 use crate::duplicates::{Contents, Fingerprint, Skip};
 use crate::engine::ScanConfig;
 use std::path::Path;
@@ -123,6 +125,13 @@ impl Contents for NativeContents {
         #[cfg(all(unix, not(target_os = "linux")))]
         return unix::examine_contents(path, len);
     }
+
+    /// On Windows the file is opened sharing only reading; other systems
+    /// have no such lock, so it's only checked.
+    #[cfg(windows)]
+    fn hold(&self, path: &Path, print: &Fingerprint) -> Result<Held, Skip> {
+        Ok(Box::new(windows::hold_contents(path, print)?))
+    }
 }
 
 /// A file's device and inode, length, modified time, and number of names.
@@ -185,6 +194,47 @@ mod tests {
             std::os::unix::fs::symlink(&file, &link).unwrap();
             assert_eq!(NativeContents.open(&link, 5).unwrap_err(), Skip::Changed);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_held_file_cant_change_but_others_can_go() {
+        let dir = std::env::temp_dir().join(format!("sb-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (kept, other) = (dir.join("kept.bin"), dir.join("other.bin"));
+        std::fs::write(&kept, b"hello").unwrap();
+        std::fs::write(&other, b"hello").unwrap();
+        let print = NativeContents.examine(&kept, 5).unwrap();
+
+        let held = NativeContents.hold(&kept, &print).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&kept).is_err());
+        assert!(std::fs::remove_file(&kept).is_err());
+        assert!(std::fs::rename(&kept, dir.join("moved.bin")).is_err());
+        assert!(std::fs::rename(&other, &kept).is_err(), "nor replaced");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"hello", "still readable");
+        let (mut reread, _) = NativeContents.open(&kept, 5).unwrap();
+        let mut text = String::new();
+        reread.read_to_string(&mut text).unwrap();
+        drop(reread);
+        std::fs::remove_file(&other).unwrap();
+        drop(held);
+        std::fs::write(&kept, b"HELLO").unwrap();
+
+        // Changed since compared, or open to write elsewhere: not held.
+        assert_eq!(
+            NativeContents.hold(&kept, &print).err(),
+            Some(Skip::Changed)
+        );
+        let print = NativeContents.examine(&kept, 5).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&kept)
+            .unwrap();
+        assert_eq!(NativeContents.hold(&kept, &print).err(), Some(Skip::InUse));
+        drop(writer);
+        assert!(NativeContents.hold(&kept, &print).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
