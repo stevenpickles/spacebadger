@@ -20,6 +20,7 @@ import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
 import type { ExportProgress } from "./protocol/ExportProgress";
 import type { ExportReport } from "./protocol/ExportReport";
 import type { ExportRequest } from "./protocol/ExportRequest";
+import type { FilterUpdated } from "./protocol/FilterUpdated";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { ItemChange } from "./protocol/ItemChange";
@@ -44,6 +45,9 @@ export const EXPECTED_PROTOCOL_VERSION = 4;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
+
+/** Must match `sb_protocol::FILTER_UPDATED_EVENT`. */
+const FILTER_UPDATED_EVENT = "filter-updated";
 
 /** Must match `sb_protocol::EXPORT_PROGRESS_EVENT`. */
 const EXPORT_PROGRESS_EVENT = "export-progress";
@@ -180,6 +184,11 @@ export function fileManagerName(os: string): string {
 
 export function onScanStatus(handler: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>(SCAN_STATUS_EVENT, (event) => handler(event.payload));
+}
+
+/** The filter caught up after a scan stalled; see `FilterUpdated`. */
+export function onFilterUpdated(handler: (updated: FilterUpdated) => void): Promise<UnlistenFn> {
+  return listen<FilterUpdated>(FILTER_UPDATED_EVENT, (event) => handler(event.payload));
 }
 
 /** A failure from a command or the system, as a sentence for messages. */

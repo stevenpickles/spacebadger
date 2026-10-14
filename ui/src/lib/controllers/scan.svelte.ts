@@ -2,7 +2,7 @@
 // cancelling scans. A newer scan (a higher generation) always replaces the
 // one shown, whether it's reported by a status event or by the command
 // that started it; what else starts over is up to the owner's `onadopt`.
-import { onScanStatus, scanCancel, scanStatus } from "../api";
+import { onFilterUpdated, onScanStatus, scanCancel, scanStatus } from "../api";
 import type { ScanStarted } from "../protocol/ScanStarted";
 import type { ScanStatus } from "../protocol/ScanStatus";
 
@@ -12,6 +12,9 @@ type OnAdopt = (previous: ScanStatus | null) => void;
 export class ScanController {
   generation = $state<number | null>(null);
   status = $state.raw<ScanStatus | null>(null);
+  /** Counts the times the filter caught up with the status after the scan
+   * stalled; what's filtered is asked again when it changes. */
+  filterUpdates = $state(0);
   #statusAt = $state(0);
   #now = $state(performance.now());
   #onerror: (message: string) => void;
@@ -43,8 +46,14 @@ export class ScanController {
 
     $effect(() => {
       const unlisten = onScanStatus((s) => this.receive(s));
+      const unlistenFilter = onFilterUpdated((u) => {
+        if (u.generation === this.generation) this.filterUpdates++;
+      });
       scanStatus().then((s) => s && this.receive(s), () => {});
-      return () => void unlisten.then((f) => f());
+      return () => {
+        void unlisten.then((f) => f());
+        void unlistenFilter.then((f) => f());
+      };
     });
 
     // Local clock so elapsed time keeps moving between coalesced updates.
