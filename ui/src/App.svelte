@@ -704,25 +704,28 @@
     untrack(() => pick(null));
   });
 
-  // Totals for several selected items follow the scan.
+  // Totals for several selected items follow the scan; an earlier
+  // revision's reply arriving late is dropped.
+  const multiRequest = latest();
   $effect(() => {
     const gen = generation;
     const nodes = picked;
-    void status?.revision;
+    const revision = status?.revision;
     if (gen === null || nodes.length < 2) {
+      multiRequest.cancel();
       multi = null;
       multiUpdating = false;
       return;
     }
     multiUpdating = true;
-    selectionSummary({ generation: gen, nodes }).then(
+    multiRequest.run(
+      queryKey(gen, revision, ...nodes),
+      () => selectionSummary({ generation: gen, nodes }),
       (s) => {
-        if (gen !== generation || nodes !== picked) return;
         multi = s;
         multiUpdating = false;
       },
-      (e: unknown) => {
-        if (gen !== generation || nodes !== picked) return;
+      (e) => {
         multiUpdating = false;
         problem = `Couldn't total the selection: ${errorText(e)}`;
       },
@@ -887,20 +890,32 @@
   /** What a folder adds up to in the map: its matching files when filtered. */
   const shownSize = (d: NodeDetails) => d.matching?.logical ?? d.logical;
 
+  // Each of the details below takes only its newest reply: a reply to an
+  // earlier filter, revision, or item (A, then B, then A again) is dropped,
+  // however late it arrives.
+  const viewDetailsRequest = latest();
+  const selectedDetailsRequest = latest();
+  const parentSizeRequest = latest();
+  const viewParentSizeRequest = latest();
+
   // Breadcrumbs follow the view; its details also refresh as the scan
   // updates sizes and the filter changes, since they're shown when nothing
   // is selected.
   $effect(() => {
     const gen = generation;
     const node = view;
-    const filter = searchId;
-    void status?.revision;
-    if (gen === null) return;
-    nodeDetails(gen, node, filter).then(
+    const filter = searchId ?? null;
+    const revision = status?.revision;
+    if (gen === null) {
+      viewDetailsRequest.cancel();
+      return;
+    }
+    viewDetailsRequest.run(
+      queryKey(gen, revision, node, filter),
+      () => nodeDetails(gen, node, filter),
       (d) => {
-        if (gen === generation && node === view) viewDetails = d;
+        if (d.generation === gen && d.node === node) viewDetails = d;
       },
-      () => {},
     );
   });
 
@@ -908,19 +923,23 @@
   $effect(() => {
     const gen = generation;
     const sel = selection;
-    const filter = searchId;
-    void [status?.revision, detailsRetry];
+    const filter = searchId ?? null;
+    const revision = status?.revision;
+    void detailsRetry;
     detailsError = null;
     if (gen === null || !sel) {
+      selectedDetailsRequest.cancel();
       selectedDetails = null;
       return;
     }
-    nodeDetails(gen, sel.node, filter).then(
+    const node = sel.node;
+    selectedDetailsRequest.run(
+      queryKey(gen, revision, node, filter),
+      () => nodeDetails(gen, node, filter),
       (d) => {
-        if (gen === generation && selection?.node === sel.node) selectedDetails = d;
+        if (d.generation === gen && d.node === node) selectedDetails = d;
       },
-      (e: unknown) => {
-        if (gen !== generation || selection?.node !== sel.node) return;
+      (e) => {
         selectedDetails = null;
         detailsError = errorText(e);
       },
@@ -933,17 +952,18 @@
     const gen = generation;
     const d = selectedDetails;
     const parent = d?.ancestors.at(-2)?.node;
+    const filter = searchId ?? null;
     parentSize = null;
+    parentSizeRequest.cancel();
     if (gen === null || !d || parent === undefined || selection?.other) return;
     if (parent === view && viewDetails?.node === view) {
       parentSize = shownSize(viewDetails);
       return;
     }
-    nodeDetails(gen, parent, searchId).then(
-      (p) => {
-        if (gen === generation && selectedDetails === d) parentSize = shownSize(p);
-      },
-      () => {},
+    parentSizeRequest.run(
+      queryKey(gen, d.node, parent, filter),
+      () => nodeDetails(gen, parent, filter),
+      (p) => (parentSize = shownSize(p)),
     );
   });
 
@@ -953,13 +973,14 @@
     const gen = generation;
     const d = viewDetails;
     const parent = d?.ancestors.at(-2)?.node;
+    const filter = searchId ?? null;
     viewParentSize = null;
+    viewParentSizeRequest.cancel();
     if (gen === null || !d || parent === undefined) return;
-    nodeDetails(gen, parent, searchId).then(
-      (p) => {
-        if (gen === generation && viewDetails === d) viewParentSize = shownSize(p);
-      },
-      () => {},
+    viewParentSizeRequest.run(
+      queryKey(gen, d.node, parent, filter),
+      () => nodeDetails(gen, parent, filter),
+      (p) => (viewParentSize = shownSize(p)),
     );
   });
 
