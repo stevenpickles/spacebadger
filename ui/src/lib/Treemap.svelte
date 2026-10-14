@@ -92,18 +92,18 @@
 
   const helpId = $props.id();
   let container: HTMLDivElement;
-  // Three stacked canvases, composited as if drawn in one, so hovering
-  // never repaints the map: tiles and selection, then the hover highlight,
-  // then the focus ring and labels (which stay above the highlight).
+  // Two stacked canvases with the hover highlight (an element) between
+  // them, composited as if drawn in one, so hovering never repaints the
+  // map: tiles and selection, then the highlight, then the focus ring and
+  // labels (which stay above the highlight).
   let canvas: HTMLCanvasElement;
-  let hoverCanvas: HTMLCanvasElement;
   let topCanvas: HTMLCanvasElement;
   let width = $state(0);
   let height = $state(0);
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
   /** The rectangle under the pointer, or -1. Only a change of rectangle
-   * redraws the map; moves within one only move the tooltip. */
+   * moves the highlight; moves within one only move the tooltip. */
   let hoverIndex = $state(-1);
   /** Where the pointer is over the map, for the tooltip. */
   let pointer = $state<{ x: number; y: number } | null>(null);
@@ -148,15 +148,15 @@
   })();
   const trace = {
     on: traceFlag,
-    /** Since tracing started: whole-map draws, their label passes, hover draws. */
+    /** Since tracing started: whole-map draws and their label passes. */
     full: new Samples(),
     labels: new Samples(),
-    hover: new Samples(),
     measures: new Samples(),
     /** measureText calls in the draw under way. */
     measuring: 0,
     draws: 0,
-    hoverDraws: 0,
+    /** Changes of hovered tile, each moving the highlight. */
+    hoverChanges: 0,
     moves: 0,
     /** When recent draws happened, for draws per second. */
     recent: [] as number[],
@@ -176,9 +176,8 @@
       // Count from when the overlay opens.
       trace.full = new Samples();
       trace.labels = new Samples();
-      trace.hover = new Samples();
       trace.measures = new Samples();
-      trace.draws = trace.hoverDraws = trace.moves = 0;
+      trace.draws = trace.hoverChanges = trace.moves = 0;
     }
     const update = () => {
       const now = performance.now();
@@ -188,9 +187,8 @@
         `draw: ${stats.draw.summary()}`,
         `traced draw: ${trace.full.summary()}`,
         `labels: ${trace.labels.summary()}`,
-        `hover draw: ${trace.hover.summary()}`,
         `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
-        `moves ${trace.moves} · draws ${trace.draws} · hover draws ${trace.hoverDraws} · draws/s ${perSecond}`,
+        `moves ${trace.moves} · draws ${trace.draws} · hover changes ${trace.hoverChanges} · draws/s ${perSecond}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
@@ -461,20 +459,16 @@
   }
 
   /** Hover: a slight lighten and a 2px line, quieter than the selection.
-   * Above the selection, below the focus ring and labels. */
-  function paintHover() {
-    const ctx = cleared(hoverCanvas);
+   * Drawn by elements between the canvases: above the selection, below the
+   * focus ring and labels. */
+  const hoverRect = $derived.by(() => {
     const l = layout;
-    const hi = hoverIndex;
-    if (!ctx || !l || hi < 0 || hi >= l.count) return;
-    const p = palette;
-    ctx.globalAlpha = dark ? 0.1 : 0.22;
-    ctx.fillStyle = p.textLight;
-    ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
-    ctx.globalAlpha = 0.7;
-    band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, dark ? p.textLight : p.textDark);
-    ctx.globalAlpha = 1;
-  }
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return null;
+    const w = l.w[i]!;
+    const h = l.h[i]!;
+    return { x: l.x[i]!, y: l.y[i]!, w, h, line: w > 2 && h > 2 };
+  });
 
   function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
     const p = palette;
@@ -544,48 +538,12 @@
     ctx.strokeRect(x + o, y + o, w - 2 * o, h - 2 * o);
   }
 
-  // Both layers are drawn in one animation frame, each only when its
-  // inputs changed.
   let frame = 0;
-  let mapDirty = false;
-  let hoverDirty = false;
-
-  function flush() {
-    frame = 0;
-    if (mapDirty) {
-      mapDirty = false;
-      draw();
-    }
-    if (hoverDirty) {
-      hoverDirty = false;
-      const started = performance.now();
-      paintHover();
-      if (trace.on) {
-        trace.hoverDraws++;
-        trace.hover.add(performance.now() - started);
-      }
-    }
-  }
-
-  function schedule() {
-    if (frame === 0) frame = requestAnimationFrame(flush);
-  }
-
   $effect(() => {
     void [layout, marks, selection, selected, palette, colors, width, height];
-    mapDirty = true;
-    schedule();
-  });
-
-  $effect(() => {
-    void [layout, hoverIndex, palette, width, height];
-    hoverDirty = true;
-    schedule();
-  });
-
-  $effect(() => () => {
     cancelAnimationFrame(frame);
-    frame = 0;
+    frame = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(frame);
   });
 
   // ---- interaction -----------------------------------------------------
@@ -614,7 +572,10 @@
     if (!l) return;
     const [x, y] = point(e);
     const index = hitTest(l, x, y);
-    if (trace.on) trace.moves++;
+    if (trace.on) {
+      trace.moves++;
+      if (index !== hoverIndex) trace.hoverChanges++;
+    }
     hoverIndex = index;
     pointer = index >= 0 ? { x, y } : null;
     keyTip = false;
@@ -964,7 +925,27 @@
   <!-- Dimmed as one, as a single canvas was. -->
   <div class="layers" class:stale style:width="{width}px" style:height="{height}px" aria-hidden="true">
     <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
-    <canvas bind:this={hoverCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+    {#if hoverRect}
+      <div
+        class="hover"
+        style:left="{hoverRect.x}px"
+        style:top="{hoverRect.y}px"
+        style:width="{hoverRect.w}px"
+        style:height="{hoverRect.h}px"
+        style:background={palette.textLight}
+        style:opacity={dark ? 0.1 : 0.22}
+      ></div>
+      {#if hoverRect.line}
+        <div
+          class="hover line"
+          style:left="{hoverRect.x}px"
+          style:top="{hoverRect.y}px"
+          style:width="{hoverRect.w}px"
+          style:height="{hoverRect.h}px"
+          style:border-color={dark ? palette.textLight : palette.textDark}
+        ></div>
+      {/if}
+    {/if}
     <canvas bind:this={topCanvas} style:width="{width}px" style:height="{height}px"></canvas>
   </div>
   {#if tooltip && tipPosition}
@@ -1019,6 +1000,15 @@
     position: absolute;
     left: 0;
     top: 0;
+  }
+  .hover {
+    position: absolute;
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .hover.line {
+    border: 2px solid;
+    opacity: 0.7;
   }
   .tooltip {
     position: absolute;
