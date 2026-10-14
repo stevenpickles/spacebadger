@@ -91,7 +91,8 @@ pub mod rect_flags {
     pub const EXPANDED: u8 = 1 << 1;
     /// A folder whose contents are still being listed.
     pub const PENDING: u8 = 1 << 2;
-    /// A folder whose own listing failed or was cancelled.
+    /// A folder whose own listing failed, was cancelled, or was read only
+    /// in part (see [`Tree::fully_listed`]).
     pub const INCOMPLETE: u8 = 1 << 3;
     pub const CLOUD: u8 = 1 << 4;
     pub const HARDLINKED: u8 = 1 << 5;
@@ -457,6 +458,8 @@ impl Ctx<'_> {
             match tree.dir_state(node) {
                 DirState::Pending => f |= rect_flags::PENDING,
                 DirState::Failed | DirState::NotScanned => f |= rect_flags::INCOMPLETE,
+                // Listed, but some entries couldn't be read.
+                DirState::Listed if !tree.fully_listed(node) => f |= rect_flags::INCOMPLETE,
                 DirState::Listed => {}
             }
             RectKind::Folder
@@ -687,6 +690,27 @@ mod tests {
             assert!(k.y >= folder.y + 16.0 - 1e-3);
             assert!(k.x >= folder.x + 2.0 - 1e-3 && k.x + k.w <= folder.x + folder.w - 2.0 + 1e-3);
         }
+    }
+
+    #[test]
+    fn folders_read_in_part_are_marked_incomplete() {
+        let mut t = Tree::new("/r");
+        let whole = dir(&mut t, NodeId::ROOT, "whole");
+        let partial = dir(&mut t, NodeId::ROOT, "partial");
+        let failed = dir(&mut t, NodeId::ROOT, "failed");
+        file(&mut t, whole, "x", 500);
+        file(&mut t, partial, "y", 500);
+        file(&mut t, failed, "z", 500);
+        t.mark_unreadable_entries(partial);
+        t.set_dir_state(failed, DirState::Failed);
+        let l = run(&t, NodeId::ROOT, &LayoutParams::new(300.0, 200.0));
+        let incomplete = |d: NodeId| {
+            let r = l.rects.iter().find(|r| r.node == d).unwrap();
+            r.flags & rect_flags::INCOMPLETE != 0
+        };
+        assert!(!incomplete(whole));
+        assert!(incomplete(partial));
+        assert!(incomplete(failed));
     }
 
     #[test]
