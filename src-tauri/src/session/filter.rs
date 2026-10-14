@@ -220,14 +220,6 @@ impl Filter {
             // report counts rounds rather than every step.
             let mut timing = None;
             loop {
-                #[cfg(test)]
-                if self.steps_left.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    std::thread::sleep(BUSY_RETRY);
-                    if self.stopped() {
-                        return;
-                    }
-                    continue;
-                }
                 match self.step(tree, revision, busy >= BUSY_TRIES, &mut timing) {
                     Step::Done(caught) => {
                         // A request that read behind did so before this
@@ -297,6 +289,12 @@ impl Filter {
                 Err(TryLockError::Poisoned(_)) => return Step::Gone,
             }
         };
+        // Checked under the lock, so a test that sets it and then reads
+        // the search knows no step comes in between.
+        #[cfg(test)]
+        if self.steps_left.load(Ordering::SeqCst) == 0 {
+            return Step::Busy;
+        }
         let Some(active) = active.as_mut() else {
             return Step::Done(None);
         };
@@ -307,11 +305,11 @@ impl Filter {
             }
         }
         #[cfg(test)]
-        let _ = self.steps_left.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |n| (n != usize::MAX).then(|| n.saturating_sub(1)),
-        );
+        let _ = self
+            .steps_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n != usize::MAX).then(|| n.saturating_sub(1))
+            });
         let _catch_up = metrics::span("catch-up");
         if active.search.catch_up(&tree, CATCH_UP_STEP) {
             active.revision = active.revision.max(revision);
@@ -496,13 +494,15 @@ mod tests {
             .steps_left
             .store(usize::MAX, Ordering::SeqCst);
 
-        until("the job catches up", || {
-            totals(&session.search_summary(id).unwrap()) == fresh(&session, "*.log")
+        // The revision is a lower bound: a round asked for at an earlier
+        // status can finish the work before the round for the newest one
+        // records it.
+        until("the job catches up, at a newer revision", || {
+            let s = session.search_summary(id).unwrap();
+            totals(&s) == fresh(&session, "*.log") && s.revision > first.revision
         });
         assert!(!finished(&session), "caught up while scanning");
-        let caught = session.search_summary(id).unwrap();
-        assert_eq!(caught.files, 3_100);
-        assert!(caught.revision > first.revision, "a newer revision");
+        assert_eq!(session.search_summary(id).unwrap().files, 3_100);
 
         c.release();
         until("the scan finishes", || finished(&session));
