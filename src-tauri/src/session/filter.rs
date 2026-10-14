@@ -487,6 +487,46 @@ mod tests {
     }
 
     #[test]
+    fn replacing_or_clearing_the_filter_drops_what_was_kept_for_it() {
+        let (session, _b, _c) = scan();
+        let fill = |id| {
+            let generation = session.generation();
+            session
+                .layout(&proto::LayoutRequest {
+                    generation,
+                    request: 0,
+                    view: 0,
+                    metric: proto::Metric::Logical,
+                    width: 800.0,
+                    height: 600.0,
+                    search: Some(id),
+                })
+                .unwrap();
+            session
+                .search_results(&proto::SearchResultsRequest {
+                    generation,
+                    search: id,
+                    metric: proto::Metric::Logical,
+                    offset: 0,
+                    limit: 10,
+                })
+                .unwrap();
+            assert!(session.search_order.lock().unwrap().is_some());
+            assert!(session.search_ranked.lock().unwrap().is_some());
+        };
+        let kept = || {
+            session.search_order.lock().unwrap().is_some()
+                || session.search_ranked.lock().unwrap().is_some()
+        };
+        fill(session.search_set("*.log").unwrap().unwrap().search);
+        let txt = session.search_set("*.txt").unwrap().unwrap().search;
+        assert!(!kept(), "replaced");
+        fill(txt);
+        assert!(session.search_set("").unwrap().is_none());
+        assert!(!kept(), "cleared");
+    }
+
+    #[test]
     fn a_new_filter_replaces_the_one_being_caught_up() {
         let (session, b, c) = scan();
         let old = session.search_set("*.log").unwrap().unwrap().search;

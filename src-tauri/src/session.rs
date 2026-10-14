@@ -355,6 +355,7 @@ impl Session {
                 .map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
+                self.forget_search_caches();
             }
             return Ok(None);
         };
@@ -385,7 +386,21 @@ impl Session {
         // What was scanned since the last step; read with the tree's lock
         // held, so the revision describes the tree.
         active.catch_up(&tree, self.scan.progress().revision);
-        Ok(Some(self.summary(current.insert(active))))
+        let summary = self.summary(current.insert(active));
+        self.forget_search_caches();
+        Ok(Some(summary))
+    }
+
+    /// Drops the filtered map's sibling order and the result list's ranking
+    /// kept for an earlier search, which can be large (a node per match).
+    /// Called with the search write-locked, so no request is using them.
+    fn forget_search_caches(&self) {
+        if let Ok(mut order) = self.search_order.lock() {
+            *order = None;
+        }
+        if let Ok(mut ranked) = self.search_ranked.lock() {
+            *ranked = None;
+        }
     }
 
     /// Matching totals for search `id`. While scanning, they can trail the
