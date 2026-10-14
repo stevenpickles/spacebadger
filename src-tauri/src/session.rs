@@ -882,6 +882,27 @@ impl Session {
         Ok(job.list(&tree, revision))
     }
 
+    /// A page of a group's files, leaving out files deleted since.
+    pub fn duplicate_files(
+        &self,
+        req: &proto::DuplicateFilesRequest,
+    ) -> Result<proto::DuplicateFilesPage, String> {
+        let job = self.duplicates_job(req.job)?;
+        let revision = self.scan.progress().revision;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        job.files(&tree, revision, req.group, req.offset, req.limit)
+    }
+
+    /// Every file but the first of each listed group, by node.
+    pub fn duplicates_extras(&self, job: u32) -> Result<proto::DuplicateExtras, String> {
+        let job = self.duplicates_job(job)?;
+        let revision = self.scan.progress().revision;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        Ok(job.extras(&tree, revision))
+    }
+
     /// Whether deleting `nodes` would leave a group of duplicates with no copy.
     pub fn duplicates_check(
         &self,

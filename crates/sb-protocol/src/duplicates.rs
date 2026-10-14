@@ -10,6 +10,16 @@ pub const DUPLICATES_STATUS_EVENT: &str = "duplicates-status";
 /// Most groups a [`DuplicatesList`] holds; the rest have less space at stake.
 pub const DUPLICATE_GROUPS_LISTED: u32 = 5_000;
 
+/// Most files a [`DuplicatesList`] holds in all. Each listed group has at
+/// least its first file; the rest are fetched with [`DuplicateFilesRequest`].
+pub const DUPLICATE_FILES_LISTED: u32 = 10_000;
+
+/// Most files a [`DuplicatesList`] holds of one group.
+pub const DUPLICATE_GROUP_PREVIEW: u32 = 100;
+
+/// Most files a [`DuplicateFilesPage`] holds.
+pub const DUPLICATE_FILES_PAGE: u32 = 1_000;
+
 /// Starts looking for duplicates among the files under `folder` (matching
 /// the search, if given) of at least `min_size` bytes, replacing any search
 /// for duplicates already running. Refused while the scan runs.
@@ -126,6 +136,9 @@ pub struct DuplicateFile {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DuplicateGroup {
+    /// Numbers the group within its search for duplicates, for as long as
+    /// that search is current.
+    pub id: u32,
     /// Each file's size: the length of its contents.
     #[ts(type = "number")]
     pub size: u64,
@@ -135,7 +148,11 @@ pub struct DuplicateGroup {
     /// storage (block cloning, deduplication) can make it less still.
     #[ts(type = "number | null")]
     pub on_disk: Option<u64>,
-    /// Shortest path first.
+    /// Files in the group still in the scan.
+    pub count: u32,
+    /// The first of them, shortest path first: at least one and at most
+    /// [`DUPLICATE_GROUP_PREVIEW`], fewer once the list holds
+    /// [`DUPLICATE_FILES_LISTED`] in all.
     pub files: Vec<DuplicateFile>,
 }
 
@@ -152,6 +169,47 @@ pub struct DuplicatesList {
     /// Groups in all; at most [`DUPLICATE_GROUPS_LISTED`] are listed.
     pub total: u32,
     pub groups: Vec<DuplicateGroup>,
+}
+
+/// Asks for a group's files, shortest path first, from `offset`; at most
+/// [`DUPLICATE_FILES_PAGE`] are sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicateFilesRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub job: u32,
+    /// [`DuplicateGroup::id`].
+    pub group: u32,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicateFilesPage {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub job: u32,
+    pub group: u32,
+    pub offset: u32,
+    /// Files in the group still in the scan.
+    pub total: u32,
+    pub files: Vec<DuplicateFile>,
+}
+
+/// Every file but the first (shortest path) of each listed group, by node,
+/// for selecting them without listing them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicateExtras {
+    pub nodes: Vec<u32>,
+    /// Their content: the files' combined length.
+    #[ts(type = "number")]
+    pub content: u64,
 }
 
 /// Asks whether deleting `nodes` would leave a group of duplicates with no

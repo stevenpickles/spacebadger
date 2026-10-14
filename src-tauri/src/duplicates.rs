@@ -6,6 +6,13 @@
 //! when the dialog opens, by fingerprint only (provisional), and again as
 //! the delete starts, reading them whole ([`Job::retained`]). A file whose
 //! group has no copy staying that's confirmed unchanged is kept.
+//!
+//! Groups are numbered in the order they were found and never renumbered,
+//! so a group's files can be fetched a page at a time. Totals and each
+//! group's figures are kept as groups are found, and worked out again only
+//! when the scan changes (items deleted), so a status costs little however
+//! many groups there are, and a list goes over each group's files only for
+//! the few it sends.
 
 use crate::session::display_path;
 use sb_core::selection;
@@ -17,8 +24,8 @@ use sb_scan::duplicates::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// While reading, status updates go out at most this often.
@@ -41,10 +48,12 @@ pub struct Job {
     cancel: AtomicBool,
     counters: Counters,
     found: Mutex<Found>,
+    tally: Mutex<Tally>,
 }
 
 struct Found {
-    groups: Vec<Group>,
+    /// By number: [`proto::DuplicateGroup::id`].
+    groups: Vec<Arc<Group>>,
     skipped: proto::DuplicateSkips,
     /// Bumped per group found.
     version: u32,
@@ -72,6 +81,7 @@ impl Job {
                 phase: proto::DuplicatesPhase::Running,
                 elapsed: None,
             }),
+            tally: Mutex::new(Tally::default()),
         }
     }
 
@@ -113,7 +123,7 @@ impl Job {
         let mut found = self.found.lock().unwrap();
         match event {
             Event::Found(group) => {
-                found.groups.push(group);
+                found.groups.push(Arc::new(group));
                 found.version += 1;
             }
             Event::Skipped(_, why) => {
@@ -133,48 +143,43 @@ impl Job {
         }
     }
 
-    /// The groups with two or more files still in the scan, most
-    /// reclaimable space first.
-    fn current(&self, tree: &Tree) -> (Vec<Group>, Summary) {
+    /// The tally brought up to date: groups found since added, and every
+    /// group's figures worked out again if the scan changed since.
+    fn tally(&self, tree: &Tree, revision: u64) -> MutexGuard<'_, Tally> {
+        let mut tally = self.tally.lock().unwrap();
+        let new = self.found.lock().unwrap().groups[tally.entries.len()..].to_vec();
+        if tally.revision != revision {
+            tally.revision = revision;
+            let mut totals = Totals::default();
+            for entry in &mut tally.entries {
+                entry.refresh(tree);
+                totals.add(entry);
+            }
+            tally.totals = totals;
+        }
+        for group in new {
+            let entry = Entry::new(group, tree);
+            tally.totals.add(&entry);
+            tally.entries.push(entry);
+        }
+        tally
+    }
+
+    fn summary(&self) -> Summary {
         let found = self.found.lock().unwrap();
-        let mut groups: Vec<Group> = found
-            .groups
-            .iter()
-            .filter_map(|g| {
-                let (files, prints) = g
-                    .files
-                    .iter()
-                    .zip(&g.prints)
-                    .filter(|&(&n, _)| tree.contains(n) && !tree.is_removed(n))
-                    .map(|(&n, &print)| (n, print))
-                    .unzip::<NodeId, Fingerprint, Vec<_>, Vec<_>>();
-                (files.len() >= 2).then_some(Group {
-                    size: g.size,
-                    digest: g.digest,
-                    files,
-                    prints,
-                })
-            })
-            .collect();
-        groups.sort_by(|a, b| {
-            reclaimable(b)
-                .cmp(&reclaimable(a))
-                .then(b.size.cmp(&a.size))
-        });
-        let summary = Summary {
+        Summary {
             skipped: found.skipped.clone(),
             version: found.version,
             phase: found.phase,
             elapsed: found.elapsed.unwrap_or_else(|| self.started.elapsed()),
-        };
-        (groups, summary)
+        }
     }
 
     /// How the search is going; `revision` is the scan's, which changes
     /// when items are deleted.
     pub fn status(&self, tree: &Tree, revision: u64) -> proto::DuplicatesStatus {
-        let (groups, found) = self.current(tree);
-        let on_disk: Vec<Option<u64>> = groups.iter().map(|g| on_disk(tree, g)).collect();
+        let totals = self.tally(tree, revision).totals;
+        let found = self.summary();
         proto::DuplicatesStatus {
             generation: self.scope.generation,
             job: self.id,
@@ -188,42 +193,40 @@ impl Job {
             total_bytes: self.plan.bytes,
             done_bytes: self.counters.done.load(Ordering::Relaxed),
             read_bytes: self.counters.read.load(Ordering::Relaxed),
-            groups: groups.len() as u32,
-            files: groups.iter().map(|g| g.files.len() as u32).sum(),
-            reclaimable: groups.iter().map(reclaimable).sum(),
-            reclaimable_on_disk: on_disk.iter().flatten().sum(),
-            on_disk_unknown: on_disk.iter().filter(|d| d.is_none()).count() as u32,
+            groups: totals.groups,
+            files: totals.files,
+            reclaimable: totals.reclaimable,
+            reclaimable_on_disk: totals.on_disk,
+            on_disk_unknown: totals.on_disk_unknown,
             skipped: found.skipped,
             version: found.version.wrapping_add(revision as u32),
         }
     }
 
-    /// The groups found so far, each with its shortest path first.
+    /// The groups found so far with the most reclaimable space, each with
+    /// its first files (shortest path first), within
+    /// [`proto::DUPLICATE_FILES_LISTED`] files in all.
     pub fn list(&self, tree: &Tree, revision: u64) -> proto::DuplicatesList {
-        let (groups, found) = self.current(tree);
-        let total = groups.len() as u32;
-        let groups = groups
-            .into_iter()
-            .take(proto::DUPLICATE_GROUPS_LISTED as usize)
-            .map(|g| {
-                let mut files: Vec<proto::DuplicateFile> = g
-                    .files
-                    .iter()
-                    .zip(&g.prints)
-                    .map(|(&n, print)| proto::DuplicateFile {
-                        node: n.index() as u32,
-                        parent: tree.parent(n).unwrap_or(NodeId::ROOT).index() as u32,
-                        path: display_path(&tree.path(n)),
-                        hardlinked: has_other_names(tree, n, print),
-                    })
-                    .collect();
-                files.sort_by(|a, b| {
-                    let len = |f: &proto::DuplicateFile| f.path.chars().count();
-                    len(a).cmp(&len(b)).then_with(|| a.path.cmp(&b.path))
-                });
+        let mut tally = self.tally(tree, revision);
+        let (listed, total) = tally.ranked();
+        // Each group listed keeps at least its first file.
+        let mut budget = proto::DUPLICATE_FILES_LISTED as usize;
+        let groups = listed
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let rest = listed.len() - i - 1;
+                let entry = &mut tally.entries[id];
+                let take = (budget - rest)
+                    .min(proto::DUPLICATE_GROUP_PREVIEW as usize)
+                    .min(entry.live as usize);
+                budget -= take;
+                let files = entry.files(tree, 0, take);
                 proto::DuplicateGroup {
-                    size: g.size,
-                    on_disk: on_disk(tree, &g),
+                    id: id as u32,
+                    size: entry.group.size,
+                    on_disk: entry.on_disk,
+                    count: entry.live,
                     files,
                 }
             })
@@ -231,10 +234,199 @@ impl Job {
         proto::DuplicatesList {
             generation: self.scope.generation,
             job: self.id,
-            version: found.version.wrapping_add(revision as u32),
+            version: self.summary().version.wrapping_add(revision as u32),
             total,
             groups,
         }
+    }
+
+    /// Files of group `id` still in the scan, shortest path first, from
+    /// `offset`: at most `limit` and [`proto::DUPLICATE_FILES_PAGE`].
+    pub fn files(
+        &self,
+        tree: &Tree,
+        revision: u64,
+        id: u32,
+        offset: u32,
+        limit: u32,
+    ) -> Result<proto::DuplicateFilesPage, String> {
+        let mut tally = self.tally(tree, revision);
+        let entry = tally
+            .entries
+            .get_mut(id as usize)
+            .ok_or_else(|| format!("group of duplicates {id} isn't in this search"))?;
+        let limit = limit.min(proto::DUPLICATE_FILES_PAGE) as usize;
+        Ok(proto::DuplicateFilesPage {
+            generation: self.scope.generation,
+            job: self.id,
+            group: id,
+            offset,
+            total: entry.live,
+            files: entry.files(tree, offset as usize, limit),
+        })
+    }
+
+    /// Every file but the first of each listed group, by node, for "Select
+    /// all but the first" in a group too large to list.
+    pub fn extras(&self, tree: &Tree, revision: u64) -> proto::DuplicateExtras {
+        let mut tally = self.tally(tree, revision);
+        let (listed, _) = tally.ranked();
+        let mut extras = proto::DuplicateExtras {
+            nodes: Vec::new(),
+            content: 0,
+        };
+        for id in listed {
+            let entry = &mut tally.entries[id];
+            let group = Arc::clone(&entry.group);
+            let order = entry.order(tree);
+            extras.content += group.size * (order.len() as u64 - 1);
+            extras.nodes.extend(
+                order[1..]
+                    .iter()
+                    .map(|&i| group.files[i as usize].index() as u32),
+            );
+        }
+        extras
+    }
+}
+
+/// What's known of the groups found, kept up to date as they're found and
+/// as items are deleted; see [`Job::tally`].
+#[derive(Default)]
+struct Tally {
+    /// The scan's revision the figures are for.
+    revision: u64,
+    /// By group number.
+    entries: Vec<Entry>,
+    totals: Totals,
+}
+
+/// The groups of two or more files still in the scan.
+#[derive(Debug, Default, Clone, Copy)]
+struct Totals {
+    groups: u32,
+    files: u32,
+    reclaimable: u64,
+    on_disk: u64,
+    on_disk_unknown: u32,
+}
+
+impl Totals {
+    fn add(&mut self, entry: &Entry) {
+        if entry.live < 2 {
+            return;
+        }
+        self.groups += 1;
+        self.files += entry.live;
+        self.reclaimable += entry.reclaimable();
+        match entry.on_disk {
+            Some(bytes) => self.on_disk += bytes,
+            None => self.on_disk_unknown += 1,
+        }
+    }
+}
+
+/// A group found, with figures for its files still in the scan.
+struct Entry {
+    group: Arc<Group>,
+    live: u32,
+    on_disk: Option<u64>,
+    /// The files still in the scan, as indexes into the group's, shortest
+    /// path first. Worked out when first needed, since it takes every
+    /// file's path.
+    order: Option<Vec<u32>>,
+}
+
+impl Entry {
+    fn new(group: Arc<Group>, tree: &Tree) -> Self {
+        let mut entry = Self {
+            group,
+            live: 0,
+            on_disk: None,
+            order: None,
+        };
+        entry.refresh(tree);
+        entry
+    }
+
+    /// Leaves out files no longer in the scan.
+    fn refresh(&mut self, tree: &Tree) {
+        let g = &self.group;
+        self.live = g.files.iter().filter(|&&n| in_scan(tree, n)).count() as u32;
+        self.on_disk = on_disk(tree, g);
+        if let Some(order) = &mut self.order {
+            order.retain(|&i| in_scan(tree, g.files[i as usize]));
+        }
+    }
+
+    fn reclaimable(&self) -> u64 {
+        self.group.size * u64::from(self.live.saturating_sub(1))
+    }
+
+    fn order(&mut self, tree: &Tree) -> &[u32] {
+        let g = &self.group;
+        self.order.get_or_insert_with(|| {
+            let mut files: Vec<(usize, String, u32)> = g
+                .files
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| in_scan(tree, n))
+                .map(|(i, &n)| {
+                    let path = display_path(&tree.path(n));
+                    (path.chars().count(), path, i as u32)
+                })
+                .collect();
+            files.sort_unstable();
+            files.into_iter().map(|(_, _, i)| i).collect()
+        })
+    }
+
+    /// Up to `limit` files from `offset`, shortest path first.
+    fn files(&mut self, tree: &Tree, offset: usize, limit: usize) -> Vec<proto::DuplicateFile> {
+        let group = Arc::clone(&self.group);
+        let order = self.order(tree);
+        let start = offset.min(order.len());
+        let end = start.saturating_add(limit).min(order.len());
+        order[start..end]
+            .iter()
+            .map(|&i| {
+                let (n, print) = (group.files[i as usize], &group.prints[i as usize]);
+                proto::DuplicateFile {
+                    node: n.index() as u32,
+                    parent: tree.parent(n).unwrap_or(NodeId::ROOT).index() as u32,
+                    path: display_path(&tree.path(n)),
+                    hardlinked: has_other_names(tree, n, print),
+                }
+            })
+            .collect()
+    }
+}
+
+impl Tally {
+    /// The numbers of the groups to list, most reclaimable space first, at
+    /// most [`proto::DUPLICATE_GROUPS_LISTED`], and how many there are in
+    /// all. Picks the top ones before sorting, so it costs little more than
+    /// a look at each group.
+    fn ranked(&self) -> (Vec<usize>, u32) {
+        let entries = &self.entries;
+        let mut ids: Vec<usize> = (0..entries.len())
+            .filter(|&i| entries[i].live >= 2)
+            .collect();
+        let total = ids.len() as u32;
+        let rank = |&a: &usize, &b: &usize| {
+            let (x, y) = (&entries[a], &entries[b]);
+            y.reclaimable()
+                .cmp(&x.reclaimable())
+                .then(y.group.size.cmp(&x.group.size))
+                .then(a.cmp(&b))
+        };
+        let listed = proto::DUPLICATE_GROUPS_LISTED as usize;
+        if ids.len() > listed {
+            ids.select_nth_unstable_by(listed - 1, rank);
+            ids.truncate(listed);
+        }
+        ids.sort_unstable_by(rank);
+        (ids, total)
     }
 }
 
@@ -583,7 +775,7 @@ impl Retained {
     }
 }
 
-/// What [`Job::current`] copies out besides the groups.
+/// What [`Job::summary`] copies out.
 struct Summary {
     skipped: proto::DuplicateSkips,
     version: u32,
@@ -591,9 +783,9 @@ struct Summary {
     elapsed: Duration,
 }
 
-/// Content in the copies beyond the first: their length.
-fn reclaimable(g: &Group) -> u64 {
-    g.size * (g.files.len() as u64).saturating_sub(1)
+/// Whether a file found is still in the scan: not deleted since.
+fn in_scan(tree: &Tree, n: NodeId) -> bool {
+    tree.contains(n) && !tree.is_removed(n)
 }
 
 /// Whether a file has other hard-link names: in the scan, or by the count
@@ -602,14 +794,17 @@ fn has_other_names(tree: &Tree, n: NodeId, print: &Fingerprint) -> bool {
     tree.flags(n) & flags::HARDLINKED != 0 || print.links.is_some_and(|l| l > 1)
 }
 
-/// The most space on disk deleting all but one copy could free: the
-/// copies' allocated sizes as scanned, less the smallest (keeping that one
-/// frees the most). `None` when a copy's allocation is unknown, or a copy
-/// has other names (deleting it may free nothing) or an unknown number of
-/// them.
+/// The most space on disk deleting all but one copy still in the scan
+/// could free: the copies' allocated sizes as scanned, less the smallest
+/// (keeping that one frees the most). `None` when a copy's allocation is
+/// unknown, or a copy has other names (deleting it may free nothing) or an
+/// unknown number of them.
 fn on_disk(tree: &Tree, g: &Group) -> Option<u64> {
-    let mut sizes = Vec::with_capacity(g.files.len());
+    let mut sizes = Vec::new();
     for (&n, print) in g.files.iter().zip(&g.prints) {
+        if !in_scan(tree, n) {
+            continue;
+        }
         if print.links.is_none() || has_other_names(tree, n, print) {
             return None;
         }
@@ -633,6 +828,10 @@ mod tests {
             modified: Some(SystemTime::UNIX_EPOCH),
             links,
         }
+    }
+
+    fn reclaimable(tree: &Tree, g: &Group) -> u64 {
+        Entry::new(Arc::new(g.clone()), tree).reclaimable()
     }
 
     fn group(tree: &mut Tree, allocated: &[Allocated]) -> Group {
@@ -709,9 +908,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn sizes(logical: u64) -> FileSizes {
+        FileSizes {
+            logical,
+            allocated: Allocated::known(logical.next_multiple_of(4096)),
+        }
+    }
+
+    fn found(size: u64, files: Vec<NodeId>) -> Event {
+        Event::Found(Group {
+            size,
+            digest: [0; 32],
+            prints: (0..files.len())
+                .map(|i| print(i as u128, Some(1)))
+                .collect(),
+            files,
+        })
+    }
+
+    fn job() -> Job {
+        let scope = Scope {
+            generation: 1,
+            folder: 0,
+            path: "/r".into(),
+            query: None,
+            min_size: 1,
+        };
+        Job::new(1, scope, Plan::default())
+    }
+
+    /// `count` files of `size` bytes named `{name}{i}` in `folder`.
+    fn files(tree: &mut Tree, folder: NodeId, name: &str, count: usize, size: u64) -> Vec<NodeId> {
+        (0..count)
+            .map(|i| {
+                let name = format!("{name}{i}");
+                tree.add_file(folder, name.as_ref(), sizes(size), None, 0)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn nodes(files: &[proto::DuplicateFile]) -> Vec<u32> {
+        files.iter().map(|f| f.node).collect()
+    }
+
+    #[test]
+    fn lists_a_bounded_preview_and_pages_the_rest() {
+        let mut tree = Tree::new("/r");
+        let deep = tree.add_dir(NodeId::ROOT, "deep".as_ref()).unwrap();
+        // Shortest path first, whatever order the files were found in.
+        let mut big = files(&mut tree, deep, "copy", 250, 100);
+        big.extend(files(&mut tree, NodeId::ROOT, "c", 50, 100));
+        let job = job();
+        job.record(found(100, big.clone()));
+        let pairs = proto::DUPLICATE_GROUPS_LISTED as usize + 500;
+        for i in 0..pairs {
+            let pair = files(&mut tree, NodeId::ROOT, &format!("p{i}-"), 2, 10);
+            job.record(found(10, pair));
+        }
+        let status = job.status(&tree, 0);
+        assert_eq!(status.groups as usize, pairs + 1);
+        assert_eq!(status.files as usize, 300 + 2 * pairs);
+        assert_eq!(status.reclaimable, 299 * 100 + pairs as u64 * 10);
+
+        let list = job.list(&tree, 0);
+        assert_eq!(list.total as usize, pairs + 1);
+        assert_eq!(list.groups.len(), proto::DUPLICATE_GROUPS_LISTED as usize);
+        let first = &list.groups[0];
+        assert_eq!((first.id, first.count), (0, 300), "most reclaimable first");
+        assert_eq!(first.files.len(), proto::DUPLICATE_GROUP_PREVIEW as usize);
+        assert_eq!(first.files[0].path, display_path(&tree.path(big[250])));
+        let listed: usize = list.groups.iter().map(|g| g.files.len()).sum();
+        assert_eq!(listed, proto::DUPLICATE_FILES_LISTED as usize, "the budget");
+        assert!(list.groups.iter().all(|g| g.count == 2 || g.id == 0));
+        assert!(list.groups.iter().all(|g| !g.files.is_empty()));
+        let last = list.groups.last().unwrap();
+        assert_eq!(last.files.len(), 1, "past the budget, the first file only");
+
+        // Pages carry on where the preview stopped, in the same order.
+        let page = job.files(&tree, 0, 0, 100, 150).unwrap();
+        assert_eq!((page.total, page.offset, page.files.len()), (300, 100, 150));
+        let all = job.files(&tree, 0, 0, 0, u32::MAX).unwrap();
+        assert_eq!(all.files.len(), 300, "at most a page");
+        assert_eq!(nodes(&all.files[..100]), nodes(&first.files));
+        assert_eq!(nodes(&all.files[100..250]), nodes(&page.files));
+        assert!(job.files(&tree, 0, 0, 400, 10).unwrap().files.is_empty());
+        let unknown = job.files(&tree, 0, pairs as u32 + 1, 0, 10).unwrap_err();
+        assert!(unknown.contains("isn't in this search"), "{unknown}");
+
+        // Every file but the first of each listed group.
+        let extras = job.extras(&tree, 0);
+        assert_eq!(extras.nodes.len(), 299 + list.groups.len() - 1);
+        assert_eq!(extras.nodes[..299], nodes(&all.files)[1..]);
+        assert_eq!(
+            extras.content,
+            299 * 100 + (list.groups.len() as u64 - 1) * 10
+        );
+    }
+
+    #[test]
+    fn totals_and_pages_follow_deletes() {
+        let mut tree = Tree::new("/r");
+        let job = job();
+        let a = files(&mut tree, NodeId::ROOT, "a", 3, 100);
+        let b = files(&mut tree, NodeId::ROOT, "b", 2, 50);
+        job.record(found(100, a.clone()));
+        let before = job.status(&tree, 0);
+        assert_eq!(
+            (before.groups, before.files, before.reclaimable),
+            (1, 3, 200)
+        );
+        assert_eq!(before.reclaimable_on_disk, 2 * 4096);
+        // Found later: counted without going over the others again.
+        job.record(found(50, b.clone()));
+        let more = job.status(&tree, 0);
+        assert_eq!((more.groups, more.files, more.reclaimable), (2, 5, 250));
+        assert_ne!(more.version, before.version);
+        let page = job.files(&tree, 0, 0, 0, 10).unwrap();
+        assert_eq!(page.files.len(), 3);
+
+        tree.remove(a[0]);
+        tree.remove(b[1]);
+        let after = job.status(&tree, 1);
+        assert_eq!((after.groups, after.files, after.reclaimable), (1, 2, 100));
+        assert_eq!(after.reclaimable_on_disk, 4096);
+        let page = job.files(&tree, 1, 0, 0, 10).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.files.iter().map(|f| f.node).collect::<Vec<_>>(),
+            [a[1].index() as u32, a[2].index() as u32]
+        );
+        let list = job.list(&tree, 1);
+        assert_eq!((list.total, list.groups.len()), (1, 1));
+        assert_eq!(list.groups[0].count, 2);
+        // A group down to one file has no extras.
+        assert_eq!(job.extras(&tree, 1).nodes, [a[2].index() as u32]);
+    }
+
     /// One group of 200,000 identical small files found among 20,000 groups
-    /// of two: how long a status (sent every 250 ms while reading) and a
-    /// list take, and how much the list sends. Run by hand:
+    /// of two: how long a status (sent every 250 ms while reading), a list,
+    /// a page of the large group, and the extras to select take, and how
+    /// much the list sends. Run by hand:
     /// `cargo test --release -p spacebadger duplicates_at_scale -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -719,10 +1056,6 @@ mod tests {
         const HUGE: usize = 200_000;
         const PAIRS: usize = 20_000;
         let mut tree = Tree::new("/r");
-        let sizes = |logical| FileSizes {
-            logical,
-            allocated: Allocated::known(logical.next_multiple_of(4096)),
-        };
         let generated = tree.add_dir(NodeId::ROOT, "generated".as_ref()).unwrap();
         let mut folder = generated;
         let mut huge = Vec::with_capacity(HUGE);
@@ -747,24 +1080,7 @@ mod tests {
             let b = tree.add_file(backup, name.as_ref(), size, None, 0).unwrap();
             pairs.push((size.logical, [a, b]));
         }
-        let found = |size, files: Vec<NodeId>| {
-            Event::Found(Group {
-                size,
-                digest: [0; 32],
-                prints: (0..files.len())
-                    .map(|i| print(i as u128, Some(1)))
-                    .collect(),
-                files,
-            })
-        };
-        let scope = Scope {
-            generation: 1,
-            folder: 0,
-            path: "/r".into(),
-            query: None,
-            min_size: 1,
-        };
-        let job = Job::new(1, scope, Plan::default());
+        let job = job();
         for (size, files) in pairs {
             job.record(found(size, files.to_vec()));
         }
@@ -779,7 +1095,10 @@ mod tests {
             let each = start.elapsed() / runs;
             println!("{what}: {each:.1?} each, {out}");
         };
+        // The first call takes in every group found so far.
+        time("first status", 1, &|| job.status(&tree, 0).groups as usize);
         time("status", 5, &|| job.status(&tree, 0).groups as usize);
+        time("first list", 1, &|| job.list(&tree, 0).groups.len());
         time("list", 3, &|| {
             let list = job.list(&tree, 0);
             let files: usize = list.groups.iter().map(|g| g.files.len()).sum();
@@ -790,6 +1109,19 @@ mod tests {
             );
             files
         });
+        let id = PAIRS as u32;
+        time("page", 5, &|| {
+            let page = job.files(&tree, 0, id, 100_000, 1000).unwrap();
+            serde_json::to_vec(&page).unwrap().len()
+        });
+        time("extras", 3, &|| {
+            let extras = job.extras(&tree, 0);
+            serde_json::to_vec(&extras).unwrap().len()
+        });
+        // After a delete, every group's figures are worked out again once.
+        time("status after a delete", 1, &|| {
+            job.status(&tree, 1).groups as usize
+        });
     }
 
     #[test]
@@ -797,13 +1129,13 @@ mod tests {
         let mut tree = Tree::new("/r");
         let known = Allocated::known;
         let g = group(&mut tree, &[known(4096), known(4096), known(1024)]);
-        assert_eq!(reclaimable(&g), 8192, "content in the extra copies");
+        assert_eq!(reclaimable(&tree, &g), 8192, "content in the extra copies");
         assert_eq!(on_disk(&tree, &g), Some(8192), "all but the smallest");
 
         // Sparse or compressed: little on disk, whatever the length.
         let sparse = group(&mut tree, &[known(0), known(0)]);
         assert_eq!(
-            (reclaimable(&sparse), on_disk(&tree, &sparse)),
+            (reclaimable(&tree, &sparse), on_disk(&tree, &sparse)),
             (4096, Some(0))
         );
 
