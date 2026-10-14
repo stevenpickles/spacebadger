@@ -111,6 +111,7 @@ impl FsAdapter for UnixFs {
                         logical: 0,
                         allocated: None,
                         identity: Identity::Unavailable,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     });
@@ -143,6 +144,8 @@ impl FsAdapter for UnixFs {
                 } else {
                     Identity::Unique
                 },
+                // The device is the scan's, checked at delete time.
+                id: u128::from(meta.ino()),
                 cloud: is_cloud(&meta),
                 modified: meta.modified().ok(),
             });

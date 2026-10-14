@@ -166,6 +166,7 @@ impl FsAdapter for LinuxFs {
                         logical: 0,
                         allocated: None,
                         identity: Identity::Unavailable,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     });
@@ -206,6 +207,8 @@ impl FsAdapter for LinuxFs {
                 } else {
                     Identity::Unique
                 },
+                // The device is the scan's, checked at delete time.
+                id: u128::from(stx.stx_ino),
                 cloud: false,
                 modified: modified(&stx),
             });

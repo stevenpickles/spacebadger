@@ -476,6 +476,7 @@ impl FsAdapter for WindowsFs {
                 } else {
                     Identity::MaybeShared { key: l.file_id }
                 },
+                id: l.file_id,
                 cloud: l.attributes & attr::CLOUD != 0
                     || (l.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(l.reparse_tag)),
                 modified: filetime(l.last_write),
