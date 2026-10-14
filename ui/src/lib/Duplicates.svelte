@@ -103,6 +103,7 @@
     folded = new Set();
     more = new Map();
     loading = new Set();
+    fetches = new Map();
   });
 
   async function fetchList() {
@@ -147,66 +148,101 @@
     return out;
   });
 
-  /** Fetches `count` of a group's files from `offset`, a page at a time;
-   * `null` if the search changed meanwhile. */
-  async function fetchFiles(group: number, offset: number, count: number): Promise<DuplicateFile[] | null> {
+  /** The latest fetch of each group's files, by group ID, with the number
+   * of files the group had when it started; an older fetch's result is
+   * dropped. */
+  let fetches = new Map<number, { ticket: number; count: number }>();
+  let tickets = 0;
+
+  /** Starts a fetch of a group's files; the returned check says whether
+   * it is still the latest, for the same search. */
+  function begin(group: number, count: number): () => boolean {
+    const ticket = ++tickets;
     const gen = generation;
     const job = status.job;
-    const files: DuplicateFile[] = [];
-    while (files.length < count) {
-      const page = await duplicateFiles({
-        generation: gen,
-        job,
-        group,
-        offset: offset + files.length,
-        limit: Math.min(PAGE, count - files.length),
-      });
-      if (gen !== generation || job !== status.job) return null;
-      files.push(...page.files);
-      if (page.files.length === 0) break;
-    }
-    return files;
+    fetches.set(group, { ticket, count });
+    loading = new Set(loading).add(group);
+    return () => gen === generation && job === status.job && fetches.get(group)?.ticket === ticket;
   }
 
-  /** Fetches the next page of a group's files. */
+  function end(group: number, latest: () => boolean) {
+    if (!latest()) return;
+    fetches.delete(group);
+    const next = new Set(loading);
+    next.delete(group);
+    loading = next;
+  }
+
+  /** Fetches up to `count` of a group's files from the first, a page at a
+   * time, starting over if the group loses files meanwhile. */
+  async function refetch(group: number, count: number, expected: number) {
+    const latest = begin(group, expected);
+    try {
+      let files: DuplicateFile[] = [];
+      let total: number | null = null;
+      while (files.length < count) {
+        const page = await duplicateFiles({
+          generation,
+          job: status.job,
+          group,
+          offset: files.length,
+          limit: Math.min(PAGE, count - files.length),
+        });
+        if (!latest()) return;
+        if (total !== null && page.total !== total) files = [];
+        total = page.total;
+        files.push(...page.files);
+        if (page.files.length === 0) break;
+      }
+      more = new Map(more).set(group, { count: total ?? expected, files });
+      error = null;
+    } catch (e) {
+      if (latest()) error = errorText(e);
+    } finally {
+      end(group, latest);
+    }
+  }
+
+  /** Fetches the next page of a group's files; if the group lost files
+   * since those shown were fetched, fetches them all again instead. */
   async function showMore(group: DuplicateGroup) {
     if (loading.has(group.id)) return;
-    loading = new Set(loading).add(group.id);
+    const extra = more.get(group.id);
     const have = shown(group);
+    const basis = have === extra?.files ? extra.count : group.count;
+    const latest = begin(group.id, basis);
+    let again = false;
     try {
-      const files = await fetchFiles(group.id, have.length, PAGE);
-      if (files) {
-        more = new Map(more).set(group.id, { count: group.count, files: [...have, ...files] });
+      const page = await duplicateFiles({
+        generation,
+        job: status.job,
+        group: group.id,
+        offset: have.length,
+        limit: PAGE,
+      });
+      if (!latest()) return;
+      if (page.total === basis) {
+        more = new Map(more).set(group.id, { count: page.total, files: [...have, ...page.files] });
         error = null;
+      } else {
+        again = true;
       }
     } catch (e) {
-      error = errorText(e);
+      if (latest()) error = errorText(e);
     } finally {
-      const next = new Set(loading);
-      next.delete(group.id);
-      loading = next;
+      end(group.id, latest);
     }
+    if (again) await refetch(group.id, have.length + PAGE, group.count);
   }
 
   /** Fetches the files shown of groups that lost some since, as far as
-   * they were shown. */
+   * they were shown, replacing any fetch of theirs under way. */
   function refetchShown(next: DuplicatesList) {
     for (const group of next.groups) {
       const extra = more.get(group.id);
-      if (!extra || extra.count === group.count || loading.has(group.id)) continue;
-      loading = new Set(loading).add(group.id);
-      fetchFiles(group.id, 0, Math.min(extra.files.length, group.count))
-        .then(
-          (files) => {
-            if (files) more = new Map(more).set(group.id, { count: group.count, files });
-          },
-          (e: unknown) => (error = errorText(e)),
-        )
-        .finally(() => {
-          const set = new Set(loading);
-          set.delete(group.id);
-          loading = set;
-        });
+      if (!extra || extra.count === group.count) continue;
+      if (fetches.get(group.id)?.count === group.count) continue;
+      void refetch(group.id, Math.min(extra.files.length, group.count), group.count);
     }
   }
 
