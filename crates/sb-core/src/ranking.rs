@@ -725,7 +725,7 @@ mod tests {
         for seed in 1..=30 {
             let mut rng = Rng(seed * 31);
             let (mut t, dirs) = random_tree(seed, 2_500);
-            let b = search("*.b", &t);
+            let mut b = search("*.b", &t);
             let key = Key {
                 scope: Scope::Files,
                 folder: NodeId::ROOT,
@@ -751,7 +751,14 @@ mod tests {
                 };
                 t.remove(gone);
             }
-            let b = search("*.b", &t);
+            // The app catches the search it has up with the edited tree;
+            // that must rank as a search made afresh would.
+            assert!(b.catch_up(&t, usize::MAX));
+            let afresh = search("*.b", &t);
+            assert_eq!(
+                reference(&t, key, Some(&b)),
+                reference(&t, key, Some(&afresh))
+            );
             let now = basis(&t, key, Some(&b), 2);
             let entry = rankings.entry(key);
             assert!(!entry.ranking().unwrap().current(&now, REFRESH));
