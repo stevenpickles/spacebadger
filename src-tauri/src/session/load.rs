@@ -301,6 +301,26 @@ fn stream(
     })
 }
 
+/// A session scanning a synthetic tree of `depth` folder levels at full
+/// speed, for tests that need more than a handful of files.
+pub(super) fn synthetic(depth: usize, wide: u64) -> Session {
+    let fs = SynthFs {
+        depth,
+        fan: 4,
+        files: 25,
+        wide,
+        delay: Duration::ZERO,
+    };
+    Session::start_on(
+        PathBuf::from(ROOT),
+        fs,
+        ScanConfig::default(),
+        None,
+        None,
+        |_| {},
+    )
+}
+
 fn run(scenario: &Scenario) -> (Vec<Sample>, Duration, usize) {
     let fs = SynthFs::from_env();
     let query = std::env::var("SB_LOAD_QUERY").unwrap_or_else(|_| "*.log".to_owned());
@@ -490,7 +510,7 @@ const PARTS: &[(&str, &str, Kind)] = &[
     ("search wait", "search", Kind::Wait),
     ("tree wait", "tree", Kind::Wait),
     ("order wait", "order", Kind::Wait),
-    ("files wait", "folder_files", Kind::Wait),
+    ("rankings wait", "rankings", Kind::Wait),
     ("catch-up", "catch-up", Kind::Stage),
     ("compute", "compute", Kind::Stage),
     ("rank", "rank", Kind::Stage),
