@@ -6,9 +6,13 @@
 //! lock waits would hold a runtime worker, and unbounded `spawn_blocking`
 //! would only queue more obsolete work. Here every query names a [`Class`],
 //! and an idle worker always takes the oldest job of the most urgent class
-//! waiting. One worker is kept for [`Class::Interactive`], so a tooltip never
-//! waits behind layouts and lists however many are running, and at most one
-//! [`Class::Background`] job runs at a time.
+//! waiting. Workers are kept apart both ways: one for
+//! [`Class::Interactive`], so a tooltip never waits behind layouts and lists
+//! however many are running; one that interactive queries can't take, so a
+//! few of them stuck behind a lock can't stop everything else; and one for
+//! [`Class::View`] that lists can't take, so pages waiting for a ranking
+//! can't hold up the map. At most one [`Class::Background`] job runs at a
+//! time.
 //!
 //! A query may name a [`Lane`]; a newer request in its lane supersedes the
 //! older ones. Waiting ones are turned away at once with
@@ -102,6 +106,8 @@ struct State {
     running: Vec<Running>,
     next_id: u64,
     stopping: bool,
+    /// Workers started, which the limits in [`State::pick`] count.
+    threads: usize,
 }
 
 impl State {
@@ -145,15 +151,30 @@ impl State {
     }
 
     /// The next job a worker may start: the oldest of the most urgent class
-    /// waiting, leaving one of `threads` for interactive queries and running
-    /// one background job at a time.
-    fn pick(&mut self, threads: usize) -> Option<Job> {
-        let others = self.running.len() - self.busy(Class::Interactive);
+    /// allowed to start. Of `threads`, interactive queries leave one for the
+    /// rest and the rest leave one for interactive queries; lists and
+    /// background jobs also leave one for layouts (with 2 threads, they
+    /// share the one), and one background job runs at a time.
+    fn pick(&mut self) -> Option<Job> {
+        let threads = self.threads;
+        if threads < 2 {
+            // A lone worker takes everything, most urgent first.
+            return Class::ALL
+                .into_iter()
+                .find_map(|class| self.queues[class as usize].pop_front());
+        }
+        let interactive = self.busy(Class::Interactive);
+        let others = self.running.len() - interactive;
+        let lists = self.busy(Class::Lists) + self.busy(Class::Background);
+        let lists_max = threads.saturating_sub(2).max(1);
         for class in Class::ALL {
             let allowed = match class {
-                Class::Interactive => true,
-                Class::Background => others + 1 < threads && self.busy(class) == 0,
-                Class::View | Class::Lists => others + 1 < threads,
+                Class::Interactive => interactive + 1 < threads,
+                Class::View => others + 1 < threads,
+                Class::Lists => others + 1 < threads && lists < lists_max,
+                Class::Background => {
+                    others + 1 < threads && lists < lists_max && self.busy(class) == 0
+                }
             };
             if allowed && let Some(job) = self.queues[class as usize].pop_front() {
                 return Some(job);
@@ -167,7 +188,6 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled when a job is queued, a worker frees up, or on shutdown.
     ready: Condvar,
-    threads: usize,
 }
 
 impl Shared {
@@ -192,13 +212,11 @@ impl Default for Runner {
 impl Runner {
     /// A runner with `threads` workers (at least 2).
     pub fn new(threads: usize) -> Self {
-        let threads = threads.max(2);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             ready: Condvar::new(),
-            threads,
         });
-        let workers = (0..threads)
+        let workers: Vec<_> = (0..threads.max(2))
             .filter_map(|i| {
                 let shared = Arc::clone(&shared);
                 std::thread::Builder::new()
@@ -207,6 +225,11 @@ impl Runner {
                     .ok()
             })
             .collect();
+        // The limits count the workers that started. (With none, queries
+        // would wait forever; a system that can't start a thread is broken
+        // in worse ways.)
+        shared.lock().threads = workers.len();
+        shared.ready.notify_all();
         Self {
             shared,
             workers: Mutex::new(workers),
@@ -404,7 +427,7 @@ fn work(shared: &Shared) {
                 if state.stopping {
                     return;
                 }
-                if let Some(job) = state.pick(shared.threads) {
+                if let Some(job) = state.pick() {
                     let id = state.next_id;
                     state.next_id += 1;
                     state.running.push(Running {
@@ -524,7 +547,7 @@ mod tests {
         assert_eq!(panicked, Err("boom failed unexpectedly".to_owned()));
         // Both workers are still there: two jobs can run at once.
         let (a, pa) = gated(&runner, Class::Interactive, None);
-        let (b, pb) = gated(&runner, Class::Interactive, None);
+        let (b, pb) = gated(&runner, Class::View, None);
         started(&a);
         started(&b);
         a.release.send(()).unwrap();
@@ -594,6 +617,69 @@ mod tests {
         until(&runner, 1, 1);
         a.release.send(()).unwrap();
         assert_eq!((pa.wait(), second.wait()), (Ok(1), Ok(2)));
+    }
+
+    #[test]
+    fn interactive_queries_stuck_on_a_lock_leave_a_worker_for_the_rest() {
+        let runner = Runner::new(3);
+        // Two interactive queries waiting for something (a lock held
+        // elsewhere); a third waits for a worker rather than taking the last.
+        let (a, pa) = gated(&runner, Class::Interactive, None);
+        let (b, pb) = gated(&runner, Class::Interactive, None);
+        started(&a);
+        started(&b);
+        let third = runner.submit(Class::Interactive, "tooltip", None, || Ok(3));
+        until(&runner, 1, 2);
+        // Layouts still get through.
+        assert_eq!(
+            runner.submit(Class::View, "layout", None, || Ok(4)).wait(),
+            Ok(4)
+        );
+        a.release.send(()).unwrap();
+        b.release.send(()).unwrap();
+        assert_eq!((pa.wait(), pb.wait(), third.wait()), (Ok(1), Ok(1), Ok(3)));
+    }
+
+    #[test]
+    fn lists_leave_a_worker_for_layouts() {
+        let runner = Runner::new(4);
+        // Pages waiting for a ranking fill what lists may take...
+        let (a, pa) = gated(&runner, Class::Lists, None);
+        let (b, pb) = gated(&runner, Class::Lists, None);
+        started(&a);
+        started(&b);
+        let page = runner.submit(Class::Lists, "page", None, || Ok(3));
+        until(&runner, 1, 2);
+        // ...and a layout, then a tooltip, still run at once.
+        assert_eq!(
+            runner.submit(Class::View, "layout", None, || Ok(4)).wait(),
+            Ok(4)
+        );
+        assert_eq!(
+            runner
+                .submit(Class::Interactive, "tip", None, || Ok(5))
+                .wait(),
+            Ok(5)
+        );
+        a.release.send(()).unwrap();
+        b.release.send(()).unwrap();
+        assert_eq!((pa.wait(), pb.wait(), page.wait()), (Ok(1), Ok(1), Ok(3)));
+    }
+
+    #[test]
+    fn a_lone_worker_takes_everything() {
+        let runner = Runner::new(2);
+        runner.shared.lock().threads = 1;
+        assert_eq!(
+            runner.submit(Class::Lists, "page", None, || Ok(1)).wait(),
+            Ok(1)
+        );
+        assert_eq!(
+            runner
+                .submit(Class::Interactive, "tip", None, || Ok(2))
+                .wait(),
+            Ok(2)
+        );
     }
 
     #[test]
