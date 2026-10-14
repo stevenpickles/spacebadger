@@ -44,9 +44,19 @@ groups: number,
  */
 files: number, 
 /**
- * Space the copies beyond the first in each group take.
+ * Content in the copies beyond the first in each group: their
+ * length, which deleting them may free less of on disk.
  */
-reclaimable: number, skipped: DuplicateSkips, 
+reclaimable: number, 
+/**
+ * Of the groups with a known [`DuplicateGroup::on_disk`], the space
+ * their copies beyond the first take on disk, at most.
+ */
+reclaimableOnDisk: number, 
+/**
+ * Groups whose space on disk can't be estimated.
+ */
+onDiskUnknown: number, skipped: DuplicateSkips, 
 /**
  * Bumped whenever the groups change, found or deleted.
  */

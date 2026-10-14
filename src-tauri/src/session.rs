@@ -16,7 +16,7 @@ use sb_protocol as proto;
 use sb_scan::duplicates::plan;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -55,6 +55,8 @@ pub struct Session {
     duplicates: Mutex<Option<Arc<Job>>>,
     /// Number of the latest search for duplicates.
     latest_duplicates: AtomicU32,
+    /// Set to stop a delete reading copies of duplicates that would stay.
+    recheck_cancel: AtomicBool,
     /// Where snapshots of completed scans are kept; `None` in tests.
     snapshots: Option<Arc<Store>>,
     /// The snapshot saved for this scan once it completed.
@@ -154,6 +156,7 @@ impl Session {
             names: Mutex::new(None),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
+            recheck_cancel: AtomicBool::new(false),
             snapshots,
             saved_snapshot,
             started_ms,
@@ -637,14 +640,22 @@ impl Session {
     /// Deletes the selected items from disk and removes those now gone from
     /// the scan, which is published as a new revision. Refused while the
     /// scan runs, since the scanner may still be adding to them.
-    pub fn delete(&self, nodes: &[u32]) -> Result<proto::DeleteReport, String> {
-        self.delete_using(nodes, delete::delete)
+    ///
+    /// Copies of duplicates that would stay are read again first, with
+    /// progress through `on_recheck`; see [`duplicates::Retained`].
+    pub fn delete(
+        &self,
+        nodes: &[u32],
+        on_recheck: &(dyn Fn(proto::DuplicatesRecheck) + Sync),
+    ) -> Result<proto::DeleteReport, String> {
+        self.delete_using(nodes, on_recheck, delete::delete)
     }
 
     /// [`Session::delete`] with the per-item delete passed in, for tests.
     fn delete_using(
         &self,
         nodes: &[u32],
+        on_recheck: &(dyn Fn(proto::DuplicatesRecheck) + Sync),
         delete_one: impl Fn(&Path, bool) -> Outcome,
     ) -> Result<proto::DeleteReport, String> {
         let _one_at_a_time = self
@@ -654,19 +665,40 @@ impl Session {
         if !self.scan.progress().state.is_finished() {
             return Err("Items can be deleted once the scan finishes or is cancelled.".into());
         }
-        let targets: Vec<(NodeId, PathBuf, bool)> = {
+        let job = self
+            .duplicates
+            .lock()
+            .map_err(|_| "duplicates are unavailable")?
+            .clone();
+        let (targets, retained): (Vec<(NodeId, PathBuf, bool)>, _) = {
             let tree = self.scan.tree();
             let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-            selection::resolve(&tree, nodes)
+            let targets = selection::resolve(&tree, nodes)
                 .items
                 .into_iter()
                 .map(|n| (n, tree.path(n), tree.is_dir(n)))
-                .collect()
+                .collect();
+            (targets, job.map(|j| j.retained(&tree, nodes)))
+        };
+        // Duplicates: items whose copy that stays can't be confirmed are
+        // kept, read with no lock held. (An outcome of its own once
+        // deletes report one per item.)
+        let kept = match retained {
+            Some(r) if !r.is_empty() => self.recheck(r, on_recheck),
+            _ => duplicates::Verdicts::new(),
         };
         let mut gone = Vec::new();
         let mut already_gone = 0;
         let mut failed = Vec::new();
         for (n, path, folder) in targets {
+            if let Some(why) = kept.get(&n) {
+                failed.push(proto::DeleteFailure {
+                    node: n.index() as u32,
+                    path: display_path(&path),
+                    message: why.message().into(),
+                });
+                continue;
+            }
             match delete_one(&path, folder) {
                 Outcome::Deleted => gone.push(n),
                 Outcome::AlreadyGone => {
@@ -803,13 +835,60 @@ impl Session {
             job.check(&tree, nodes)
         };
         // The disk is looked at with no lock held.
-        Ok(pending.finish())
+        Ok(pending.finish(&native::NativeContents))
     }
 
     /// Stops reading; the groups found so far stay.
     pub fn duplicates_cancel(&self, job: u32) -> Result<(), String> {
         self.duplicates_job(job)?.cancel();
         Ok(())
+    }
+
+    /// Reads the copies of duplicates a delete would keep, reporting
+    /// progress every so often, and returns the selected items to keep.
+    fn recheck(
+        &self,
+        retained: duplicates::Retained,
+        on_recheck: &(dyn Fn(proto::DuplicatesRecheck) + Sync),
+    ) -> duplicates::Verdicts {
+        self.recheck_cancel.store(false, Ordering::SeqCst);
+        let counters = sb_scan::duplicates::Counters::default();
+        let total = retained.bytes();
+        let report = |finished| {
+            on_recheck(proto::DuplicatesRecheck {
+                generation: self.generation(),
+                done_bytes: counters.read.load(Ordering::Relaxed),
+                total_bytes: total,
+                finished,
+            })
+        };
+        report(false);
+        // A panic while reading confirms nothing: every item is kept.
+        let unread = retained.keep_all(duplicates::Unconfirmed::Unknown);
+        let done = AtomicBool::new(false);
+        let verdicts = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(duplicates::REPORT_EVERY);
+                    if !done.load(Ordering::Relaxed) {
+                        report(false);
+                    }
+                }
+            });
+            let verdicts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                retained.verify(&native::NativeContents, &self.recheck_cancel, &counters)
+            }));
+            done.store(true, Ordering::Relaxed);
+            verdicts
+        });
+        report(true);
+        verdicts.unwrap_or(unread)
+    }
+
+    /// Stops a delete reading copies of duplicates; the items whose copy
+    /// wasn't confirmed yet are kept.
+    pub fn duplicates_recheck_cancel(&self) {
+        self.recheck_cancel.store(true, Ordering::SeqCst);
     }
 
     /// The native path of a node, for file manager actions.
@@ -1238,7 +1317,9 @@ mod tests {
         assert_eq!(summary.missing, 1, "the scan root is never an item");
 
         let before = session.scan.progress().revision;
-        let report = session.delete_using(&[id(a), id(old)], remove).unwrap();
+        let report = session
+            .delete_using(&[id(a), id(old)], &|_| {}, remove)
+            .unwrap();
         assert_eq!(report.deleted, [id(old)]);
         assert!(report.failed.is_empty());
         assert_eq!((report.files, report.logical), (2, 8000));
@@ -1255,7 +1336,7 @@ mod tests {
 
         // Already gone: removed from the scan without an error.
         std::fs::remove_file(tmp.0.join("keep.txt")).unwrap();
-        let report = session.delete_using(&[id(keep)], remove).unwrap();
+        let report = session.delete_using(&[id(keep)], &|_| {}, remove).unwrap();
         assert_eq!((report.deleted.len(), report.already_gone), (1, 1));
         assert_eq!(session.status().files, 0);
     }
@@ -1363,7 +1444,7 @@ mod tests {
         // Deleting one copy leaves a group of one, which is no group.
         let list = session.duplicates_list(filtered.job).unwrap();
         let first = list.groups[0].files[0].node;
-        session.delete_using(&[first], remove).unwrap();
+        session.delete_using(&[first], &|_| {}, remove).unwrap();
         let after = session.duplicates_status(filtered.job).unwrap();
         assert_eq!((after.groups, after.reclaimable), (0, 0));
         assert_ne!(after.version, filtered.version);
@@ -1375,5 +1456,128 @@ mod tests {
             session.duplicates_list(done.job).is_err(),
             "replaced by the newer search"
         );
+    }
+
+    #[test]
+    fn deletes_only_files_whose_other_copy_is_confirmed() {
+        let tmp = fixture_named("recheck");
+        let copy: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        let (kept, extra) = (tmp.0.join("kept.bin"), tmp.0.join("old").join("extra.bin"));
+        let (kept2, extra2) = (
+            tmp.0.join("kept2.dat"),
+            tmp.0.join("old").join("extra2.dat"),
+        );
+        let other: Vec<u8> = copy.iter().map(|b| b ^ 0x5A).collect();
+        std::fs::write(&kept, &copy).unwrap();
+        std::fs::write(&extra, &copy).unwrap();
+        std::fs::write(&kept2, &other).unwrap();
+        std::fs::write(&extra2, &other).unwrap();
+        let (kept3, extra3) = (
+            tmp.0.join("kept3.txt"),
+            tmp.0.join("old").join("extra3.txt"),
+        );
+        let third: Vec<u8> = copy.iter().map(|b| b ^ 0x33).collect();
+        std::fs::write(&kept3, &third).unwrap();
+        std::fs::write(&extra3, &third).unwrap();
+
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Arc::new(Session::start(tmp.0.clone(), move |s| {
+            sink.lock().unwrap().push(s)
+        }));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = proto::DuplicatesRequest {
+            generation: session.generation(),
+            folder: 0,
+            search: None,
+            min_size: 1000,
+        };
+        session
+            .duplicates_start(&request, move |s| {
+                let _ = tx.send(s);
+            })
+            .unwrap();
+        let done = loop {
+            let s = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            if s.phase != proto::DuplicatesPhase::Running {
+                break s;
+            }
+        };
+        assert_eq!((done.groups, done.skipped.changing), (3, 0));
+        let id = |p: &Path| {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let mut n = NodeId::ROOT;
+            for part in p.strip_prefix(&tmp.0).unwrap() {
+                n = child(&tree, n, part.to_str().unwrap());
+            }
+            n.index() as u32
+        };
+        let (e1, e2, e3) = (id(&extra), id(&extra2), id(&extra3));
+
+        // The kept copy is overwritten with other bytes of the same length.
+        let mut edited = copy.clone();
+        edited[150_000] ^= 0xFF;
+        std::fs::write(&kept, &edited).unwrap();
+        let f = std::fs::File::options().write(true).open(&kept).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        drop(f);
+        let check = session.duplicates_check(done.job, &[e1, e2]).unwrap();
+        assert_eq!(
+            (check.kept_gone, check.to_recheck),
+            (1, 2),
+            "the same size is no longer proof"
+        );
+
+        let progress = Mutex::new(Vec::new());
+        let report = session
+            .delete_using(&[e1, e2], &|p| progress.lock().unwrap().push(p), remove)
+            .unwrap();
+        assert_eq!(report.deleted, [e2], "its copy is unchanged");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].node, e1);
+        assert_eq!(
+            report.failed[0].message,
+            duplicates::Unconfirmed::Changed.message()
+        );
+        assert!(extra.exists() && !extra2.exists() && kept.exists());
+        let progress = progress.into_inner().unwrap();
+        let last = progress.last().unwrap();
+        assert!(last.finished);
+        assert_eq!(last.total_bytes, 2 * copy.len() as u64);
+        assert_eq!(
+            last.done_bytes,
+            copy.len() as u64,
+            "the changed copy wasn't read"
+        );
+
+        // An unchanged copy that can't be read leaves it unknown, which is
+        // never taken as proof.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let locked = std::fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .open(&kept3)
+                .unwrap();
+            let report = session.delete_using(&[e3], &|_| {}, remove).unwrap();
+            assert!(report.deleted.is_empty());
+            assert_eq!(
+                report.failed[0].message,
+                duplicates::Unconfirmed::Unknown.message()
+            );
+            drop(locked);
+            assert!(extra3.exists());
+        }
+        let report = session.delete_using(&[e3], &|_| {}, remove).unwrap();
+        assert_eq!(report.deleted, [e3]);
+        assert!(!extra3.exists() && kept3.exists());
     }
 }

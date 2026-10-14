@@ -46,6 +46,8 @@ pub struct DuplicateSkips {
     pub vanished: u32,
     /// Changed since the scan (size, or no longer a plain file).
     pub changed: u32,
+    /// Written to while being read.
+    pub changing: u32,
     /// Stored behind a reparse point (deduplicated, tiered, virtualized),
     /// so reading it raw wouldn't give its contents.
     pub special: u32,
@@ -91,9 +93,16 @@ pub struct DuplicatesStatus {
     pub groups: u32,
     /// Files in those groups.
     pub files: u32,
-    /// Space the copies beyond the first in each group take.
+    /// Content in the copies beyond the first in each group: their
+    /// length, which deleting them may free less of on disk.
     #[ts(type = "number")]
     pub reclaimable: u64,
+    /// Of the groups with a known [`DuplicateGroup::on_disk`], the space
+    /// their copies beyond the first take on disk, at most.
+    #[ts(type = "number")]
+    pub reclaimable_on_disk: u64,
+    /// Groups whose space on disk can't be estimated.
+    pub on_disk_unknown: u32,
     pub skipped: DuplicateSkips,
     /// Bumped whenever the groups change, found or deleted.
     pub version: u32,
@@ -107,8 +116,8 @@ pub struct DuplicateFile {
     /// The containing folder.
     pub parent: u32,
     pub path: String,
-    /// It has other hard-link names, so deleting this one alone may free
-    /// nothing.
+    /// It has other hard-link names, in the scan or not, so deleting this
+    /// one alone may free nothing.
     pub hardlinked: bool,
 }
 
@@ -117,9 +126,15 @@ pub struct DuplicateFile {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DuplicateGroup {
-    /// Each file's size.
+    /// Each file's size: the length of its contents.
     #[ts(type = "number")]
     pub size: u64,
+    /// The most space on disk deleting all but the largest copy could
+    /// free, from the scan's allocated sizes. `None` when a copy's
+    /// allocation is unknown or a copy has other hard-link names. Shared
+    /// storage (block cloning, deduplication) can make it less still.
+    #[ts(type = "number | null")]
+    pub on_disk: Option<u64>,
     /// Shortest path first.
     pub files: Vec<DuplicateFile>,
 }
@@ -151,7 +166,10 @@ pub struct DuplicatesCheckRequest {
     pub nodes: Vec<u32>,
 }
 
-/// Groups of duplicates a delete would leave with no copy.
+/// Groups of duplicates a delete would leave with no copy, as far as can be
+/// told before it's confirmed. Provisional: the delete checks the copies
+/// that would stay again, contents included, and keeps files whose copy it
+/// can't confirm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -159,8 +177,12 @@ pub struct DuplicatesCheck {
     /// Groups whose every file would be deleted.
     pub all_selected: u32,
     /// Groups whose files that would stay are gone from disk or have
-    /// changed size since they were compared.
+    /// changed since they were compared: another file, length, or
+    /// modified time.
     pub kept_gone: u32,
+    /// Groups that would lose some files and keep others, whose copies
+    /// staying the delete reads again first.
+    pub to_recheck: u32,
     /// Groups with copies that would stay, which weren't looked for on disk
     /// because there were too many to check quickly.
     pub unchecked: u32,
@@ -171,3 +193,25 @@ pub struct DuplicatesCheck {
 
 /// Most examples a [`DuplicatesCheck`] lists.
 pub const DUPLICATE_CHECK_EXAMPLES: usize = 5;
+
+/// Name of the event that carries [`DuplicatesRecheck`] updates.
+pub const DUPLICATES_RECHECK_EVENT: &str = "duplicates-recheck";
+
+/// How far a delete has got reading the copies of duplicates that would
+/// stay, before it moves anything. Files whose copy can't be confirmed are
+/// kept and reported as failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DuplicatesRecheck {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Bytes read so far.
+    #[ts(type = "number")]
+    pub done_bytes: u64,
+    /// Bytes to read if the first copy of each group is confirmed.
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    /// Reading is over and moving has started.
+    pub finished: bool,
+}

@@ -14,8 +14,8 @@ mod session;
 mod snapshots;
 
 use sb_protocol::{
-    AppInfo, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest, DuplicatesCheck,
-    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    AppInfo, DUPLICATES_RECHECK_EVENT, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest,
+    DuplicatesCheck, DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
     FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
     SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
@@ -436,9 +436,11 @@ fn set_delete_allowed(state: State<'_, AppState>, allowed: bool) -> bool {
 
 /// Moves selected items (folders with their contents) to the Recycle Bin or
 /// Trash and removes them from the scan. Refused unless deleting is turned
-/// on. Runs on a blocking thread: large folders take a while.
+/// on. Runs on a blocking thread: large folders take a while, and copies of
+/// duplicates that would stay are read first, with progress as events.
 #[tauri::command]
 async fn delete_items(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: DeleteRequest,
 ) -> Result<DeleteReport, String> {
@@ -446,9 +448,24 @@ async fn delete_items(
         return Err("Deleting is turned off. Turn on “Allow deleting” first.".into());
     }
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.delete(&request.nodes))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        session.delete(&request.nodes, &|progress| {
+            let _ = app.emit(DUPLICATES_RECHECK_EVENT, progress);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stops a delete reading copies of duplicates that would stay; files whose
+/// copy wasn't confirmed are kept, the rest still move.
+#[tauri::command]
+async fn duplicates_recheck_cancel(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    state.session(generation)?.duplicates_recheck_cancel();
+    Ok(())
 }
 
 /// Shows a scanned file or folder selected in the system file manager
@@ -610,6 +627,7 @@ pub fn run() {
             duplicates_list,
             duplicates_check,
             duplicates_cancel,
+            duplicates_recheck_cancel,
             set_delete_allowed,
             restart_elevated,
             delete_items,
