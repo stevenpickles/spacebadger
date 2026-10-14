@@ -44,7 +44,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The result says what happened to each item: moved, already gone, changed, couldn't be moved, or gone without being confirmed in the Recycle Bin (a warning). Items that were already gone are no longer counted as moved.
 - The confirmation gives the content size, and how much disk space is freed only when that can be known (not with hard links or unmeasured files).
 - On Windows, an item is left alone if any name in its full path, the scanned folder, the folders above it, and a network server and share included, would be read differently by the Recycle Bin: one ending with a dot or a space (`root.` would be taken for `root`), a reserved device name such as `NUL` or `COM1`, a special shell folder name ending in `.{…}`, or anything else Windows would rewrite. The result says which name, and nothing is moved.
-- On Windows, the item Windows Explorer finds at the path must be the one just checked. A special shell folder in the path (by its name or its `desktop.ini`) can lead Explorer to another place, such as your profile or the Recycle Bin; such items are left alone with a message saying so.
+- On Windows, the item Windows Explorer finds at the path must be the very one just checked, by name as well as by file (another hard-link name of the same file doesn't count). A special shell folder or a folder shortcut in the path (by its name or its `desktop.ini`) can lead Explorer to another place, such as your profile, the Recycle Bin, or the shortcut's target; such items are left alone with a message saying so.
 
 ## [0.2.0] - 2026-10-13
 
