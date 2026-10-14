@@ -50,6 +50,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Fixed
 - With Folders unchecked, the Contents tab could still list files just deleted, at no size, if it refreshed as the delete finished.
+- The details could show the change of the item selected before, beside the one selected now, when its answer came back last; likewise for the folder in view.
+- The details could fall back to an earlier filter's totals, or an earlier revision's, when a slow answer arrived after a newer one.
+- The contents list could mix rows from different moments of a running scan, showing an item twice or leaving one out. The rows it shows now always come from one scan update, refreshed together as the scan goes on.
 
 ## [0.2.0] - 2026-10-13
 

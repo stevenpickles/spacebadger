@@ -9,4 +9,9 @@ export type SmallItemsPage = { generation: number, folder: number, offset: numbe
  * Other children of the folder with no size in this metric, which the
  * map never draws.
  */
-empty: number, };
+empty: number, 
+/**
+ * The scan revision the items were ranked at, so pages fetched at
+ * different times can be told apart.
+ */
+revision: number, };
