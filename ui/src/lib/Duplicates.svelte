@@ -458,7 +458,7 @@
           {#if loading.has(r.group.id)}
             Loading…
           {:else}
-            Show {formatCount(Math.min(PAGE, r.left))} more ({formatCount(r.left)} not shown)
+            Show {formatCount(Math.min(PAGE, r.left))} more of {formatCount(r.left)}
           {/if}
         </button>
       {:else}
@@ -605,7 +605,12 @@
     padding-left: 1.5em;
   }
   .more {
+    max-width: calc(100% - 1.5em);
     margin-left: 1.5em;
+    overflow: hidden;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .name {
     display: block;
