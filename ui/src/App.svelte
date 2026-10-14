@@ -862,6 +862,7 @@
     const count = (o: DeleteReport["others"][number]["outcome"]) => r.others.filter((i) => i.outcome === o).length;
     const notes = [
       [count("uncertain"), "not confirmed in the " + trash],
+      [count("kept"), "kept as possibly the last copy"],
       [count("changed"), "changed since the scan"],
       [count("failed"), "couldn't be moved"],
       [count("alreadyMissing"), "no longer there"],

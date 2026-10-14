@@ -169,6 +169,7 @@
       changed: of("changed"),
       failed: of("failed"),
       missing: of("alreadyMissing"),
+      kept: of("kept"),
     };
   });
 
@@ -209,7 +210,7 @@
   onclose={onClosed}
 >
   {#if result}
-    {@const { uncertain, changed, failed, missing } = outcomes}
+    {@const { uncertain, changed, failed, missing, kept } = outcomes}
     <h2 id="{id}-title">
       {#if result.recycled === result.total}
         Moved {plural(result.recycled, "item")} ({formatBytes(result.size)}) to the {trashName}
@@ -237,6 +238,13 @@
           )} may have been deleted without a copy.
         </p>
         {@render items(uncertain)}
+      {/if}
+      {#if kept.length > 0}
+        <p class="warning">
+          Kept {plural(kept.length, "duplicate")}: {one(kept.length, "it", "each")} may be the last copy, since
+          {one(kept.length, "it", "it or its other copies")} couldn't be confirmed unchanged.
+        </p>
+        {@render items(kept)}
       {/if}
       {#if changed.length > 0}
         <p>
