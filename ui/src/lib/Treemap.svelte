@@ -92,12 +92,21 @@
 
   const helpId = $props.id();
   let container: HTMLDivElement;
+  // Two stacked canvases with the hover highlight (an element) between
+  // them, composited as if drawn in one, so hovering never repaints the
+  // map: tiles and selection, then the highlight, then the focus ring and
+  // labels (which stay above the highlight).
   let canvas: HTMLCanvasElement;
+  let topCanvas: HTMLCanvasElement;
   let width = $state(0);
   let height = $state(0);
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
-  let hover = $state<{ index: number; x: number; y: number } | null>(null);
+  /** The rectangle under the pointer, or -1. Only a change of rectangle
+   * moves the highlight; moves within one only move the tooltip. */
+  let hoverIndex = $state(-1);
+  /** Where the pointer is over the map, for the tooltip. */
+  let pointer = $state<{ x: number; y: number } | null>(null);
   /** Details for the tooltip's item, fetched shortly after it changes. */
   let tipDetails = $state.raw<NodeDetails | null>(null);
   /** The tooltip follows the keyboard selection until the mouse moves. */
@@ -128,12 +137,58 @@
   let showPerf = $state(false);
   let perfText = $state("");
 
+  /** Paint tracing: on with the overlay, or with `localStorage.sbTrace = "1"`
+   * or `?sbTrace` in the URL. Off, it costs a branch per measured text. */
+  const traceFlag = (() => {
+    try {
+      return localStorage.getItem("sbTrace") === "1" || new URLSearchParams(location.search).has("sbTrace");
+    } catch {
+      return false;
+    }
+  })();
+  const trace = {
+    on: traceFlag,
+    /** Since tracing started: whole-map draws and their label passes. */
+    full: new Samples(),
+    labels: new Samples(),
+    measures: new Samples(),
+    /** measureText calls in the draw under way. */
+    measuring: 0,
+    draws: 0,
+    /** Changes of hovered tile, each moving the highlight. */
+    hoverChanges: 0,
+    moves: 0,
+    /** When recent draws happened, for draws per second. */
+    recent: [] as number[],
+  };
+
+  /** ctx.measureText, counted while tracing. Label widths aren't cached:
+   * measuring was a small part of the label pass (docs/validation/treemap-paint.md). */
+  function measure(ctx: CanvasRenderingContext2D, text: string): number {
+    if (trace.on) trace.measuring++;
+    return ctx.measureText(text).width;
+  }
+
   $effect(() => {
+    trace.on = traceFlag || showPerf;
     if (!showPerf) return;
+    if (!traceFlag) {
+      // Count from when the overlay opens.
+      trace.full = new Samples();
+      trace.labels = new Samples();
+      trace.measures = new Samples();
+      trace.draws = trace.hoverChanges = trace.moves = 0;
+    }
     const update = () => {
+      const now = performance.now();
+      const perSecond = trace.recent.filter((t) => now - t <= 1000).length;
       perfText = [
         `layout round trip: ${stats.layout.summary()}`,
         `draw: ${stats.draw.summary()}`,
+        `traced draw: ${trace.full.summary()}`,
+        `labels: ${trace.labels.summary()}`,
+        `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
+        `moves ${trace.moves} · draws ${trace.draws} · hover changes ${trace.hoverChanges} · draws/s ${perSecond}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
@@ -218,6 +273,8 @@
           ) {
             stats.layout.add(performance.now() - started);
             layout = reply;
+            // The tile under a resting pointer may be another one now.
+            if (rest) hoverAt(rest.x, rest.y);
             if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
             shown = { generation: want.generation, view: want.view, search: want.search };
             error = null;
@@ -244,6 +301,19 @@
     return () => observer.disconnect();
   });
 
+  /** Device pixels per CSS pixel. Moving to a monitor with other scaling can
+   * change it without resizing the map, so it's watched for a redraw. */
+  let dpr = $state(window.devicePixelRatio || 1);
+
+  $effect(() => {
+    // Matches only the current ratio, so it changes once the ratio does;
+    // re-armed for the new ratio each time.
+    const query = window.matchMedia(`(resolution: ${dpr}dppx)`);
+    const changed = () => (dpr = window.devicePixelRatio || 1);
+    query.addEventListener("change", changed);
+    return () => query.removeEventListener("change", changed);
+  });
+
   // ---- drawing ---------------------------------------------------------
 
   function fillFor(l: DecodedLayout, i: number): string {
@@ -261,12 +331,12 @@
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
-    if (ctx.measureText(text).width <= max) return text;
+    if (measure(ctx, text) <= max) return text;
     let lo = 0;
     let hi = text.length;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (ctx.measureText(text.slice(0, mid) + "…").width <= max) lo = mid;
+      if (measure(ctx, text.slice(0, mid) + "…") <= max) lo = mid;
       else hi = mid - 1;
     }
     return lo === 0 ? "" : text.slice(0, lo) + "…";
@@ -287,31 +357,48 @@
 
   function draw() {
     const started = performance.now();
+    trace.measuring = 0;
     paint();
     const now = performance.now();
     stats.draw.add(now - started);
+    if (trace.on) {
+      trace.draws++;
+      trace.full.add(now - started);
+      trace.measures.add(trace.measuring);
+      trace.recent.push(now);
+      while (trace.recent.length > 0 && now - trace.recent[0]! > 1000) trace.recent.shift();
+    }
     if (inputAt !== null) {
       stats.input.add(now - inputAt);
       inputAt = null;
     }
   }
 
-  function paint() {
-    const ctx = canvas?.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
+  /** A cleared 2D context for `c`, sized to the map at the device pixel ratio. */
+  function cleared(c: HTMLCanvasElement | undefined): CanvasRenderingContext2D | null {
+    const ctx = c?.getContext("2d");
+    if (!c || !ctx) return null;
+    const ratio = window.devicePixelRatio || 1;
+    if (c.width !== Math.round(width * ratio) || c.height !== Math.round(height * ratio)) {
+      c.width = Math.round(width * ratio);
+      c.height = Math.round(height * ratio);
     }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, width, height);
+    return ctx;
+  }
+
+  /** Tiles and selection on the bottom canvas; focus ring and labels on top. */
+  function paint() {
+    const ctx = cleared(canvas);
+    const top = cleared(topCanvas);
+    if (!ctx || !top) return;
     const l = layout;
     if (!l) return;
 
     const p = palette;
-    ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
-    ctx.textBaseline = "alphabetic";
+    top.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
+    top.textBaseline = "alphabetic";
     const gap = p.gap;
 
     for (let i = 0; i < l.count; i++) {
@@ -365,16 +452,7 @@
       }
     }
 
-    // Hover: a slight lighten and a 2px line, quieter than the selection.
-    const hi = hover ? hover.index : -1;
-    if (hi >= 0 && hi < l.count) {
-      ctx.globalAlpha = dark ? 0.1 : 0.22;
-      ctx.fillStyle = p.textLight;
-      ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
-      ctx.globalAlpha = 0.7;
-      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, ink);
-      ctx.globalAlpha = 1;
-    }
+    // The hover highlight goes between the canvases (see paintHover).
 
     // The focused item: a heavy dark-and-light ring, keeping the accent
     // inside it when the item is also picked.
@@ -383,15 +461,29 @@
       const y = l.y[si]!;
       const w = l.w[si]!;
       const h = l.h[si]!;
-      band(ctx, x, y, w, h, 0, 3, ink);
-      band(ctx, x, y, w, h, 3, 1, paper);
-      if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
+      band(top, x, y, w, h, 0, 3, ink);
+      band(top, x, y, w, h, 3, 1, paper);
+      if (pickedAt(si) && w > 14 && h > 14) band(top, x, y, w, h, 4, 2, p.accent);
     }
 
     // Labels go last, so tints and frames never hide them.
     // Labels go inside the frames of selected and focused tiles.
-    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    const labelsAt = trace.on ? performance.now() : 0;
+    for (let i = 0; i < l.count; i++) drawLabel(top, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    if (trace.on) trace.labels.add(performance.now() - labelsAt);
   }
+
+  /** Hover: a slight lighten and a 2px line, quieter than the selection.
+   * Drawn by elements between the canvases: above the selection, below the
+   * focus ring and labels. */
+  const hoverRect = $derived.by(() => {
+    const l = layout;
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return null;
+    const w = l.w[i]!;
+    const h = l.h[i]!;
+    return { x: l.x[i]!, y: l.y[i]!, w, h, line: w > 2 && h > 2 };
+  });
 
   function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
     const p = palette;
@@ -420,13 +512,13 @@
       // Shorter wordings as the region narrows.
       const n = formatCount(l.items[i]!);
       const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
-        (t) => ctx.measureText(t).width <= room,
+        (t) => measure(ctx, t) <= room,
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
     } else {
       // The size in full, or none where it doesn't fit.
       const size = formatBytes(l.weight[i]!);
-      const sizeWidth = ctx.measureText(size).width;
+      const sizeWidth = measure(ctx, size);
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
         label(ctx, name!, x + 4, y + line1, room);
@@ -463,7 +555,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, marks, selection, selected, hover, palette, colors, width, height];
+    void [layout, marks, selection, selected, palette, colors, width, height, dpr];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -490,17 +582,31 @@
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
-  function onMove(e: MouseEvent) {
+  /** Where the pointer last rested over the map while it hovers, or null:
+   * a new layout is hit-tested there, so the highlight and tooltip follow
+   * the tile now under the pointer. */
+  let rest: { x: number; y: number } | null = null;
+
+  function hoverAt(x: number, y: number) {
     const l = layout;
-    if (!l) return;
+    const index = l ? hitTest(l, x, y) : -1;
+    if (trace.on && index !== hoverIndex) trace.hoverChanges++;
+    hoverIndex = index;
+    pointer = index >= 0 ? { x, y } : null;
+  }
+
+  function onMove(e: MouseEvent) {
     const [x, y] = point(e);
-    const index = hitTest(l, x, y);
-    hover = index >= 0 ? { index, x, y } : null;
+    rest = { x, y };
+    if (trace.on) trace.moves++;
+    hoverAt(x, y);
     keyTip = false;
   }
 
   function onLeave() {
-    hover = null;
+    rest = null;
+    hoverIndex = -1;
+    pointer = null;
   }
 
   /** Replaces the selection with the item at rectangle `i`. */
@@ -672,7 +778,7 @@
       if (i >= 0) {
         onpick(only(i));
         keyTip = true;
-        hover = null;
+        onLeave();
         announceAt(i);
       }
     } else if (e.key === "Enter") {
@@ -699,8 +805,8 @@
   /** Zoom-in over what double-click opens: folders and small items. */
   const cursor = $derived.by(() => {
     const l = layout;
-    if (!l || !hover || hover.index >= l.count) return "default";
-    const i = hover.index;
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return "default";
     return l.kind[i] !== KIND_FILE && l.node[i] !== view ? "zoom-in" : "default";
   });
 
@@ -710,7 +816,7 @@
   const tipIndex = $derived.by(() => {
     const l = layout;
     if (!l) return -1;
-    if (hover) return hover.index < l.count ? hover.index : -1;
+    if (hoverIndex >= 0) return hoverIndex < l.count ? hoverIndex : -1;
     return keyTip ? selectedIndex(l, selection) : -1;
   });
 
@@ -786,8 +892,9 @@
   const tipAnchor = $derived.by(() => {
     const l = layout;
     if (!l || tipIndex < 0) return null;
-    if (hover) {
-      return { right: hover.x + 12, left: hover.x - 12, below: hover.y + 12, above: hover.y - 12 };
+    if (hoverIndex >= 0 && pointer) {
+      const { x, y } = pointer;
+      return { right: x + 12, left: x - 12, below: y + 12, above: y - 12 };
     }
     // Keyboard: under small tiles, just inside the top of big ones.
     const x = l.x[tipIndex]!;
@@ -837,13 +944,32 @@
     Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
     actions. Escape clears the selection.
   </p>
-  <canvas
-    bind:this={canvas}
-    class:stale
-    style:width="{width}px"
-    style:height="{height}px"
-    aria-hidden="true"
-  ></canvas>
+  <!-- Dimmed as one, as a single canvas was. -->
+  <div class="layers" class:stale style:width="{width}px" style:height="{height}px" aria-hidden="true">
+    <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
+    {#if hoverRect}
+      <div
+        class="hover"
+        style:left="{hoverRect.x}px"
+        style:top="{hoverRect.y}px"
+        style:width="{hoverRect.w}px"
+        style:height="{hoverRect.h}px"
+        style:background={palette.textLight}
+        style:opacity={dark ? 0.1 : 0.22}
+      ></div>
+      {#if hoverRect.line}
+        <div
+          class="hover line"
+          style:left="{hoverRect.x}px"
+          style:top="{hoverRect.y}px"
+          style:width="{hoverRect.w}px"
+          style:height="{hoverRect.h}px"
+          style:border-color={dark ? palette.textLight : palette.textDark}
+        ></div>
+      {/if}
+    {/if}
+    <canvas bind:this={topCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+  </div>
   {#if tooltip && tipPosition}
     <div
       class="tooltip"
@@ -884,12 +1010,27 @@
   .treemap:focus-visible {
     box-shadow: inset 0 0 0 2px var(--accent);
   }
-  canvas {
-    display: block;
+  .layers {
+    position: relative;
     transition: opacity 0.15s;
   }
-  canvas.stale {
+  .layers.stale {
     opacity: 0.6;
+  }
+  canvas {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+  }
+  .hover {
+    position: absolute;
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .hover.line {
+    border: 2px solid;
+    opacity: 0.7;
   }
   .tooltip {
     position: absolute;
