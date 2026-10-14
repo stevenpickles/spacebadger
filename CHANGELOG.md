@@ -23,6 +23,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - CSV has full paths, names, sizes in bytes and as shown, file counts, file types, each item's share, and files' modified times in ISO 8601 local time. It opens correctly in Excel, non-English names included, and names that look like formulas stay text.
 - The text report lists totals, the 50 largest folders and files (with modified dates), the filter, and what wasn't counted.
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
+- Exports and snapshots are written to a new file of their own, then renamed into place once complete: a failed export leaves the chosen file as it was, and no other file beside it is ever overwritten or written through a link.
 
 ### Toolbar
 - The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
