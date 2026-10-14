@@ -78,6 +78,19 @@ Without a filter, the tail is the tree's read lock instead: small_items 16.6 ms 
 5. **Search catch-up is small at interactive rates.** With requests every 150 ms the backlog averages 2,000–5,000 nodes and peaked at 46,000 (1.9 ms); about 40 ns per node. It is unbounded, though: after the interface goes quiet (window hidden, no status refreshes), the first query pays for everything scanned meanwhile, at about 12 ms per second of scanning at this scan rate, with both locks held. Typing a filter mid-scan took 51–52 ms, but `search_set` examines in steps without the search mutex, so other requests weren't held up by it.
 6. **Queue time is negligible here**: p95 under 0.1 ms and at most 0.8 ms on 24 threads, because the load doesn't saturate the runtime. On a machine with fewer cores, synchronous lock waits on workers could add to it; the queue is recorded per request to show that.
 
+### After the layout orders only what it draws
+
+Run again once #39 (the layout orders only the children it draws) and #41 (revisions read under the tree lock) were merged into `dev`, one run, p95/p99 in ms while scanning:
+
+| Scenario | layout | details | Contents | tooltip |
+|---|---|---|---|---|
+| Filter on, Contents with folders | 12.2 / 15.9 | 12.3 / 15.6 | 12.0 / 13.8 | 9.4 / 12.0 |
+| Filter on, Contents with files only | 32.0 / 34.5 | 31.1 / 34.3 | 33.0 / 35.3 | 29.0 / 33.0 |
+| No filter, Contents with folders | 7.5 / 28.5 | 7.1 / 22.3 | 7.2 / 28.8 | 6.1 / 8.0 |
+| Filter typed 5 s into the scan | 9.1 / 9.8 | 9.1 / 9.8 | 8.9 / 9.5 | 7.8 / 9.6 |
+
+The unfiltered layout's compute fell from 15–24 ms to about 5.4 ms, which removes most of contributor 3 at p95. Its p99 is a single stall of about 22 ms, and it reaches the other requests through the search mutex: the layout takes it before the tree, so while it waits for the tree, everything that takes the search mutex waits too. With a filter, contributors 1 and 2 are unchanged.
+
 Not covered by this baseline: IPC transfer, JSON serialization, decoding, and painting, which need the real app (`SPACEBADGER_TRACE` and `spacebadgerTrace.full()`). The app was only checked to write the report at exit.
 
 ## Recommendations for the restructuring
