@@ -93,6 +93,29 @@ impl Held {
     }
 }
 
+/// Whether `a` and `b` are the same entry on the same drive, each read as
+/// [`hold`] reads it: the same kind and file ID (when the drive gives
+/// IDs), and the same normalized path as Windows names each handle (long
+/// names, not 8.3 ones). The path matters as well as the ID: two hard-link
+/// names of a file share an ID, and moving one leaves the other.
+#[cfg(windows)]
+pub fn same_object(a: &Path, b: &Path) -> io::Result<bool> {
+    let (found_a, held_a) = hold(a, false)?;
+    let (found_b, held_b) = hold(b, false)?;
+    if found_a.volume != found_b.volume || found_a.kind != found_b.kind {
+        return Ok(false);
+    }
+    let unidentified = found_a.ids == [0; 2] && found_b.ids == [0; 2];
+    if !unidentified && !found_a.ids.iter().any(|&id| found_b.has_id(id)) {
+        return Ok(false);
+    }
+    Ok(held_a
+        .at
+        .as_deref()
+        .zip(held_b.at.as_deref())
+        .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y)))
+}
+
 /// Whether a path from [`Whereabouts::Moved`] is in its volume's Recycle
 /// Bin.
 pub fn in_recycle_bin(path: &str) -> bool {

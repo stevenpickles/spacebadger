@@ -8,6 +8,9 @@ import type { ChangesRequest } from "./protocol/ChangesRequest";
 import type { CompareSummary } from "./protocol/CompareSummary";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { DuplicateExtras } from "./protocol/DuplicateExtras";
+import type { DuplicateFilesPage } from "./protocol/DuplicateFilesPage";
+import type { DuplicateFilesRequest } from "./protocol/DuplicateFilesRequest";
 import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
 import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
 import type { DuplicatesList } from "./protocol/DuplicatesList";
@@ -232,9 +235,20 @@ export function duplicatesStatus(generation: number, job: number): Promise<Dupli
   return invoke<DuplicatesStatus>("duplicates_status", { generation, job });
 }
 
-/** The groups of duplicates found so far, most reclaimable space first. */
+/** The groups of duplicates found so far, most reclaimable space first, each
+ * with its first files; the rest come from `duplicateFiles`. */
 export function duplicatesList(generation: number, job: number): Promise<DuplicatesList> {
   return invoke<DuplicatesList>("duplicates_list", { generation, job });
+}
+
+/** More of a group's files, shortest path first; at most `DUPLICATE_FILES_PAGE`. */
+export function duplicateFiles(request: DuplicateFilesRequest): Promise<DuplicateFilesPage> {
+  return invoke<DuplicateFilesPage>("duplicate_files", { request });
+}
+
+/** Every file but the first of each listed group, by node, to select them. */
+export function duplicatesExtras(generation: number, job: number): Promise<DuplicateExtras> {
+  return invoke<DuplicateExtras>("duplicates_extras", { generation, job });
 }
 
 /** Whether deleting the items would leave a group of duplicates with no copy. */
