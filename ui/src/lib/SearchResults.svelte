@@ -18,6 +18,8 @@
     metric?: Metric;
     /** Scan revision; a change refetches the visible rows. */
     revision: number;
+    /** A change refetches them too (the filter caught up). */
+    refresh?: number;
     scanning: boolean;
     /** Unfiltered size of the scan, for comparison. */
     scanned: number;
@@ -37,6 +39,7 @@
     summary,
     metric = "logical",
     revision,
+    refresh = 0,
     scanning,
     scanned,
     selected,
@@ -82,7 +85,7 @@
   let loaded = new Set<string>();
   $effect(() => {
     const want = { generation, search: summary.search, metric };
-    const tag = `${generation}/${summary.search}/${metric}/${revision}/${attempt}`;
+    const tag = `${generation}/${summary.search}/${metric}/${revision}/${refresh}/${attempt}`;
     for (let p = Math.floor(first / PAGE); p * PAGE < Math.max(last, 1); p++) {
       const key = `${tag}/${p}`;
       if (loaded.has(key)) continue;

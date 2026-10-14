@@ -12,4 +12,10 @@ search: number, query: string, files: number, logical: number,
 /**
  * Known, owned allocation of matching files.
  */
-allocated: number, unknownAllocationFiles: number, };
+allocated: number, unknownAllocationFiles: number, 
+/**
+ * The scan revision (see [`ScanStatus::revision`]) the totals were last
+ * fully caught up with. The filter keeps up with a scan in the
+ * background, so while scanning this can trail the latest status.
+ */
+revision: number, };

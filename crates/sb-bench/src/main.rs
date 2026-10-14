@@ -3,67 +3,111 @@
 //!
 //! ```text
 //! cargo run --release -p sb-bench -- [--nodes N]... [--seed S]
+//! cargo run --release -p sb-bench -- [--wide N]... [--wide-slow N]... [--wide-dir PATH]...
+//! cargo run --release -p sb-bench -- [--lod N]...
 //! ```
 //!
-//! Without `--nodes` it runs 1,000,000 and 5,000,000 nodes. Each size is
-//! measured in a fresh child process so peak memory belongs to that size
-//! alone. Real-disk scans are measured with the `sb-scan` `scan` example.
+//! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
+//! synthetic folder of N entries through the scan engine, `--wide-slow` the
+//! same folder listed slower than the engine adds it, and `--wide-dir` a
+//! real folder with the native adapter (see [`wide`]). `--lod` lays out a
+//! folder of N equal small files and a mixed tree of N nodes (see [`lod`]). Each case is measured
+//! in a fresh child process so peak memory belongs to that case alone.
+//! Real-disk scans are otherwise measured with the `sb-scan` `scan` example.
 
+mod lod;
 mod memory;
 mod synth;
+mod wide;
 
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache, RectKind};
+use sb_core::ranking::{self, Scope, Walk};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::suggest::NameIndex;
 use sb_core::tree::{FileSizes, NodeId, Tree};
 use sb_protocol::wire;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[global_allocator]
+static ALLOC: lod::Counting = lod::Counting;
+
 const DEFAULT_SIZES: [usize; 2] = [1_000_000, 5_000_000];
 
+/// One measurement, run in its own process.
+enum Case {
+    Nodes(usize),
+    Wide(usize),
+    WideSlow(usize),
+    WideDir(PathBuf),
+    Lod(usize),
+}
+
+impl Case {
+    fn args(&self) -> [String; 2] {
+        match self {
+            Self::Nodes(n) => ["--nodes".into(), n.to_string()],
+            Self::Wide(n) => ["--wide".into(), n.to_string()],
+            Self::WideSlow(n) => ["--wide-slow".into(), n.to_string()],
+            Self::WideDir(p) => ["--wide-dir".into(), p.display().to_string()],
+            Self::Lod(n) => ["--lod".into(), n.to_string()],
+        }
+    }
+}
+
 fn main() {
-    let mut sizes = Vec::new();
+    let mut cases = Vec::new();
     let mut seed = 1u64;
     let mut child = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        let mut text = || args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
         let mut value = || {
-            args.next()
-                .and_then(|v| v.replace('_', "").parse::<u64>().ok())
-                .unwrap_or_else(|| panic!("{arg} needs a number"))
+            text()
+                .replace('_', "")
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{arg} needs a number"))
         };
         match arg.as_str() {
-            "--nodes" => sizes.push(value() as usize),
+            "--nodes" => cases.push(Case::Nodes(value() as usize)),
+            "--wide" => cases.push(Case::Wide(value() as usize)),
+            "--wide-slow" => cases.push(Case::WideSlow(value() as usize)),
+            "--wide-dir" => cases.push(Case::WideDir(PathBuf::from(text()))),
+            "--lod" => cases.push(Case::Lod(value() as usize)),
             "--seed" => seed = value(),
             "--child" => child = true,
-            _ => panic!("unknown argument {arg}; usage: sb-bench [--nodes N]... [--seed S]"),
+            _ => panic!(
+                "unknown argument {arg}; usage: sb-bench [--nodes N]... [--wide N]... \
+                 [--wide-slow N]... [--wide-dir PATH]... [--lod N]... [--seed S]"
+            ),
         }
     }
-    if sizes.is_empty() {
-        sizes.extend(DEFAULT_SIZES);
+    if cases.is_empty() {
+        cases.extend(DEFAULT_SIZES.map(Case::Nodes));
     }
-    if child || sizes.len() == 1 {
-        for &n in &sizes {
-            run(n, seed);
+    if child || cases.len() == 1 {
+        for case in &cases {
+            match case {
+                Case::Nodes(n) => run(*n, seed),
+                Case::Wide(n) => wide::synthetic(*n),
+                Case::WideSlow(n) => wide::synthetic_slow(*n),
+                Case::WideDir(p) => wide::real(p),
+                Case::Lod(n) => lod::run(*n, seed),
+            }
         }
         return;
     }
     print_machine();
-    // One process per size, so each peak-memory figure stands alone.
+    // One process per case, so each peak-memory figure stands alone.
     let exe = std::env::current_exe().expect("own executable path");
-    for n in sizes {
+    for case in cases {
+        let [flag, value] = case.args();
         let status = Command::new(&exe)
-            .args([
-                "--child",
-                "--nodes",
-                &n.to_string(),
-                "--seed",
-                &seed.to_string(),
-            ])
+            .args(["--child", &flag, &value, "--seed", &seed.to_string()])
             .status()
             .expect("run benchmark child");
-        assert!(status.success(), "benchmark for {n} nodes failed");
+        assert!(status.success(), "benchmark {flag} {value} failed");
     }
 }
 
@@ -215,6 +259,33 @@ fn run(nodes: usize, seed: u64) {
         ms(small)
     );
 
+    // What the Contents list asks for: the largest files anywhere under the
+    // root, and the root's own children, each in one walk.
+    let rank = |scope: Scope, want: usize| {
+        let key = ranking::Key {
+            scope,
+            folder: NodeId::ROOT,
+            metric: Metric::Allocated,
+            search: None,
+        };
+        let basis = ranking::Basis {
+            revision: 1,
+            finished: true,
+            signature: ranking::Signature::of(&tree, NodeId::ROOT, None),
+            at: Instant::now(),
+        };
+        let mut walk = Walk::new(key, basis, want);
+        walk.step(&tree, None, usize::MAX);
+        walk.finish().items().len()
+    };
+    let (files, ranked) = time(5, || rank(Scope::Files, ranking::MIN_RANKED));
+    let (children, listed) = time(5, || rank(Scope::Children, usize::MAX));
+    println!(
+        "ranking: top {ranked} files under the root {}; root's {listed} children {}",
+        ms(files),
+        ms(children)
+    );
+
     let (indexed, index) = time(3, || NameIndex::build(&tree));
     let (asked, found) = time(3, || index.folders("ab", 8).len());
     println!(
@@ -231,6 +302,8 @@ fn run(nodes: usize, seed: u64) {
         "*e*; !*.tmp; !*.log",
         "dir:a",
         "*.pdf; !dir:e",
+        "size:>100MB",
+        "*.pdf; older:1y",
     ] {
         let (searched, s) = time(3, || {
             let mut s = Search::new(Matcher::new(query).expect("non-empty"));
@@ -305,6 +378,7 @@ fn grow(tree: &mut Tree, count: usize, seed: u64) -> usize {
                 logical: 4096,
                 allocated: sb_core::size::Allocated::known(4096),
             },
+            None,
             0,
         )
         .expect("within capacity");

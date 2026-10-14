@@ -17,6 +17,10 @@
   --gap: hsl(32 75% 62%);
   /* Outline of folders not yet fully scanned. */
   --incomplete: #a86a00;
+  /* Text for changes since an earlier scan, matching the change colors. */
+  --change-grown: #a8360c;
+  --change-shrunk: #1f5f9e;
+  --change-new: #7a2f91;
   /* Treemap label colors, chosen per tile by fill brightness. */
   --map-text-dark: #14171d;
   --map-text-light: #f4f3f0;
@@ -50,6 +54,9 @@
     --warn-bg: #4d3d0f;
     --gap: hsl(32 55% 42%);
     --incomplete: #d9a441;
+    --change-grown: #ff9e7a;
+    --change-shrunk: #8cc4ff;
+    --change-new: #dca3ee;
     --map-gap: #1b1e25;
     --on-accent: #10131a;
   }

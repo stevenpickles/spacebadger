@@ -1,11 +1,15 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
   // Canvas treemap. Pulls a layout from the backend whenever its inputs
-  // change; at most one request is in flight, and changes that arrive
-  // meanwhile are folded into one follow-up request (natural backpressure).
+  // change. Another view, metric, filter, or scan supersedes the request in
+  // flight (the backend drops or stops it); a newer revision or size waits
+  // for it, folded into one follow-up request (natural backpressure).
   import { announce } from "./announce.svelte";
-  import { nodeDetails, requestLayout } from "./api";
+  import { changeMarks, nodeDetails, requestLayout } from "./api";
+  import type { Lane } from "./protocol/Lane";
+  import { Lanes, latest, queryKey } from "./request";
   import {
+    changeColor,
     depthColor,
     typeModeFolderColor,
     otherSmallColor,
@@ -13,6 +17,7 @@
     typeColor,
     type ColorMode,
   } from "./colors";
+  import { MARK_UNKNOWN } from "./compare";
   import { formatBytes, formatCount, percent, plural, shortcut } from "./format";
   import {
     decodeLayout,
@@ -44,10 +49,14 @@
     view: number;
     metric: Metric;
     colors: ColorMode;
+    /** The earlier scan the "change" colors compare with. */
+    compare?: string | null;
     /** Active filename search; only matching files are drawn. */
     search: number | null;
     /** Scan revision; a change triggers a new layout. */
     revision: number;
+    /** A change triggers a new layout too (the filter caught up). */
+    refresh?: number;
     /** The focused item: the one with details, and where arrow keys start. */
     selection: Selection | null;
     /** Selected files and folders (actions apply to these). */
@@ -72,8 +81,10 @@
     view,
     metric,
     colors,
+    compare = null,
     search,
     revision,
+    refresh = 0,
     selection,
     selected,
     anchor,
@@ -87,12 +98,21 @@
 
   const helpId = $props.id();
   let container: HTMLDivElement;
+  // Two stacked canvases with the hover highlight (an element) between
+  // them, composited as if drawn in one, so hovering never repaints the
+  // map: tiles and selection, then the highlight, then the focus ring and
+  // labels (which stay above the highlight).
   let canvas: HTMLCanvasElement;
+  let topCanvas: HTMLCanvasElement;
   let width = $state(0);
   let height = $state(0);
   let layout = $state.raw<DecodedLayout | null>(null);
   let error = $state<string | null>(null);
-  let hover = $state<{ index: number; x: number; y: number } | null>(null);
+  /** The rectangle under the pointer, or -1. Only a change of rectangle
+   * moves the highlight; moves within one only move the tooltip. */
+  let hoverIndex = $state(-1);
+  /** Where the pointer is over the map, for the tooltip. */
+  let pointer = $state<{ x: number; y: number } | null>(null);
   /** Details for the tooltip's item, fetched shortly after it changes. */
   let tipDetails = $state.raw<NodeDetails | null>(null);
   /** The tooltip follows the keyboard selection until the mouse moves. */
@@ -123,12 +143,58 @@
   let showPerf = $state(false);
   let perfText = $state("");
 
+  /** Paint tracing: on with the overlay, or with `localStorage.sbTrace = "1"`
+   * or `?sbTrace` in the URL. Off, it costs a branch per measured text. */
+  const traceFlag = (() => {
+    try {
+      return localStorage.getItem("sbTrace") === "1" || new URLSearchParams(location.search).has("sbTrace");
+    } catch {
+      return false;
+    }
+  })();
+  const trace = {
+    on: traceFlag,
+    /** Since tracing started: whole-map draws and their label passes. */
+    full: new Samples(),
+    labels: new Samples(),
+    measures: new Samples(),
+    /** measureText calls in the draw under way. */
+    measuring: 0,
+    draws: 0,
+    /** Changes of hovered tile, each moving the highlight. */
+    hoverChanges: 0,
+    moves: 0,
+    /** When recent draws happened, for draws per second. */
+    recent: [] as number[],
+  };
+
+  /** ctx.measureText, counted while tracing. Label widths aren't cached:
+   * measuring was a small part of the label pass (docs/validation/treemap-paint.md). */
+  function measure(ctx: CanvasRenderingContext2D, text: string): number {
+    if (trace.on) trace.measuring++;
+    return ctx.measureText(text).width;
+  }
+
   $effect(() => {
+    trace.on = traceFlag || showPerf;
     if (!showPerf) return;
+    if (!traceFlag) {
+      // Count from when the overlay opens.
+      trace.full = new Samples();
+      trace.labels = new Samples();
+      trace.measures = new Samples();
+      trace.draws = trace.hoverChanges = trace.moves = 0;
+    }
     const update = () => {
+      const now = performance.now();
+      const perSecond = trace.recent.filter((t) => now - t <= 1000).length;
       perfText = [
         `layout round trip: ${stats.layout.summary()}`,
         `draw: ${stats.draw.summary()}`,
+        `traced draw: ${trace.full.summary()}`,
+        `labels: ${trace.labels.summary()}`,
+        `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
+        `moves ${trace.moves} · draws ${trace.draws} · hover changes ${trace.hoverChanges} · draws/s ${perSecond}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
@@ -148,54 +214,86 @@
       (shown.generation !== generation || shown.view !== view || shown.search !== search),
   );
 
+  /** Change marks for the drawn layout's rectangles, in change mode. */
+  let marks = $state.raw<{ layout: DecodedLayout; compare: string; bytes: Uint8Array } | null>(null);
+  const changeMode = $derived(colors === "change" && compare !== null);
+
+  async function fetchMarks(l: DecodedLayout, cmp: string, lane: Lane): Promise<Uint8Array> {
+    const nodes = Array.from(l.node.subarray(0, l.count));
+    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }, lane));
+  }
+
+  /** Marks for the map already drawn: newer ones supersede older ones. */
+  const marksLane = new Lanes();
+
+  // Switching to change colors, or to another comparison, marks the map
+  // already drawn; new layouts come with their marks (see fetchLayout).
+  $effect(() => {
+    const l = layout;
+    const cmp = changeMode ? compare : null;
+    if (!l || cmp === null || (marks?.layout === l && marks.compare === cmp)) return;
+    fetchMarks(l, cmp, marksLane.next()).then(
+      (bytes) => {
+        if (layout === l && compare === cmp) marks = { layout: l, compare: cmp, bytes };
+      },
+      () => {},
+    );
+  });
+
   let nextRequest = 1;
-  let inFlight = false;
-  let again = false;
+  const layouts = latest();
 
   $effect(() => {
     // Dependencies that change the layout.
-    void [generation, view, metric, search, revision, width, height];
+    void [generation, view, metric, search, revision, refresh, width, height];
     fetchLayout();
   });
 
-  async function fetchLayout() {
-    if (inFlight) {
-      again = true;
-      return;
-    }
-    inFlight = true;
-    try {
-      do {
-        again = false;
-        if (width < 1 || height < 1) break;
-        const want = { generation, view, metric, search };
-        const request = nextRequest++;
-        try {
-          const started = performance.now();
-          const reply = decodeLayout(
-            await requestLayout({ ...want, request, width, height }),
-          );
-          // Drop replies for a view, metric, search, or scan no longer shown.
-          if (
-            want.generation === generation &&
-            want.view === view &&
-            want.metric === metric &&
-            want.search === search &&
-            reply.generation === generation
-          ) {
-            stats.layout.add(performance.now() - started);
-            layout = reply;
-            shown = { generation: want.generation, view: want.view, search: want.search };
-            error = null;
-            onlayout?.(reply);
-          }
-        } catch (e) {
-          if (want.generation === generation && want.search === search) error = String(e);
+  function fetchLayout() {
+    if (width < 1 || height < 1) return;
+    const want = { generation, view, metric, search };
+    layouts.run(
+      queryKey(want.generation, want.view, want.metric, want.search),
+      revision,
+      async (lane) => {
+        // The size is read when the request starts, so one waiting behind
+        // the request in flight asks for the newest.
+        const started = performance.now();
+        const reply = decodeLayout(
+          await requestLayout({ ...want, request: nextRequest++, width, height }, lane),
+        );
+        // In change mode the marks arrive with the layout, so tiles never
+        // flash in neutral colors first.
+        const cmp = changeMode ? compare : null;
+        let replyMarks: Uint8Array | null = null;
+        // Asked in the layout's lane, so another view supersedes them too.
+        if (cmp !== null) replyMarks = await fetchMarks(reply, cmp, lane).catch(() => null);
+        return { reply, cmp, replyMarks, started };
+      },
+      ({ reply, cmp, replyMarks, started }) => {
+        // Drop replies for a view, metric, search, or scan no longer shown.
+        if (
+          want.generation !== generation ||
+          want.view !== view ||
+          want.metric !== metric ||
+          want.search !== search ||
+          reply.generation !== generation
+        ) {
+          return;
         }
-      } while (again);
-    } finally {
-      inFlight = false;
-    }
+        stats.layout.add(performance.now() - started);
+        layout = reply;
+        // The tile under a resting pointer may be another one now.
+        if (rest) hoverAt(rest.x, rest.y);
+        if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
+        shown = { generation: want.generation, view: want.view, search: want.search };
+        error = null;
+        onlayout?.(reply);
+      },
+      (e) => {
+        if (want.generation === generation && want.search === search) error = String(e);
+      },
+    );
   }
 
   // ---- sizing ----------------------------------------------------------
@@ -210,11 +308,28 @@
     return () => observer.disconnect();
   });
 
+  /** Device pixels per CSS pixel. Moving to a monitor with other scaling can
+   * change it without resizing the map, so it's watched for a redraw. */
+  let dpr = $state(window.devicePixelRatio || 1);
+
+  $effect(() => {
+    // Matches only the current ratio, so it changes once the ratio does;
+    // re-armed for the new ratio each time.
+    const query = window.matchMedia(`(resolution: ${dpr}dppx)`);
+    const changed = () => (dpr = window.devicePixelRatio || 1);
+    query.addEventListener("change", changed);
+    return () => query.removeEventListener("change", changed);
+  });
+
   // ---- drawing ---------------------------------------------------------
 
   function fillFor(l: DecodedLayout, i: number): string {
     const kind = l.kind[i];
     if (kind === KIND_OTHER) return otherSmallColor(dark);
+    if (colors === "change") {
+      const m = marks?.layout === l && marks.compare === compare ? marks.bytes[i]! : MARK_UNKNOWN;
+      return changeColor(m, kind === KIND_FOLDER, dark);
+    }
     if (colors === "type") {
       return kind === KIND_FOLDER ? typeModeFolderColor(dark) : typeColor(l.ftype[i]!, dark);
     }
@@ -223,12 +338,12 @@
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
-    if (ctx.measureText(text).width <= max) return text;
+    if (measure(ctx, text) <= max) return text;
     let lo = 0;
     let hi = text.length;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (ctx.measureText(text.slice(0, mid) + "…").width <= max) lo = mid;
+      if (measure(ctx, text.slice(0, mid) + "…") <= max) lo = mid;
       else hi = mid - 1;
     }
     return lo === 0 ? "" : text.slice(0, lo) + "…";
@@ -249,31 +364,48 @@
 
   function draw() {
     const started = performance.now();
+    trace.measuring = 0;
     paint();
     const now = performance.now();
     stats.draw.add(now - started);
+    if (trace.on) {
+      trace.draws++;
+      trace.full.add(now - started);
+      trace.measures.add(trace.measuring);
+      trace.recent.push(now);
+      while (trace.recent.length > 0 && now - trace.recent[0]! > 1000) trace.recent.shift();
+    }
     if (inputAt !== null) {
       stats.input.add(now - inputAt);
       inputAt = null;
     }
   }
 
-  function paint() {
-    const ctx = canvas?.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
+  /** A cleared 2D context for `c`, sized to the map at the device pixel ratio. */
+  function cleared(c: HTMLCanvasElement | undefined): CanvasRenderingContext2D | null {
+    const ctx = c?.getContext("2d");
+    if (!c || !ctx) return null;
+    const ratio = window.devicePixelRatio || 1;
+    if (c.width !== Math.round(width * ratio) || c.height !== Math.round(height * ratio)) {
+      c.width = Math.round(width * ratio);
+      c.height = Math.round(height * ratio);
     }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, width, height);
+    return ctx;
+  }
+
+  /** Tiles and selection on the bottom canvas; focus ring and labels on top. */
+  function paint() {
+    const ctx = cleared(canvas);
+    const top = cleared(topCanvas);
+    if (!ctx || !top) return;
     const l = layout;
     if (!l) return;
 
     const p = palette;
-    ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
-    ctx.textBaseline = "alphabetic";
+    top.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
+    top.textBaseline = "alphabetic";
     const gap = p.gap;
 
     for (let i = 0; i < l.count; i++) {
@@ -327,16 +459,7 @@
       }
     }
 
-    // Hover: a slight lighten and a 2px line, quieter than the selection.
-    const hi = hover ? hover.index : -1;
-    if (hi >= 0 && hi < l.count) {
-      ctx.globalAlpha = dark ? 0.1 : 0.22;
-      ctx.fillStyle = p.textLight;
-      ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
-      ctx.globalAlpha = 0.7;
-      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, ink);
-      ctx.globalAlpha = 1;
-    }
+    // The hover highlight goes between the canvases (see paintHover).
 
     // The focused item: a heavy dark-and-light ring, keeping the accent
     // inside it when the item is also picked.
@@ -345,15 +468,29 @@
       const y = l.y[si]!;
       const w = l.w[si]!;
       const h = l.h[si]!;
-      band(ctx, x, y, w, h, 0, 3, ink);
-      band(ctx, x, y, w, h, 3, 1, paper);
-      if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
+      band(top, x, y, w, h, 0, 3, ink);
+      band(top, x, y, w, h, 3, 1, paper);
+      if (pickedAt(si) && w > 14 && h > 14) band(top, x, y, w, h, 4, 2, p.accent);
     }
 
     // Labels go last, so tints and frames never hide them.
     // Labels go inside the frames of selected and focused tiles.
-    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    const labelsAt = trace.on ? performance.now() : 0;
+    for (let i = 0; i < l.count; i++) drawLabel(top, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    if (trace.on) trace.labels.add(performance.now() - labelsAt);
   }
+
+  /** Hover: a slight lighten and a 2px line, quieter than the selection.
+   * Drawn by elements between the canvases: above the selection, below the
+   * focus ring and labels. */
+  const hoverRect = $derived.by(() => {
+    const l = layout;
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return null;
+    const w = l.w[i]!;
+    const h = l.h[i]!;
+    return { x: l.x[i]!, y: l.y[i]!, w, h, line: w > 2 && h > 2 };
+  });
 
   function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
     const p = palette;
@@ -382,13 +519,13 @@
       // Shorter wordings as the region narrows.
       const n = formatCount(l.items[i]!);
       const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
-        (t) => ctx.measureText(t).width <= room,
+        (t) => measure(ctx, t) <= room,
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
     } else {
       // The size in full, or none where it doesn't fit.
       const size = formatBytes(l.weight[i]!);
-      const sizeWidth = ctx.measureText(size).width;
+      const sizeWidth = measure(ctx, size);
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
         label(ctx, name!, x + 4, y + line1, room);
@@ -425,7 +562,7 @@
 
   let frame = 0;
   $effect(() => {
-    void [layout, selection, selected, hover, palette, colors, width, height];
+    void [layout, marks, selection, selected, palette, colors, width, height, dpr];
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
@@ -452,17 +589,31 @@
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
-  function onMove(e: MouseEvent) {
+  /** Where the pointer last rested over the map while it hovers, or null:
+   * a new layout is hit-tested there, so the highlight and tooltip follow
+   * the tile now under the pointer. */
+  let rest: { x: number; y: number } | null = null;
+
+  function hoverAt(x: number, y: number) {
     const l = layout;
-    if (!l) return;
+    const index = l ? hitTest(l, x, y) : -1;
+    if (trace.on && index !== hoverIndex) trace.hoverChanges++;
+    hoverIndex = index;
+    pointer = index >= 0 ? { x, y } : null;
+  }
+
+  function onMove(e: MouseEvent) {
     const [x, y] = point(e);
-    const index = hitTest(l, x, y);
-    hover = index >= 0 ? { index, x, y } : null;
+    rest = { x, y };
+    if (trace.on) trace.moves++;
+    hoverAt(x, y);
     keyTip = false;
   }
 
   function onLeave() {
-    hover = null;
+    rest = null;
+    hoverIndex = -1;
+    pointer = null;
   }
 
   /** Replaces the selection with the item at rectangle `i`. */
@@ -634,7 +785,7 @@
       if (i >= 0) {
         onpick(only(i));
         keyTip = true;
-        hover = null;
+        onLeave();
         announceAt(i);
       }
     } else if (e.key === "Enter") {
@@ -661,8 +812,8 @@
   /** Zoom-in over what double-click opens: folders and small items. */
   const cursor = $derived.by(() => {
     const l = layout;
-    if (!l || !hover || hover.index >= l.count) return "default";
-    const i = hover.index;
+    const i = hoverIndex;
+    if (!l || i < 0 || i >= l.count) return "default";
     return l.kind[i] !== KIND_FILE && l.node[i] !== view ? "zoom-in" : "default";
   });
 
@@ -672,7 +823,7 @@
   const tipIndex = $derived.by(() => {
     const l = layout;
     if (!l) return -1;
-    if (hover) return hover.index < l.count ? hover.index : -1;
+    if (hoverIndex >= 0) return hoverIndex < l.count ? hoverIndex : -1;
     return keyTip ? selectedIndex(l, selection) : -1;
   });
 
@@ -681,13 +832,16 @@
     tipIndex >= 0 && layout && layout.kind[tipIndex] !== KIND_OTHER ? layout.node[tipIndex]! : -1,
   );
 
+  /** Each tooltip supersedes the one before, if it isn't answered yet. */
+  const tipLane = new Lanes();
+
   $effect(() => {
     const node = tipNode;
     const gen = generation;
     tipDetails = null;
     if (node < 0) return;
     const timer = setTimeout(() => {
-      nodeDetails(gen, node).then(
+      nodeDetails(gen, node, null, tipLane.next()).then(
         (d) => {
           if (d.node === tipNode && d.generation === generation) tipDetails = d;
         },
@@ -736,7 +890,7 @@
     const folder = l.kind[i] === KIND_FOLDER;
     const lines: (string | null)[] = [size];
     if (folder) lines.push(d ? plural(d.files, "file") : null);
-    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned yet");
+    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned");
     if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
     return { title: d?.name ?? l.labels.get(i) ?? "", path: d ? d.path : null, lines };
   });
@@ -748,8 +902,9 @@
   const tipAnchor = $derived.by(() => {
     const l = layout;
     if (!l || tipIndex < 0) return null;
-    if (hover) {
-      return { right: hover.x + 12, left: hover.x - 12, below: hover.y + 12, above: hover.y - 12 };
+    if (hoverIndex >= 0 && pointer) {
+      const { x, y } = pointer;
+      return { right: x + 12, left: x - 12, below: y + 12, above: y - 12 };
     }
     // Keyboard: under small tiles, just inside the top of big ones.
     const x = l.x[tipIndex]!;
@@ -799,13 +954,32 @@
     Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
     actions. Escape clears the selection.
   </p>
-  <canvas
-    bind:this={canvas}
-    class:stale
-    style:width="{width}px"
-    style:height="{height}px"
-    aria-hidden="true"
-  ></canvas>
+  <!-- Dimmed as one, as a single canvas was. -->
+  <div class="layers" class:stale style:width="{width}px" style:height="{height}px" aria-hidden="true">
+    <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
+    {#if hoverRect}
+      <div
+        class="hover"
+        style:left="{hoverRect.x}px"
+        style:top="{hoverRect.y}px"
+        style:width="{hoverRect.w}px"
+        style:height="{hoverRect.h}px"
+        style:background={palette.textLight}
+        style:opacity={dark ? 0.1 : 0.22}
+      ></div>
+      {#if hoverRect.line}
+        <div
+          class="hover line"
+          style:left="{hoverRect.x}px"
+          style:top="{hoverRect.y}px"
+          style:width="{hoverRect.w}px"
+          style:height="{hoverRect.h}px"
+          style:border-color={dark ? palette.textLight : palette.textDark}
+        ></div>
+      {/if}
+    {/if}
+    <canvas bind:this={topCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+  </div>
   {#if tooltip && tipPosition}
     <div
       class="tooltip"
@@ -846,12 +1020,27 @@
   .treemap:focus-visible {
     box-shadow: inset 0 0 0 2px var(--accent);
   }
-  canvas {
-    display: block;
+  .layers {
+    position: relative;
     transition: opacity 0.15s;
   }
-  canvas.stale {
+  .layers.stale {
     opacity: 0.6;
+  }
+  canvas {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+  }
+  .hover {
+    position: absolute;
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .hover.line {
+    border: 2px solid;
+    opacity: 0.7;
   }
   .tooltip {
     position: absolute;

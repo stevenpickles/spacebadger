@@ -61,3 +61,4 @@ The small-items list stayed open after the selection moved to an unrelated item.
 - 5M nodes on a real disk: the largest real tree available is the 3.56M-node `C:\` above. The 5M figures are synthetic.
 - Linux and macOS performance.
 - Slow network shares (open question 2 in the plan).
+- A single folder with millions of entries: measured later in [`wide-dirs.md`](wide-dirs.md).

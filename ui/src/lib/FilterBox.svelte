@@ -1,15 +1,17 @@
 <script lang="ts">
   // The filter box with completion (the ARIA combobox pattern). The term the
-  // caret ends gets suggestions: keywords (`dir:`, `is:`), file types after
-  // `is:`, and folder names after `dir:` or extensions after `*.` from the
-  // scan. Arrow keys move through them, Enter or Tab accepts, Escape closes
+  // caret ends gets suggestions: keywords (`dir:`, `is:`, `size:`, `older:`,
+  // `newer:`), file types after `is:`, common sizes and ages after `size:`,
+  // `older:`, and `newer:`, and folder names after `dir:` or extensions
+  // after `*.` from the scan. Arrow keys move through them, Enter or Tab accepts, Escape closes
   // the list and, once closed, clears the box. ArrowDown or Ctrl+Space opens
   // the list on an empty term.
   import { tick } from "svelte";
   import { filterSuggest } from "./api";
   import { typeColor } from "./colors";
-  import { contextAt, insertable, keywords, replaceTerm, types, type Context } from "./completion";
+  import { contextAt, insertable, keywords, replaceTerm, types, values, type Context } from "./completion";
   import { formatBytes, plural } from "./format";
+  import { Lanes } from "./request";
   import { theme } from "./theme.svelte";
 
   interface Props {
@@ -51,6 +53,8 @@
   /** Suggestions from the scan, for the context they were asked for. */
   let remote = $state.raw<{ key: string; items: Item[] } | null>(null);
   let seq = 0;
+  /** A newer completion request supersedes the one before in the backend. */
+  const suggestLane = new Lanes();
 
   const ctx = $derived(contextAt(value, caret));
   const key = $derived(ctx ? `${generation}/${ctx.kind}/${ctx.typed.toLowerCase()}` : "");
@@ -68,6 +72,8 @@
         }));
       case "type":
         return types(ctx.typed).map((k) => ({ insert: k.text, detail: k.describe, type: k.type, done: true }));
+      case "value":
+        return values(ctx.prefix, ctx.typed).map((k) => ({ insert: k.text, detail: k.describe, done: true }));
       default:
         return remote?.key === key ? remote.items : [];
     }
@@ -83,7 +89,10 @@
     if (!c || gen === null || (c.kind !== "folder" && c.kind !== "extension")) return;
     const mine = ++seq;
     const timer = setTimeout(() => {
-      filterSuggest({ generation: gen, kind: c.kind === "folder" ? "folder" : "extension", typed: c.typed, limit: LIMIT })
+      filterSuggest(
+        { generation: gen, kind: c.kind === "folder" ? "folder" : "extension", typed: c.typed, limit: LIMIT },
+        suggestLane.next(),
+      )
         .then((found) => {
           if (mine !== seq) return;
           const what = c.kind === "folder" ? "folder" : "file";
@@ -209,7 +218,8 @@
   />
   <span class="spinner" class:on={searching} aria-hidden="true"></span>
   <span id="filter-hint" class="sr-only">
-    Matches file names. dir: matches folder names, is: file types. Arrow keys show suggestions; Escape clears.
+    Matches file names. dir: matches folder names, is: file types, and size:, older:, and newer: narrow by size and
+    modified date. Arrow keys show suggestions; Escape clears.
   </span>
   <ul id="filter-suggestions" role="listbox" aria-label="Suggestions" hidden={!open}>
     {#if open}

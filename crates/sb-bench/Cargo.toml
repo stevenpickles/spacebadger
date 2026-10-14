@@ -1,6 +1,6 @@
 [package]
 name = "sb-bench"
-description = "Scale benchmark for SpaceBadger's tree, search, layout, and wire format"
+description = "Scale benchmark for SpaceBadger's tree, search, layout, wire format, and wide-folder scans"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 sb-core.workspace = true
 sb-protocol.workspace = true
+sb-scan.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.62.2", features = [

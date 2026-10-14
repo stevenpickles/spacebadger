@@ -1,12 +1,15 @@
 <script lang="ts" module>
+  import type { DeleteItem } from "./protocol/DeleteItem";
+
   export interface DeleteResult {
-    /** Items moved (or already gone). */
-    moved: number;
     /** Items asked for. */
     total: number;
-    /** Size of the moved items, in bytes. */
+    /** Items moved to the Recycle Bin or Trash. */
+    recycled: number;
+    /** Size of the recycled items, in bytes. */
     size: number;
-    failures: { path: string; message: string }[];
+    /** Every item not recycled, with what happened to it. */
+    others: DeleteItem[];
   }
 </script>
 
@@ -16,9 +19,13 @@
   // it covers. The confirm button stays disabled until the word "delete" is
   // typed and a short countdown has run, so a reflexive Enter or click can't
   // go through. When the move is done the dialog stays open to report what
-  // moved and what couldn't.
+  // moved and, separately, what was already gone, what had changed since
+  // the scan and was left alone, what couldn't be moved, and what is gone
+  // without being confirmed in the bin.
   import { untrack } from "svelte";
   import { describeItems, exactBytes, formatBytes, plural } from "./format";
+  import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
+  import type { DuplicatesRecheck } from "./protocol/DuplicatesRecheck";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
   import SampleList from "./SampleList.svelte";
 
@@ -30,8 +37,15 @@
     filtered: boolean;
     /** Running as administrator or root. */
     privileged: boolean;
+    /** Groups of duplicates the delete would leave with no copy. */
+    duplicates?: DuplicatesCheck | "unknown" | null;
     /** The delete is running. */
     busy: boolean;
+    /** While it runs, how far it has got reading the copies of duplicates
+     * that would stay, before moving anything. */
+    recheck?: DuplicatesRecheck | null;
+    /** Stops that reading; files whose copy isn't confirmed are kept. */
+    onstoprecheck?: () => void;
     /** Set once the delete has finished: the dialog then shows the outcome. */
     result?: DeleteResult | null;
     onconfirm: () => void;
@@ -45,7 +59,10 @@
     trashName,
     filtered,
     privileged,
+    duplicates = null,
     busy,
+    recheck = null,
+    onstoprecheck,
     result = null,
     onconfirm,
     oncancel,
@@ -70,8 +87,15 @@
 
   const matches = $derived(typed.trim().toLowerCase() === WORD);
   const ready = $derived(matches && left === 0 && !busy);
+  /** Reading copies of duplicates that would stay, before moving. */
+  const rechecking = $derived(busy && recheck !== null && !recheck.finished);
+  let stopped = $state(false);
   const missing = $derived.by(() => {
     // The field's label already asks for the word; this adds the wait.
+    if (rechecking && recheck) {
+      if (stopped) return "Stopping…";
+      return `Checking the copies that stay: ${formatBytes(recheck.doneBytes)} of ${formatBytes(recheck.totalBytes)}`;
+    }
     if (busy) return "Moving…";
     if (left > 0) return `You can confirm in ${left} s`;
     return matches ? "" : `Type ${WORD} above`;
@@ -82,10 +106,20 @@
   );
   const contents = $derived(describeItems(summary.items, summary.folders, summary.files));
 
+  const checked = $derived(typeof duplicates === "object" ? duplicates : null);
+  const lostGroups = $derived(checked ? checked.allSelected + checked.keptGone : 0);
+  /** Groups keeping copies that look unchanged, read again before moving. */
+  const recheckGroups = $derived(checked ? checked.toRecheck - checked.keptGone - checked.unchecked : 0);
+  /** Some groups of duplicates weren't checked; say so. */
+  const unchecked = $derived(duplicates === "unknown" || (checked?.unchecked ?? 0) > 0);
+
   /** Every warning paragraph, for aria-describedby. */
   const describedBy = $derived(
     [
       `${id}-what`,
+      lostGroups > 0 ? `${id}-duplicates` : "",
+      recheckGroups > 0 ? `${id}-recheck` : "",
+      unchecked ? `${id}-unchecked` : "",
       summary.folders > 0 ? `${id}-folders` : "",
       `${id}-skip`,
       privileged ? `${id}-admin` : "",
@@ -127,6 +161,21 @@
     else if (!busy) oncancel();
   }
 
+  /** The result's items not recycled, by outcome. */
+  const outcomes = $derived.by(() => {
+    const of = (o: DeleteItem["outcome"]) => result?.others.filter((i) => i.outcome === o) ?? [];
+    return {
+      uncertain: of("uncertain"),
+      changed: of("changed"),
+      failed: of("failed"),
+      missing: of("alreadyMissing"),
+      kept: of("kept"),
+    };
+  });
+
+  /** "it"/"they" style wording for `n` items. */
+  const one = (n: number, single: string, several: string) => (n === 1 ? single : several);
+
   /** Escape: the parent decides when the dialog goes away. */
   function onCancel(e: Event) {
     e.preventDefault();
@@ -161,46 +210,125 @@
   onclose={onClosed}
 >
   {#if result}
-    {@const all = result.failures.length === 0 && result.moved === result.total}
+    {@const { uncertain, changed, failed, missing, kept } = outcomes}
     <h2 id="{id}-title">
-      {#if all}
-        Moved {plural(result.moved, "item")} ({formatBytes(result.size)})
+      {#if result.recycled === result.total}
+        Moved {plural(result.recycled, "item")} ({formatBytes(result.size)}) to the {trashName}
+      {:else if result.recycled > 0}
+        Moved {result.recycled.toLocaleString()} of {plural(result.total, "item")} to the {trashName}
       {:else}
-        Moved {result.moved.toLocaleString()} of {plural(result.total, "item")} to the {trashName}
+        Nothing was moved to the {trashName}
       {/if}
     </h2>
-    <p id="{id}-result">
-      {#if all}
-        They're in the {trashName}. The space is freed when it's emptied.
-      {:else if result.failures.length > 0}
-        {plural(result.failures.length, "item")} couldn't be moved and {result.failures.length === 1 ? "is" : "are"}
-        still where {result.failures.length === 1 ? "it was" : "they were"}:
-      {:else}
-        The rest were no longer there.
+    <div id="{id}-result">
+      {#if result.recycled > 0}
+        <p>
+          {one(result.recycled, "It's", "They're")} in the {trashName}{result.recycled < result.total
+            ? ` (${formatBytes(result.size)})`
+            : ""}. The space is freed when it's emptied.
+        </p>
       {/if}
-    </p>
-    {#if result.failures.length > 0}
-      <ul class="failures">
-        {#each result.failures as failure, i (i)}
-          <li>
-            <div class="selectable path"><PathText path={failure.path} /></div>
-            <div class="muted small selectable">{failure.message}</div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
+      {#if uncertain.length > 0}
+        <p class="warning">
+          {plural(uncertain.length, "item")}
+          {one(uncertain.length, "isn't", "aren't")} confirmed to be in the {trashName}: some or all of {one(
+            uncertain.length,
+            "it",
+            "them",
+          )} may have been deleted without a copy.
+        </p>
+        {@render items(uncertain)}
+      {/if}
+      {#if kept.length > 0}
+        <p class="warning">
+          Kept {plural(kept.length, "duplicate")}: {one(kept.length, "it", "each")} may be the last copy, since
+          {one(kept.length, "it", "it or its other copies")} couldn't be confirmed unchanged.
+        </p>
+        {@render items(kept)}
+      {/if}
+      {#if changed.length > 0}
+        <p>
+          {plural(changed.length, "item")} changed since the scan and {one(changed.length, "was", "were")} left alone.
+          Scan again to see {one(changed.length, "it as it is", "them as they are")} now.
+        </p>
+        {@render items(changed)}
+      {/if}
+      {#if failed.length > 0}
+        <p>
+          {plural(failed.length, "item")} couldn't be moved and {one(failed.length, "is", "are")} still where
+          {one(failed.length, "it was", "they were")}.
+        </p>
+        {@render items(failed)}
+      {/if}
+      {#if missing.length > 0}
+        <p>
+          {plural(missing.length, "item")}
+          {one(missing.length, "was", "were")} no longer there, so nothing was moved for {one(
+            missing.length,
+            "it",
+            "them",
+          )}.
+        </p>
+        {@render items(missing)}
+      {/if}
+    </div>
     <div class="buttons">
       <button type="button" bind:this={closeButton} onclick={() => onclose?.()}>Close</button>
     </div>
   {:else}
     <h2 id="{id}-title">Move {what} to the {trashName}?</h2>
     <p id="{id}-what">
-      {contents}. Frees about <span title={exactBytes(summary.logical)}>{formatBytes(summary.logical)}</span> when the
-      {trashName} is emptied.
+      {contents}, <span title={exactBytes(summary.logical)}>{formatBytes(summary.logical)}</span> of content.
+      {#if summary.unknownAllocationFiles > 0}
+        How much disk space this frees isn't known: {plural(summary.unknownAllocationFiles, "file")} couldn't be
+        measured on disk.
+      {:else if summary.hardlinked}
+        Some files have other hard links, so their disk space is freed only once every link is gone.
+      {:else}
+        Frees up to about <span title={exactBytes(summary.allocated)}>{formatBytes(summary.allocated)}</span> on disk
+        when the {trashName} is emptied.
+      {/if}
     </p>
     <div class="samples">
       <SampleList samples={summary.samples} total={summary.items} paths />
     </div>
+    {#if checked && lostGroups > 0}
+      <div class="warning" id="{id}-duplicates">
+        {#if checked.allSelected > 0}
+          <p>
+            This deletes every copy in {plural(checked.allSelected, "group")} of duplicates. Nothing of
+            {checked.allSelected === 1 ? "it" : "them"} would remain outside the {trashName}.
+          </p>
+        {/if}
+        {#if checked.keptGone > 0}
+          <p>
+            In {plural(checked.keptGone, "group")} of duplicates, the copies left out are gone or changed since they
+            were compared, so the duplicates you selected from {checked.keptGone === 1 ? "it" : "them"} may be kept,
+            not moved.
+          </p>
+        {/if}
+        <ul class="small">
+          {#each checked.examples as path (path)}
+            <li class="selectable"><PathText {path} /></li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if recheckGroups > 0}
+      <p class="muted small" id="{id}-recheck">
+        The copies left out of {plural(recheckGroups, "group")} of duplicates you selected from look unchanged since
+        they were compared, but that's provisional: before anything moves they're read again, and a selected duplicate
+        that has changed, or whose copy can't be confirmed, is kept. Duplicates inside selected folders go with their
+        folders.
+      </p>
+    {/if}
+    {#if unchecked}
+      <p class="muted small" id="{id}-unchecked">
+        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time. Duplicates you selected
+        are still checked before anything moves, and kept if no copy can be confirmed, but duplicates inside selected
+        folders go with them: make sure a copy of each group stays.
+      </p>
+    {/if}
     {#if summary.folders > 0}
       <p class="warning" id="{id}-folders">
         Folders go with everything in them{filtered ? ", including files the filter hides" : ""}.
@@ -229,13 +357,36 @@
     <div class="buttons">
       <!-- Always present, so the dialog doesn't change height as it counts down. -->
       <span class="muted small hint" role={busy ? "status" : undefined}>{missing}</span>
-      <button type="button" disabled={busy} onclick={oncancel}>Cancel</button>
+      {#if rechecking}
+        <button
+          type="button"
+          disabled={stopped}
+          title="Files whose copy isn't confirmed yet are kept; the rest still move"
+          onclick={() => {
+            stopped = true;
+            onstoprecheck?.();
+          }}>Stop checking</button
+        >
+      {:else}
+        <button type="button" disabled={busy} onclick={oncancel}>Cancel</button>
+      {/if}
       <button type="button" class="danger filled" disabled={!ready} onclick={confirm}>
         Move to the {trashName}
       </button>
     </div>
   {/if}
 </dialog>
+
+{#snippet items(list: DeleteItem[])}
+  <ul class="failures">
+    {#each list as item (item.node)}
+      <li>
+        <div class="selectable path"><PathText path={item.path} /></div>
+        {#if item.message}<div class="muted small selectable">{item.message}</div>{/if}
+      </li>
+    {/each}
+  </ul>
+{/snippet}
 
 <style>
   dialog {
@@ -288,6 +439,17 @@
   .warning {
     color: var(--danger);
     font-weight: 600;
+  }
+  div.warning {
+    margin: 1em 0;
+  }
+  div.warning p {
+    margin: 0;
+  }
+  div.warning ul {
+    margin: 4px 0 0;
+    padding-left: 1.2em;
+    font-weight: normal;
   }
   .type {
     display: flex;

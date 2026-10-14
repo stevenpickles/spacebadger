@@ -3,19 +3,38 @@
 //! Commands that touch scan data are `async` so they run off the main
 //! (UI) thread. Every scan-specific request names its generation; requests
 //! for an older generation are refused so stale replies never mix scans.
+//!
+//! Queries of the scan run on the query runner ([`runner`]), each in a class
+//! by urgency, and most with the interface's [`Lane`] so a newer request
+//! supersedes older ones. Work that reads the disk or runs long with its own
+//! progress and cancelling (planning duplicates, deleting, exporting,
+//! comparing, revealing) uses blocking threads instead, so it can't occupy
+//! the runner's few workers. Commands that only read or set a flag or a
+//! status stay inline, and the dialogs stay off the main thread.
 
+mod atomic_file;
 mod delete;
+mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
+mod identity;
+mod metrics;
 #[cfg(windows)]
 mod recycle_windows;
+mod runner;
 mod session;
+mod snapshots;
 
+use runner::{Class, Runner};
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
-    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
-    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
-    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
+    AppInfo, DUPLICATES_RECHECK_EVENT, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest,
+    DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
+    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, Lane, LayoutRequest, NodeDetails,
+    PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
+    SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
+    SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -23,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[derive(Default)]
@@ -32,6 +51,13 @@ struct AppState {
     /// Deleting was turned on in this run of the app. Never saved, so every
     /// start begins with it off.
     delete_allowed: AtomicBool,
+    /// The file last exported, which "Show in Explorer" can reveal.
+    last_export: Mutex<Option<PathBuf>>,
+    /// Where snapshots of completed scans are saved, for comparing later
+    /// scans with; `None` if the app has no data folder.
+    snapshots: Option<Arc<snapshots::Store>>,
+    /// Runs the queries of the scan.
+    runner: Runner,
 }
 
 impl AppState {
@@ -48,10 +74,28 @@ impl AppState {
 
     /// Replaces the current scan; dropping the old session cancels it.
     fn start(&self, app: &AppHandle, root: PathBuf) -> ScanStarted {
+        // `spacebadger .` names the folder it was started in; snapshots are
+        // kept by absolute path, so another folder's never match.
+        let root = std::path::absolute(&root).unwrap_or(root);
+        // Rescanning the same folder goes on comparing with the same
+        // earlier scan, held in memory in case its file is pruned.
+        let carried = self
+            .current()
+            .filter(|s| s.root == root)
+            .and_then(|s| s.carry());
         let emitter = app.clone();
-        let session = Arc::new(Session::start(root, move |status| {
-            let _ = emitter.emit(SCAN_STATUS_EVENT, status);
-        }));
+        let session = Arc::new(Session::start_with(
+            root,
+            self.snapshots.clone(),
+            carried,
+            move |status| {
+                let _ = emitter.emit(SCAN_STATUS_EVENT, status);
+            },
+        ));
+        let emitter = app.clone();
+        session.on_filter_updated(move |updated| {
+            let _ = emitter.emit(FILTER_UPDATED_EVENT, updated);
+        });
         let started = session.started();
         *self.session.lock().unwrap() = Some(session);
         started
@@ -74,11 +118,13 @@ fn app_info() -> AppInfo {
 #[tauri::command]
 async fn scan_choose(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<ScanStarted>, String> {
     let picked = app
         .dialog()
         .file()
+        .set_parent(&window)
         .set_title("Choose a folder or drive to scan")
         .blocking_pick_folder();
     let Some(picked) = picked else {
@@ -115,9 +161,19 @@ async fn scan_status(state: State<'_, AppState>) -> Result<Option<ScanStatus>, S
 
 /// The treemap for one view, as the binary format in `sb_protocol::wire`.
 #[tauri::command]
-async fn layout(state: State<'_, AppState>, request: LayoutRequest) -> Result<Response, String> {
+async fn layout(
+    state: State<'_, AppState>,
+    request: LayoutRequest,
+    lane: Option<Lane>,
+) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    Ok(Response::new(session.layout(&request)?))
+    let wire = state
+        .runner
+        .submit(Class::View, "layout", lane, move || {
+            session.layout(&request)
+        })
+        .await?;
+    Ok(Response::new(wire))
 }
 
 /// Details of a scanned item; with `search`, also what that filter matches
@@ -128,13 +184,22 @@ async fn node_details(
     generation: u64,
     node: u32,
     search: Option<u32>,
+    lane: Option<Lane>,
 ) -> Result<NodeDetails, String> {
-    state.session(generation)?.details(node, search)
+    let session = state.session(generation)?;
+    state
+        .runner
+        .submit(Class::Interactive, "node_details", lane, move || {
+            session.details(node, search)
+        })
+        .await
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.
-/// Large trees take a moment, so this runs on a blocking thread; a newer
-/// call makes an older one return an error.
+/// A newer call makes an older one return an error: the search is numbered
+/// here, as it's asked for, so a newer one always wins even if an older one
+/// starts later. Large trees take a moment, so it runs with the layouts,
+/// ahead of the lists that wait for it.
 #[tauri::command]
 async fn search_set(
     state: State<'_, AppState>,
@@ -142,9 +207,13 @@ async fn search_set(
     query: String,
 ) -> Result<Option<SearchSummary>, String> {
     let session = state.session(generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.search_set(&query))
+    let id = session.search_begin();
+    state
+        .runner
+        .submit(Class::View, "search_set", None, move || {
+            session.search_set_as(id, &query)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -152,43 +221,65 @@ async fn search_summary(
     state: State<'_, AppState>,
     generation: u64,
     search: u32,
+    lane: Option<Lane>,
 ) -> Result<SearchSummary, String> {
-    state.session(generation)?.search_summary(search)
+    let session = state.session(generation)?;
+    state
+        .runner
+        .submit(Class::Interactive, "search_summary", lane, move || {
+            session.search_summary(search)
+        })
+        .await
 }
 
 #[tauri::command]
 async fn search_results(
     state: State<'_, AppState>,
     request: SearchResultsRequest,
+    lane: Option<Lane>,
 ) -> Result<SearchPage, String> {
-    state.session(request.generation)?.search_results(&request)
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "search_results", lane, move || {
+            session.search_results(&request)
+        })
+        .await
 }
 
 /// The largest files anywhere under a folder. Ranking a large folder takes a
-/// moment, so this runs on a blocking thread.
+/// moment, and stops between steps once superseded.
 #[tauri::command]
 async fn folder_files(
     state: State<'_, AppState>,
     request: FolderFilesRequest,
+    lane: Option<Lane>,
 ) -> Result<FolderFilesPage, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.folder_files(&request))
+    state
+        .runner
+        .submit(Class::Lists, "folder_files", lane, move || {
+            session.folder_files(&request)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 /// Folder names or extensions from the scan for the filter's completion.
-/// The first call after a change indexes the whole tree, so this runs on a
-/// blocking thread.
+/// The first call after a change indexes the whole tree, so this runs
+/// after everything else waiting.
 #[tauri::command]
 async fn filter_suggest(
     state: State<'_, AppState>,
     request: SuggestRequest,
+    lane: Option<Lane>,
 ) -> Result<Vec<Suggestion>, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.suggest(&request))
+    state
+        .runner
+        .submit(Class::Background, "filter_suggest", lane, move || {
+            session.suggest(&request)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 /// The files and folders merged into an "other small items" region.
@@ -196,11 +287,19 @@ async fn filter_suggest(
 async fn small_items(
     state: State<'_, AppState>,
     request: SmallItemsRequest,
+    lane: Option<Lane>,
 ) -> Result<SmallItemsPage, String> {
-    state.session(request.generation)?.small_items(&request)
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "small_items", lane, move || {
+            session.small_items(&request)
+        })
+        .await
 }
 
 /// Capacity and free space of the scanned volume; `None` where unavailable.
+/// Asks the system about the disk, so this runs on a blocking thread.
 #[tauri::command]
 async fn volume_info(
     state: State<'_, AppState>,
@@ -218,8 +317,219 @@ async fn volume_info(
 async fn selection_summary(
     state: State<'_, AppState>,
     request: SelectionRequest,
+    lane: Option<Lane>,
 ) -> Result<SelectionSummary, String> {
-    state.session(request.generation)?.selection(&request.nodes)
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Interactive, "selection_summary", lane, move || {
+            session.selection(&request.nodes)
+        })
+        .await
+}
+
+/// Starts looking for duplicate files under a folder, the one command that
+/// reads file contents (never of cloud files). Progress and the final
+/// status arrive as events. Planning walks the folder, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DuplicatesRequest,
+) -> Result<DuplicatesStatus, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_start(&request, move |status| {
+            let _ = app.emit(DUPLICATES_STATUS_EVENT, status);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_status(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesStatus, String> {
+    state.session(generation)?.duplicates_status(job)
+}
+
+/// The groups of duplicates found so far, with the first few files of each.
+/// Builds their paths, so this runs with the lists.
+#[tauri::command]
+async fn duplicates_list(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesList, String> {
+    let session = state.session(generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "duplicates_list", None, move || {
+            session.duplicates_list(job)
+        })
+        .await
+}
+
+/// More of a group's files. The first page asked for orders the group by
+/// path, so this runs with the lists.
+#[tauri::command]
+async fn duplicate_files(
+    state: State<'_, AppState>,
+    request: DuplicateFilesRequest,
+) -> Result<DuplicateFilesPage, String> {
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "duplicate_files", None, move || {
+            session.duplicate_files(&request)
+        })
+        .await
+}
+
+/// Every file but the first of each listed group, by node, for selecting
+/// them. Orders the groups by path, so this runs with the lists.
+#[tauri::command]
+async fn duplicates_extras(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicateExtras, String> {
+    let session = state.session(generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "duplicates_extras", None, move || {
+            session.duplicates_extras(job)
+        })
+        .await
+}
+
+/// Whether deleting the given items would leave a group of duplicates with
+/// no copy. Looks at the files that would stay on disk, so this runs on a
+/// blocking thread rather than holding up the query runner.
+#[tauri::command]
+async fn duplicates_check(
+    state: State<'_, AppState>,
+    request: DuplicatesCheckRequest,
+) -> Result<DuplicatesCheck, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_check(request.job, &request.nodes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_cancel(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<(), String> {
+    state.session(generation)?.duplicates_cancel(job)
+}
+
+/// Earlier scans of the current root that it can be compared with, newest
+/// first. Reads each snapshot's header, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_snapshots(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<Vec<sb_protocol::SnapshotInfo>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.snapshots())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Compares the scan with an earlier one, or with `None` stops comparing.
+/// Reading a large snapshot and matching it takes a moment, so this runs on
+/// a blocking thread.
+#[tauri::command]
+async fn compare_set(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: Option<String>,
+) -> Result<Option<sb_protocol::CompareSummary>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_set(snapshot.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// How one item changed since the earlier scan. After a delete the scan
+/// may be matched again first.
+#[tauri::command]
+async fn compare_item(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: String,
+    node: u32,
+    lane: Option<Lane>,
+) -> Result<sb_protocol::ItemChange, String> {
+    let session = state.session(generation)?;
+    state
+        .runner
+        .submit(Class::Interactive, "compare_item", lane, move || {
+            session.compare_item(&snapshot, node)
+        })
+        .await
+}
+
+/// One byte per node of a drawn layout, for the "Change" colors. Runs with
+/// the layouts.
+#[tauri::command]
+async fn change_marks(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangeMarksRequest,
+    lane: Option<Lane>,
+) -> Result<Response, String> {
+    let session = state.session(request.generation)?;
+    let marks = state
+        .runner
+        .submit(Class::View, "change_marks", lane, move || {
+            session.change_marks(&request)
+        })
+        .await?;
+    Ok(Response::new(marks))
+}
+
+/// The biggest changes under a folder since the earlier scan. The first
+/// page walks the folder, so this runs with the lists.
+#[tauri::command]
+async fn compare_changes(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangesRequest,
+    lane: Option<Lane>,
+) -> Result<sb_protocol::ChangesPage, String> {
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "compare_changes", lane, move || {
+            session.changes(&request)
+        })
+        .await
+}
+
+/// Whether request timings are kept (`SPACEBADGER_TRACE` is set), so the
+/// interface keeps its own too.
+#[tauri::command]
+fn trace_enabled() -> bool {
+    metrics::enabled()
+}
+
+/// The request timings so far as a text table, then forgotten if `reset`;
+/// `None` when they aren't kept. For diagnosing slow interactions.
+#[tauri::command]
+fn trace_report(reset: bool) -> Option<String> {
+    let report = metrics::report();
+    if reset {
+        metrics::reset();
+    }
+    report
 }
 
 /// Asks first, then starts SpaceBadger again with administrator rights,
@@ -272,9 +582,11 @@ fn set_delete_allowed(state: State<'_, AppState>, allowed: bool) -> bool {
 
 /// Moves selected items (folders with their contents) to the Recycle Bin or
 /// Trash and removes them from the scan. Refused unless deleting is turned
-/// on. Runs on a blocking thread: large folders take a while.
+/// on. Runs on a blocking thread: large folders take a while, and copies of
+/// duplicates that would stay are read first, with progress as events.
 #[tauri::command]
 async fn delete_items(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: DeleteRequest,
 ) -> Result<DeleteReport, String> {
@@ -282,9 +594,24 @@ async fn delete_items(
         return Err("Deleting is turned off. Turn on “Allow deleting” first.".into());
     }
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.delete(&request.nodes))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        session.delete(&request.nodes, &|progress| {
+            let _ = app.emit(DUPLICATES_RECHECK_EVENT, progress);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stops a delete reading copies of duplicates that would stay; files whose
+/// copy wasn't confirmed are kept, the rest still move.
+#[tauri::command]
+async fn duplicates_recheck_cancel(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    state.session(generation)?.duplicates_recheck_cancel();
+    Ok(())
 }
 
 /// Shows a scanned file or folder selected in the system file manager
@@ -292,6 +619,75 @@ async fn delete_items(
 #[tauri::command]
 async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Result<(), String> {
     let path = state.session(generation)?.path(node)?;
+    tauri::async_runtime::spawn_blocking(move || reveal_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Asks where to save, then exports what's under a folder there as CSV or
+/// a report. Returns `None` if the save dialog was dismissed. Writing runs
+/// on a blocking thread and reports its progress as events; it stops if a
+/// new scan replaces this one meanwhile.
+#[tauri::command]
+async fn export_save(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request: ExportRequest,
+) -> Result<Option<ExportReport>, String> {
+    let generation = request.generation;
+    // Not held across the dialog, so a scan started meanwhile isn't kept alive.
+    state.session(generation)?;
+    let (kind, extension) = match request.format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Report => ("Text", "txt"),
+    };
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Export")
+        .set_file_name(Session::export_file_name(
+            &request.file_name,
+            request.format,
+        ))
+        .add_filter(kind, &[extension])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let session = state
+        .session(generation)
+        .map_err(|_| "A new scan started, so nothing was exported.".to_owned())?;
+    let emitter = app.clone();
+    let target = path.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let current = || {
+            emitter
+                .state::<AppState>()
+                .current()
+                .is_some_and(|s| s.generation() == generation)
+        };
+        session.export(&request, &target, current, |rows| {
+            let _ = emitter.emit(EXPORT_PROGRESS_EVENT, ExportProgress { generation, rows });
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.last_export.lock().unwrap() = Some(path);
+    Ok(Some(report))
+}
+
+/// Shows the file last exported selected in the system file manager.
+#[tauri::command]
+async fn reveal_export(state: State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .last_export
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("Nothing has been exported yet.")?;
     tauri::async_runtime::spawn_blocking(move || reveal_path(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -333,7 +729,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let state = AppState::default();
+            let state = AppState {
+                snapshots: app
+                    .path()
+                    .app_local_data_dir()
+                    .ok()
+                    .map(|dir| Arc::new(snapshots::Store::new(dir.join("snapshots")))),
+                ..AppState::default()
+            };
             // `spacebadger <folder>` starts scanning that folder right away.
             if let Some(root) = std::env::args_os().nth(1) {
                 state.start(app.handle(), PathBuf::from(root));
@@ -355,6 +758,8 @@ pub fn run() {
             layout,
             node_details,
             reveal,
+            export_save,
+            reveal_export,
             search_set,
             search_summary,
             search_results,
@@ -363,10 +768,35 @@ pub fn run() {
             filter_suggest,
             volume_info,
             selection_summary,
+            duplicates_start,
+            duplicates_status,
+            duplicates_list,
+            duplicate_files,
+            duplicates_extras,
+            duplicates_check,
+            duplicates_cancel,
+            duplicates_recheck_cancel,
             set_delete_allowed,
             restart_elevated,
-            delete_items
+            delete_items,
+            compare_snapshots,
+            compare_set,
+            compare_item,
+            change_marks,
+            compare_changes,
+            trace_enabled,
+            trace_report
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running SpaceBadger");
+        .build(tauri::generate_context!())
+        .expect("error while running SpaceBadger")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Queries still running are asked to stop; one stuck in a
+                // long step is left behind rather than holding up the exit.
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.runner.shutdown(std::time::Duration::from_secs(2));
+                }
+                metrics::write_report();
+            }
+        });
 }

@@ -11,28 +11,44 @@
 //! `!is:` leaves a type out. Full paths are never matched, and file
 //! contents are never read.
 //!
+//! `size:`, `older:`, and `newer:` terms restrict instead: every one must
+//! hold, on top of the patterns. `size:>500MB`, `size:<=1GB`, and
+//! `size:10MB..1GB` compare the logical size; `older:1y` and `newer:30d`
+//! (or a date, `older:2024-01-01`) compare the modified time. A leading `!`
+//! turns a restriction around. Files whose modified time is unknown never
+//! pass an age term, turned around or not.
+//!
 //! [`Search`] keeps its own totals for matching files and every folder above
 //! them, so the treemap can be drawn from matching bytes only. It catches up
 //! incrementally: new nodes are examined in ID order (IDs only grow), and
 //! files re-measured after being added are replayed from
 //! [`Tree::changed_files`], which also lists removed files; those leave the
-//! matches. Hard-link ownership is kept: an alias that matches contributes
-//! its logical length but no allocation, exactly as in the tree.
+//! matches. When the query depends on size, a re-measured file is matched
+//! again and can join or leave the matches. Hard-link ownership is kept: an
+//! alias that matches contributes its logical length but no allocation,
+//! exactly as in the tree.
 
 use crate::filetype::FileType;
 use crate::layout::Metric;
 use crate::tree::{NodeId, Tree};
 use std::ffi::OsStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const NONE: u32 = u32::MAX;
+
+/// Bytes in a KB, as the interface shows sizes: Windows Explorer counts
+/// 1,024, macOS Finder and Linux file managers 1,000. A filter typed from
+/// what's on screen then means what it says.
+const KILO: u64 = if cfg!(windows) { 1024 } else { 1000 };
 
 /// Case-insensitive matcher for a query such as `*.jpg; *.png; !thumb*` or
 /// `*.js; !dir:node_modules`.
 ///
 /// A file matches when its name matches any included file pattern (or there
 /// are none) and no excluded one, it's inside a folder matching an included
-/// `dir:` pattern (or there are none), and inside no folder matching an
-/// excluded one.
+/// `dir:` pattern (or there are none), inside no folder matching an
+/// excluded one, and its size and modified time pass every `size:`,
+/// `older:`, and `newer:` term.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     query: String,
@@ -43,6 +59,10 @@ pub struct Matcher {
     dir_exclude: Vec<Pattern>,
     /// `is:` file types; an included type counts like an included pattern.
     types: TypeSet,
+    /// `size:` terms, in bytes of logical size.
+    sizes: Vec<Range>,
+    /// `older:` and `newer:` terms, in seconds since the Unix epoch.
+    ages: Vec<Range>,
     /// Every pattern is ASCII, so ASCII names can be matched bytewise.
     ascii: bool,
     /// Some pattern has `?`, so non-ASCII names are needed as characters.
@@ -205,28 +225,66 @@ fn wildcard<T: Copy + PartialEq>(
 }
 
 impl Matcher {
-    /// `None` when the query has no patterns; an unknown `is:` type counts
-    /// as none. Use [`Matcher::parse`] to report it.
+    /// `None` when the query has no patterns; an unknown `is:` type or a
+    /// malformed term counts as none. Use [`Matcher::parse`] to report it.
     pub fn new(query: &str) -> Option<Self> {
         Self::parse(query).ok().flatten()
     }
 
     /// `Ok(None)` when the query has no patterns. Patterns are separated by
     /// `;` and trimmed; a leading `!` excludes, a `dir:` prefix (any case)
-    /// makes a folder pattern, and `is:` names a file type. Fails on an
-    /// unknown or ambiguous type.
+    /// makes a folder pattern, `is:` names a file type, and `size:`,
+    /// `older:`, and `newer:` restrict by size and age, counted from now.
+    /// Fails on an unknown or ambiguous type or a malformed size or age.
+    ///
+    /// Dates such as `older:2024-01-01` start at midnight UTC here; the app
+    /// uses [`Matcher::parse_at`] to start them at local midnight instead.
     pub fn parse(query: &str) -> Result<Option<Self>, String> {
+        Self::parse_at(query, SystemTime::now(), &utc_midnight)
+    }
+
+    /// [`Matcher::parse`] with ages counted back from `now`, and dates
+    /// starting at the moment `midnight(year, month, day)` gives, in seconds
+    /// since the Unix epoch. It's only asked about real dates; `None` makes
+    /// the date an error.
+    pub fn parse_at(
+        query: &str,
+        now: SystemTime,
+        midnight: &dyn Fn(i32, u32, u32) -> Option<i64>,
+    ) -> Result<Option<Self>, String> {
+        let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let mut include = Vec::new();
         let mut exclude = Vec::new();
         let mut dir_include = Vec::new();
         let mut dir_exclude = Vec::new();
         let mut types = TypeSet::default();
+        let mut sizes = Vec::new();
+        let mut ages = Vec::new();
         for term in query.split(';') {
             let term = term.trim();
             let (excluded, term) = match term.strip_prefix('!') {
                 Some(rest) => (true, rest.trim_start()),
                 None => (false, term),
             };
+            if let Some(value) = strip_prefix_ignore_case(term, "size:") {
+                // A term still being typed, such as "size:>", is no term yet.
+                if let Some(range) = size_range(value.trim())? {
+                    sizes.push(range.negated(excluded));
+                }
+                continue;
+            }
+            let age =
+                [("older:", true), ("newer:", false)]
+                    .into_iter()
+                    .find_map(|(prefix, older)| {
+                        strip_prefix_ignore_case(term, prefix).map(|value| (value, older))
+                    });
+            if let Some((value, older)) = age {
+                if let Some(range) = age_range(value.trim(), older, now, midnight)? {
+                    ages.push(range.negated(excluded));
+                }
+                continue;
+            }
             if let Some(word) = strip_prefix_ignore_case(term, "is:") {
                 let word = word.trim();
                 // "is:" alone, still being typed, is no pattern yet.
@@ -261,7 +319,7 @@ impl Matcher {
                 .chain(&dir_include)
                 .chain(&dir_exclude)
         };
-        if all().next().is_none() && types.is_empty() {
+        if all().next().is_none() && types.is_empty() && sizes.is_empty() && ages.is_empty() {
             return Ok(None);
         }
         let ascii = all().all(|p| p.text().is_ascii());
@@ -273,6 +331,8 @@ impl Matcher {
             dir_include,
             dir_exclude,
             types,
+            sizes,
+            ages,
             ascii,
             globs,
         }))
@@ -283,15 +343,29 @@ impl Matcher {
     }
 
     /// Whether a file name passes the file patterns, taking its type from
-    /// the name alone. See [`Matcher::matches_file`].
+    /// the name alone, as an empty file of unknown age. See
+    /// [`Matcher::matches_file`].
     pub fn matches(&self, name: &OsStr) -> bool {
-        self.matches_file(name, 0)
+        self.matches_file(name, 0, None)
     }
 
-    /// Whether a file passes the file patterns and `is:` types; `len` only
-    /// settles `.ts` (see [`FileType::of`]). The folder patterns are applied
-    /// by [`Search`], which knows where the file is.
-    pub fn matches_file(&self, name: &OsStr, len: u64) -> bool {
+    /// Whether a file passes the file patterns, `is:` types, and the size
+    /// and age terms. `len` is its logical size, which also settles `.ts`
+    /// (see [`FileType::of`]), and `modified` its last-modified time in
+    /// seconds since the Unix epoch. The folder patterns are applied by
+    /// [`Search`], which knows where the file is.
+    pub fn matches_file(&self, name: &OsStr, len: u64, modified: Option<u32>) -> bool {
+        if !self.sizes.iter().all(|r| r.holds(len)) {
+            return false;
+        }
+        if !self.ages.is_empty() {
+            let Some(modified) = modified else {
+                return false;
+            };
+            if !self.ages.iter().all(|r| r.holds(u64::from(modified))) {
+                return false;
+            }
+        }
         let kind = || TypeSet::bit(FileType::of(name, len));
         let any_include = !self.include.is_empty() || self.types.include != 0;
         self.with_name(name, |test| {
@@ -302,6 +376,13 @@ impl Matcher {
                 || (self.types.exclude != 0 && self.types.exclude & kind() != 0);
             included && !excluded
         })
+    }
+
+    /// Whether a file can start or stop matching when its size changes:
+    /// the query has `size:` terms, or `is:` types, since a `.ts` file's
+    /// type depends on its size.
+    pub fn depends_on_size(&self) -> bool {
+        !self.sizes.is_empty() || !self.types.is_empty()
     }
 
     /// The query has `dir:` patterns.
@@ -387,6 +468,246 @@ impl FolderMatch {
     }
 }
 
+/// An inclusive range a file's size or modified time must fall in, or
+/// outside of when negated. `lo > hi` holds for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Range {
+    lo: u64,
+    hi: u64,
+    negated: bool,
+}
+
+impl Range {
+    fn new(lo: u64, hi: u64) -> Self {
+        Self {
+            lo,
+            hi,
+            negated: false,
+        }
+    }
+
+    /// Values below `limit`; nothing when it's 0.
+    fn below(limit: u64) -> Self {
+        match limit.checked_sub(1) {
+            Some(hi) => Self::new(0, hi),
+            None => Self::new(1, 0),
+        }
+    }
+
+    fn negated(self, negated: bool) -> Self {
+        Self { negated, ..self }
+    }
+
+    fn holds(&self, value: u64) -> bool {
+        (self.lo <= value && value <= self.hi) != self.negated
+    }
+}
+
+/// The range a `size:` value describes: `>N`, `>=N`, `<N`, `<=N`, or
+/// `N..M` (inclusive). `None` while it's still being typed.
+fn size_range(value: &str) -> Result<Option<Range>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Some((from, to)) = value.split_once("..") {
+        let (from, to) = (from.trim(), to.trim());
+        let lo = if from.is_empty() {
+            0.0
+        } else {
+            bytes(from, value)?
+        };
+        if to.is_empty() {
+            return Ok(None);
+        }
+        let hi = bytes(to, value)?;
+        if lo > hi {
+            return Err(format!(
+                "“size:{value}” goes from larger to smaller. Put the smaller size first."
+            ));
+        }
+        return Ok(Some(Range::new(whole(lo.ceil()), whole(hi.floor()))));
+    }
+    let (op, number) = [">=", "<=", ">", "<"]
+        .into_iter()
+        .find_map(|op| value.strip_prefix(op).map(|rest| (op, rest.trim())))
+        .ok_or_else(|| {
+            // "size:=1GB" reads as "size:>1GB", not "size:>=1GB", in the hint.
+            let size = value.trim_start_matches('=').trim_start();
+            format!(
+                "“size:{value}” needs a comparison: size:>{size}, size:<{size}, \
+                 or a range like size:10MB..1GB."
+            )
+        })?;
+    if number.is_empty() {
+        return Ok(None);
+    }
+    // Fractional bounds round toward what the comparison means: on Windows
+    // 1.3KB is 1,331.2 bytes, so <1.3KB keeps 1,331 bytes and >1.3KB starts
+    // at 1,332.
+    let n = bytes(number, value)?;
+    Ok(Some(match op {
+        ">" => Range::new(whole(n.floor()).saturating_add(1), u64::MAX),
+        ">=" => Range::new(whole(n.ceil()), u64::MAX),
+        "<" => Range::below(whole(n.ceil())),
+        _ => Range::new(0, whole(n.floor())),
+    }))
+}
+
+/// A whole, non-negative number of bytes as `u64`; the conversion
+/// saturates, so an absurd size simply matches nothing.
+fn whole(n: f64) -> u64 {
+    n as u64
+}
+
+/// A size such as `500MB`, `1.5 GB`, or `4096` (bytes), possibly
+/// fractional. `value` is the whole term, for the error message.
+fn bytes(text: &str, value: &str) -> Result<f64, String> {
+    let (number, unit) = split_number(text);
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => Some(1),
+        "k" | "kb" => Some(KILO),
+        "m" | "mb" => Some(KILO.pow(2)),
+        "g" | "gb" => Some(KILO.pow(3)),
+        "t" | "tb" => Some(KILO.pow(4)),
+        "kib" => Some(1 << 10),
+        "mib" => Some(1 << 20),
+        "gib" => Some(1 << 30),
+        "tib" => Some(1 << 40),
+        _ => None,
+    };
+    match (number.parse::<f64>(), multiplier) {
+        (Ok(n), Some(m)) if n.is_finite() && n >= 0.0 => Ok(n * m as f64),
+        _ => Err(format!(
+            "“size:{value}” isn't a size: try size:>500MB or size:>1.5GB (B, KB, MB, GB, TB)."
+        )),
+    }
+}
+
+/// Splits `1.5GB` into `1.5` and `GB`, trimming between them.
+fn split_number(text: &str) -> (&str, &str) {
+    let end = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    (&text[..end], text[end..].trim())
+}
+
+const DAY: u64 = 86_400;
+
+/// The range of modified times an `older:` or `newer:` value describes, in
+/// seconds since the Unix epoch, counted back from `now`: a duration such
+/// as `30d`, `6mo`, or `1y` (a month is 30 days, a year 365), or a date
+/// such as `2024-01-01`, starting when `midnight` says. Older is strictly
+/// before that moment; newer is at or after it. `None` while it's still
+/// being typed, including a date such as `2024-06-`.
+///
+/// The tree keeps times before 1970 as 1 (see
+/// [`crate::tree::epoch_seconds`]), so moments before 1970 aren't told
+/// apart: `older:1960-01-01` matches every file from before 1970.
+fn age_range(
+    value: &str,
+    older: bool,
+    now: u64,
+    midnight: &dyn Fn(i32, u32, u32) -> Option<i64>,
+) -> Result<Option<Range>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let keyword = if older { "older" } else { "newer" };
+    let moment = if let Some(day) = date(value) {
+        let secs = day
+            .and_then(|(y, m, d)| midnight(y, m, d))
+            .ok_or_else(|| format!("“{keyword}:{value}” isn't a real date."))?;
+        u64::try_from(secs).unwrap_or(0)
+    } else if date_prefix(value) {
+        return Ok(None);
+    } else {
+        let (number, unit) = split_number(value);
+        let unit_secs = match unit.to_ascii_lowercase().as_str() {
+            "h" => Some(3_600),
+            "d" => Some(DAY),
+            "w" => Some(7 * DAY),
+            "mo" => Some(30 * DAY),
+            "y" => Some(365 * DAY),
+            "m" => {
+                return Err(format!(
+                    "“{keyword}:{value}”: use mo for months, like {keyword}:{number}mo."
+                ));
+            }
+            _ => None,
+        };
+        match (number.parse::<f64>(), unit_secs) {
+            (Ok(n), Some(unit)) if n.is_finite() && n >= 0.0 => {
+                now.saturating_sub((n * unit as f64) as u64)
+            }
+            _ => {
+                return Err(format!(
+                    "“{keyword}:{value}” isn't an age: try {keyword}:30d, {keyword}:6mo, \
+                     {keyword}:1y, or {keyword}:2024-01-01."
+                ));
+            }
+        }
+    };
+    Ok(Some(if older {
+        // Stored pre-1970 times (1) are older than any moment from 1970 on.
+        Range::below(moment.max(2))
+    } else {
+        Range::new(moment, u64::MAX)
+    }))
+}
+
+/// The year, month, and day of a `YYYY-MM-DD` date. `None` when `text`
+/// isn't shaped like a date; `Some(None)` when it is but the date doesn't
+/// exist.
+fn date(text: &str) -> Option<Option<(i32, u32, u32)>> {
+    let mut parts = text.split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    if parts.next().is_some() || !digits(y, 4..=4) || !digits(m, 1..=2) || !digits(d, 1..=2) {
+        return None;
+    }
+    let (y, m, d): (i32, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Some(None),
+    };
+    Some((1..=days_in_month).contains(&d).then_some((y, m, d)))
+}
+
+/// Whether `text` is the start of a `YYYY-MM-DD` date still being typed:
+/// `2024`, `2024-`, `2024-0`, `2024-06`, or `2024-06-`.
+fn date_prefix(text: &str) -> bool {
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    let parts: Vec<&str> = text.split('-').collect();
+    match parts[..] {
+        [y] => digits(y, 4..=4),
+        [y, m] => digits(y, 4..=4) && digits(m, 0..=2),
+        [y, m, ""] => digits(y, 4..=4) && digits(m, 1..=2),
+        _ => false,
+    }
+}
+
+/// Midnight UTC of a date, in seconds since the Unix epoch (negative
+/// before 1970). The resolver [`Matcher::parse`] uses.
+pub fn utc_midnight(year: i32, month: u32, day: u32) -> Option<i64> {
+    // Days since 1970-01-01, after Howard Hinnant's days_from_civil: years
+    // start in March, so the leap day falls at the end of one.
+    let y = i64::from(year) - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * i64::from((month + 9) % 12) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * DAY as i64)
+}
+
 /// `text` without `prefix`, compared ignoring ASCII case.
 fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let head = text.get(..prefix.len())?;
@@ -463,19 +784,43 @@ impl Search {
     /// Examines up to `budget` new nodes and replays re-measured files.
     /// Returns `true` once every node in `tree` has been examined.
     pub fn catch_up(&mut self, tree: &Tree, budget: usize) -> bool {
-        // Changes to files not yet examined are picked up when they are.
         let changes = tree.changed_files();
-        let mut removed = false;
+        let recheck = self.matcher.depends_on_size();
+        let mut dropped = false;
         for &raw in &changes[self.changes_seen..] {
             let file = NodeId::from_index(raw);
-            if file.index() < self.next && self.slot[file.index()] != NONE {
-                self.refresh(tree, file);
-                removed |= tree.is_removed(file);
+            // Changes to files not yet examined are picked up when they are.
+            if file.index() >= self.next {
+                continue;
+            }
+            // Removed files keep their slot but count no files.
+            let matched = self.totals(file).files != 0;
+            // Every entry for a file is judged on the tree as it is now, so
+            // repeats within one batch agree and never add a file twice.
+            let matches = if recheck {
+                self.file_matches(tree, file)
+            } else {
+                matched && !tree.is_removed(file)
+            };
+            if matched {
+                let new = if matches {
+                    Totals::of_file(tree, file)
+                } else {
+                    Totals::default()
+                };
+                self.replace(tree, file, new);
+                dropped |= !matches;
+            } else if matches {
+                self.add(tree, file);
             }
         }
         self.changes_seen = changes.len();
-        if removed {
-            self.matches.retain(|&f| !tree.is_removed(f));
+        if dropped {
+            let (slot, totals) = (&self.slot, &self.totals);
+            self.matches.retain(|f| match slot[f.index()] {
+                NONE => false,
+                s => totals[s as usize].files != 0,
+            });
         }
 
         let end = tree.len().min(self.next.saturating_add(budget));
@@ -486,29 +831,36 @@ impl Search {
         }
         for i in self.next..end {
             let node = NodeId::from_index(i as u32);
-            // A folder's ID is lower than its contents', so the folders
-            // above a node were examined before it.
-            let outer = match tree.parent(node) {
-                Some(p) if folders => FolderMatch::from_bits(self.scope[p.index()]),
-                _ => FolderMatch::default(),
-            };
             if tree.is_dir(node) {
                 // The scan root's name is its whole path, so it never counts.
                 if folders && node != NodeId::ROOT {
                     let own = self.matcher.folder(tree.name(node));
-                    self.scope[i] = own.within(outer).bits();
+                    self.scope[i] = own.within(self.outer(tree, node)).bits();
                 }
-            } else if !tree.is_removed(node)
-                && self.matcher.in_scope(outer)
-                && self
-                    .matcher
-                    .matches_file(tree.name(node), tree.logical(node))
-            {
+            } else if self.file_matches(tree, node) {
                 self.add(tree, node);
             }
         }
         self.next = end;
         self.next == tree.len()
+    }
+
+    /// How the folders above an examined node meet the `dir:` patterns. A
+    /// folder's ID is lower than its contents', so they were examined first.
+    fn outer(&self, tree: &Tree, node: NodeId) -> FolderMatch {
+        match tree.parent(node) {
+            Some(p) if !self.scope.is_empty() => FolderMatch::from_bits(self.scope[p.index()]),
+            _ => FolderMatch::default(),
+        }
+    }
+
+    /// Whether a file in the examined part of the tree matches as it is now.
+    fn file_matches(&self, tree: &Tree, file: NodeId) -> bool {
+        !tree.is_removed(file)
+            && self.matcher.in_scope(self.outer(tree, file))
+            && self
+                .matcher
+                .matches_file(tree.name(file), tree.logical(file), tree.modified(file))
     }
 
     fn add(&mut self, tree: &Tree, file: NodeId) {
@@ -530,9 +882,9 @@ impl Search {
         }
     }
 
-    /// Re-reads a matching file's sizes and adjusts its ancestors.
-    fn refresh(&mut self, tree: &Tree, file: NodeId) {
-        let new = Totals::of_file(tree, file);
+    /// Replaces a matching file's totals, re-read or zero when it no longer
+    /// matches, and adjusts its ancestors by the difference.
+    fn replace(&mut self, tree: &Tree, file: NodeId, new: Totals) {
         let old = std::mem::replace(self.totals_mut(file), new);
         if old == new {
             return;
@@ -589,6 +941,14 @@ impl Search {
     /// Nodes examined so far.
     pub fn examined(&self) -> usize {
         self.next
+    }
+
+    /// An upper bound on what [`Search::catch_up`] has left to do on
+    /// `tree`: nodes not yet examined plus change-log entries not yet
+    /// replayed, some of which it skips (files not yet examined, repeats).
+    pub fn backlog(&self, tree: &Tree) -> usize {
+        tree.len().saturating_sub(self.next)
+            + tree.changed_files().len().saturating_sub(self.changes_seen)
     }
 }
 
@@ -799,13 +1159,13 @@ mod tests {
         let docs = t.add_dir(NodeId::ROOT, "docs".as_ref()).unwrap();
         let report_dir = t.add_dir(NodeId::ROOT, "report".as_ref()).unwrap();
         let a = t
-            .add_file(docs, "report.pdf".as_ref(), sizes(100, 4096), 0)
+            .add_file(docs, "report.pdf".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
-        t.add_file(docs, "notes.txt".as_ref(), sizes(50, 4096), 0)
+        t.add_file(docs, "notes.txt".as_ref(), sizes(50, 4096), None, 0)
             .unwrap();
-        t.add_file(report_dir, "data.csv".as_ref(), sizes(10, 4096), 0)
+        t.add_file(report_dir, "data.csv".as_ref(), sizes(10, 4096), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "Report-2.pdf".as_ref(), sizes(0, 0), 0)
+        t.add_file(NodeId::ROOT, "Report-2.pdf".as_ref(), sizes(0, 0), None, 0)
             .unwrap();
 
         let s = search("report", &t);
@@ -830,15 +1190,15 @@ mod tests {
     fn catches_up_with_new_files_in_budgeted_steps() {
         let mut t = Tree::new("/r");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
-        t.add_file(d, "x1".as_ref(), sizes(1, 1), 0).unwrap();
+        t.add_file(d, "x1".as_ref(), sizes(1, 1), None, 0).unwrap();
         let mut s = Search::new(Matcher::new("x").unwrap());
         assert!(!s.catch_up(&t, 2));
         assert!(s.catch_up(&t, 2));
         assert_eq!(s.totals(NodeId::ROOT).files, 1);
 
         let v = s.version();
-        t.add_file(d, "x2".as_ref(), sizes(2, 2), 0).unwrap();
-        t.add_file(d, "y".as_ref(), sizes(4, 4), 0).unwrap();
+        t.add_file(d, "x2".as_ref(), sizes(2, 2), None, 0).unwrap();
+        t.add_file(d, "y".as_ref(), sizes(4, 4), None, 0).unwrap();
         assert!(s.catch_up(&t, usize::MAX));
         assert_eq!(s.totals(d).logical, 3);
         assert!(s.version() > v);
@@ -849,10 +1209,16 @@ mod tests {
         let mut t = Tree::new("/r");
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let owner = t
-            .add_file(NodeId::ROOT, "movie.mkv".as_ref(), sizes(100, 4096), 0)
+            .add_file(
+                NodeId::ROOT,
+                "movie.mkv".as_ref(),
+                sizes(100, 4096),
+                None,
+                0,
+            )
             .unwrap();
         let alias = t
-            .add_file(d, "movie link.mkv".as_ref(), sizes(100, 4096), 0)
+            .add_file(d, "movie link.mkv".as_ref(), sizes(100, 4096), None, 0)
             .unwrap();
         let mut s = search("link", &t);
         assert_eq!(s.totals(d).allocated, 4096);
@@ -883,8 +1249,14 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let size = (x >> 40) % 10_000;
-            t.add_file(NodeId::ROOT, format!("f{i}").as_ref(), sizes(size, size), 0)
-                .unwrap();
+            t.add_file(
+                NodeId::ROOT,
+                format!("f{i}").as_ref(),
+                sizes(size, size),
+                None,
+                0,
+            )
+            .unwrap();
         }
         let s = search("f", &t);
         let mut expected = s.matches().to_vec();
@@ -903,10 +1275,14 @@ mod tests {
         let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
         let e = t.add_dir(d, "e".as_ref()).unwrap();
         let keep = t
-            .add_file(NodeId::ROOT, "a.log".as_ref(), sizes(1, 4096), 0)
+            .add_file(NodeId::ROOT, "a.log".as_ref(), sizes(1, 4096), None, 0)
             .unwrap();
-        let gone = t.add_file(d, "b.log".as_ref(), sizes(2, 8192), 0).unwrap();
-        let deeper = t.add_file(e, "c.log".as_ref(), sizes(4, 4096), 0).unwrap();
+        let gone = t
+            .add_file(d, "b.log".as_ref(), sizes(2, 8192), None, 0)
+            .unwrap();
+        let deeper = t
+            .add_file(e, "c.log".as_ref(), sizes(4, 4096), None, 0)
+            .unwrap();
         let mut s = search("log", &t);
         assert_eq!(s.totals(NodeId::ROOT).files, 3);
         let v = s.version();
@@ -942,12 +1318,15 @@ mod tests {
     fn changes_to_unexamined_files_are_read_when_examined() {
         let mut t = Tree::new("/r");
         let f = t
-            .add_file(NodeId::ROOT, "a".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "a".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         let mut s = Search::new(Matcher::new("a").unwrap());
+        assert_eq!(s.backlog(&t), 2);
         s.catch_up(&t, 1); // only the root
         t.update_file(f, sizes(7, 8));
+        assert_eq!(s.backlog(&t), 2, "the file, and its change");
         s.catch_up(&t, usize::MAX);
+        assert_eq!(s.backlog(&t), 0);
         assert_eq!(
             s.totals(NodeId::ROOT),
             Totals {
@@ -986,7 +1365,8 @@ mod tests {
             (cache, "blob.bin"),
             (NodeId::ROOT, "top.js"),
         ] {
-            t.add_file(dir, name.as_ref(), sizes(10, 4096), 0).unwrap();
+            t.add_file(dir, name.as_ref(), sizes(10, 4096), None, 0)
+                .unwrap();
         }
 
         let s = search("dir:node_modules", &t);
@@ -1029,9 +1409,9 @@ mod tests {
         let mut s = search("dir:node_modules", &t);
         assert!(s.matches().is_empty());
         let inner = t.add_dir(nm, "pkg".as_ref()).unwrap();
-        t.add_file(inner, "a.js".as_ref(), sizes(5, 4096), 0)
+        t.add_file(inner, "a.js".as_ref(), sizes(5, 4096), None, 0)
             .unwrap();
-        t.add_file(NodeId::ROOT, "b.js".as_ref(), sizes(5, 4096), 0)
+        t.add_file(NodeId::ROOT, "b.js".as_ref(), sizes(5, 4096), None, 0)
             .unwrap();
         assert!(s.catch_up(&t, usize::MAX));
         assert_eq!(names(&s, &t), ["a.js"]);
@@ -1049,7 +1429,8 @@ mod tests {
             (NodeId::ROOT, "app.ts", 2),
             (NodeId::ROOT, "stream.ts", 2 << 20),
         ] {
-            t.add_file(dir, name.as_ref(), sizes(len, 4096), 0).unwrap();
+            t.add_file(dir, name.as_ref(), sizes(len, 4096), None, 0)
+                .unwrap();
         }
 
         let s = search("is:video", &t);
@@ -1085,5 +1466,274 @@ mod tests {
         let err = Matcher::parse("is:d").unwrap_err();
         assert!(err.contains("document or diskimage"), "{err}");
         assert!(Matcher::new("is:vidoe").is_none());
+    }
+
+    #[test]
+    fn size_terms_compare_logical_sizes() {
+        let k = KILO;
+        let m = |q: &str, len: u64| {
+            Matcher::new(q)
+                .unwrap()
+                .matches_file("a".as_ref(), len, None)
+        };
+        assert!(m("size:>500MB", 500 * k * k + 1));
+        assert!(!m("size:>500MB", 500 * k * k));
+        assert!(m("size:>=500mb", 500 * k * k));
+        assert!(m("SIZE: < 10KB", 10 * k - 1));
+        assert!(!m("size:<10KB", 10 * k));
+        assert!(m("size:<=10KB", 10 * k));
+        assert!(m("size:>1.5GB", 3 * k * k * k / 2 + 1));
+        assert!(!m("size:>1.5GB", 3 * k * k * k / 2));
+        assert!(m("size:>100", 101), "a bare number is bytes");
+        assert!(m("size:>1 KiB", 1025));
+        assert!(!m("size:<0", 0), "nothing is smaller than nothing");
+        for (len, expected) in [
+            (10 * k * k - 1, false),
+            (10 * k * k, true),
+            (k * k * k, true),
+            (k * k * k + 1, false),
+        ] {
+            assert_eq!(m("size:10MB..1GB", len), expected, "{len}");
+        }
+        assert!(m("size:..1KB", 0), "an open start is 0");
+
+        // Fractional bounds round the way each comparison means.
+        let x = 1.3 * k as f64;
+        let (floor, ceil) = (x.floor() as u64, x.ceil() as u64);
+        assert!(m("size:<1.3KB", ceil - 1) && !m("size:<1.3KB", ceil));
+        assert!(m("size:<=1.3KB", floor) && !m("size:<=1.3KB", floor + 1));
+        assert!(!m("size:>1.3KB", floor) && m("size:>1.3KB", floor + 1));
+        assert!(m("size:>=1.3KB", ceil) && !m("size:>=1.3KB", ceil - 1));
+        let y = 1.7 * k as f64;
+        assert!(m("size:1.3KB..1.7KB", ceil) && !m("size:1.3KB..1.7KB", ceil - 1));
+        assert!(m("size:1.3KB..1.7KB", y.floor() as u64));
+        assert!(!m("size:1.3KB..1.7KB", y.floor() as u64 + 1));
+        assert!(
+            !m("size:0.2..0.8", 0) && !m("size:0.2..0.8", 1),
+            "no whole byte"
+        );
+
+        assert!(!m("!size:>1GB", 2 * k * k * k), "! turns a term around");
+        assert!(m("!size:>1GB", k));
+        assert!(
+            !m("size:>1KB; size:<1MB", 2 * k * k),
+            "every size term must hold"
+        );
+        assert!(m("size:>1KB; size:<1MB", 2 * k));
+    }
+
+    #[test]
+    fn malformed_sizes_and_ages_are_reported() {
+        for (query, words) in [
+            ("size:500MB", "needs a comparison"),
+            ("size:>abc", "isn't a size"),
+            ("size:>5PB", "isn't a size"),
+            ("size:>-1", "isn't a size"),
+            ("size:1GB..10MB", "larger to smaller"),
+            ("size:abc..", "isn't a size"),
+            ("older:30", "isn't an age"),
+            ("newer:soon", "isn't an age"),
+            ("older:6m", "use mo for months"),
+            ("older:2023-02-29", "isn't a real date"),
+            ("newer:2024-13-01", "isn't a real date"),
+        ] {
+            let err = Matcher::parse(query).unwrap_err();
+            assert!(err.contains(words), "{query}: {err}");
+            assert!(err.contains(query.split_once(':').unwrap().1), "{err}");
+        }
+        for (query, hint) in [("size:==1GB", "size:>1GB,"), ("size:=1GB", "size:<1GB,")] {
+            let err = Matcher::parse(query).unwrap_err();
+            assert!(err.contains(hint) && !err.contains(">="), "{err}");
+        }
+        for typing in [
+            "size:",
+            "size:>",
+            "size:>=",
+            "size:10MB..",
+            "older:",
+            "!newer: ",
+            "older:2024",
+            "older:2024-",
+            "older:2024-0",
+            "newer:2024-06",
+            "newer:2024-06-",
+        ] {
+            assert!(Matcher::parse(typing).unwrap().is_none(), "{typing:?}");
+        }
+    }
+
+    #[test]
+    fn age_terms_compare_modified_times() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let m = |q: &str, age_days: Option<u32>| {
+            let modified = age_days.map(|d| 1_800_000_000 - d * 86_400);
+            Matcher::parse_at(q, now, &utc_midnight)
+                .unwrap()
+                .unwrap()
+                .matches_file("a".as_ref(), 0, modified)
+        };
+        assert!(m("older:1y", Some(366)));
+        assert!(!m("older:1y", Some(364)));
+        assert!(m("newer:30d", Some(29)));
+        assert!(m("newer:30d", Some(30)), "newer includes the moment itself");
+        assert!(!m("newer:30d", Some(31)));
+        assert!(m("older:6MO", Some(181)));
+        assert!(!m("older:6mo", Some(179)));
+        assert!(m("newer:2w", Some(13)));
+        assert!(m("newer:48h", Some(1)));
+        assert!(!m("newer:48h", Some(3)));
+        assert!(m("older:1y; newer:2y", Some(400)), "every age term holds");
+        assert!(!m("older:1y; newer:2y", Some(800)));
+        assert!(m("!older:1y", Some(10)));
+        assert!(!m("!older:1y", Some(400)));
+        for q in ["older:1y", "newer:1y", "!older:1y", "!newer:30d"] {
+            assert!(!m(q, None), "{q}: an unknown time never passes");
+        }
+
+        // 2024-01-01T00:00:00Z.
+        let m = Matcher::new("older:2024-01-01").unwrap();
+        assert!(m.matches_file("a".as_ref(), 0, Some(1_704_067_199)));
+        assert!(!m.matches_file("a".as_ref(), 0, Some(1_704_067_200)));
+        let m = Matcher::new("newer:2024-06-30").unwrap();
+        assert!(m.matches_file("a".as_ref(), 0, Some(1_719_705_600)));
+        assert!(!m.matches_file("a".as_ref(), 0, Some(1_719_705_599)));
+        assert_eq!(date("2024-2-29"), Some(Some((2024, 2, 29))));
+        assert_eq!(date("2023-02-29"), Some(None));
+        assert_eq!(date("30d"), None);
+        assert_eq!(utc_midnight(1970, 1, 1), Some(0));
+        assert_eq!(utc_midnight(2000, 3, 1), Some(951_868_800));
+        assert_eq!(utc_midnight(2024, 2, 29), Some(1_709_164_800));
+        assert_eq!(utc_midnight(1969, 12, 31), Some(-86_400));
+    }
+
+    #[test]
+    fn dates_start_when_the_resolver_says() {
+        // A resolver for a zone eight hours behind UTC.
+        let pacific = |y, m, d| utc_midnight(y, m, d).map(|s| s + 8 * 3_600);
+        let now = SystemTime::now();
+        let m = Matcher::parse_at("newer:2024-06-30", now, &pacific)
+            .unwrap()
+            .unwrap();
+        let utc_midnight_30th = 1_719_705_600;
+        assert!(!m.matches_file("a".as_ref(), 0, Some(utc_midnight_30th)));
+        assert!(m.matches_file("a".as_ref(), 0, Some(utc_midnight_30th + 8 * 3_600)));
+        let none = |_, _, _| None;
+        let err = Matcher::parse_at("older:2024-03-10", now, &none).unwrap_err();
+        assert!(err.contains("isn't a real date"), "{err}");
+    }
+
+    #[test]
+    fn times_before_1970_are_not_told_apart() {
+        // The tree stores any time before 1970 as 1.
+        let m = |q: &str, modified| {
+            Matcher::new(q)
+                .unwrap()
+                .matches_file("a".as_ref(), 0, Some(modified))
+        };
+        assert!(m("older:1970-01-02", 1));
+        assert!(
+            m("older:1960-01-01", 1),
+            "a date before 1970 still finds them"
+        );
+        assert!(!m("older:1960-01-01", 86_400));
+        assert!(m("older:200y", 1));
+        assert!(m("newer:1960-01-01", 1));
+        assert!(m("older:2200-01-01", u32::MAX), "nor after 2106");
+    }
+
+    #[test]
+    fn size_and_age_terms_combine_with_patterns() {
+        let now = SystemTime::now();
+        let ago = |days: u64| Some(now - std::time::Duration::from_secs(days * 86_400));
+        let mut t = Tree::new("/r");
+        let dl = t.add_dir(NodeId::ROOT, "Downloads".as_ref()).unwrap();
+        for (dir, name, len, modified) in [
+            (dl, "old.iso", 4 << 30, ago(800)),
+            (dl, "new.iso", 4 << 30, ago(2)),
+            (dl, "small.iso", 1 << 20, ago(800)),
+            (dl, "undated.iso", 4 << 30, None),
+            (NodeId::ROOT, "old.mkv", 2 << 30, ago(900)),
+            (NodeId::ROOT, "notes.txt", 10, ago(900)),
+        ] {
+            t.add_file(dir, name.as_ref(), sizes(len, len), modified, 0)
+                .unwrap();
+        }
+
+        let s = search("size:>1GB", &t);
+        assert_eq!(
+            names(&s, &t),
+            ["new.iso", "old.iso", "old.mkv", "undated.iso"],
+            "a restriction alone matches every file that passes it"
+        );
+        let s = search("size:>1GB; older:1y", &t);
+        assert_eq!(names(&s, &t), ["old.iso", "old.mkv"]);
+        let s = search("*.iso; older:1y", &t);
+        assert_eq!(names(&s, &t), ["old.iso", "small.iso"]);
+        let s = search("is:video; *.iso; size:>1GB; !older:1y", &t);
+        assert_eq!(names(&s, &t), ["new.iso"]);
+        let s = search("dir:downloads; newer:1w", &t);
+        assert_eq!(names(&s, &t), ["new.iso"]);
+        assert_eq!(s.totals(dl).logical, 4 << 30);
+    }
+
+    #[test]
+    fn remeasured_files_join_and_leave_size_matches() {
+        let mut t = Tree::new("/r");
+        let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
+        let grows = t
+            .add_file(d, "grows.bin".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let shrinks = t
+            .add_file(d, "shrinks.bin".as_ref(), sizes(5000, 8192), None, 0)
+            .unwrap();
+        let mut s = search("size:>1000", &t);
+        assert_eq!(s.matches(), [shrinks]);
+        let v = s.version();
+
+        t.update_file(grows, sizes(2000, 4096));
+        t.update_file(shrinks, sizes(10, 4096));
+        t.update_file(grows, sizes(3000, 4096));
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.matches(), [grows], "each file counted once");
+        assert!(s.version() > v);
+        assert_eq!(
+            s.totals(NodeId::ROOT),
+            Totals {
+                logical: 3000,
+                allocated: 4096,
+                unknown: 0,
+                files: 1
+            }
+        );
+        assert_eq!(s.totals(d), s.totals(NodeId::ROOT));
+        assert_eq!(s.totals(shrinks), Totals::default());
+
+        // Back in again, and then removed.
+        t.update_file(shrinks, sizes(7000, 8192));
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.matches(), [grows, shrinks]);
+        assert_eq!(s.totals(d).logical, 10_000);
+        t.remove(shrinks);
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.matches(), [grows]);
+        assert_eq!(s.totals(d).logical, 3000);
+
+        // The same as a search started now.
+        let fresh = search("size:>1000", &t);
+        assert_eq!(fresh.matches(), s.matches());
+        assert_eq!(fresh.totals(NodeId::ROOT), s.totals(NodeId::ROOT));
+    }
+
+    #[test]
+    fn remeasured_ts_files_change_type() {
+        let mut t = Tree::new("/r");
+        let f = t
+            .add_file(NodeId::ROOT, "clip.ts".as_ref(), sizes(2, 4096), None, 0)
+            .unwrap();
+        let mut s = search("is:video", &t);
+        assert!(s.matches().is_empty(), "a small .ts is code");
+        t.update_file(f, sizes(2 << 20, 2 << 20));
+        s.catch_up(&t, usize::MAX);
+        assert_eq!(s.matches(), [f], "a large one is video");
     }
 }

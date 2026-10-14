@@ -3,14 +3,16 @@
 //! behind each adapter's choices.
 
 pub mod adapter;
+pub mod duplicates;
 pub mod engine;
 pub mod fake;
 pub mod native;
 
 pub use adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    BATCH_ENTRIES, Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
+    ScanError, Sink, batched,
 };
 pub use engine::{
-    OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
+    HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
 };
 pub use native::NativeFs;

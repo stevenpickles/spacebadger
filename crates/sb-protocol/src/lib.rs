@@ -11,13 +11,21 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub mod compare;
+pub mod duplicates;
 pub mod wire;
+
+pub use compare::*;
+pub use duplicates::*;
 
 /// Incremented whenever a command or event shape changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
+
+/// Name of the event that carries [`FilterUpdated`].
+pub const FILTER_UPDATED_EVENT: &str = "filter-updated";
 
 /// Static information about the running backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -120,6 +128,21 @@ pub struct ScanStatus {
     pub omissions: Vec<OmissionGroup>,
 }
 
+/// The filter caught up with a scan status after requests had been
+/// answered from it as of an earlier one, and the scan hasn't reported
+/// since: what's filtered (totals, map, results) is worth asking again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilterUpdated {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub search: u32,
+    /// The scan revision the filter now reflects.
+    #[ts(type = "number")]
+    pub revision: u64,
+}
+
 /// Returned when a scan starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +151,27 @@ pub struct ScanStarted {
     #[ts(type = "number")]
     pub generation: u64,
     pub root: String,
+}
+
+/// The error a query command fails with when a newer request in the same
+/// [`Lane`] replaced it before it finished. The interface drops it silently:
+/// the newer request's reply is the one wanted.
+pub const SUPERSEDED: &str = "superseded by a newer request";
+
+/// Where a query's reply goes, so a newer request makes older ones moot.
+/// Each consumer in the interface (the map's layouts, its tooltips, one
+/// details panel, one list) has its own `key`, and numbers its requests
+/// with `seq` whenever its earlier replies stop mattering. A query with a
+/// higher `seq` in the same lane supersedes the lower ones still waiting or
+/// running: they fail with [`SUPERSEDED`]. Requests with the same `seq`,
+/// such as the pages of one list, never supersede each other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Lane {
+    pub key: String,
+    #[ts(type = "number")]
+    pub seq: u64,
 }
 
 /// Asks for the treemap of `view` at the given size. The binary reply is
@@ -156,6 +200,9 @@ pub enum FolderState {
     /// Still being listed.
     Pending,
     Listed,
+    /// Listed, but some entries couldn't be read (the listing failed part
+    /// way, or entries vanished or couldn't be measured).
+    Partial,
     /// Listing failed; contents are unknown.
     Failed,
     /// Not listed because the scan was cancelled.
@@ -193,6 +240,11 @@ pub struct NodeDetails {
     pub files: u64,
     pub cloud: bool,
     pub hardlinked: bool,
+    /// A file's last-modified time in seconds since the Unix epoch; `None`
+    /// for folders, when the filesystem didn't say, and for times before
+    /// 1970 or after 2106, which the scan doesn't keep exactly.
+    #[ts(type = "number | null")]
+    pub modified: Option<u64>,
     /// For a hard-link alias, the path that owns the allocation.
     pub alias_of: Option<String>,
     /// From the scan root down to and including this node.
@@ -233,6 +285,11 @@ pub struct SearchSummary {
     pub allocated: u64,
     #[ts(type = "number")]
     pub unknown_allocation_files: u64,
+    /// The scan revision (see [`ScanStatus::revision`]) the totals were last
+    /// fully caught up with. The filter keeps up with a scan in the
+    /// background, so while scanning this can trail the latest status.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// Asks for a page of matching files, largest first by `metric`.
@@ -324,6 +381,10 @@ pub struct SmallItemsPage {
     /// Other children of the folder with no size in this metric, which the
     /// map never draws.
     pub empty: u32,
+    /// The scan revision the items were ranked at, so pages fetched at
+    /// different times can be told apart.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// Asks for a page of the files anywhere under a folder, largest first by
@@ -370,6 +431,9 @@ pub struct FolderFilesPage {
     pub files: Vec<FolderFile>,
     /// Other files under the folder with no size in this metric.
     pub empty: u32,
+    /// The scan revision the files were ranked at.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// What the filter's completion is suggesting.
@@ -479,6 +543,10 @@ pub struct SelectionSummary {
     pub allocated: u64,
     #[ts(type = "number")]
     pub unknown_allocation_files: u64,
+    /// Some files in the items have other hard-link names, so deleting
+    /// them may free less disk space than they're allocated (none while
+    /// another name remains).
+    pub hardlinked: bool,
     /// Entries left out because they're no longer in the scan.
     pub missing: u32,
     /// The largest items, at most [`SELECTION_SAMPLES`].
@@ -501,35 +569,137 @@ pub struct DeleteRequest {
     pub nodes: Vec<u32>,
 }
 
+/// What happened to one item a delete was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DeleteOutcome {
+    /// Moved to the Recycle Bin or Trash.
+    Recycled,
+    /// Nothing was there any more when its turn came; nothing was moved.
+    AlreadyMissing,
+    /// Not the item the scan found (replaced, modified, or now a link), so
+    /// it was left alone. A rescan shows it as it is now.
+    Changed,
+    /// Couldn't be moved; still where it was.
+    Failed,
+    /// Not confirmed in the Recycle Bin or Trash: some or all of it may
+    /// have been deleted without a copy.
+    Uncertain,
+    /// A duplicate selected itself, kept because it may be the last copy:
+    /// it changed since compared, or no copy that stays was confirmed. The
+    /// message says which.
+    Kept,
+}
+
+/// An item a delete didn't simply recycle, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct DeleteFailure {
+pub struct DeleteItem {
     pub node: u32,
     pub path: String,
+    pub outcome: DeleteOutcome,
+    /// Empty for [`DeleteOutcome::AlreadyMissing`].
     pub message: String,
 }
 
-/// What a delete did. Deleted items are removed from the scan, which moves
-/// to a new revision.
+/// What a delete did. Items no longer where they were are removed from
+/// the scan, which moves to a new revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DeleteReport {
     #[ts(type = "number")]
     pub generation: u64,
-    /// Items now gone from disk and from the scan.
-    pub deleted: Vec<u32>,
-    /// Of those, items that were already gone before the delete.
-    pub already_gone: u32,
-    pub failed: Vec<DeleteFailure>,
-    /// Totals of the deleted items, as scanned.
+    /// Items moved to the Recycle Bin or Trash.
+    pub recycled: Vec<u32>,
+    /// Items taken out of the scan: those recycled, already missing, or
+    /// uncertain with nothing left at their path.
+    pub removed: Vec<u32>,
+    /// Every item not recycled, with what happened to it, in the order
+    /// tried.
+    pub others: Vec<DeleteItem>,
+    /// Totals of the recycled items, as scanned.
     #[ts(type = "number")]
     pub files: u64,
     #[ts(type = "number")]
     pub logical: u64,
     #[ts(type = "number")]
     pub allocated: u64,
+}
+
+/// Name of the event that carries [`ExportProgress`] updates.
+pub const EXPORT_PROGRESS_EVENT: &str = "export-progress";
+
+/// What a CSV export lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportScope {
+    /// The folder's own files and folders.
+    Contents,
+    /// Every file and folder at any depth under it.
+    Everything,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportFormat {
+    /// One row per file and folder.
+    Csv,
+    /// A readable summary: totals and the largest folders and files.
+    Report,
+}
+
+/// Saves what's under a folder to a file the user chooses in the native
+/// save dialog. With `search`, only what that filter matches is exported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    /// Ignored for a report, which always covers everything under the folder.
+    pub scope: ExportScope,
+    pub format: ExportFormat,
+    pub metric: Metric,
+    pub search: Option<u32>,
+    /// The name the save dialog suggests.
+    pub file_name: String,
+    /// When the export was asked for, in the user's local time, for the
+    /// report's header.
+    pub exported_at: String,
+}
+
+/// Sent while an export is written, once the file has been chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportProgress {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Rows written so far; for a report, items examined.
+    #[ts(type = "number")]
+    pub rows: u64,
+}
+
+/// A finished export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportReport {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Where the file was saved.
+    pub path: String,
+    pub format: ExportFormat,
+    /// CSV rows written, not counting the header; for a report, the folders
+    /// and files it lists.
+    #[ts(type = "number")]
+    pub rows: u64,
 }
 
 #[cfg(test)]

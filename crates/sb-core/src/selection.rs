@@ -1,7 +1,7 @@
 //! A set of items chosen in the interface, reduced to what an action on
 //! them would touch.
 
-use crate::tree::{NodeId, Tree};
+use crate::tree::{NodeId, Tree, flags};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -22,6 +22,9 @@ pub struct Resolved {
     pub allocated: u64,
     /// Files in `items` whose allocation is unknown.
     pub unknown: u64,
+    /// Some file in `items` has other hard-link names (see
+    /// [`flags::HARDLINKED`]), so deleting it may free nothing.
+    pub hardlinked: bool,
 }
 
 /// Reduces `ids` to the outermost selected items. The scan root is never
@@ -63,7 +66,21 @@ pub fn resolve(tree: &Tree, ids: &[u32]) -> Resolved {
         out.allocated += tree.allocated(n);
         out.unknown += u64::from(tree.unknown_allocation_files(n));
     }
+    // Only walked when the scan found hard links at all.
+    out.hardlinked = tree.alias_count() > 0 && out.items.iter().any(|&n| hardlinked(tree, n));
     out
+}
+
+/// Whether `node` or a file under it is hard-linked.
+fn hardlinked(tree: &Tree, node: NodeId) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if tree.flags(n) & flags::HARDLINKED != 0 {
+            return true;
+        }
+        stack.extend(tree.children(n));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -88,10 +105,14 @@ mod tests {
         let mut t = Tree::new("/r");
         let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
         let b = t.add_dir(a, "b".as_ref()).unwrap();
-        let x = t.add_file(b, "x".as_ref(), sizes(10, 4096), 0).unwrap();
-        let y = t.add_file(a, "y".as_ref(), sizes(20, 8192), 0).unwrap();
+        let x = t
+            .add_file(b, "x".as_ref(), sizes(10, 4096), None, 0)
+            .unwrap();
+        let y = t
+            .add_file(a, "y".as_ref(), sizes(20, 8192), None, 0)
+            .unwrap();
         let z = t
-            .add_file(NodeId::ROOT, "z".as_ref(), sizes(1, 512), 0)
+            .add_file(NodeId::ROOT, "z".as_ref(), sizes(1, 512), None, 0)
             .unwrap();
 
         let r = resolve(&t, &[id(x), id(z), id(a), id(b), id(z)]);
@@ -111,15 +132,33 @@ mod tests {
     fn skips_the_root_and_unknown_or_removed_items() {
         let mut t = Tree::new("/r");
         let f = t
-            .add_file(NodeId::ROOT, "f".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "f".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         let g = t
-            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), 0)
+            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         t.remove(g);
         let r = resolve(&t, &[0, id(f), id(g), 999]);
         assert_eq!(r.items, [f]);
         assert_eq!(r.missing, 3);
         assert!(resolve(&t, &[]).items.is_empty());
+    }
+
+    #[test]
+    fn notes_hard_links_inside_the_items() {
+        let mut t = Tree::new("/r");
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        let one = t.add_file(a, "one".as_ref(), sizes(1, 1), None, 0).unwrap();
+        let two = t
+            .add_file(NodeId::ROOT, "two".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        let plain = t
+            .add_file(NodeId::ROOT, "plain".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        assert!(!resolve(&t, &[id(a), id(plain)]).hardlinked);
+        t.mark_alias(two, one);
+        assert!(resolve(&t, &[id(a)]).hardlinked, "the owner, in a folder");
+        assert!(resolve(&t, &[id(two)]).hardlinked, "the alias");
+        assert!(!resolve(&t, &[id(plain)]).hardlinked);
     }
 }

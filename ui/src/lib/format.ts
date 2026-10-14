@@ -5,7 +5,7 @@
  * Explorer takes 1 KB as 1,024 bytes, macOS Finder and Linux file managers
  * as 1,000. So a size here matches the one shown next to it there.
  */
-const KILO = /Windows/i.test(navigator.userAgent) ? 1024 : 1000;
+export const KILO = /Windows/i.test(navigator.userAgent) ? 1024 : 1000;
 
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
@@ -29,6 +29,12 @@ export function formatBytes(bytes: number): string {
 /** Exact byte count for details, e.g. "1,234,567 bytes". */
 export function exactBytes(bytes: number): string {
   return `${bytes.toLocaleString()} ${bytes === 1 ? "byte" : "bytes"}`;
+}
+
+/** A time in seconds since the Unix epoch as a date and time in the user's
+ * locale, e.g. "Oct 13, 2026, 2:05 PM". */
+export function formatDate(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 export function formatCount(n: number): string {

@@ -1,13 +1,14 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -17,11 +18,26 @@ enum Node {
         allocated: Option<u64>,
         identity: Identity,
         cloud: bool,
+        modified: Option<SystemTime>,
     },
     Other(EntryKind),
 }
 
-type GateReceiver = Arc<Mutex<Receiver<()>>>;
+/// The listing's side of a [`Gate`]: says when it reaches the gate, then
+/// waits there.
+struct GateWaiter {
+    entered: Sender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl GateWaiter {
+    fn wait(&self) {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+    }
+}
+
+type GateReceiver = Arc<GateWaiter>;
 
 /// A fake filesystem rooted at [`FakeFs::ROOT`]. Paths given to the builder
 /// are relative to the root and use `/` separators.
@@ -30,16 +46,39 @@ pub struct FakeFs {
     nodes: Arc<Mutex<BTreeMap<PathBuf, Node>>>,
     errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
     gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Listings that fail after this many entries.
+    late_errors: Arc<Mutex<BTreeMap<PathBuf, (usize, ScanError)>>>,
+    /// Listings that block after this many entries.
+    late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
 
 /// Releases a gated directory listing when dropped or sent to.
-pub struct Gate(Sender<()>);
+pub struct Gate {
+    release: Sender<()>,
+    entered: Receiver<()>,
+}
 
 impl Gate {
+    fn new() -> (Self, GateReceiver) {
+        let (release, release_rx) = channel();
+        let (entered_tx, entered) = channel();
+        let receiver = GateWaiter {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        };
+        (Self { release, entered }, Arc::new(receiver))
+    }
+
     pub fn release(self) {
-        let _ = self.0.send(());
+        let _ = self.release.send(());
+    }
+
+    /// Waits up to `timeout` for a listing to reach the gate, where it then
+    /// stays until released; whether one did.
+    pub fn entered(&self, timeout: Duration) -> bool {
+        self.entered.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -90,6 +129,7 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::Unique,
                 cloud: false,
+                modified: None,
             },
         )
     }
@@ -102,6 +142,7 @@ impl FakeFs {
                 allocated: None,
                 identity: Identity::Unique,
                 cloud: false,
+                modified: None,
             },
         )
     }
@@ -114,6 +155,7 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::Unique,
                 cloud: true,
+                modified: None,
             },
         )
     }
@@ -127,8 +169,19 @@ impl FakeFs {
                 allocated: Some(allocated),
                 identity: Identity::MaybeShared { key },
                 cloud: false,
+                modified: None,
             },
         )
+    }
+
+    /// Sets the modified time of the file at `path`, added earlier.
+    pub fn set_modified(&self, path: &str, time: SystemTime) -> &Self {
+        if let Some(Node::File { modified, .. }) =
+            self.nodes.lock().unwrap().get_mut(&Self::abs(path))
+        {
+            *modified = Some(time);
+        }
+        self
     }
 
     pub fn other(&self, path: &str, kind: EntryKind) -> &Self {
@@ -148,12 +201,35 @@ impl FakeFs {
     /// Makes listing `path` block until the returned gate is released or dropped.
     pub fn gate_dir(&self, path: &str) -> Gate {
         self.dir(path);
-        let (tx, rx) = channel();
-        self.gates
+        let (gate, receiver) = Gate::new();
+        self.gates.lock().unwrap().insert(Self::abs(path), receiver);
+        gate
+    }
+
+    /// Makes listing `path` fail after its first `entries` entries (in name
+    /// order) were handed over.
+    pub fn fail_dir_after(&self, path: &str, entries: usize, kind: ErrorKind) -> &Self {
+        self.dir(path);
+        self.late_errors
             .lock()
             .unwrap()
-            .insert(Self::abs(path), Arc::new(Mutex::new(rx)));
-        Gate(tx)
+            .insert(Self::abs(path), (entries, ScanError::new(kind, "injected")));
+        self
+    }
+
+    /// Makes listing `path` block after its first `entries` entries (in name
+    /// order) were handed over, until the returned gate is released or
+    /// dropped. Entries are handed over in whole batches, so `entries` should
+    /// be a multiple of [`BATCH_ENTRIES`](crate::adapter::BATCH_ENTRIES) for
+    /// all of them to arrive first.
+    pub fn gate_dir_after(&self, path: &str, entries: usize) -> Gate {
+        self.dir(path);
+        let (gate, receiver) = Gate::new();
+        self.late_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), (entries, receiver));
+        gate
     }
 
     /// Sets what [`FsAdapter::measure_file`] returns for `path`.
@@ -191,54 +267,35 @@ impl FsAdapter for FakeFs {
         }
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
-            let _ = gate.lock().unwrap().recv();
+            gate.wait();
         }
         if let Some(err) = self.errors.lock().unwrap().get(dir) {
             return Err(err.clone());
         }
-        let nodes = self.nodes.lock().unwrap();
-        let entries = nodes
-            .iter()
-            .filter(|(p, _)| p.parent() == Some(dir))
-            .map(|(p, node)| {
-                let name: OsString = p.file_name().unwrap().to_owned();
-                match node {
-                    Node::Dir => Entry {
-                        name,
-                        kind: EntryKind::Directory,
-                        logical: 0,
-                        allocated: Some(0),
-                        identity: Identity::Unique,
-                        cloud: false,
-                    },
-                    Node::File {
-                        logical,
-                        allocated,
-                        identity,
-                        cloud,
-                    } => Entry {
-                        name,
-                        kind: EntryKind::File,
-                        logical: *logical,
-                        allocated: *allocated,
-                        identity: *identity,
-                        cloud: *cloud,
-                    },
-                    Node::Other(kind) => Entry {
-                        name,
-                        kind: *kind,
-                        logical: 0,
-                        allocated: Some(0),
-                        identity: Identity::Unique,
-                        cloud: false,
-                    },
+        let late_error = self.late_errors.lock().unwrap().get(dir).cloned();
+        let late_gate = self.late_gates.lock().unwrap().get(dir).cloned();
+        let entries = self.entries(dir);
+        batched(sink, |out| {
+            for (i, entry) in entries.into_iter().enumerate() {
+                if let Some((at, err)) = &late_error
+                    && i == *at
+                {
+                    return Err(err.clone());
                 }
-            })
-            .collect();
-        Ok(entries)
+                if let Some((at, gate)) = &late_gate
+                    && i == *at
+                {
+                    gate.wait();
+                }
+                if out.push(entry).is_break() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
@@ -254,5 +311,61 @@ impl FsAdapter for FakeFs {
             }),
             _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
         }
+    }
+}
+
+impl FakeFs {
+    /// The direct children of `dir` in name order.
+    fn entries(&self, dir: &Path) -> Vec<Entry> {
+        let nodes = self.nodes.lock().unwrap();
+        nodes
+            .iter()
+            .filter(|(p, _)| p.parent() == Some(dir))
+            .map(|(p, node)| {
+                let name: OsString = p.file_name().unwrap().to_owned();
+                match node {
+                    Node::Dir => Entry {
+                        name,
+                        kind: EntryKind::Directory,
+                        logical: 0,
+                        allocated: Some(0),
+                        identity: Identity::Unique,
+                        id: 0,
+                        cloud: false,
+                        modified: None,
+                    },
+                    Node::File {
+                        logical,
+                        allocated,
+                        identity,
+                        cloud,
+                        modified,
+                    } => Entry {
+                        name,
+                        kind: EntryKind::File,
+                        logical: *logical,
+                        allocated: *allocated,
+                        identity: *identity,
+                        // Linked files stand in for objects with an ID.
+                        id: match identity {
+                            Identity::MaybeShared { key } => *key,
+                            _ => 0,
+                        },
+                        cloud: *cloud,
+                        modified: *modified,
+                    },
+                    Node::Other(kind) => Entry {
+                        name,
+                        kind: *kind,
+                        logical: 0,
+                        allocated: Some(0),
+                        identity: Identity::Unique,
+                        id: 0,
+                        cloud: false,
+                        modified: None,
+                    },
+                }
+            })
+            .collect()
     }
 }

@@ -10,20 +10,27 @@
 //!   report neither attribute fall back to `/proc/self/mountinfo`.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
+    batched,
 };
+use crate::duplicates::{Fingerprint, Skip};
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
+use sb_core::tree::unix_object_id;
 use std::collections::HashSet;
 use std::ffi::{CStr, OsStr, OsString};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
-const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
+// The birth time comes with the same call where the filesystem keeps one.
+const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS
+    .union(StatxFlags::MNT_ID)
+    .union(StatxFlags::BTIME);
 
 struct Boundary {
     dev: u64,
@@ -55,8 +62,26 @@ fn dev(stx: &Statx) -> u64 {
     (u64::from(stx.stx_dev_major) << 32) | u64::from(stx.stx_dev_minor)
 }
 
+/// The birth time in whole seconds, when statx filled it in.
+fn birth(stx: &Statx) -> Option<i64> {
+    (stx.stx_mask & StatxFlags::BTIME.bits() != 0).then_some(stx.stx_btime.tv_sec)
+}
+
 fn mount_id(stx: &Statx) -> Option<u64> {
     (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+}
+
+/// The last write time, when statx filled it in (part of `BASIC_STATS`).
+fn modified(stx: &Statx) -> Option<SystemTime> {
+    if stx.stx_mask & StatxFlags::MTIME.bits() == 0 {
+        return None;
+    }
+    let t = &stx.stx_mtime;
+    let nanos = Duration::new(0, t.tv_nsec);
+    match u64::try_from(t.tv_sec) {
+        Ok(secs) => UNIX_EPOCH.checked_add(Duration::from_secs(secs) + nanos),
+        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(t.tv_sec.unsigned_abs()) - nanos),
+    }
 }
 
 fn kind_of(stx: &Statx) -> FileType {
@@ -124,7 +149,29 @@ impl FsAdapter for LinuxFs {
         Ok(kind)
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        batched(sink, |out| self.list(dir, out))
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        let stx = statx(CWD, file, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(error)?;
+        if kind_of(&stx) != FileType::RegularFile {
+            return Err(ScanError::new(
+                ErrorKind::Vanished,
+                "no longer a regular file",
+            ));
+        }
+        Ok(Measured {
+            logical: stx.stx_size,
+            allocated: Some(stx.stx_blocks.saturating_mul(512)),
+        })
+    }
+}
+
+impl LinuxFs {
+    /// Reads `dir` with `getdents`, `statx`ing each entry and passing it on
+    /// at once; stops early when the batcher says so.
+    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let boundary = self.boundary();
         let fd = openat(
             CWD,
@@ -133,7 +180,6 @@ impl FsAdapter for LinuxFs {
             Mode::empty(),
         )
         .map_err(error)?;
-        let mut entries = Vec::new();
         for item in Dir::read_from(fd.as_fd()).map_err(error)? {
             let item = item.map_err(error)?;
             let name: &CStr = item.file_name();
@@ -145,14 +191,19 @@ impl FsAdapter for LinuxFs {
                 Ok(stx) => stx,
                 Err(err) => {
                     let kind = error(err).kind;
-                    entries.push(Entry {
+                    let failed = Entry {
                         name: os_name,
                         kind: EntryKind::Failed(kind),
                         logical: 0,
                         allocated: None,
                         identity: Identity::Unavailable,
+                        id: 0,
                         cloud: false,
-                    });
+                        modified: None,
+                    };
+                    if out.push(failed).is_break() {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -178,7 +229,7 @@ impl FsAdapter for LinuxFs {
                 }
                 _ => EntryKind::Special,
             };
-            entries.push(Entry {
+            let entry = Entry {
                 name: os_name,
                 kind,
                 logical: stx.stx_size,
@@ -190,24 +241,16 @@ impl FsAdapter for LinuxFs {
                 } else {
                     Identity::Unique
                 },
+                // The device is the scan's, checked at delete time.
+                id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
-            });
+                modified: modified(&stx),
+            };
+            if out.push(entry).is_break() {
+                return Ok(());
+            }
         }
-        Ok(entries)
-    }
-
-    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        let stx = statx(CWD, file, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(error)?;
-        if kind_of(&stx) != FileType::RegularFile {
-            return Err(ScanError::new(
-                ErrorKind::Vanished,
-                "no longer a regular file",
-            ));
-        }
-        Ok(Measured {
-            logical: stx.stx_size,
-            allocated: Some(stx.stx_blocks.saturating_mul(512)),
-        })
+        Ok(())
     }
 }
 
@@ -278,6 +321,40 @@ fn filesystem_name(magic: u32) -> Option<&'static str> {
 /// Whether the process runs as root, which bypasses permission checks.
 pub fn is_privileged() -> bool {
     rustix::process::geteuid().is_root()
+}
+
+/// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
+/// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
+/// blocking; anything but a plain file of the scanned size is refused.
+pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    // `O_NOATIME` spares the disk a write per file read, but only the
+    // file's owner (or root) may ask for it.
+    let fd = match rustix::fs::open(path, flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open(path, flags, Mode::empty()),
+        opened => opened,
+    }
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP => Skip::Changed,
+        e => Skip::of(&e.into()),
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok((file, super::fingerprint(&meta)))
+}
+
+/// The fingerprint of the file at `path`, without opening it: a plain file
+/// of `len` bytes, not a link.
+pub fn examine_contents(path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(super::fingerprint(&meta))
 }
 
 #[cfg(test)]

@@ -3,7 +3,10 @@
 //! - Lists with `FileIdExtdDirectoryInfo` (falling back to
 //!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
 //!   reparse tags, and file IDs come from the listing without opening files.
+//!   Entries are passed on as each 64 KiB buffer is decoded, in batches, so
+//!   a huge folder is never held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
+//!   The modified time is the listing's `LastWriteTime`.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -13,16 +16,21 @@
 //!   (protected folders become listable). Elevation is never requested.
 //! - Per-file opens use `FILE_READ_ATTRIBUTES` with `OPEN_REPARSE_POINT` and
 //!   `OPEN_NO_RECALL`, which the probes showed don't hydrate placeholders.
+//! - Finding duplicates reads contents only after such an open shows a plain
+//!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, classify_io,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
+    batched, classify_io,
 };
+use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
 };
@@ -31,13 +39,15 @@ use windows::Win32::Security::{
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO,
-    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileStandardInfo, GetDiskFreeSpaceExW,
-    GetDriveTypeW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
-    OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
+    FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
+    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -65,6 +75,7 @@ mod tag {
     pub const LX_FIFO: u32 = 0x8000_0024;
     pub const LX_CHR: u32 = 0x8000_0025;
     pub const LX_BLK: u32 = 0x8000_0026;
+    pub const WOF: u32 = 0x8000_0017;
 
     /// `IO_REPARSE_TAG_CLOUD` and its `CLOUD_1`..`CLOUD_F` variants.
     pub fn is_cloud(tag: u32) -> bool {
@@ -133,29 +144,210 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 fn open(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
+    open_with(
+        path,
+        access,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+    )
+    .map_err(scan_error)
+}
+
+fn open_with(
+    path: &Path,
+    access: u32,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> windows::core::Result<OwnedHandle> {
+    open_shared(
+        path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        flags,
+    )
+}
+
+fn open_shared(
+    path: &Path,
+    access: u32,
+    share: FILE_SHARE_MODE,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> windows::core::Result<OwnedHandle> {
     let path = wide(path);
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+            flags,
             None,
         )
-    }
-    .map_err(scan_error)?;
+    }?;
     // SAFETY: CreateFileW returned a valid handle that we now own.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
 }
 
-fn raw(handle: &OwnedHandle) -> HANDLE {
+/// The OS error behind a failed call, so [`Skip::of`] can classify it.
+fn io_error(err: &windows::core::Error) -> std::io::Error {
+    let code = err.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::other(err.message())
+    }
+}
+
+/// Opens a file to read its contents for finding duplicates. A first open
+/// reads only attributes, which never recalls anything; a cloud file
+/// (placeholder, pinned, or offline), a link, a file stored behind another
+/// reparse point (deduplicated, tiered, or virtualized, whose raw contents
+/// aren't the file's), or a file whose size changed since the scan is
+/// refused there. The open that reads is made with `OPEN_NO_RECALL` and
+/// (except for WOF-compressed files, which only read right through their
+/// filter) `OPEN_REPARSE_POINT`, must be the same file, and is checked
+/// again.
+pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
+    let skip = |e: windows::core::Error| Skip::of(&io_error(&e));
+    let probe = probe_contents(path)?;
+    let compressed = check_contents(&probe, len)?;
+    let id = file_id(&probe);
+    drop(probe);
+    let mut flags = FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN;
+    if !compressed {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags).map_err(skip)?;
+    // A filesystem that gives no ID (FAT, some shares) relies on the
+    // other checks.
+    if let (Some(before), Some(now)) = (id, file_id(&handle))
+        && before != now
+    {
+        return Err(Skip::Changed);
+    }
+    check_contents(&handle, len)?;
+    let print = fingerprint(&handle)?;
+    Ok((std::fs::File::from(handle), print))
+}
+
+/// Opens the file at `path` for reading while sharing only reading, so
+/// until the handle is closed no one can write to, rename, replace, or
+/// delete it, and checks it's the file `print` describes. Refused (as in
+/// use) while another program has it open to write or delete. Checked
+/// first with an attributes-only open, as [`open_contents`] does, so a
+/// cloud file is never opened for its data.
+pub fn hold_contents(path: &Path, print: &Fingerprint) -> Result<OwnedHandle, Skip> {
+    let probe = probe_contents(path)?;
+    let compressed = check_contents(&probe, print.len)?;
+    drop(probe);
+    let mut flags = FILE_FLAG_OPEN_NO_RECALL;
+    if !compressed {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let handle = open_shared(
+        path,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ,
+        flags,
+    )
+    .map_err(|e| Skip::of(&io_error(&e)))?;
+    check_contents(&handle, print.len)?;
+    if !print.unchanged(&fingerprint(&handle)?) {
+        return Err(Skip::Changed);
+    }
+    Ok(handle)
+}
+
+/// The fingerprint of the file at `path`, read with the attributes-only
+/// open [`open_contents`] starts with, refusing what it refuses.
+pub fn examine_contents(path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+    let probe = probe_contents(path)?;
+    check_contents(&probe, len)?;
+    fingerprint(&probe)
+}
+
+/// Opens a file for its attributes only, which never recalls anything.
+fn probe_contents(path: &Path) -> Result<OwnedHandle, Skip> {
+    open_with(
+        path,
+        FILE_READ_ATTRIBUTES.0,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+    )
+    .map_err(|e| Skip::of(&io_error(&e)))
+}
+
+/// A handle's file ID, length, last write time, and number of names.
+pub fn fingerprint(handle: &impl AsRawHandle) -> Result<Fingerprint, Skip> {
+    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(info_skip)?;
+    let basic = info::<FILE_BASIC_INFO>(handle, FileBasicInfo).map_err(info_skip)?;
+    Ok(Fingerprint {
+        id: file_id(handle).map(|(volume, id)| (volume, u128::from_le_bytes(id))),
+        len: standard.EndOfFile as u64,
+        modified: filetime(basic.LastWriteTime),
+        links: Some(standard.NumberOfLinks),
+    })
+}
+
+/// Whether contents can be read from a handle with these attributes and
+/// reparse tag: `Ok(true)` for a WOF-compressed file, `Ok(false)` for a
+/// plain one.
+fn readable(attributes: u32, reparse_tag: u32) -> Result<bool, Skip> {
+    let reparse = attributes & attr::REPARSE_POINT != 0;
+    if attributes & attr::CLOUD != 0 || (reparse && tag::is_cloud(reparse_tag)) {
+        return Err(Skip::Cloud);
+    }
+    if classify(attributes, reparse_tag) != EntryKind::File {
+        return Err(Skip::Changed);
+    }
+    match reparse_tag {
+        _ if !reparse => Ok(false),
+        tag::WOF => Ok(true),
+        _ => Err(Skip::Special),
+    }
+}
+
+fn info_skip(e: ScanError) -> Skip {
+    match e.kind {
+        ErrorKind::Vanished => Skip::Vanished,
+        ErrorKind::PermissionDenied => Skip::Denied,
+        _ => Skip::Unreadable,
+    }
+}
+
+/// Checks a handle's file against the scan; see [`readable`].
+fn check_contents(handle: &OwnedHandle, len: u64) -> Result<bool, Skip> {
+    let tag_info =
+        info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo).map_err(info_skip)?;
+    let compressed = readable(tag_info.FileAttributes, tag_info.ReparseTag)?;
+    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(info_skip)?;
+    if standard.EndOfFile as u64 != len {
+        return Err(Skip::Changed);
+    }
+    Ok(compressed)
+}
+
+/// The volume and file ID of a handle's file: the 128-bit ID where the
+/// filesystem has one, else the older 64-bit index, else `None`.
+fn file_id(handle: &impl AsRawHandle) -> Option<(u64, [u8; 16])> {
+    if let Ok(id) = info::<FILE_ID_INFO>(handle, FileIdInfo) {
+        return Some((id.VolumeSerialNumber, id.FileId.Identifier));
+    }
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(raw(handle), &mut by_handle) }.ok()?;
+    let index = (u64::from(by_handle.nFileIndexHigh) << 32) | u64::from(by_handle.nFileIndexLow);
+    if index == 0 {
+        return None;
+    }
+    let mut id = [0; 16];
+    id[..8].copy_from_slice(&index.to_le_bytes());
+    Some((u64::from(by_handle.dwVolumeSerialNumber), id))
+}
+
+fn raw(handle: &impl AsRawHandle) -> HANDLE {
     HANDLE(handle.as_raw_handle())
 }
 
 fn info<T: Default>(
-    handle: &OwnedHandle,
+    handle: &impl AsRawHandle,
     class: FILE_INFO_BY_HANDLE_CLASS,
 ) -> Result<T, ScanError> {
     let mut value = T::default();
@@ -179,6 +371,22 @@ struct Listed {
     attributes: u32,
     reparse_tag: u32,
     file_id: u128,
+    /// `LastWriteTime`: 100 ns intervals since 1601, 0 when not set.
+    last_write: i64,
+}
+
+/// Seconds from 1601-01-01, where `FILETIME` counts from, to the Unix epoch.
+const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
+
+/// A `FILETIME` as a time; `None` for 0, which means the filesystem has none.
+fn filetime(ticks: i64) -> Option<SystemTime> {
+    let ticks = u64::try_from(ticks).ok().filter(|&t| t != 0)?;
+    let since_1601 = Duration::new(ticks / 10_000_000, (ticks % 10_000_000) as u32 * 100);
+    let offset = Duration::from_secs(FILETIME_EPOCH_OFFSET);
+    match since_1601.checked_sub(offset) {
+        Some(after) => UNIX_EPOCH.checked_add(after),
+        None => UNIX_EPOCH.checked_sub(offset - since_1601),
+    }
 }
 
 /// Windows filesystem adapter. Create one per scan.
@@ -196,17 +404,39 @@ impl WindowsFs {
         Self::default()
     }
 
-    fn list(&self, dir: &Path) -> Result<Vec<Listed>, ScanError> {
+    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let handle = open(dir, FILE_LIST_DIRECTORY.0)?;
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
-            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo) {
-                Err(err) if err.kind == ErrorKind::Unavailable => {
+            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo, out) {
+                // Only before any entry was read, so none is listed twice.
+                Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
                     self.use_both_dir_info.store(true, Ordering::Relaxed);
                 }
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo)
+        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo, out)
+    }
+}
+
+impl Listed {
+    fn entry(self) -> Entry {
+        Entry {
+            kind: classify(self.attributes, self.reparse_tag),
+            logical: self.end_of_file,
+            allocated: Some(self.allocation_size),
+            // Listings carry no link count, so every file may be shared.
+            identity: if self.file_id == 0 {
+                Identity::Unavailable
+            } else {
+                Identity::MaybeShared { key: self.file_id }
+            },
+            id: self.file_id,
+            cloud: self.attributes & attr::CLOUD != 0
+                || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
+            modified: filetime(self.last_write),
+            name: self.name,
+        }
     }
 }
 
@@ -238,6 +468,7 @@ impl DirInfo for FILE_ID_EXTD_DIR_INFO {
             attributes: self.FileAttributes,
             reparse_tag: self.ReparsePointTag,
             file_id: u128::from_le_bytes(self.FileId.Identifier),
+            last_write: self.LastWriteTime,
         }
     }
 }
@@ -262,15 +493,18 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
             // For reparse points this class reports the tag in EaSize.
             reparse_tag: self.EaSize,
             file_id: self.FileId as u64 as u128,
+            last_write: self.LastWriteTime,
         }
     }
 }
 
+/// Reads a directory a buffer at a time, passing each entry on as it's
+/// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
     class: FILE_INFO_BY_HANDLE_CLASS,
-) -> Result<Vec<Listed>, ScanError> {
-    let mut out = Vec::new();
+    out: &mut Batcher<'_, '_>,
+) -> Result<(), ScanError> {
     let mut buffer = vec![0u64; 8192];
     loop {
         let result = unsafe {
@@ -283,7 +517,7 @@ fn list_with<T: DirInfo>(
         };
         match result {
             Ok(()) => {}
-            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(out),
+            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(()),
             Err(err) => return Err(scan_error(err)),
         }
         let base = buffer.as_ptr().cast::<u8>();
@@ -298,8 +532,11 @@ fn list_with<T: DirInfo>(
                     record.name_len(),
                 )
             };
-            if name != [0x2e] && name != [0x2e, 0x2e] {
-                out.push(record.listed(name));
+            if name != [0x2e]
+                && name != [0x2e, 0x2e]
+                && out.push(record.listed(name).entry()).is_break()
+            {
+                return Ok(());
             }
             if record.next() == 0 {
                 break;
@@ -324,25 +561,8 @@ impl FsAdapter for WindowsFs {
         )
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
-        Ok(self
-            .list(dir)?
-            .into_iter()
-            .map(|l| Entry {
-                kind: classify(l.attributes, l.reparse_tag),
-                logical: l.end_of_file,
-                allocated: Some(l.allocation_size),
-                // Listings carry no link count, so every file may be shared.
-                identity: if l.file_id == 0 {
-                    Identity::Unavailable
-                } else {
-                    Identity::MaybeShared { key: l.file_id }
-                },
-                cloud: l.attributes & attr::CLOUD != 0
-                    || (l.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(l.reparse_tag)),
-                name: l.name,
-            })
-            .collect())
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        batched(sink, |out| self.list(dir, out))
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
@@ -517,6 +737,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn converts_filetimes() {
+        assert_eq!(filetime(0), None);
+        assert_eq!(filetime(-5), None);
+        let epoch = FILETIME_EPOCH_OFFSET as i64 * 10_000_000;
+        assert_eq!(filetime(epoch), Some(UNIX_EPOCH));
+        assert_eq!(
+            filetime(epoch + 15_000_000),
+            Some(UNIX_EPOCH + Duration::from_millis(1500))
+        );
+        assert_eq!(
+            filetime(epoch - 10_000_000),
+            UNIX_EPOCH.checked_sub(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
     fn classifies_reparse_tags_by_category() {
         let rp = attr::REPARSE_POINT;
         let dir = attr::DIRECTORY;
@@ -539,5 +775,45 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn file_ids_match_for_one_file_and_differ_between_files() {
+        let dir = std::env::temp_dir().join(format!("sb-file-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let id = |p: &Path| file_id(&open(p, FILE_READ_ATTRIBUTES.0).unwrap());
+        assert!(id(&a).is_some());
+        assert_eq!(id(&a), id(&a));
+        assert_ne!(id(&a), id(&b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_contents_only_of_plain_and_compressed_files() {
+        let rp = attr::REPARSE_POINT;
+        assert_eq!(readable(0x20, 0), Ok(false));
+        assert_eq!(readable(0x20 | rp, tag::WOF), Ok(true));
+        assert_eq!(
+            readable(0x20 | rp, 0x8000_0013),
+            Err(Skip::Special),
+            "dedup"
+        );
+        assert_eq!(readable(0x20 | rp, 0x8000_0012), Err(Skip::Special), "SIS");
+        assert_eq!(
+            readable(0x20 | rp, 0x9000_001C),
+            Err(Skip::Special),
+            "ProjFS"
+        );
+        assert_eq!(readable(0x20 | rp, 0x9000_301A), Err(Skip::Cloud));
+        assert_eq!(
+            readable(0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
+            Err(Skip::Cloud)
+        );
+        assert_eq!(readable(0x20 | attr::OFFLINE, 0), Err(Skip::Cloud));
+        assert_eq!(readable(rp, tag::SYMLINK), Err(Skip::Changed));
+        assert_eq!(readable(attr::DIRECTORY, 0), Err(Skip::Changed));
     }
 }
