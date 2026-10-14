@@ -1,7 +1,9 @@
 //! Writing a file in full before it replaces anything.
 //!
 //! A [`TempFile`] is a new file beside the destination, named
-//! `.<name>.<pid>-<random>.partial` and created exclusively: if anything
+//! `.<name>.<pid>-<random>.partial` (with at most the first
+//! [`NAME_BYTES`] bytes of the name, so a long name still fits the
+//! 255-character limit) and created exclusively: if anything
 //! already has that name, a file or a link (dangling or not), another name
 //! is tried, so nothing that was there is truncated or written through.
 //! The handle is kept from creation to the end, and [`TempFile::persist`]
@@ -28,6 +30,9 @@ pub const EXTENSION: &str = "partial";
 /// Names tried before giving up; a clash at all is unlikely.
 const ATTEMPTS: usize = 16;
 
+/// The most of the destination's name a temporary name holds.
+const NAME_BYTES: usize = 64;
+
 /// A new file being written, not yet in its place.
 #[derive(Debug)]
 pub struct TempFile {
@@ -38,6 +43,7 @@ pub struct TempFile {
 impl TempFile {
     /// Creates a temporary file in `dir` for a destination called `name`.
     pub fn new_in(dir: &Path, name: &str) -> io::Result<Self> {
+        let name = shortened(name);
         let mut last = None;
         for _ in 0..ATTEMPTS {
             let path = dir.join(format!(
@@ -159,6 +165,16 @@ fn remove_through(path: &Path, file: File) {
     }
 }
 
+/// The start of `name`, at most [`NAME_BYTES`] bytes, cut between
+/// characters.
+fn shortened(name: &str) -> &str {
+    let mut end = name.len().min(NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 /// A number no other temporary name in this process has had, and that
 /// other processes are unlikely to pick.
 fn unique() -> u64 {
@@ -215,6 +231,30 @@ mod tests {
         t.persist(&dest).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
         assert_eq!(names(&tmp.0), ["out.csv"]);
+    }
+
+    #[test]
+    fn long_names_are_shortened() {
+        let tmp = temp("long");
+        // 229 characters, near the limit, with ones of several bytes.
+        let name = format!("{}{}.csv", "a".repeat(200), "\u{e9}".repeat(25));
+        assert_eq!(name.chars().count(), 229);
+        let dest = tmp.0.join(&name);
+        let t = TempFile::beside(&dest).unwrap();
+        let temp_name = t.path().file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(temp_name.starts_with(&format!(".{}.", "a".repeat(64))));
+        t.file().write_all(b"long").unwrap();
+        t.persist(&dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "long");
+        assert_eq!(names(&tmp.0), [name]);
+        // Never cut inside a character.
+        let wide = "\u{e9}".repeat(40);
+        assert_eq!(shortened(&wide), "\u{e9}".repeat(32));
+        assert_eq!(
+            shortened(&format!("a{wide}")),
+            format!("a{}", "\u{e9}".repeat(31))
+        );
+        assert_eq!(shortened("short"), "short");
     }
 
     #[test]
