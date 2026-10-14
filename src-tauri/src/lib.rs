@@ -192,8 +192,10 @@ async fn node_details(
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.
-/// Large trees take a moment, so this runs with the lists; a newer call
-/// makes an older one return an error.
+/// A newer call makes an older one return an error: the search is numbered
+/// here, as it's asked for, so a newer one always wins even if an older one
+/// starts later. Large trees take a moment, so it runs with the layouts,
+/// ahead of the lists that wait for it.
 #[tauri::command]
 async fn search_set(
     state: State<'_, AppState>,
@@ -201,10 +203,11 @@ async fn search_set(
     query: String,
 ) -> Result<Option<SearchSummary>, String> {
     let session = state.session(generation)?;
+    let id = session.search_begin();
     state
         .runner
-        .submit(Class::Lists, "search_set", None, move || {
-            session.search_set(&query)
+        .submit(Class::View, "search_set", None, move || {
+            session.search_set_as(id, &query)
         })
         .await
 }

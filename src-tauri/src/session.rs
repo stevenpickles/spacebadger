@@ -352,7 +352,24 @@ impl Session {
     /// query clears the filter. Examines the tree in steps and gives up early
     /// if a newer search is requested meanwhile.
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
-        let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
+        self.search_set_as(self.search_begin(), query)
+    }
+
+    /// Numbers a new search, replacing any earlier one; numbered when it's
+    /// asked for, not when it starts, so of two asked for at nearly the same
+    /// time the later one always wins.
+    pub fn search_begin(&self) -> u32 {
+        self.latest_search.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// [`Session::search_set`] for a search numbered by
+    /// [`Session::search_begin`]; gives up at once if a newer one was asked
+    /// for meanwhile.
+    pub fn search_set_as(
+        &self,
+        id: u32,
+        query: &str,
+    ) -> Result<Option<proto::SearchSummary>, String> {
         let superseded = || format!("search {id} was replaced by a newer one");
         let Some(matcher) = Matcher::parse_at(query, SystemTime::now(), &local_midnight)? else {
             let mut current = locked("search", || self.filter.active.write())
@@ -1700,6 +1717,26 @@ mod tests {
             let got: Vec<_> = page.files.iter().map(|f| (f.node, f.weight)).collect();
             assert_eq!(got, all[p * 200..(p + 1) * 200], "page {p}");
         }
+    }
+
+    #[test]
+    fn a_search_asked_for_later_wins_even_if_it_starts_first() {
+        let tmp = fixture_named("search-order");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (older, newer) = (session.search_begin(), session.search_begin());
+        let summary = session.search_set_as(newer, "*.log").unwrap().unwrap();
+        assert_eq!(summary.search, newer);
+        assert!(session.search_set_as(older, "*.bin").is_err());
+        assert!(session.search_set_as(older, "").is_ok());
+        // The newer search is still the one in effect.
+        assert_eq!(session.search_summary(newer).unwrap().files, summary.files);
     }
 
     #[test]

@@ -428,7 +428,7 @@ fn run(scenario: &Scenario) -> (Vec<Sample>, Duration, usize) {
         let found = Arc::new(AtomicU32::new(0));
         let into = Arc::clone(&found);
         let how = How {
-            class: Class::Lists,
+            class: Class::View,
             blocking: true,
             overlap: false,
         };
