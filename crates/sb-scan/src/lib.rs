@@ -13,6 +13,6 @@ pub use adapter::{
     ScanError, Sink, batched,
 };
 pub use engine::{
-    OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
+    HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
 };
 pub use native::NativeFs;
