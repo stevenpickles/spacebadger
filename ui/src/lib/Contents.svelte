@@ -20,10 +20,18 @@
   // folder, each with the subfolder it's in. Rows are fetched a page at a
   // time as they scroll into view; the list refetches what's visible when
   // the scan changes, and starts over for a new folder, filter, or mode.
-  import { tick } from "svelte";
+  //
+  // Rankings move as the scan goes on, so pages fetched at different times
+  // can overlap or leave gaps. The rows shown are one set, bound to the
+  // revision it was fetched for: a newer revision refetches every visible
+  // page together and replaces the set whole, one refresh at a time with
+  // only the newest waiting, and replies for a set that's been replaced
+  // are dropped.
+  import { onDestroy, tick, untrack } from "svelte";
   import { errorText, folderFiles, smallItems } from "./api";
   import { exactBytes, formatBytes, percent, plural } from "./format";
   import ItemList from "./ItemList.svelte";
+  import { Coalescer, latest, queryKey, type Ticket } from "./request";
   import type { Pick } from "./selection";
 
   interface Props {
@@ -113,15 +121,35 @@
   /** The first page of a new list scrolls to an item already selected. */
   let revealed = false;
 
-  /** Counts fresh starts of the list. Requests carry it, so going back to
-   * an earlier folder, filter, or mode fetches again, and replies to an
-   * earlier start are dropped. */
-  let epoch = $state(0);
+  /** The set of rows shown. Starting a set (a fresh list or a refresh)
+   * supersedes replies for the one before, and teardown drops them all. */
+  const sets = latest();
+  /** The set rows are added to as they scroll into view, and the revision
+   * it belongs to; `null` before the first. */
+  let shownSet = $state.raw<{ ticket: Ticket; revision: number } | null>(null);
+  /** Pages of the shown set fetched or on their way. */
+  let loaded = new Set<number>();
+  /** A refresh is fetching the next set; pages wait for it. */
+  let refreshing = $state(false);
+  const refreshes = new Coalescer();
+  onDestroy(() => refreshes.dispose());
 
-  // A different folder, filter, mode, or scan starts at the top.
+  /** Everything that decides which rows a set holds and in what order. A
+   * reply that says which revision it ranked can be checked against it
+   * with `sets.accepts`. */
+  const setKey = (rev: number) => queryKey(generation, folder, search, folders, rev);
+
+  /** The pages covering the visible rows. */
+  function visiblePages(): number[] {
+    const pages: number[] = [];
+    for (let p = Math.floor(first / PAGE); p * PAGE < Math.max(last, 1); p++) pages.push(p);
+    return pages;
+  }
+
+  // A different folder, filter, mode, or scan starts a new set at the top.
   let shown = "";
   $effect(() => {
-    const key = `${generation}/${folder}/${search}/${folders}`;
+    const key = queryKey(generation, folder, search, folders);
     if (key === shown) return;
     shown = key;
     rows = new Map();
@@ -129,45 +157,108 @@
     empty = 0;
     error = null;
     revealed = false;
-    epoch++;
+    const rev = untrack(() => revision);
+    refreshes.clear();
+    loaded = new Set();
+    shownSet = { ticket: sets.begin(setKey(rev)), revision: rev };
     list?.reset();
   });
 
-  // Fetch the pages covering the visible rows; refetch on every revision.
-  let loaded = new Set<string>();
+  // Fetch the pages of the shown set that come into view.
   $effect(() => {
-    const mine = epoch;
-    const tag = `${mine}/${revision}/${attempt}`;
-    for (let p = Math.floor(first / PAGE); p * PAGE < Math.max(last, 1); p++) {
-      const key = `${tag}/${p}`;
-      if (loaded.has(key)) continue;
-      loaded.add(key);
+    const set = shownSet;
+    void attempt;
+    if (!set || refreshing) return;
+    for (const p of visiblePages()) {
+      if (loaded.has(p)) continue;
+      loaded.add(p);
       fetchPage(p * PAGE).then(
         (page) => {
-          if (mine !== epoch) return;
-          const next = new Map(rows);
-          page.rows.forEach((r, i) => next.set(page.offset + i, r));
-          // Rows past a shrunken end would linger otherwise.
-          for (const i of next.keys()) if (i >= page.total) next.delete(i);
-          rows = next;
-          total = page.total;
-          empty = page.empty;
-          error = null;
-          if (!revealed) {
-            revealed = true;
-            const at = page.rows.findIndex((r) => selected.has(r.node));
-            // After the list has grown to its new length.
-            if (at >= 0) void tick().then(() => list?.scrollToRow(page.offset + at));
-          }
+          if (sets.current(set.ticket)) addPage(page);
         },
         (e: unknown) => {
-          loaded.delete(key);
-          if (mine === epoch) error = errorText(e);
+          if (!sets.current(set.ticket)) return;
+          loaded.delete(p);
+          error = errorText(e);
         },
       );
     }
-    if (loaded.size > 200) loaded = new Set([...loaded].slice(-50));
   });
+
+  function addPage(page: Page) {
+    const next = new Map(rows);
+    page.rows.forEach((r, i) => next.set(page.offset + i, r));
+    // Rows past a shrunken end would linger otherwise.
+    for (const i of next.keys()) if (i >= page.total) next.delete(i);
+    rows = next;
+    total = page.total;
+    empty = page.empty;
+    error = null;
+    revealOnce();
+  }
+
+  /** Scrolls to an item already selected, the first time rows arrive. */
+  function revealOnce() {
+    if (revealed || rows.size === 0) return;
+    revealed = true;
+    let at = -1;
+    for (const [i, r] of rows) if (selected.has(r.node) && (at < 0 || i < at)) at = i;
+    // After the list has grown to its new length.
+    if (at >= 0) void tick().then(() => list?.scrollToRow(at));
+  }
+
+  // A newer revision refetches what's visible as one set.
+  $effect(() => {
+    const rev = revision;
+    const set = untrack(() => shownSet);
+    if (!set || set.revision === rev) return;
+    // The refresh reads what it needs when it starts; nothing it reads
+    // should rerun this.
+    untrack(() => refreshes.run(refresh));
+  });
+
+  /** Pages a refresh fetches at most besides the visible ones. */
+  const KEEP_PAGES = 10;
+
+  /** Fetches the visible pages for the newest revision and replaces the
+   * rows with them, all at once. Pages loaded earlier come along while
+   * there are few, so ranges and Select all still reach them; otherwise
+   * rows out of view are dropped and fetched again when they come into
+   * view. */
+  async function refresh() {
+    const rev = revision;
+    if (shownSet?.revision === rev) return;
+    const ticket = sets.begin(setKey(rev));
+    const visible = visiblePages();
+    const pages = loaded.size <= KEEP_PAGES ? [...new Set([...loaded, ...visible])].sort((a, b) => a - b) : visible;
+    refreshing = true;
+    try {
+      const got = await Promise.all(pages.map((p) => fetchPage(p * PAGE)));
+      if (!sets.current(ticket)) return;
+      const next = new Map<number, ContentsRow>();
+      for (const page of got) page.rows.forEach((r, i) => next.set(page.offset + i, r));
+      const end = got[got.length - 1];
+      if (end) {
+        for (const i of next.keys()) if (i >= end.total) next.delete(i);
+        total = end.total;
+        empty = end.empty;
+      }
+      rows = next;
+      error = null;
+      revealOnce();
+      loaded = new Set(pages);
+      shownSet = { ticket, revision: rev };
+    } catch (e) {
+      if (!sets.current(ticket)) return;
+      // The rows shown stay as they were; pages coming into view are
+      // fetched for the new revision.
+      error = errorText(e);
+      loaded = new Set();
+      shownSet = { ticket, revision: rev };
+    } finally {
+      refreshing = false;
+    }
+  }
 
   function indexOf(node: number): number {
     for (const [i, r] of rows) if (r.node === node) return i;
@@ -185,6 +276,7 @@
 
   function retry() {
     error = null;
+    loaded = new Set();
     attempt++;
   }
 
