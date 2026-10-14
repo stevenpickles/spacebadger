@@ -95,6 +95,40 @@ pub fn run(files: usize, seed: u64) {
     folders.truncate(2_000);
     folders.insert(0, NodeId::ROOT);
     measure("mixed tree", &g.tree, &folders);
+
+    // The cache at its bound: many folders of one file each (folder entries
+    // dominate), and folders of 500 files (children dominate).
+    for per_folder in [1usize, 500] {
+        let mut tree = Tree::new("/full");
+        let mut views = Vec::new();
+        for d in 0..files / per_folder.max(1) / 2 {
+            let sub = tree
+                .add_dir(NodeId::ROOT, format!("d{d}").as_ref())
+                .expect("capacity");
+            for i in 0..per_folder {
+                tree.add_file(sub, format!("f{i}").as_ref(), sizes(4096), None, 0)
+                    .expect("capacity");
+            }
+            tree.set_dir_state(sub, DirState::Listed);
+            views.push(sub);
+        }
+        tree.set_dir_state(NodeId::ROOT, DirState::Listed);
+        let params = LayoutParams::new(1920.0, 1080.0);
+        let mut cache = OrderCache::default();
+        let before = live();
+        let mut peak = 0;
+        for &v in &views {
+            layout::layout(&tree, v, Metric::Allocated, None, &params, &mut cache, true);
+            peak = peak.max(live().wrapping_sub(before));
+        }
+        println!(
+            "full cache, {} folders of {per_folder}: holds {} ({} children), at most {}",
+            views.len(),
+            kib(live().wrapping_sub(before)),
+            cache.entries(),
+            kib(peak)
+        );
+    }
 }
 
 /// Times layouts of the first view, then lays out every view with one cache
