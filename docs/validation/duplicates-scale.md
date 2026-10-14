@@ -40,3 +40,14 @@ Release build (`npx tauri build --no-bundle`), on a folder of 1,200 identical 1 
 - The search reads 1.34 GB in about a second. The large group's header says "1,200 copies", its first 100 files are listed, then "Show 1,000 more of 1,100"; clicking it adds the next 1,000 rows, and a further row offers the last 100.
 - "Select all but the first", before any more were shown, selected 1,204 files (1,199 + 5), 1.18 GB, and the map highlighted every one; the files fetched afterwards showed as selected.
 - Deleting one file from among those fetched by Show more (with Allow deleting on, in the test folder only) removed it from the expanded group without folding it: the files shown were fetched again, and the totals dropped to 1,209 files.
+
+## Follow-up from review
+
+A review of the change found a defect and a regression, now fixed:
+
+1. **A delete could leave the tally behind.** The duplicates calls read the scan's revision before taking the tree's read lock. A delete edits the tree and bumps the revision under the write lock, so a call landing in between saw the edited tree with the old revision, skipped the tally's refresh, and paired stale counts with a fresh order: a listed group could come with no files (the interface failed rendering its name), the extras could panic while holding the tally's lock (poisoning it, so every later status and list failed), or select every copy left in a group. The revision is now read with the tree's lock held. As a second line, lists, pages, and the extras check each file against the tree as they go: a group with no file left isn't listed, the extras always leave the first file still there, and a panic while the tally is held starts it over rather than poisoning it. Tests pair an edited tree with the old revision and check all three cases, and a panic while tallying.
+2. **Folded groups carried over.** Groups were folded by ID, which starts again from 0 for each search, and the set was never cleared, so a new search opened with unrelated groups folded. It's cleared with each new search.
+
+Fetches of a group's files are also ticketed now: a list refresh after a delete replaces a fetch under way rather than being skipped, older results are dropped, and Show more fetches the shown files again if the group lost some meanwhile. After Enter on Show more the focus stays on the first row loaded (checked in the desktop app).
+
+Checking each file costs a little on large pages. Measured again after the fixes, two runs: status 0.18–0.22 µs, first status 6.5–6.9 ms, list and JSON 8.3–9.3 ms, first list 112–118 ms, a page 0.67–0.70 ms, extras 3.1 ms, status after a delete 4.8–5.4 ms.
