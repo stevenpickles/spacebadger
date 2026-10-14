@@ -52,7 +52,8 @@ pub struct Store {
 
 /// A snapshot file found while pruning.
 struct Found {
-    created: u64,
+    /// Finish time, then the number after it among same-time ones.
+    order: (u64, u64),
     path: PathBuf,
     size: u64,
     /// Removed last when over the total: 0 a daily one, 1 one of the
@@ -100,21 +101,27 @@ impl Store {
         };
         // Removed when dropped unless persisted.
         temp.file().write_all(&bytes)?;
-        // The first free id, claimed only if it's still free as the file is
-        // renamed into place: saves at once, in this app or another copy of
-        // it, each keep a snapshot of their own.
-        let mut n = 0;
-        while dir
-            .join(format!("{}.{EXTENSION}", numbered(&base, n)))
-            .exists()
-        {
-            n += 1;
-        }
+        // The id after the last of the same time, so a newer snapshot never
+        // takes the lower number of one pruned, claimed only if it's still
+        // free as the file is renamed into place: saves at once, in this app
+        // or another copy of it, each keep a snapshot of their own.
+        let created = snap.header().created_ms;
+        let mut n = snapshot_files(&dir)
+            .iter()
+            .map(|(id, _)| order_of(id))
+            .filter(|&(c, _)| c == created)
+            .map(|(_, n)| n + 1)
+            .max()
+            .unwrap_or(0);
+        let mut tries = 0;
         let id = loop {
             let id = numbered(&base, n);
             match temp.persist_new(&format!("{id}.{EXTENSION}")) {
                 Ok(()) => break id,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < MAX_SAME_TIME => n += 1,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < MAX_SAME_TIME => {
+                    n += 1;
+                    tries += 1;
+                }
                 Err(e) => return Err(e),
             }
         };
@@ -138,7 +145,8 @@ impl Store {
                 (root_key(Path::new(&header.root)) == key).then_some((id, header))
             })
             .collect();
-        found.sort_by_key(|f| std::cmp::Reverse(f.1.created_ms));
+        // Same-time ones by their number: `<ms>-2` before `<ms>-10`.
+        found.sort_by_key(|f| std::cmp::Reverse((f.1.created_ms, order_of(&f.0).1)));
         found
     }
 
@@ -171,18 +179,18 @@ impl Store {
             let mut files: Vec<Found> = snapshot_files(&dir)
                 .into_iter()
                 .map(|(id, path)| Found {
-                    created: created_of(&id),
+                    order: order_of(&id),
                     size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
                     path,
                     rank: 0,
                 })
                 .collect();
             // Oldest first, so each day's first comes before the rest of it.
-            files.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.path.cmp(&b.path)));
+            files.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.path.cmp(&b.path)));
             let newest_from = files.len().saturating_sub(self.keep_newest);
             let mut days = HashSet::new();
             for (i, mut f) in files.into_iter().enumerate() {
-                let first_of_day = days.insert(f.created / DAY_MS);
+                let first_of_day = days.insert(f.order.0 / DAY_MS);
                 f.rank = if i == 0 {
                     2
                 } else if i >= newest_from {
@@ -200,8 +208,8 @@ impl Store {
             let _ = fs::remove_dir(&dir);
         }
         all.sort_by(|a, b| {
-            (a.rank, a.created)
-                .cmp(&(b.rank, b.created))
+            (a.rank, a.order)
+                .cmp(&(b.rank, b.order))
                 .then_with(|| a.path.cmp(&b.path))
         });
         let mut total: u64 = all.iter().map(|f| f.size).sum();
@@ -269,7 +277,7 @@ fn remove_stale_temps(dir: &Path) {
 
 /// The id of the `n`th snapshot of a root finished at `base`: `base`, then
 /// `base-1`, `base-2`, and so on.
-fn numbered(base: &str, n: usize) -> String {
+fn numbered(base: &str, n: u64) -> String {
     if n == 0 {
         base.to_owned()
     } else {
@@ -277,12 +285,13 @@ fn numbered(base: &str, n: usize) -> String {
     }
 }
 
-/// The finish time in an id (`1760000000000` or `1760000000000-1`).
-fn created_of(id: &str) -> u64 {
-    id.split('-')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// The finish time in an id and the number after it (`1760000000000` is
+/// `(1760000000000, 0)`, `1760000000000-2` is `(1760000000000, 2)`), so
+/// same-time snapshots sort as numbered.
+fn order_of(id: &str) -> (u64, u64) {
+    let mut parts = id.split('-').map(|s| s.parse().unwrap_or(0));
+    let created = parts.next().unwrap_or(0);
+    (created, parts.next().unwrap_or(0))
 }
 
 /// The root as compared: its path with one kind of separator (on Windows,
@@ -553,6 +562,23 @@ mod tests {
             options.custom_flags(0x0200_0000).access_mode(0x100);
         }
         options.open(path).unwrap()
+    }
+
+    #[test]
+    fn same_time_snapshots_sort_by_number() {
+        let tmp = temp("numbered");
+        let store = Store::with_limits(tmp.0.clone(), 3, u64::MAX);
+        let a = Path::new("/data/a");
+        for logical in 0..12 {
+            store
+                .save(a, &snap("/data/a", 1000, logical), None)
+                .unwrap();
+        }
+        let ids: Vec<String> = store.list(a).into_iter().map(|(id, _)| id).collect();
+        // The first, and the newest three: `1000-10` is newer than `1000-9`.
+        assert_eq!(ids, ["1000-11", "1000-10", "1000-9", "1000"]);
+        assert_eq!(order_of("1000-10"), (1000, 10));
+        assert_eq!(order_of("1000"), (1000, 0));
     }
 
     #[test]
