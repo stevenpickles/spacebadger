@@ -682,11 +682,24 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         let limit = self.config.sample_limit;
         let mut subdirs = Vec::new();
-        let mut shared = Vec::new();
+        let mut remeasure = Vec::new();
+        // Hard-link owners are looked up before taking the lock and new
+        // owners recorded after releasing it: the map holds an entry per file
+        // on Windows, and growing it at millions of entries takes long enough
+        // to stall readers. Names sharing a file within this batch are
+        // matched under the lock through a map bounded by the batch.
+        let known: Vec<Option<NodeId>> = entries
+            .iter()
+            .map(|e| match e.identity {
+                Identity::MaybeShared { key } => self.owners.get(&key).copied(),
+                _ => None,
+            })
+            .collect();
+        let mut first_names: HashMap<u128, NodeId> = HashMap::new();
         let tree_lock = Arc::clone(&self.tree);
         let mut tree = tree_lock.write().unwrap();
         let mut unreadable = false;
-        for entry in entries {
+        for (entry, known) in entries.into_iter().zip(known) {
             let skipped = match entry.kind {
                 EntryKind::File | EntryKind::Directory => None,
                 EntryKind::Symlink => Some(OmissionReason::Symlink),
@@ -717,8 +730,25 @@ impl<A: FsAdapter> Aggregator<A> {
                 tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
                     .map(|id| {
                         tree.set_id(id, fingerprint(entry.id));
-                        if let Identity::MaybeShared { key } = entry.identity {
-                            shared.push((id, key));
+                        let Identity::MaybeShared { key } = entry.identity else {
+                            return;
+                        };
+                        let owner = match known {
+                            Some(owner) => owner,
+                            None => match first_names.entry(key) {
+                                MapEntry::Vacant(v) => {
+                                    v.insert(id);
+                                    return;
+                                }
+                                MapEntry::Occupied(o) => *o.get(),
+                            },
+                        };
+                        tree.mark_alias(id, owner);
+                        // Listings of other names can be stale (NTFS), so
+                        // re-measure both sides once.
+                        remeasure.push((id, tree.path(id)));
+                        if self.remeasured.insert(owner) {
+                            remeasure.push((owner, tree.path(owner)));
                         }
                     })
             };
@@ -735,32 +765,7 @@ impl<A: FsAdapter> Aggregator<A> {
             tree.mark_unreadable_entries(dir);
         }
         drop(tree);
-
-        // Hard-link owners are looked up with the lock released: the map
-        // holds an entry per file on Windows, and growing it at millions of
-        // entries takes long enough to stall readers.
-        let mut aliases = Vec::new();
-        for (id, key) in shared {
-            match self.owners.entry(key) {
-                MapEntry::Vacant(v) => {
-                    v.insert(id);
-                }
-                MapEntry::Occupied(o) => aliases.push((id, *o.get())),
-            }
-        }
-        let mut remeasure = Vec::new();
-        if !aliases.is_empty() {
-            let mut tree = tree_lock.write().unwrap();
-            for (id, owner) in aliases {
-                tree.mark_alias(id, owner);
-                // Listings of other names can be stale (NTFS), so re-measure
-                // both sides once.
-                remeasure.push((id, tree.path(id)));
-                if self.remeasured.insert(owner) {
-                    remeasure.push((owner, tree.path(owner)));
-                }
-            }
-        }
+        self.owners.extend(first_names);
         if self.stop.is_some() {
             return;
         }

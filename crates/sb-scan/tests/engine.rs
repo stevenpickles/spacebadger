@@ -120,6 +120,30 @@ fn records_each_entrys_object_id() {
 }
 
 #[test]
+fn hard_links_within_one_listing_count_allocation_once() {
+    let fs = FakeFs::new();
+    fs.linked_file("a/one.bin", 4096, 4096, 9)
+        .linked_file("a/two.bin", 4096, 4096, 9)
+        .linked_file("a/three.bin", 4096, 4096, 9)
+        .linked_file("b/four.bin", 4096, 4096, 9);
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+
+    assert_eq!(progress.hardlink_aliases, 3);
+    assert_eq!(progress.allocated, 4096);
+    // One name owns the allocation and the others point at it.
+    let names = ["a/one.bin", "a/two.bin", "a/three.bin", "b/four.bin"].map(|p| find(&tree, p));
+    let owners: Vec<_> = names
+        .iter()
+        .filter(|&&n| tree.alias_owner(n).is_none())
+        .collect();
+    assert_eq!(owners.len(), 1);
+    for &n in &names {
+        assert!(tree.alias_owner(n).is_none_or(|o| o == *owners[0]));
+    }
+}
+
+#[test]
 fn links_mounts_and_special_files_are_skipped_and_counted() {
     let fs = FakeFs::new();
     fs.file("real.bin", 100, 4096)
