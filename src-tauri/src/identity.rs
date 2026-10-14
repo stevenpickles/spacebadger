@@ -93,6 +93,28 @@ impl Held {
     }
 }
 
+/// Whether `a` and `b` are the same object on the same drive, each read as
+/// [`hold`] reads it: by file ID, or for a drive that gives none, by where
+/// Windows says each is.
+#[cfg(windows)]
+pub fn same_object(a: &Path, b: &Path) -> io::Result<bool> {
+    let (found_a, held_a) = hold(a, false)?;
+    let (found_b, held_b) = hold(b, false)?;
+    if found_a.volume != found_b.volume || found_a.kind != found_b.kind {
+        return Ok(false);
+    }
+    if found_a.ids.iter().any(|&id| found_b.has_id(id)) {
+        return Ok(true);
+    }
+    let unidentified = found_a.ids == [0; 2] && found_b.ids == [0; 2];
+    Ok(unidentified
+        && held_a
+            .at
+            .as_deref()
+            .zip(held_b.at.as_deref())
+            .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y)))
+}
+
 /// Whether a path from [`Whereabouts::Moved`] is in its volume's Recycle
 /// Bin.
 pub fn in_recycle_bin(path: &str) -> bool {

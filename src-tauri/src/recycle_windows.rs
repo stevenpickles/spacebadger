@@ -7,19 +7,20 @@
 //! sink here aborts any delete that wouldn't be.
 
 use crate::delete::RecycleError;
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{E_ABORT, RPC_E_CHANGED_MODE};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx,
-    CoUninitialize,
+    CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NO_UI, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FileOperation,
     IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-    SHCreateItemFromParsingName, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+    SHCreateItemFromParsingName, SIGDN_FILESYSPATH, TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
 use windows::core::{HRESULT, HSTRING, PCWSTR, Ref, Result, implement};
 
@@ -174,12 +175,17 @@ impl Drop for Com {
 /// Why an item stayed where it was.
 pub const NOT_RECYCLABLE: &str = "It can't go to the Recycle Bin here (it may be on a network or removable drive, be too large for the Recycle Bin, or recycling may be turned off), and SpaceBadger never deletes permanently.";
 
+/// Why an item the shell would take for another is left alone.
+pub const ELSEWHERE: &str = "Windows Explorer reads its path as leading to a different item (a folder in it may be a special shell folder), so it was left alone; nothing was moved.";
+
 /// Moves `path` to the Recycle Bin. Fails, leaving the item alone, if
-/// Windows would delete it permanently instead.
+/// Windows would delete it permanently instead, or if the shell takes the
+/// path to anything but the object at it.
 pub fn recycle(path: &Path) -> std::result::Result<(), RecycleError> {
     let _com = Com::init().map_err(RecycleError::Failed)?;
     let seen = Arc::new(Seen::default());
-    let name = HSTRING::from(shell_path(path).as_os_str());
+    let item = shell_item(path)?;
+    confirm(path, &item)?;
     // SAFETY: COM is initialized on this thread; every pointer passed is
     // valid for the duration of the call.
     let performed = unsafe {
@@ -188,7 +194,6 @@ pub fn recycle(path: &Path) -> std::result::Result<(), RecycleError> {
             op.SetOperationFlags(
                 FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE,
             )?;
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None)?;
             let guard: IFileOperationProgressSink = Guard(Arc::clone(&seen)).into();
             op.DeleteItem(&item, &guard)?;
             let done = op.PerformOperations();
@@ -199,8 +204,58 @@ pub fn recycle(path: &Path) -> std::result::Result<(), RecycleError> {
     classify(
         seen.refused.load(Ordering::SeqCst),
         seen.unrecycled.load(Ordering::SeqCst),
-        performed.map_err(|e| e.message()),
+        performed.map_err(|e| describe(&e)),
     )
+}
+
+/// An error's message, or its code when Windows has no message for it.
+fn describe(e: &windows::core::Error) -> String {
+    let message = e.message();
+    if message.trim().is_empty() {
+        format!("error {}.", e.code())
+    } else {
+        message
+    }
+}
+
+/// The shell's item for `path`. COM must be initialized on this thread.
+fn shell_item(path: &Path) -> std::result::Result<IShellItem, RecycleError> {
+    let name = HSTRING::from(shell_path(path).as_os_str());
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    unsafe { SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None) }.map_err(|e| {
+        RecycleError::Failed(format!(
+            "Couldn't move it to the Recycle Bin: {}",
+            describe(&e)
+        ))
+    })
+}
+
+/// Refuses unless the shell's item is the object at `path` as the checks
+/// read it. The shell parses with its own namespace on top of Win32: a
+/// folder named `x.{CLSID}`, or a system folder whose `desktop.ini` gives a
+/// CLSID, hands everything below it to another namespace, which can put a
+/// user's real file, or the Recycle Bin, where the scan saw a different
+/// one. So the file-system path the shell resolved must lead to the same
+/// file ID on the same drive (not the same text: it may be in 8.3 form).
+fn confirm(path: &Path, item: &IShellItem) -> std::result::Result<(), RecycleError> {
+    let elsewhere = || RecycleError::Refused(ELSEWHERE.into());
+    let resolved = filesystem_path(item).ok_or_else(elsewhere)?;
+    match crate::identity::same_object(path, &resolved) {
+        Ok(true) => Ok(()),
+        _ => Err(elsewhere()),
+    }
+}
+
+/// Where in the file system the shell's item is, if anywhere.
+fn filesystem_path(item: &IShellItem) -> Option<PathBuf> {
+    // SAFETY: a valid item; the string returned is ours to free, and is
+    // copied before it is.
+    unsafe {
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+        CoTaskMemFree(Some(name.0.cast_const().cast()));
+        Some(path)
+    }
 }
 
 /// The result of a move from what the progress sink saw (a delete it
@@ -257,34 +312,40 @@ fn shell_path(path: &Path) -> PathBuf {
 }
 
 /// Why the shell might reach something other than the exact item at
-/// `path`, if it might. The checks read `\\?\` paths exactly, but the shell
-/// parses them the way Win32 does, so every name in the path, from the
-/// drive down, must mean the same to both: none ending with a dot or a
-/// space (Win32 drops them), none that is a device such as `NUL` or `COM1`,
-/// no `.` or `..`, no `:` (a data stream) or wildcard, and Win32 must give
-/// back the shell form of the path unchanged.
+/// `path`, if it might: a quick look at the names before the shell's own
+/// reading is checked (`confirm`). The checks read `\\?\` paths exactly,
+/// but the shell parses them the way Win32 does, so every name in the path,
+/// a network server and share included, must mean the same to both: none
+/// ending with a dot or a space (Win32 drops them), none that is a device
+/// such as `NUL` or `COM1`, none ending in `.{CLSID}` (a shell folder), no
+/// `.` or `..`, no `:` (a data stream) or wildcard, and Win32 must give back
+/// the shell form of the path unchanged.
 pub fn misread(path: &Path) -> Option<String> {
     let inexact = || {
         Some(format!(
             "Its path {} can't be given to the Recycle Bin exactly as it is, so it could reach another item; nothing was moved.",
-            quoted(path.as_os_str())
+            quoted(shell_path(path).as_os_str())
         ))
     };
     let mut components = path.components();
-    let verbatim = match components.next() {
+    let (verbatim, mut names) = match components.next() {
         Some(Component::Prefix(p)) if path.is_absolute() => match p.kind() {
-            Prefix::Disk(_) | Prefix::UNC(..) => false,
-            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..) => true,
+            Prefix::Disk(_) => (false, vec![]),
+            Prefix::VerbatimDisk(_) => (true, vec![]),
+            Prefix::UNC(server, share) => (false, vec![server, share]),
+            Prefix::VerbatimUNC(server, share) => (true, vec![server, share]),
             _ => return inexact(),
         },
         _ => return inexact(),
     };
     for c in components {
-        let part = match c {
-            Component::RootDir => continue,
-            Component::Normal(part) => part,
+        match c {
+            Component::RootDir => {}
+            Component::Normal(part) => names.push(part),
             _ => return inexact(),
-        };
+        }
+    }
+    for part in names {
         let name = part.to_string_lossy();
         if name.ends_with(['.', ' ']) {
             return Some(format!(
@@ -295,6 +356,12 @@ pub fn misread(path: &Path) -> Option<String> {
         if device(&name) {
             return Some(format!(
                 "The name {} in its path is reserved by Windows for a device, so the Recycle Bin can't reach it safely; nothing was moved.",
+                quoted(part)
+            ));
+        }
+        if shell_folder(&name) {
+            return Some(format!(
+                "The name {} in its path makes it a special shell folder, which the Recycle Bin would take for another place; nothing was moved.",
                 quoted(part)
             ));
         }
@@ -326,15 +393,11 @@ pub fn misread(path: &Path) -> Option<String> {
     None
 }
 
-/// Whether Win32 takes a name for a device, as it does `nul` and `COM1`,
-/// with any extension or trailing spaces before it.
+/// Whether a name is a device to Win32 and the shell, as `nul` and `COM1`
+/// are. With an extension (`nul.txt`) it depends on the Windows version,
+/// which the round trip through Win32 settles.
 fn device(name: &str) -> bool {
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(' ');
-    let upper = stem.to_uppercase();
+    let upper = name.to_uppercase();
     match upper.as_str() {
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         _ => {
@@ -348,13 +411,30 @@ fn device(name: &str) -> bool {
     }
 }
 
-fn quoted(text: &std::ffi::OsStr) -> String {
+/// Whether a folder name ends in `.{CLSID}`, which makes the shell treat it
+/// as that shell folder.
+fn shell_folder(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let Some(guid) = ext.strip_prefix('{').and_then(|g| g.strip_suffix('}')) else {
+        return false;
+    };
+    let groups: Vec<&str> = guid.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn quoted(text: &OsStr) -> String {
     format!("“{}”", text.to_string_lossy())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW};
 
     #[test]
     fn a_delete_without_a_copy_outranks_every_other_result() {
@@ -427,6 +507,8 @@ mod tests {
             r"\\?\C:\dir\file ",
             r"\\?\UNC\host\share\root.\f",
             r"\\?\C:\...\f",
+            r"\\?\UNC\server.\share\f",
+            r"\\server\share \f",
         ];
         for path in trailing {
             assert!(
@@ -437,11 +519,8 @@ mod tests {
         let devices = [
             r"\\?\C:\dir\NUL",
             r"\\?\C:\con\file",
-            r"\\?\C:\dir\aux.txt",
             r"\\?\C:\dir\Com1",
-            r"\\?\C:\dir\lpt9.log",
             r"\\?\C:\dir\COM¹",
-            r"\\?\C:\dir\nul .txt",
             r"\\?\C:\dir\CONOUT$",
         ];
         for path in devices {
@@ -450,6 +529,25 @@ mod tests {
                 "{path}"
             );
         }
+        // Devices only on some versions of Windows, which Win32 itself
+        // shows by rewriting the path.
+        for path in [r"C:\dir\aux.js", r"C:\dir\lpt9.log", r"C:\nul .txt\f"] {
+            assert!(
+                misread(Path::new(path)).is_none_or(|m| m.contains("exactly as it is")),
+                "{path}"
+            );
+        }
+        let shell_folders = [
+            r"\\?\C:\x.{59031a47-3f72-44a7-89c5-5595fe6b30ee}\f",
+            r"C:\j.{645FF040-5081-101B-9F08-00AA002F954E}\a.txt",
+        ];
+        for path in shell_folders {
+            assert!(
+                misread(Path::new(path)).is_some_and(|m| m.contains("special shell folder")),
+                "{path}"
+            );
+        }
+        assert_eq!(misread(Path::new(r"C:\notes.{draft}\f")), None);
         let inexact = [
             r"\\?\C:\dir\..\file",
             r"\\?\C:\dir\.\file",
@@ -472,6 +570,46 @@ mod tests {
                 misread(Path::new(path)).is_some_and(|m| m.contains("exactly as it is")),
                 "{path}"
             );
+        }
+        // Named as the user would write it.
+        assert!(
+            misread(Path::new(r"\\?\C:\dir\a*"))
+                .is_some_and(|m| m.starts_with(r"Its path “C:\dir\a*”")),
+        );
+    }
+
+    /// A folder in the path that the shell treats as a shell folder, by its
+    /// `.{CLSID}` name or its `desktop.ini`, leads the shell elsewhere: here
+    /// to the user's profile folder, read but never touched. Nothing is
+    /// moved; only the shell's reading is checked.
+    #[test]
+    fn a_path_the_shell_resolves_elsewhere_is_refused() {
+        let tmp = Dir::new("sb-shellns");
+        // The users-files folder: the profile, which always has AppData.
+        let clsid = "{59031a47-3f72-44a7-89c5-5595fe6b30ee}";
+        let named = tmp.0.join(format!("x.{clsid}")).join("AppData");
+        let system = tmp.0.join("dj");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::create_dir_all(system.join("AppData")).unwrap();
+        std::fs::write(
+            system.join("desktop.ini"),
+            format!("[.ShellClassInfo]\r\nCLSID={clsid}\r\n"),
+        )
+        .unwrap();
+        make_system(&system);
+        let plain = tmp.0.join("plain.txt");
+        std::fs::write(&plain, "x").unwrap();
+        let _com = Com::init().unwrap();
+        let check = |path: &Path| shell_item(path).and_then(|item| confirm(path, &item));
+        assert_eq!(check(&plain), Ok(()));
+        for path in [named, system.join("AppData")] {
+            assert_eq!(
+                check(&path),
+                Err(RecycleError::Refused(ELSEWHERE.into())),
+                "{}",
+                path.display()
+            );
+            assert!(path.exists());
         }
     }
 
@@ -502,6 +640,65 @@ mod tests {
             Err(RecycleError::Refused(NOT_RECYCLABLE.to_owned()))
         );
         assert!(survived, "the file was deleted");
+    }
+
+    /// A folder in a temporary folder, removed when dropped.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_system(folder: &Path) {
+        let wide: Vec<u16> = folder.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path.
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_SYSTEM) }.unwrap();
+    }
+
+    /// A shell folder inside a folder being recycled is never followed:
+    /// either the folder goes whole, the shell folder's own files with it,
+    /// or (as Windows 11 does) the shell refuses and nothing moves. May put
+    /// a small folder in the Recycle Bin, with a Control Panel junction
+    /// inside (no files behind it). Run by hand:
+    /// `cargo test -p spacebadger a_shell_folder_inside_is_never_followed -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_shell_folder_inside_is_never_followed() {
+        let outer = Dir::new("sb-recycle-junction");
+        let junction = outer.0.join("cp");
+        std::fs::create_dir_all(&junction).unwrap();
+        std::fs::write(
+            junction.join("desktop.ini"),
+            "[.ShellClassInfo]\r\nCLSID={21EC2020-3AEA-1069-A2DD-08002B30309D}\r\n",
+        )
+        .unwrap();
+        std::fs::write(junction.join("inner.txt"), "recycle me").unwrap();
+        make_system(&junction);
+        let (_, inner) = crate::identity::hold(&junction.join("inner.txt"), false).unwrap();
+        let result = recycle(&outer.0);
+        let now = inner.whereabouts();
+        if result.is_ok() {
+            assert!(!outer.0.exists());
+            assert!(matches!(
+                now,
+                crate::identity::Whereabouts::Moved(to) if crate::identity::in_recycle_bin(&to)
+            ));
+        } else {
+            assert!(matches!(result, Err(RecycleError::Failed(_))), "{result:?}");
+            assert_eq!(now, crate::identity::Whereabouts::Unmoved);
+            assert!(junction.join("inner.txt").exists() && junction.join("desktop.ini").exists());
+        }
     }
 
     /// Puts a small file in the Recycle Bin. Run by hand:
