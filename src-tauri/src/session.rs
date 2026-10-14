@@ -1696,6 +1696,10 @@ mod tests {
         // A selected file that changed itself no longer matches its copies.
         std::fs::write(&kept, &copy).unwrap();
         std::fs::write(&extra, &edited).unwrap();
+        let f = std::fs::File::options().write(true).open(&extra).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000))
+            .unwrap();
+        drop(f);
         let report = session.delete_using(&[e1], &|_| {}, remove).unwrap();
         assert_eq!(
             report.others[0].message,
