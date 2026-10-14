@@ -2,6 +2,7 @@
 //! earlier one ("what grew?").
 
 use super::{MAX_PAGE, Session, display_path, node};
+use crate::metrics::locked;
 use crate::snapshots::Store;
 use sb_core::compare::{Change, Comparison, Item, change_level};
 use sb_core::snapshot::{self, Snapshot};
@@ -164,7 +165,7 @@ impl Session {
         let header = snapshot.header().clone();
         let (comparison, revision) = {
             let tree = self.scan.tree();
-            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
             let revision = self.scan.progress().revision;
             (Arc::new(Comparison::new(&tree, &snapshot)), revision)
         };
@@ -198,7 +199,7 @@ impl Session {
     /// How `id` changed since the snapshot.
     pub fn compare_item(&self, snapshot: &str, id: u32) -> Result<proto::ItemChange, String> {
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let cur = self.current(snapshot, &tree)?;
         let n = node(&tree, id)?;
         let change = cur.comparison.change(&tree, &cur.snapshot, n);
@@ -217,7 +218,7 @@ impl Session {
     pub fn change_marks(&self, req: &proto::ChangeMarksRequest) -> Result<Vec<u8>, String> {
         use proto::change_mark as mark;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let cur = self.current(&req.snapshot, &tree)?;
         Ok(req
             .nodes
@@ -250,7 +251,7 @@ impl Session {
     /// including items removed since.
     pub fn changes(&self, req: &proto::ChangesRequest) -> Result<proto::ChangesPage, String> {
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let cur = self.current(&req.snapshot, &tree)?;
         let folder = node(&tree, req.folder)?;
         let cached = {
