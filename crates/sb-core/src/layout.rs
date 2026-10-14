@@ -145,8 +145,8 @@ pub const REORDER_HYSTERESIS: f64 = 1.5;
 ///
 /// Only children drawn on their own are remembered, so a folder of millions
 /// of tiny files costs as little as one of a few files. The cache holds at
-/// most [`ORDER_CACHE_ENTRIES`] children in all (about 8 MiB) and forgets the
-/// folders used least recently to stay within that.
+/// most [`ORDER_CACHE_ENTRIES`] children in all and forgets the folders used
+/// least recently to stay within that.
 #[derive(Debug)]
 pub struct OrderCache {
     /// Folder → its children's ranks in the last order used.
@@ -175,13 +175,14 @@ impl Ranks {
 }
 
 /// Upper bound on remembered children across all folders, 8 bytes each, a
-/// folder counting as [`FOLDER_COST`] more: a 4K view has room for about
-/// 690,000 rectangles of the minimum area, so even one folder filling such a
-/// view fits.
+/// folder counting as [`FOLDER_COST`] more. One folder may use at most half
+/// of it, about 520,000 children, so it never pushes out every other folder;
+/// a folder drawing more is sorted afresh each time.
 pub const ORDER_CACHE_ENTRIES: usize = 1 << 20;
 
-/// A folder's own entry in the cache, in children: about 32 bytes.
-const FOLDER_COST: usize = 4;
+/// A folder's own entry in the cache, in children: its map slot with the
+/// map's spare capacity, and its allocation's overhead, about 96 bytes.
+const FOLDER_COST: usize = 12;
 
 impl Default for OrderCache {
     fn default() -> Self {
@@ -257,10 +258,12 @@ impl OrderCache {
         if let Some(old) = self.folders.remove(&dir) {
             self.entries -= old.rank.len();
         }
-        // An empty order needs no remembering, and one larger than the whole
-        // cache isn't kept; the folder is sorted afresh each time instead.
+        // An empty order needs no remembering, and one larger than half the
+        // cache isn't kept (the folder is sorted afresh each time instead),
+        // so that remembering it leaves room for at least a quarter of the
+        // cache's worth of other folders.
         let cost = children.len() + FOLDER_COST;
-        if children.is_empty() || cost > self.limit {
+        if children.is_empty() || cost > self.limit / 2 {
             return;
         }
         if self.cost() + cost > self.limit {
@@ -303,6 +306,7 @@ impl OrderCache {
                 self.entries -= old.rank.len();
             }
         }
+        self.folders.shrink_to_fit();
     }
 }
 
@@ -1522,11 +1526,49 @@ mod tests {
         let last = *dirs.last().unwrap();
         assert!(cache.folders.contains_key(&last));
         assert!(!cache.folders.contains_key(&dirs[0]));
-        // A folder with more drawn children than the whole cache isn't kept.
-        let mut tiny = OrderCache::with_limit(5);
+        // A folder costing more than half the cache isn't kept.
+        let mut tiny = OrderCache::with_limit(40);
         layout(&t, last, Metric::Allocated, None, &params, &mut tiny, true);
         assert_eq!(tiny.entries(), 0);
         cache.clear();
         assert_eq!(cache.entries(), 0);
+    }
+
+    #[test]
+    fn a_folder_filling_most_of_the_cache_does_not_push_out_the_others() {
+        let mut t = Tree::new("/r");
+        let big = dir(&mut t, NodeId::ROOT, "big");
+        // 80 drawn children: with the folder's own cost, 92 of the 100.
+        for i in 0..80 {
+            file(&mut t, big, &format!("f{i}"), 1000);
+        }
+        let a = file(&mut t, NodeId::ROOT, "a", 100_000);
+        let b = file(&mut t, NodeId::ROOT, "b", 90_000);
+        let params = LayoutParams::new(1000.0, 1000.0);
+        let mut cache = OrderCache::with_limit(100);
+        let order = |t: &Tree, cache: &mut OrderCache| {
+            layout(
+                t,
+                NodeId::ROOT,
+                Metric::Allocated,
+                None,
+                &params,
+                cache,
+                true,
+            )
+            .rects
+            .iter()
+            .filter(|r| r.depth == 1)
+            .map(|r| r.node)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&t, &mut cache), [a, b, big]);
+        assert!(!cache.folders.contains_key(&big), "sorted afresh instead");
+        // b passes a while scanning, but not by enough to move: the root's
+        // order must still be remembered on every later layout.
+        t.update_file(b, sizes(120_000));
+        for _ in 0..3 {
+            assert_eq!(order(&t, &mut cache), [a, b, big]);
+        }
     }
 }
