@@ -581,32 +581,45 @@ mod tests {
     #[test]
     fn says_when_the_filter_caught_up_after_requests_read_behind_and_the_scan_stalled() {
         let (session, b, _c) = scan();
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&updates);
-        session.on_filter_updated(move |u| sink.lock().unwrap().push(u));
+        let (sink, updates) = std::sync::mpsc::channel();
+        session.on_filter_updated(move |u| {
+            let _ = sink.send(u);
+        });
         let id = session.search_set("*.log").unwrap().unwrap().search;
         let held = &session.filter.steps_left;
         held.store(0, Ordering::SeqCst);
         b.release();
-        until("b is listed", || listed(&session, "b"));
         // The scan reports nothing more once `b` is in, since `c` is never
-        // listed: wait for its last status.
-        let mut last = session.scan.progress().revision;
-        until("the scan goes quiet", || {
-            std::thread::sleep(Duration::from_millis(50));
-            let now = session.scan.progress().revision;
-            std::mem::replace(&mut last, now) == now
+        // listed: wait for the status saying so (only `c` left to list),
+        // which the job is nudged with just after it's published. Sampling
+        // for a quiet spell instead misses a status the scanner coalesced
+        // and publishes late, and a newer status rightly drops the
+        // announcement, as it brings requests of its own.
+        until("the last status reaches the job", || {
+            let p = session.scan.progress();
+            p.pending_dirs == 1 && session.filter.nudged.load(Ordering::SeqCst) == p.revision
         });
+        let last = session.scan.progress().revision;
         // Answered behind that status.
         let behind = session.search_summary(id).unwrap();
         assert!(behind.revision < last);
         assert_eq!(behind.files, 100);
+        assert!(
+            session.filter.read_behind.load(Ordering::SeqCst),
+            "the request is noted as read behind"
+        );
         held.store(usize::MAX, Ordering::SeqCst);
-        until("the update is announced", || {
-            !updates.lock().unwrap().is_empty()
-        });
+        // Due once the job catches up (milliseconds) and then `QUIET`.
+        let u = updates
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no update announced; the scan went from revision {last} to {}",
+                    session.scan.progress().revision
+                )
+            });
         let revision = session.scan.progress().revision;
-        let u = updates.lock().unwrap()[0].clone();
+        assert_eq!(revision, last, "the scan stayed quiet");
         assert_eq!(
             (u.generation, u.search, u.revision),
             (session.generation(), id, revision)
@@ -614,8 +627,7 @@ mod tests {
         let now = session.search_summary(id).unwrap();
         assert_eq!((now.files, now.revision), (3_100, revision));
         // Read up to date, nothing more is announced.
-        std::thread::sleep(QUIET * 2);
-        assert_eq!(updates.lock().unwrap().len(), 1);
+        assert!(updates.recv_timeout(QUIET * 2).is_err());
     }
 
     #[test]
