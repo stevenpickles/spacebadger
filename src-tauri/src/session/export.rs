@@ -60,8 +60,9 @@ impl Session {
     ) -> Result<proto::ExportReport, String> {
         let query = match req.search {
             Some(id) => Some(
-                self.search
-                    .lock()
+                self.filter
+                    .active
+                    .read()
                     .map_err(|_| "search is unavailable")?
                     .as_ref()
                     .filter(|a| a.id == id)
@@ -200,8 +201,9 @@ impl Session {
     }
 
     /// Runs one step of an export with the tree and, when filtered, the
-    /// search caught up with it. The search lock is taken only for a
-    /// filtered export, so an unfiltered one never holds up the filtered map.
+    /// search (up to date once the scan has finished, see
+    /// [`Session::read_locked`]). The search lock is taken only for a
+    /// filtered export.
     fn export_step<R>(
         &self,
         job: &Job<'_>,
@@ -210,35 +212,27 @@ impl Session {
         if !(job.current)() {
             return Err(REPLACED.into());
         }
-        let mut search = match job.query {
-            Some(_) => Some(self.search.lock().map_err(|_| "search is unavailable")?),
-            None => None,
-        };
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let (search, tree, _) = self.read_locked(&tree, job.query.is_some())?;
         node(&tree, job.req.folder)?;
-        let filter = match (search.as_deref_mut(), &job.query) {
-            (Some(slot), Some(query)) => Some(&same_filter(slot, query, &tree)?.search),
-            _ => None,
+        let filter = match &job.query {
+            Some(query) => Some(&same_filter(search.as_deref(), query)?.search),
+            None => None,
         };
         Ok(step(&tree, filter))
     }
 }
 
-/// The active search if its query is `query`, caught up with `tree`. The
-/// text is compared rather than the search number, since applying the same
-/// filter again starts a new search.
+/// The active search if its query is `query`. The text is compared rather
+/// than the search number, since applying the same filter again starts a
+/// new search.
 fn same_filter<'a>(
-    slot: &'a mut Option<ActiveSearch>,
+    slot: Option<&'a Option<ActiveSearch>>,
     query: &str,
-    tree: &Tree,
-) -> Result<&'a mut ActiveSearch, String> {
-    let active = slot
-        .as_mut()
+) -> Result<&'a ActiveSearch, String> {
+    slot.and_then(Option::as_ref)
         .filter(|a| a.search.matcher().query() == query)
-        .ok_or(FILTER_CHANGED)?;
-    active.search.catch_up(tree, usize::MAX);
-    Ok(active)
+        .ok_or_else(|| FILTER_CHANGED.to_owned())
 }
 
 /// ISO 8601 in local time with its offset, such as

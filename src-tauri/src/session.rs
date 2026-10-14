@@ -2,25 +2,27 @@
 //! scanner's types to the protocol's.
 
 mod export;
+mod filter;
 
 use crate::delete::{self, Outcome, Scanned, Target};
 use crate::duplicates::{self, Job};
 use crate::identity::{self, Found};
 use crate::metrics::{self, locked};
 use crate::snapshots::Store;
+use filter::{ActiveSearch, Filter, current};
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::ranking::{self, Basis, Key, Ranking, Rankings, Scope, Signature};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::selection;
-use sb_core::suggest::NameIndex;
+use sb_core::suggest::{self, NameIndex};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::plan;
 use sb_scan::{FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 mod compare;
@@ -52,16 +54,28 @@ const RANK_WAIT: Duration = Duration::from_millis(250);
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` and `compare` before the tree,
-// then `rankings`, and `order` last; waiting on `ranked` holds only
-// `rankings`. `rematching` is taken with the tree read-locked, and
-// `compare` briefly inside it.
+// Lock order: `deleting` first, the search (`filter.active`) and `compare`
+// before the tree, then `rankings`, and the order caches and
+// `search_ranked` last; waiting on `ranked` holds only `rankings`, and the
+// scanner takes the tree and then its progress. `rematching` is taken with
+// the tree read-locked, and `compare` briefly inside it. Requests only
+// read-lock the search; it's write-locked briefly to set a search or bring
+// it up to date once the scan has finished. The job keeping it caught up
+// while scanning read-locks the tree first and only tries the search's
+// write lock, so it never waits holding either; when requests keep it off,
+// it waits for the search's write lock, then the tree, in request order
+// (see `filter`).
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
     on_status: StatusSink,
     order: Mutex<OrderCache>,
-    search: Mutex<Option<ActiveSearch>>,
+    /// The active search, kept caught up with the scan in the background.
+    filter: Arc<Filter>,
+    /// Sibling order for the filtered map, for the search numbered.
+    search_order: Mutex<Option<(u32, OrderCache)>>,
+    /// The active search's matches ranked by size, for the result list.
+    search_ranked: Mutex<Option<(u32, Ranked)>>,
     /// Number of the most recently requested search.
     latest_search: AtomicU32,
     /// Held while deleting, so deletes run one at a time.
@@ -72,7 +86,11 @@ pub struct Session {
     /// Signalled when a walk taken to be finished is kept or given up.
     ranked: Condvar,
     /// Folder names and extensions for the filter's completion.
-    names: Mutex<Option<Names>>,
+    names: Arc<Mutex<Option<Names>>>,
+    /// Set while the completion index is rebuilt in the background.
+    names_building: Arc<AtomicBool>,
+    /// Set when the session goes, to stop a rebuild in the background.
+    names_cancel: Arc<AtomicBool>,
     /// The latest search for duplicate files.
     duplicates: Mutex<Option<Arc<Job>>>,
     /// Number of the latest search for duplicates.
@@ -107,6 +125,9 @@ struct Names {
 /// While scanning, the completion index is rebuilt at most this often.
 const NAMES_REFRESH: Duration = Duration::from_secs(5);
 
+/// Nodes the completion index takes in per hold of the tree's lock.
+const NAMES_STEP: usize = 50_000;
+
 /// A walk taken to be finished by [`Session::ranked`]. Dropping it ends
 /// the walk's finishing if its ranking wasn't kept (an edit came first, or
 /// an error), and wakes the requests waiting for it.
@@ -123,15 +144,6 @@ impl Drop for Finishing<'_> {
         }
         self.session.ranked.notify_all();
     }
-}
-
-struct ActiveSearch {
-    id: u32,
-    search: Search,
-    /// Sibling order for the filtered map.
-    order: OrderCache,
-    /// Matches ranked by size, for the result list.
-    ranked: Option<Ranked>,
 }
 
 impl Session {
@@ -175,6 +187,8 @@ impl Session {
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
         let tree_cell = Arc::new(OnceLock::new());
+        let filter = Filter::start(Arc::clone(&tree_cell));
+        let nudge = Arc::clone(&filter);
         let saved_snapshot = Arc::new(Mutex::new(None));
         let saver = snapshots.as_ref().map(|store| compare::Saver {
             store: Arc::clone(store),
@@ -184,6 +198,7 @@ impl Session {
             protect: carried.as_ref().map(|c| c.id().to_owned()),
         });
         let scan = Scan::start(root.clone(), adapter, config, move |p| {
+            nudge.nudge(p.revision);
             sink(status(&display, p));
             if let Some(saver) = &saver {
                 saver.progress(&p.state);
@@ -195,12 +210,16 @@ impl Session {
             scan,
             on_status,
             order: Mutex::new(OrderCache::default()),
-            search: Mutex::new(None),
+            filter,
+            search_order: Mutex::new(None),
+            search_ranked: Mutex::new(None),
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
             rankings: Mutex::new(Rankings::default()),
             ranked: Condvar::new(),
-            names: Mutex::new(None),
+            names: Arc::new(Mutex::new(None)),
+            names_building: Arc::new(AtomicBool::new(false)),
+            names_cancel: Arc::new(AtomicBool::new(false)),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
             recheck_cancel: AtomicBool::new(false),
@@ -217,6 +236,20 @@ impl Session {
     /// A delete is moving items right now.
     pub fn is_deleting(&self) -> bool {
         self.deleting.try_lock().is_err()
+    }
+
+    /// Has `emit` called when the filter catches up after requests were
+    /// answered from it as of an earlier status and the scan has gone quiet
+    /// (see `Filter::on_caught_up`), so the interface can ask again.
+    pub fn on_filter_updated(&self, emit: impl Fn(proto::FilterUpdated) + Send + Sync + 'static) {
+        let generation = self.generation();
+        self.filter.on_caught_up(move |search, revision| {
+            emit(proto::FilterUpdated {
+                generation,
+                search,
+                revision,
+            })
+        });
     }
 
     pub fn generation(&self) -> u64 {
@@ -241,19 +274,22 @@ impl Session {
             req.width.clamp(0.0, 16_384.0),
             req.height.clamp(0.0, 16_384.0),
         );
-        let mut search =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
-        let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        // Read with the tree's lock held, so the revision sent describes the
-        // tree laid out (see `with_duplicates`).
-        let progress = self.scan.progress();
+        let tree_lock = self.scan.tree();
+        // The progress is read with the tree's lock held, so the revision
+        // sent describes the tree laid out (see `with_duplicates`).
+        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
         let finished = progress.state.is_finished();
         let view = node(&tree, req.view)?;
         // While scanning, keep sibling order stable; once finished, sort afresh.
         let result = match req.search {
             Some(id) => {
-                let active = current_search(&mut search, id, &tree)?;
+                let active = current(&search, id)?;
+                let mut order = locked("order", || self.search_order.lock())
+                    .map_err(|_| "layout state is unavailable")?;
+                let order = match &mut *order {
+                    Some((of, order)) if *of == id => order,
+                    slot => &mut slot.insert((id, OrderCache::default())).1,
+                };
                 let _compute = metrics::span("compute");
                 layout::layout(
                     &tree,
@@ -261,18 +297,19 @@ impl Session {
                     metric,
                     Some(&active.search),
                     &params,
-                    &mut active.order,
+                    order,
                     !finished,
                 )
             }
             None => {
-                drop(search);
                 let mut order = locked("order", || self.order.lock())
                     .map_err(|_| "layout state is unavailable")?;
                 let _compute = metrics::span("compute");
                 layout::layout(&tree, view, metric, None, &params, &mut order, !finished)
             }
         };
+        // Encoding needs only the tree, and its last step not even that.
+        drop(search);
 
         let _encode = metrics::span("encode");
         let mut rects = Vec::with_capacity(result.rects.len());
@@ -284,7 +321,7 @@ impl Session {
                 RectKind::OtherSmall => false,
             };
             if labelled {
-                names.push((i as u32, tree.name(r.node).to_string_lossy()));
+                names.push((i as u32, tree.name(r.node).to_string_lossy().into_owned()));
             }
             rects.push(proto::wire::Rect {
                 x: r.x,
@@ -305,7 +342,8 @@ impl Session {
                 parent: r.parent(&tree).index() as u32,
             });
         }
-        let labels: Vec<(u32, &str)> = names.iter().map(|(i, s)| (*i, s.as_ref())).collect();
+        drop(tree);
+        let labels: Vec<(u32, &str)> = names.iter().map(|(i, s)| (*i, s.as_str())).collect();
         let mut header_flags = 0;
         if result.truncated {
             header_flags |= proto::wire::LAYOUT_TRUNCATED;
@@ -331,10 +369,11 @@ impl Session {
         let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
         let superseded = || format!("search {id} was replaced by a newer one");
         let Some(matcher) = Matcher::parse_at(query, SystemTime::now(), &local_midnight)? else {
-            let mut current =
-                locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
+            let mut current = locked("search", || self.filter.active.write())
+                .map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
+                self.forget_search_caches();
             }
             return Ok(None);
         };
@@ -352,28 +391,42 @@ impl Session {
             }
         }
         let mut current =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
+            locked("search", || self.filter.active.write()).map_err(|_| "search is unavailable")?;
         if self.latest_search.load(Ordering::SeqCst) != id {
             return Err(superseded());
         }
         let tree = locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
-        search.catch_up(&tree, usize::MAX);
-        let active = current.insert(ActiveSearch {
+        let mut active = ActiveSearch {
             id,
             search,
-            order: OrderCache::default(),
-            ranked: None,
-        });
-        Ok(Some(self.summary(active)))
+            revision: 0,
+        };
+        // What was scanned since the last step; read with the tree's lock
+        // held, so the revision describes the tree.
+        active.catch_up(&tree, self.scan.progress().revision);
+        let summary = self.summary(current.insert(active));
+        self.forget_search_caches();
+        Ok(Some(summary))
     }
 
-    /// Matching totals for search `id`, brought up to date with the scan.
+    /// Drops the filtered map's sibling order and the result list's ranking
+    /// kept for an earlier search, which can be large (a node per match).
+    /// Called with the search write-locked, so no request is using them.
+    fn forget_search_caches(&self) {
+        if let Ok(mut order) = self.search_order.lock() {
+            *order = None;
+        }
+        if let Ok(mut ranked) = self.search_ranked.lock() {
+            *ranked = None;
+        }
+    }
+
+    /// Matching totals for search `id`. While scanning, they can trail the
+    /// scan by a status (see [`proto::SearchSummary::revision`]).
     pub fn search_summary(&self, id: u32) -> Result<proto::SearchSummary, String> {
-        let mut search =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let active = current_search(&mut search, id, &tree)?;
+        let (search, _tree, _) = self.read_locked(&tree, true)?;
+        let active = current(&search, id)?;
         Ok(self.summary(active))
     }
 
@@ -387,6 +440,7 @@ impl Session {
             logical: totals.logical,
             allocated: totals.allocated,
             unknown_allocation_files: u64::from(totals.unknown),
+            revision: active.revision,
         }
     }
 
@@ -395,16 +449,20 @@ impl Session {
         &self,
         req: &proto::SearchResultsRequest,
     ) -> Result<proto::SearchPage, String> {
-        let mut search =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let active = current_search(&mut search, req.search, &tree)?;
+        let (search, tree, _) = self.read_locked(&tree, true)?;
+        let active = current(&search, req.search)?;
         let metric = metric(req.metric);
+        let mut ranked = locked("search_ranked", || self.search_ranked.lock())
+            .map_err(|_| "search results are unavailable")?;
         let rank = metrics::span("rank");
-        let ranked = match &mut active.ranked {
-            Some(r) if r.is_current(&active.search, metric) => r,
-            slot => slot.insert(Ranked::new(&active.search, metric)),
+        let ranked = match &mut *ranked {
+            Some((id, r)) if *id == active.id && r.is_current(&active.search, metric) => r,
+            slot => {
+                &mut slot
+                    .insert((active.id, Ranked::new(&active.search, metric)))
+                    .1
+            }
         };
         let total = ranked.len();
         let start = (req.offset as usize).min(total);
@@ -509,21 +567,13 @@ impl Session {
         // Waited for another request's walk, whose ranking then does.
         let mut waited = false;
         loop {
-            let mut search = match key.search {
-                Some(_) => Some(
-                    locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?,
-                ),
-                None => None,
-            };
-            let tree =
-                locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
-            // Read with the tree's lock held, so the revision describes the
-            // tree walked (see `with_duplicates`).
-            let progress = self.scan.progress();
+            // The progress is read with the tree's lock held, so the revision
+            // describes the tree walked (see `with_duplicates`).
+            let (search, tree, progress) = self.read_locked(&tree_lock, key.search.is_some())?;
             let folder = node(&tree, key.folder.index() as u32)?;
-            let filter = match (key.search, search.as_mut()) {
-                (Some(id), Some(search)) => Some(&current_search(search, id, &tree)?.search),
-                _ => None,
+            let filter = match key.search {
+                Some(id) => Some(&current(&search, id)?.search),
+                None => None,
             };
             let now = Basis {
                 revision: progress.revision,
@@ -607,7 +657,9 @@ impl Session {
 
     /// Folder names or extensions for the filter's completion, largest
     /// first. The index is rebuilt when the scan has changed, but during a
-    /// scan at most every [`NAMES_REFRESH`].
+    /// scan at most every [`NAMES_REFRESH`], and then in the background
+    /// while the previous index answers. It's built in steps, so the
+    /// scanner isn't held up meanwhile.
     pub fn suggest(&self, req: &proto::SuggestRequest) -> Result<Vec<proto::Suggestion>, String> {
         let progress = self.scan.progress();
         let scanning = matches!(progress.state, ScanState::Scanning);
@@ -617,21 +669,18 @@ impl Session {
             let fresh = names.as_ref().is_some_and(|n| {
                 n.revision == progress.revision || (scanning && n.built.elapsed() < NAMES_REFRESH)
             });
-            if !fresh {
+            if !fresh && scanning && names.is_some() {
+                self.refresh_names(progress.revision);
+            } else if !fresh {
                 let tree = self.scan.tree();
-                let tree =
-                    locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-                // Read again with the tree's lock held, so the index is kept
-                // under the revision of the tree it's built from.
-                let revision = self.scan.progress().revision;
-                let _index = metrics::span("index");
-                *names = Some(Names {
-                    revision,
-                    built: Instant::now(),
-                    index: Arc::new(NameIndex::build(&tree)),
-                });
+                // Read with the tree's lock held, so the index is kept under
+                // the revision of the tree it's built from.
+                let tree = Arc::downgrade(&tree);
+                *names = Some(build_names(&tree, &self.names_cancel, || {
+                    self.scan.progress().revision
+                })?);
             }
-            Arc::clone(&names.as_ref().expect("just built").index)
+            Arc::clone(&names.as_ref().expect("built").index)
         };
         let limit = req.limit.min(50) as usize;
         let found = match req.kind {
@@ -646,6 +695,41 @@ impl Session {
                 logical: e.logical,
             })
             .collect())
+    }
+
+    /// Rebuilds the completion index on another thread, unless that's
+    /// already happening; `revision` is the scan's when asked, which the
+    /// index reflects at least.
+    fn refresh_names(&self, revision: u64) {
+        if self.names_building.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        /// Clears the flag however the build ends, a panic included.
+        struct Building(Arc<AtomicBool>);
+        impl Drop for Building {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let building = Building(Arc::clone(&self.names_building));
+        // Weak, so a rescan's new tree doesn't keep the old one alive.
+        let tree = Arc::downgrade(&self.scan.tree());
+        let names = Arc::clone(&self.names);
+        let cancel = Arc::clone(&self.names_cancel);
+        // If the thread can't start, the closure goes, and the guard with it.
+        let _ = std::thread::Builder::new()
+            .name("sb-names".into())
+            .spawn(move || {
+                let _building = building;
+                let _timing = metrics::command("suggest_index");
+                let built = build_names(&tree, &cancel, || revision);
+                if let (Ok(built), Ok(mut names)) = (built, names.lock()) {
+                    // A request may have built a newer one meanwhile.
+                    if names.as_ref().is_none_or(|n| n.revision <= revision) {
+                        *names = Some(built);
+                    }
+                }
+            });
     }
 
     /// A page of the items merged into a small-items region.
@@ -701,22 +785,19 @@ impl Session {
 
     /// Details of a node; with `search`, also what that filter matches
     /// under it. A search that's no longer current gives no matching totals
-    /// rather than an error, since a newer one is on its way.
+    /// rather than an error, since a newer one is on its way. Without one,
+    /// such as for a tooltip, the search's lock isn't taken.
     pub fn details(&self, id: u32, search: Option<u32>) -> Result<proto::NodeDetails, String> {
-        let mut active =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        let (active, tree, _) = self.read_locked(&tree, search.is_some())?;
         let n = node(&tree, id)?;
-        let matching = search
-            .and_then(|s| current_search(&mut active, s, &tree).ok())
-            .map(|a| {
-                let t = a.search.totals(n);
-                proto::Matching {
-                    files: u64::from(t.files),
-                    logical: t.logical,
-                }
-            });
+        let matching = search.and_then(|s| current(&active, s).ok()).map(|a| {
+            let t = a.search.totals(n);
+            proto::Matching {
+                files: u64::from(t.files),
+                logical: t.logical,
+            }
+        });
         let node_flags = tree.flags(n);
         let is_dir = tree.is_dir(n);
         let allocated = if is_dir {
@@ -920,6 +1001,10 @@ impl Session {
             }
         });
         let ((), progress) = edited.ok_or("scan data is unavailable")?;
+        // Derived views are brought up to date before the change is
+        // announced, so the requests it prompts find them ready.
+        self.filter.nudge(progress.revision);
+        self.rematch();
         report.recycled = recycled.iter().map(|n| n.index() as u32).collect();
         report.removed = removed.iter().map(|n| n.index() as u32).collect();
         (self.on_status)(status(&display_path(&self.root), &progress));
@@ -965,13 +1050,11 @@ impl Session {
             return Err("Duplicates can be found once the scan finishes or is cancelled.".into());
         }
         let (scope, plan) = {
-            let mut search =
-                locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
             let tree = self.scan.tree();
-            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+            let (search, tree, _) = self.read_locked(&tree, req.search.is_some())?;
             let folder = node(&tree, req.folder)?;
             let filter = match req.search {
-                Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
+                Some(id) => Some(&current(&search, id)?.search),
                 None => None,
             };
             let scope = duplicates::Scope {
@@ -1150,8 +1233,38 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.filter.stop();
+        self.names_cancel.store(true, Ordering::SeqCst);
         if let Ok(Some(job)) = self.duplicates.get_mut().map(Option::take) {
             job.cancel();
+        }
+    }
+}
+
+/// Builds the completion index from `tree` a step at a time, releasing the
+/// lock (and the tree itself) in between, until `cancel` is set; `revision`
+/// is read with the lock held at the last step and kept with the index.
+fn build_names(
+    tree: &Weak<RwLock<Tree>>,
+    cancel: &AtomicBool,
+    revision: impl Fn() -> u64,
+) -> Result<Names, String> {
+    let mut builder = suggest::Builder::default();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("the scan was replaced".into());
+        }
+        let tree = tree.upgrade().ok_or("the scan was replaced")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        let _index = metrics::span("index");
+        if builder.step(&tree, NAMES_STEP) {
+            let revision = revision();
+            drop(tree);
+            return Ok(Names {
+                revision,
+                built: Instant::now(),
+                index: Arc::new(builder.finish()),
+            });
         }
     }
 }
@@ -1171,24 +1284,6 @@ fn report_duplicates(session: &Weak<Session>, job: &Job, emit: &impl Fn(proto::D
         };
         emit(status);
     }
-}
-
-/// The active search if it is `id`, caught up with `tree`.
-fn current_search<'a>(
-    search: &'a mut Option<ActiveSearch>,
-    id: u32,
-    tree: &Tree,
-) -> Result<&'a mut ActiveSearch, String> {
-    let active = search
-        .as_mut()
-        .filter(|a| a.id == id)
-        .ok_or_else(|| format!("search {id} is no longer current"))?;
-    if metrics::enabled() {
-        metrics::count("catch-up", active.search.backlog(tree));
-    }
-    let _catch_up = metrics::span("catch-up");
-    active.search.catch_up(tree, usize::MAX);
-    Ok(active)
 }
 
 fn metric(m: proto::Metric) -> layout::Metric {
@@ -1711,6 +1806,39 @@ mod tests {
         let names: Vec<_> = after.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["logs"]);
         assert_eq!(after.revision, progress.revision);
+    }
+
+    #[test]
+    fn filter_totals_asked_during_a_delete_count_the_edited_tree() {
+        let tmp = fixture_named("filter-delete");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let a = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let logs = child(&tree, child(&tree, NodeId::ROOT, "old"), "logs");
+            child(&tree, logs, "a.log")
+        };
+        let search = session.search_set("*.log").unwrap().unwrap().search;
+        // Read with the search caught up before the edit; it's brought up
+        // to date again rather than counting the deleted file.
+        let details = during_delete(&session, a, || session.details(0, Some(search))).unwrap();
+        assert_eq!(
+            details.matching,
+            Some(proto::Matching {
+                files: 1,
+                logical: 3000
+            })
+        );
+        let summary = session.search_summary(search).unwrap();
+        assert_eq!((summary.files, summary.logical), (1, 3000));
+        assert_eq!(summary.revision, session.scan.progress().revision);
     }
 
     #[test]

@@ -392,6 +392,25 @@ impl Session {
         })
     }
 
+    /// Matches the comparison that's on again after the tree changed, so
+    /// the requests that follow find it ready instead of the first of them,
+    /// such as a tooltip, doing it.
+    pub(super) fn rematch(&self) {
+        let Some(id) = self
+            .compare
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|a| a.info.id.clone()))
+        else {
+            return;
+        };
+        let tree = self.scan.tree();
+        if let Ok(tree) = locked("tree", || tree.read()) {
+            // Gone means comparing was turned off meanwhile.
+            let _ = self.current(&id, &tree);
+        }
+    }
+
     /// The comparison with snapshot `id` if it's matched for `revision`.
     fn matched_for(&self, id: &str, revision: u64) -> Result<Option<Current>, String> {
         let compare = self
@@ -599,6 +618,22 @@ mod tests {
             let c = c.unwrap();
             assert_eq!((c.kind, c.after), (proto::ChangeKind::Shrunk, 0));
         }
+        // A delete matches it again itself, before announcing the change.
+        let grows = NodeId::from_index(find(&second, "grows.txt"));
+        let (_, progress) = second.scan.edit_finished(|t| t.remove(grows)).unwrap();
+        assert!(
+            second
+                .matched_for(&id, progress.revision)
+                .unwrap()
+                .is_none()
+        );
+        second.rematch();
+        assert!(
+            second
+                .matched_for(&id, progress.revision)
+                .unwrap()
+                .is_some()
+        );
 
         // A rescan carries the earlier scan over, even once its file is gone.
         let carried = second.carry().expect("comparing");

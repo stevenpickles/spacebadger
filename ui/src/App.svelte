@@ -86,6 +86,9 @@
   const scan = new ScanController((message) => (problem = message));
   const generation = $derived(scan.generation);
   const status = $derived(scan.status);
+  /** Bumped when the filter caught up after a stalled scan; what's
+   * filtered (totals, details, map, results) is asked again. */
+  const filterUpdates = $derived(scan.filterUpdates);
   let view = $state(ROOT);
   /** The focused item: its details are shown and arrow keys start there. */
   let selection = $state<Selection | null>(null);
@@ -315,6 +318,7 @@
     const gen = generation;
     const id = searchId;
     const revision = status?.revision ?? 0;
+    void filterUpdates;
     if (gen === null || id === undefined) {
       searchTotals.cancel();
       return;
@@ -669,6 +673,7 @@
     const node = view;
     const filter = searchId ?? null;
     const revision = status?.revision ?? 0;
+    void filterUpdates;
     if (gen === null) {
       viewDetailsRequest.cancel();
       return;
@@ -689,6 +694,7 @@
     const sel = selection;
     const filter = searchId ?? null;
     const revision = status?.revision ?? 0;
+    void filterUpdates;
     void detailsRetry;
     detailsError = null;
     if (gen === null || !sel) {
@@ -1216,6 +1222,7 @@
           compare={compareId}
           search={search?.search ?? null}
           revision={status?.revision ?? 0}
+          refresh={filterUpdates}
           {selection}
           selected={pickedSet}
           {anchor}
@@ -1383,6 +1390,7 @@
               {generation}
               summary={search}
               revision={status?.revision ?? 0}
+              refresh={filterUpdates}
               {scanning}
               scanned={status?.logical ?? 0}
               selected={pickedSet}

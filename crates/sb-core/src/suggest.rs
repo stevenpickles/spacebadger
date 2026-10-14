@@ -46,50 +46,9 @@ impl NameIndex {
     /// Indexes every folder (except the scan root, whose name is a path)
     /// and file extension in `tree`.
     pub fn build(tree: &Tree) -> Self {
-        let mut folders = Grouped::default();
-        let mut extensions = Grouped::default();
-        // Each folder's entry in `folders`, so a folder inside another of
-        // the same name is found by comparing numbers.
-        let mut folder_of = vec![NONE; tree.len()];
-        let mut lower = String::new();
-        for i in 1..tree.len() {
-            let node = NodeId::from_index(i as u32);
-            if tree.is_removed(node) {
-                continue;
-            }
-            let name = tree.name(node);
-            if tree.is_dir(node) {
-                lowercase_into(name.as_encoded_bytes(), name, &mut lower);
-                let id = folders.id(&lower, || name.to_string_lossy().into_owned());
-                folder_of[i] = id;
-                let nested = ancestors(tree, node).any(|a| folder_of[a.index()] == id);
-                let e = &mut folders.entries[id as usize];
-                e.count += 1;
-                if !nested {
-                    e.logical += tree.logical(node);
-                }
-            } else if let Some(ext) = extension(name.as_encoded_bytes()) {
-                lowercase_into(ext, name, &mut lower);
-                let id = extensions.id(&lower, String::new);
-                let e = &mut extensions.entries[id as usize];
-                e.count += 1;
-                e.logical += tree.logical(node);
-            }
-        }
-        let mut folders = folders.entries;
-        let mut extensions = extensions.entries;
-        let order = |a: &Entry, b: &Entry| b.logical.cmp(&a.logical).then(a.lower.cmp(&b.lower));
-        // Only the kept names need sorting.
-        if folders.len() > MAX_FOLDER_NAMES {
-            folders.select_nth_unstable_by(MAX_FOLDER_NAMES - 1, order);
-            folders.truncate(MAX_FOLDER_NAMES);
-        }
-        folders.sort_unstable_by(order);
-        extensions.sort_unstable_by(order);
-        Self {
-            folders,
-            extensions,
-        }
+        let mut builder = Builder::default();
+        builder.step(tree, usize::MAX);
+        builder.finish()
     }
 
     /// Up to `limit` folder names for `typed`: those starting with it, then
@@ -101,6 +60,80 @@ impl NameIndex {
     /// Up to `limit` extensions for `typed`, as for [`NameIndex::folders`].
     pub fn extensions(&self, typed: &str, limit: usize) -> Vec<&Entry> {
         find(&self.extensions, typed, limit)
+    }
+}
+
+/// Builds a [`NameIndex`] a part of the tree at a time, so the tree's lock
+/// can be released in between while a scan goes on. Nodes added meanwhile
+/// are indexed too. Each folder's size is read when it's reached, so while
+/// scanning the sizes are from slightly different moments.
+#[derive(Default)]
+pub struct Builder {
+    folders: Grouped,
+    extensions: Grouped,
+    /// Each folder's entry in `folders`, so a folder inside another of
+    /// the same name is found by comparing numbers.
+    folder_of: Vec<u32>,
+    /// Next node to index; the scan root (0), whose name is a path, isn't.
+    next: usize,
+    lower: String,
+}
+
+impl Builder {
+    /// Indexes up to `budget` more nodes of `tree`. Returns `true` once
+    /// every node in it has been indexed.
+    pub fn step(&mut self, tree: &Tree, budget: usize) -> bool {
+        let start = self.next.max(1);
+        let end = tree.len().max(start).min(start.saturating_add(budget));
+        self.folder_of.resize(end, NONE);
+        for i in start..end {
+            let node = NodeId::from_index(i as u32);
+            if tree.is_removed(node) {
+                continue;
+            }
+            let name = tree.name(node);
+            if tree.is_dir(node) {
+                lowercase_into(name.as_encoded_bytes(), name, &mut self.lower);
+                let id = self
+                    .folders
+                    .id(&self.lower, || name.to_string_lossy().into_owned());
+                self.folder_of[i] = id;
+                // A folder's ID is lower than its contents', so the folders
+                // above it were indexed first.
+                let nested = ancestors(tree, node).any(|a| self.folder_of[a.index()] == id);
+                let e = &mut self.folders.entries[id as usize];
+                e.count += 1;
+                if !nested {
+                    e.logical += tree.logical(node);
+                }
+            } else if let Some(ext) = extension(name.as_encoded_bytes()) {
+                lowercase_into(ext, name, &mut self.lower);
+                let id = self.extensions.id(&self.lower, String::new);
+                let e = &mut self.extensions.entries[id as usize];
+                e.count += 1;
+                e.logical += tree.logical(node);
+            }
+        }
+        self.next = end;
+        self.next >= tree.len()
+    }
+
+    /// The index of everything stepped through.
+    pub fn finish(self) -> NameIndex {
+        let mut folders = self.folders.entries;
+        let mut extensions = self.extensions.entries;
+        let order = |a: &Entry, b: &Entry| b.logical.cmp(&a.logical).then(a.lower.cmp(&b.lower));
+        // Only the kept names need sorting.
+        if folders.len() > MAX_FOLDER_NAMES {
+            folders.select_nth_unstable_by(MAX_FOLDER_NAMES - 1, order);
+            folders.truncate(MAX_FOLDER_NAMES);
+        }
+        folders.sort_unstable_by(order);
+        extensions.sort_unstable_by(order);
+        NameIndex {
+            folders,
+            extensions,
+        }
     }
 }
 
@@ -286,5 +319,31 @@ mod tests {
             names(index.extensions("m", 10)),
             [("mkv", 1, 9_000), ("md", 1, 500)]
         );
+    }
+
+    #[test]
+    fn building_in_steps_indexes_what_was_added_meanwhile() {
+        let mut t = Tree::new("/r");
+        let nm = t.add_dir(NodeId::ROOT, "node_modules".as_ref()).unwrap();
+        file(&mut t, nm, "a.js", 100);
+        let mut builder = Builder::default();
+        assert!(!builder.step(&t, 1), "one node at a time");
+        assert!(builder.step(&t, 1));
+        // The scan goes on between steps.
+        let inner = t.add_dir(nm, "Node_Modules".as_ref()).unwrap();
+        file(&mut t, inner, "b.JS", 50);
+        file(&mut t, NodeId::ROOT, "c.md", 7);
+        assert!(!builder.step(&t, 2));
+        assert!(builder.step(&t, 2));
+        assert!(builder.step(&t, 2), "nothing left");
+        let stepped = builder.finish();
+        let whole = NameIndex::build(&t);
+        assert_eq!(stepped.extensions("", 10), whole.extensions("", 10));
+        assert_eq!(
+            names(stepped.folders("", 10)),
+            [("node_modules", 2, 100)],
+            "the nested folder counted once, at the size when it was reached"
+        );
+        assert_eq!(names(whole.folders("", 10)), [("node_modules", 2, 150)]);
     }
 }
