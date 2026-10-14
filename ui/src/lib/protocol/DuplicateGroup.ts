@@ -6,6 +6,11 @@ import type { DuplicateFile } from "./DuplicateFile";
  */
 export type DuplicateGroup = { 
 /**
+ * Numbers the group within its search for duplicates, for as long as
+ * that search is current.
+ */
+id: number, 
+/**
  * Each file's size: the length of its contents.
  */
 size: number, 
@@ -17,6 +22,12 @@ size: number,
  */
 onDisk: number | null, 
 /**
- * Shortest path first.
+ * Files in the group still in the scan.
+ */
+count: number, 
+/**
+ * The first of them, shortest path first: at least one and at most
+ * [`DUPLICATE_GROUP_PREVIEW`], fewer once the list holds
+ * [`DUPLICATE_FILES_LISTED`] in all.
  */
 files: Array<DuplicateFile>, };

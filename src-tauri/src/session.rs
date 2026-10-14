@@ -865,21 +865,47 @@ impl Session {
             .ok_or_else(|| format!("search for duplicates {job} is no longer current"))
     }
 
-    pub fn duplicates_status(&self, job: u32) -> Result<proto::DuplicatesStatus, String> {
+    /// Calls `f` with the search for duplicates numbered `job`, the tree,
+    /// and the tree's revision. The revision is read with the tree's lock
+    /// held, since an edit bumps it under the write lock (tree, then
+    /// progress, the aggregator's order), so it always describes the tree
+    /// passed. Read before, a delete in between would pair the edited tree
+    /// with the old revision, and the job would keep its figures for files
+    /// no longer there.
+    fn with_duplicates<R>(
+        &self,
+        job: u32,
+        f: impl FnOnce(&Job, &Tree, u64) -> R,
+    ) -> Result<R, String> {
         let job = self.duplicates_job(job)?;
-        let revision = self.scan.progress().revision;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        Ok(job.status(&tree, revision))
+        let revision = self.scan.progress().revision;
+        Ok(f(&job, &tree, revision))
+    }
+
+    pub fn duplicates_status(&self, job: u32) -> Result<proto::DuplicatesStatus, String> {
+        self.with_duplicates(job, |job, tree, revision| job.status(tree, revision))
     }
 
     /// The duplicates found so far, leaving out files deleted since.
     pub fn duplicates_list(&self, job: u32) -> Result<proto::DuplicatesList, String> {
-        let job = self.duplicates_job(job)?;
-        let revision = self.scan.progress().revision;
-        let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
-        Ok(job.list(&tree, revision))
+        self.with_duplicates(job, |job, tree, revision| job.list(tree, revision))
+    }
+
+    /// A page of a group's files, leaving out files deleted since.
+    pub fn duplicate_files(
+        &self,
+        req: &proto::DuplicateFilesRequest,
+    ) -> Result<proto::DuplicateFilesPage, String> {
+        self.with_duplicates(req.job, |job, tree, revision| {
+            job.files(tree, revision, req.group, req.offset, req.limit)
+        })?
+    }
+
+    /// Every file but the first of each listed group, by node.
+    pub fn duplicates_extras(&self, job: u32) -> Result<proto::DuplicateExtras, String> {
+        self.with_duplicates(job, |job, tree, revision| job.extras(tree, revision))
     }
 
     /// Whether deleting `nodes` would leave a group of duplicates with no copy.
