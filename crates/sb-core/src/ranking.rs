@@ -401,7 +401,11 @@ impl Entry {
         if self.finishing == Some(ranking.walk) {
             self.finishing = None;
         }
-        if self.ranking.as_ref().is_some_and(|r| r.newer_than(&ranking)) {
+        if self
+            .ranking
+            .as_ref()
+            .is_some_and(|r| r.newer_than(&ranking))
+        {
             return false;
         }
         self.ranking = Some(ranking);
