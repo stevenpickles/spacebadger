@@ -117,32 +117,47 @@ Randomized tests compare walked, cached, and partial pages with a full sort (tie
 
 ### After the filter is kept up in the background
 
-Branch `feature/39/derived-views` (contributor 1 and part of 5). The search is no longer caught up by requests: it sits behind a read-write lock shared with a job that, after each scan status, advances it 10,000 nodes per step (about 0.4 ms), read-locking the tree first and only trying the search's write lock, so it backs off for 1 ms while requests read. Requests read-lock the search, and only when they're given one (tooltips never touch it), so layouts, details, totals, and Contents run side by side; the layout releases it before encoding and the tree before serializing. While scanning, a request may see the search as of an earlier status (`SearchSummary::revision` says which); once the scan has finished, a request whose search is behind the tree's revision catches it up exclusively first, so final results are unchanged. The job's steps take 0.46–0.49 ms at p50 and 0.8–2.4 ms at p95 (it's timed as `search_catch_up` in the report).
+Branch `feature/39/derived-views`, merged with `dev` at `cb60f40` (the ranking cache and the treemap changes included); contributor 1 and part of 5. Requests no longer catch the search up. Instead, the search sits behind a read-write lock shared with a job. After each scan status, the job advances the search 10,000 nodes per step. It read-locks the tree first and only tries the search's write lock, backing off for 1 ms while requests read. Requests read-lock the search only when they're given one, and tooltips never touch it. So layouts, details, totals, and the Contents list run side by side. The layout releases the search before encoding, and the tree before serializing. While scanning, a request may see the search as of an earlier status (`SearchSummary::revision` says which). Once the scan has finished, a request whose search is behind the tree's revision catches it up exclusively first, so final results are unchanged. The job's steps take 0.25 ms on average, 0.36 ms at p95, and at most 2.7 ms (timed as `search_catch_up` in the report).
 
-These runs were made while other processes kept all 24 hardware threads busy (a run queue of about 40), so every number is higher and noisier than the baseline above, and requests are sometimes descheduled while holding a lock. To compare like with like, the dev build (`af911b3`) and this branch were run alternately, three times each; ranges over the runs, with the median in brackets, in ms, filter on and Contents showing folders:
+`dev` (`cb60f40`) and this branch were run alternately, three times each, on a quiet machine (scans of 9.0–9.7 s). The table gives ranges over the runs, with the median in brackets, in ms:
 
-| | Request | p50 | p95 | p99 |
-|---|---|---|---|---|
-| While scanning, before | node_details | 2.1–3.5 (2.4) | 10.4–14.6 (10.7) | 13.8–29.9 (14.2) |
-| after | node_details | 0.1–0.7 (0.1) | 5.9–10.2 (6.9) | 25.1–44.7 (29.5) |
-| before | search_summary | 1.8–5.6 (2.3) | 8.6–15.5 (11.1) | 10.8–29.9 (13.7) |
-| after | search_summary | 0.5–4.1 (0.6) | 9.2–10.1 (9.9) | 11.5–44.9 (12.3) |
-| before | small_items (Contents) | 0.5–6.9 (1.0) | 3.9–10.6 (4.9) | 9.2–33.0 (13.5) |
-| after | small_items (Contents) | 0.7–1.1 (0.8) | 7.0–11.7 (9.9) | 12.7–81.0 (33.7) |
-| before | tooltip | 0.1–0.2 (0.1) | 3.9–7.7 (5.1) | 8.3–14.2 (8.9) |
-| after | tooltip | 0.1–0.3 (0.1) | 1.5–7.6 (6.5) | 12.2–19.5 (15.1) |
-| before | layout | 9.0–9.9 (9.6) | 12.1–15.1 (13.1) | 16.0–33.1 (16.0) |
-| after | layout | 8.5–9.6 (8.8) | 11.8–15.6 (12.0) | 15.3–89.3 (24.2) |
-| After the scan, before | node_details | 0.1–7.1 (0.5) | 8.6–12.2 (10.6) | 9.5–12.5 (11.1) |
-| after | node_details | 0.1 (0.1) | 1.6–6.1 (2.3) | 3.3–11.3 (4.9) |
-| before | search_summary | 0.1–8.0 (0.4) | 6.1–12.3 (10.9) | 8.6–12.8 (11.2) |
-| after | search_summary | 0.1–0.4 (0.1) | 0.5–6.1 (2.1) | 1.0–11.2 (4.3) |
+| Scenario | Request | Before p95 | After p95 | Before p99 | After p99 |
+|---|---|---|---|---|---|
+| Filter on, Contents with folders | tooltip | 5.2–6.1 (5.3) | 3.9–4.5 (4.0) | 6.6–7.2 (6.8) | 5.3–7.0 (5.7) |
+| | node_details | 5.7–7.2 (6.5) | 4.2–5.5 (5.2) | 6.3–8.8 (8.3) | 7.2–16.9 (7.8) |
+| | small_items (Contents) | 6.3–7.5 (6.7) | 5.0–6.8 (5.2) | 7.3–11.4 (8.1) | 7.3–21.8 (11.3) |
+| | search_summary | 6.6–6.9 (6.7) | 5.0–5.5 (5.2) | 7.1–11.4 (7.6) | 7.2–17.4 (7.8) |
+| | layout | 7.0–8.5 (7.0) | 5.3–7.2 (6.8) | 8.0–11.4 (8.4) | 11.8–22.7 (12.7) |
+| Filter on, Contents with files only | tooltip | 8.1–10.5 (8.8) | 3.8–5.7 (4.8) | 9.2–11.5 (10.4) | 4.9–7.2 (5.8) |
+| | node_details | 8.7–11.5 (9.9) | 3.9–5.9 (4.8) | 9.1–13.2 (10.9) | 4.9–6.5 (5.3) |
+| | folder_files (Contents) | 8.3–10.4 (8.9) | 7.2–9.1 (7.6) | 9.2–11.3 (10.2) | 8.4–9.8 (9.1) |
+| | layout | 9.0–11.6 (9.8) | 5.3–7.5 (5.4) | 10.0–13.2 (10.9) | 5.9–7.8 (6.0) |
+| Filter typed 5 s into the scan | tooltip | 1.4–6.7 (3.4) | 0.3–3.6 (3.5) | 5.6–7.6 (5.9) | 4.1–6.3 (4.1) |
+| | node_details | 1.8–7.2 (5.1) | 3.8–4.6 (4.0) | 6.5–11.3 (8.0) | 4.4–6.3 (5.1) |
+| | small_items (Contents) | 5.4–6.2 (5.6) | 4.2–5.9 (4.4) | 6.1–11.3 (8.3) | 4.4–6.0 (4.7) |
 
-The search wait is gone: after the scan, with no writer, details and the filter's totals no longer wait for the layout, and while scanning details answer in 0.1 ms at the median instead of 2.4. The target is not met at p99 while scanning, though. With the search mutex out of the way, what's left of every slow request is waiting for the tree's lock while the scanner holds it for writing (`tree wait` is all of their time, and the job holds nothing then). Timing the scanner's write holds (a temporary probe in `apply_batch`, not committed) found holds of 33–55 ms at 2,097,152 nodes and 16–33 ms at 1,048,576, when the tree's column vectors double and are copied (Windows' allocator copies on growth), and 10–27 ms at other sizes as the name buffer grows; a request that arrives during one waits for it, as do the requests waiting behind it. Before, those requests mostly waited 10–15 ms for the search mutex instead, which hid the stalls in the same p99. The earlier three pairs, with 25,000-node steps, gave the same picture.
+At the median, details while scanning come back in 0.1 ms instead of 3.3 ms with Contents showing folders, and in 0.8 ms instead of 5.0 ms with files only. After the scan, with the filter on, details, the filter's totals, tooltips, and the Contents list (folders) answer in under 0.5 ms at p99, where before they took 5.8–7.9 ms waiting for the layout; with files only, tooltips and details fall from about 19.5 ms at p99 to 0.2–0.3 ms.
 
-Remaining contributors, in order: the scanner's write holds while the tree grows (the engine: segmented columns, or reserving from the previous snapshot's size, would remove the large ones); `folder_files` ranking (contributor 2, a separate change); and readers waiting behind a writer queued behind the layout's 8–10 ms read hold (contributor 3), which a prioritized executor or a shorter compute would shorten.
+Target: tooltips, details, and the Contents list under 16 ms at p99 while scanning with a filter.
 
-The completion index is built in steps of 50,000 nodes with the tree's lock released in between, and while scanning, an index past its five seconds keeps answering while a new one is built on its own thread, so typing in the filter no longer holds the scanner up for a whole build (431 ms for 5M nodes). A delete matches the comparison again before announcing the change, rather than leaving it to the first tooltip after it.
+- **Met at the median of three runs, for every scenario.** The worst medians are 11.3 ms (Contents, folders) and 9.1 ms (Contents, files only).
+- **One run each exceeded it for details (16.9 ms) and the Contents list (21.8 ms).** Both came from a single stall in the first scenario: the whole time went to waiting for the tree while the scanner held it for writing. The job holds nothing at that point.
+
+Timing the scanner's write holds (a temporary probe in `apply_batch`, not committed) on a busy machine explains these stalls:
+
+- **33–55 ms at 2,097,152 nodes and 16–33 ms at 1,048,576**, when the tree's column vectors double and are copied (Windows' allocator copies on growth).
+- **10–27 ms at other sizes**, as the name buffer grows.
+
+A request that arrives during one of these holds waits for it, and so do the requests behind it. Before, those requests also waited for the search mutex, which hid the stall within the same tail.
+
+The same comparison against the earlier `dev` (`af911b3`, before the ranking cache) had been made while other processes kept all 24 hardware threads busy (a run queue of about 40). It showed the same picture with larger numbers. While scanning, details took 0.1 ms at the median instead of 2.4 ms. After the scan, details took 2.3 ms at p95 instead of 10.6 ms. The p99 while scanning, however, was set by write stalls, which descheduling stretched to 25–80 ms.
+
+Remaining contributors, in order:
+
+1. The scanner's write holds while the tree grows. Fixing them belongs to the engine: segmented columns, or reserving from the previous snapshot's size, would remove the large ones.
+2. Readers waiting behind a writer, which in turn is queued behind the layout's 5–7 ms read hold (contributor 3). A prioritized executor would shorten this.
+
+The completion index is now built in steps of 50,000 nodes, with the tree's lock released between steps. While scanning, an index past its five seconds keeps answering while a new one is built on its own thread. Typing in the filter therefore no longer holds the scanner up for a whole build (431 ms for 5M nodes). A delete matches the comparison again before announcing the change, rather than leaving that to the first tooltip after it.
 
 Not covered by this baseline: IPC transfer, JSON serialization, decoding, and painting, which need the real app (`SPACEBADGER_TRACE` and `spacebadgerTrace.full()`). The app was only checked to write the report at exit.
 
