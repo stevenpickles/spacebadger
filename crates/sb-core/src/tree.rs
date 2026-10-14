@@ -338,6 +338,20 @@ impl Tree {
         }
     }
 
+    /// The first of `node`'s children as [`Tree::children`] lists them.
+    pub fn first_child(&self, node: NodeId) -> Option<NodeId> {
+        let c = self.first_child[node.index()];
+        (c != NONE).then_some(NodeId(c))
+    }
+
+    /// The child [`Tree::children`] lists after `node`. New children are
+    /// added in front, so a walk can stop at a child and go on from it
+    /// after the tree has grown, missing only what was added meanwhile.
+    pub fn next_sibling(&self, node: NodeId) -> Option<NodeId> {
+        let c = self.next_sibling[node.index()];
+        (c != NONE).then_some(NodeId(c))
+    }
+
     /// The node's own name; empty for the root.
     pub fn name(&self, node: NodeId) -> &OsStr {
         let i = node.index();
