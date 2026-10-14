@@ -135,6 +135,27 @@ pub struct ScanStarted {
     pub root: String,
 }
 
+/// The error a query command fails with when a newer request in the same
+/// [`Lane`] replaced it before it finished. The interface drops it silently:
+/// the newer request's reply is the one wanted.
+pub const SUPERSEDED: &str = "superseded by a newer request";
+
+/// Where a query's reply goes, so a newer request makes older ones moot.
+/// Each consumer in the interface (the map's layouts, its tooltips, one
+/// details panel, one list) has its own `key`, and numbers its requests
+/// with `seq` whenever its earlier replies stop mattering. A query with a
+/// higher `seq` in the same lane supersedes the lower ones still waiting or
+/// running: they fail with [`SUPERSEDED`]. Requests with the same `seq`,
+/// such as the pages of one list, never supersede each other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Lane {
+    pub key: String,
+    #[ts(type = "number")]
+    pub seq: u64,
+}
+
 /// Asks for the treemap of `view` at the given size. The binary reply is
 /// described in [`wire`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
