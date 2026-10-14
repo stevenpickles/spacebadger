@@ -73,6 +73,7 @@
   import SearchResults from "./lib/SearchResults.svelte";
   import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
+  import { latest, queryKey } from "./lib/request";
   import { applyPick, type MenuRequest, type Pick, type Selection } from "./lib/selection";
   import StatusBar from "./lib/StatusBar.svelte";
   import Treemap from "./lib/Treemap.svelte";
@@ -382,36 +383,44 @@
   }
 
   // How the selected item and the viewed folder changed, for the details.
+  // Only the newest request counts: selecting A then B must not show A's
+  // change beside B when A's reply comes last.
+  const selectedChangeRequest = latest();
+  const viewChangeRequest = latest();
   $effect(() => {
     const gen = generation;
     const cmp = compareId;
     const node = selection && !selection.other ? selection.node : null;
-    void status?.revision;
+    const revision = status?.revision;
     if (gen === null || cmp === null || node === null) {
+      selectedChangeRequest.cancel();
       selectedChange = null;
       return;
     }
-    compareItem(gen, cmp, node).then(
+    selectedChangeRequest.run(
+      queryKey(gen, revision, cmp, node),
+      () => compareItem(gen, cmp, node),
       (c) => {
-        if (gen === generation && compareId === cmp) selectedChange = c;
+        if (c.generation === gen && c.node === node) selectedChange = c;
       },
-      () => {},
     );
   });
   $effect(() => {
     const gen = generation;
     const cmp = compareId;
     const node = view;
-    void status?.revision;
+    const revision = status?.revision;
     if (gen === null || cmp === null) {
+      viewChangeRequest.cancel();
       viewChange = null;
       return;
     }
-    compareItem(gen, cmp, node).then(
+    viewChangeRequest.run(
+      queryKey(gen, revision, cmp, node),
+      () => compareItem(gen, cmp, node),
       (c) => {
-        if (gen === generation && compareId === cmp) viewChange = c;
+        if (c.generation === gen && c.node === node) viewChange = c;
       },
-      () => {},
     );
   });
 
