@@ -672,7 +672,7 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         let limit = self.config.sample_limit;
         let mut subdirs = Vec::new();
-        let mut remeasure = Vec::new();
+        let mut shared = Vec::new();
         let tree_lock = Arc::clone(&self.tree);
         let mut tree = tree_lock.write().unwrap();
         let mut unreadable = false;
@@ -706,21 +706,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
                     .map(|id| {
                         if let Identity::MaybeShared { key } = entry.identity {
-                            match self.owners.entry(key) {
-                                MapEntry::Vacant(v) => {
-                                    v.insert(id);
-                                }
-                                MapEntry::Occupied(o) => {
-                                    let owner = *o.get();
-                                    tree.mark_alias(id, owner);
-                                    // Listings of other names can be stale (NTFS),
-                                    // so re-measure both sides once.
-                                    remeasure.push(id);
-                                    if self.remeasured.insert(owner) {
-                                        remeasure.push(owner);
-                                    }
-                                }
-                            }
+                            shared.push((id, key));
                         }
                     })
             };
@@ -736,8 +722,33 @@ impl<A: FsAdapter> Aggregator<A> {
         if unreadable {
             tree.mark_unreadable_entries(dir);
         }
-        let remeasure: Vec<_> = remeasure.into_iter().map(|n| (n, tree.path(n))).collect();
         drop(tree);
+
+        // Hard-link owners are looked up with the lock released: the map
+        // holds an entry per file on Windows, and growing it at millions of
+        // entries takes long enough to stall readers.
+        let mut aliases = Vec::new();
+        for (id, key) in shared {
+            match self.owners.entry(key) {
+                MapEntry::Vacant(v) => {
+                    v.insert(id);
+                }
+                MapEntry::Occupied(o) => aliases.push((id, *o.get())),
+            }
+        }
+        let mut remeasure = Vec::new();
+        if !aliases.is_empty() {
+            let mut tree = tree_lock.write().unwrap();
+            for (id, owner) in aliases {
+                tree.mark_alias(id, owner);
+                // Listings of other names can be stale (NTFS), so re-measure
+                // both sides once.
+                remeasure.push((id, tree.path(id)));
+                if self.remeasured.insert(owner) {
+                    remeasure.push((owner, tree.path(owner)));
+                }
+            }
+        }
         if self.stop.is_some() {
             return;
         }
