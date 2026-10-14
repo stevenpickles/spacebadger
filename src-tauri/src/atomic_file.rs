@@ -20,6 +20,13 @@
 //!   for another changes nothing, and only this user (or an administrator)
 //!   can change what's inside the private one. The file is also checked to
 //!   be the one written, by device and inode, just before the rename.
+//!   File systems without Unix modes or owners of their own (FAT and exFAT
+//!   drives, NTFS, SMB shares, NFS mapping users) can't make a private
+//!   folder; there the file is made directly in the destination's folder,
+//!   and only that check stands between a substitute and the destination,
+//!   which narrows the window but can't close it. Outside Linux, a folder
+//!   this user may write to but not list can't be held open, so it's used
+//!   by path, as before.
 //!
 //! [`TempFile::persist`] replaces the destination, as a user choosing to
 //! overwrite a file asked; renaming replaces a destination that is itself a
@@ -189,14 +196,18 @@ mod sys {
     /// The temporary file's folder, also the destination's.
     #[derive(Debug)]
     pub struct Staged {
+        /// Absolute, as the folder was when the file was created.
         dir: PathBuf,
     }
 
     impl Staged {
         /// Creates the file `entry` in `dir`, only if nothing has that name.
         pub fn create(dir: &Path, entry: &str) -> io::Result<(Self, File)> {
+            // Resolved now, so a later change of working folder can't move
+            // the destination.
+            let dir = std::path::absolute(dir)?;
             let file = create_new(&dir.join(entry))?;
-            Ok((Self { dir: dir.into() }, file))
+            Ok((Self { dir }, file))
         }
 
         /// Renames `file` itself to `name` in the folder.
@@ -217,7 +228,8 @@ mod sys {
     pub(super) fn create_new(path: &Path) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
         };
         let mut options = OpenOptions::new();
         // `create_new` is CREATE_NEW, which fails on any existing name.
@@ -225,12 +237,14 @@ mod sys {
         // so refused), never followed to create its target. std adds this
         // flag itself with `create_new`; it's repeated here so that doesn't
         // rest on std's internals. DELETE lets the file be renamed or
-        // removed through this handle.
+        // removed through this handle. No one else may write to it while
+        // it's open; reading and renaming are still shared.
         options
             .write(true)
             .create_new(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0);
+            .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0);
         options.open(path)
     }
 
@@ -318,12 +332,10 @@ mod sys {
         }
     }
 
-    /// `path` as an absolute wide path in the `\\?\` form (no terminator),
-    /// so long paths work. A relative path is made absolute as a path-based
-    /// rename would.
+    /// The absolute `path` as a wide path in the `\\?\` form (no
+    /// terminator), so long paths work.
     fn wide(path: &Path) -> Vec<u16> {
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let text: Vec<u16> = absolute
+        let text: Vec<u16> = path
             .as_os_str()
             .encode_wide()
             .map(|c| {
@@ -350,104 +362,125 @@ mod sys {
 
 #[cfg(not(windows))]
 mod sys {
-    use rustix::fd::OwnedFd;
-    use rustix::fs::{AtFlags, Mode, OFlags, Stat};
+    use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, Stat};
+    use rustix::io::Errno;
+    use std::borrow::Cow;
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// The file's name in its private folder.
     const FILE: &str = "data";
 
-    /// The private folder holding the file, and the destination's folder,
-    /// both held open.
+    /// The destination's folder: held open, or by its path where it can't
+    /// be opened (outside Linux, a folder this user may write to but not
+    /// list).
+    #[derive(Debug)]
+    enum Dir {
+        Open(OwnedFd),
+        Path(PathBuf),
+    }
+
+    impl Dir {
+        fn open(path: &Path) -> io::Result<Self> {
+            // O_PATH needs no permission on the folder itself.
+            #[cfg(target_os = "linux")]
+            let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            #[cfg(not(target_os = "linux"))]
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            match rustix::fs::open(path, flags, Mode::empty()) {
+                Ok(fd) => Ok(Self::Open(fd)),
+                Err(Errno::ACCESS) => Ok(Self::Path(path.into())),
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        /// `name` in the folder, for the `*at` calls.
+        fn at<'a>(&'a self, name: &'a Path) -> (BorrowedFd<'a>, Cow<'a, Path>) {
+            match self {
+                Self::Open(fd) => (fd.as_fd(), Cow::Borrowed(name)),
+                Self::Path(dir) => (CWD, Cow::Owned(dir.join(name))),
+            }
+        }
+    }
+
+    /// Where the file is.
+    #[derive(Debug)]
+    enum Holder {
+        /// In the private folder, held open; `id` is what that folder is,
+        /// to remove only it.
+        Private { stage: OwnedFd, id: (u64, u64) },
+        /// Directly in the destination's folder, where the file system
+        /// can't make a private folder.
+        Plain,
+    }
+
+    /// The temporary file, and the destination's folder.
     #[derive(Debug)]
     pub struct Staged {
-        dir: OwnedFd,
-        stage: OwnedFd,
-        /// The private folder's name in `dir`.
-        entry: String,
-        /// What the private folder is, to remove only it.
-        id: (u64, u64),
+        dir: Dir,
+        /// The temporary name in `dir`.
+        entry: PathBuf,
+        holder: Holder,
+        /// What the file is, to publish or remove only it.
+        file_id: (u64, u64),
     }
 
     impl Staged {
         /// Makes the private folder `entry` in `dir`, only if nothing has
-        /// that name, and the file in it.
+        /// that name, and the file in it. Where the folder can't be made
+        /// private, the file is `entry` itself.
         pub fn create(dir: &Path, entry: &str) -> io::Result<(Self, File)> {
-            let dir = rustix::fs::open(
+            let dir = Dir::open(dir)?;
+            let entry = PathBuf::from(entry);
+            let (holder, file) = {
+                let (at, path) = dir.at(&entry);
+                // Fails on any existing name, links included.
+                rustix::fs::mkdirat(at, &*path, Mode::RWXU)?;
+                match private(at, &path) {
+                    Ok(Some(made)) => made,
+                    Ok(None) => (Holder::Plain, create_file(at, &path)?),
+                    Err(e) => {
+                        // Only ever removes an empty folder.
+                        let _ = rustix::fs::unlinkat(at, &*path, AtFlags::REMOVEDIR);
+                        return Err(e);
+                    }
+                }
+            };
+            let file_id = id(&rustix::fs::fstat(&file)?);
+            let staged = Self {
                 dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?;
-            // Fails on any existing name, links included.
-            rustix::fs::mkdirat(&dir, entry, Mode::RWXU)?;
-            let made = (|| -> io::Result<_> {
-                let stage = rustix::fs::openat(
-                    &dir,
-                    entry,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?;
-                // Another user could have swapped in a folder of their own
-                // between making and opening it.
-                let st = rustix::fs::fstat(&stage)?;
-                if st.st_uid != rustix::process::geteuid().as_raw() || st.st_mode & 0o077 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "the temporary folder isn't private",
-                    ));
-                }
-                let file = rustix::fs::openat(
-                    &stage,
-                    FILE,
-                    OFlags::WRONLY
-                        | OFlags::CREATE
-                        | OFlags::EXCL
-                        | OFlags::NOFOLLOW
-                        | OFlags::CLOEXEC,
-                    Mode::from_raw_mode(0o666),
-                )?;
-                Ok((stage, id(&st), File::from(file)))
-            })();
-            match made {
-                Ok((stage, id, file)) => {
-                    let staged = Self {
-                        dir,
-                        stage,
-                        entry: entry.into(),
-                        id,
-                    };
-                    Ok((staged, file))
-                }
-                Err(e) => {
-                    // Only ever removes an empty folder.
-                    let _ = rustix::fs::unlinkat(&dir, entry, AtFlags::REMOVEDIR);
-                    Err(e)
-                }
-            }
+                entry,
+                holder,
+                file_id,
+            };
+            Ok((staged, file))
         }
 
-        /// Renames `file`, checked to be still the one in the private
-        /// folder, to `name` in the destination's folder.
-        pub fn commit(&self, file: &File, name: &OsStr, replace: bool) -> io::Result<()> {
-            if !self.holds(file) {
+        /// Renames the file, checked to be still the one written, to `name`
+        /// in the destination's folder.
+        pub fn commit(&self, _file: &File, name: &OsStr, replace: bool) -> io::Result<()> {
+            let (from_at, from) = self.file_at();
+            let there = rustix::fs::statat(from_at, &*from, AtFlags::SYMLINK_NOFOLLOW)?;
+            if id(&there) != self.file_id {
                 return Err(io::Error::other("the temporary file was replaced"));
             }
+            let name = Path::new(name);
+            let (to_at, to) = self.dir.at(name);
             if replace {
-                rustix::fs::renameat(&self.stage, FILE, &self.dir, name)?;
+                rustix::fs::renameat(from_at, &*from, to_at, &*to)?;
                 return Ok(());
             }
             #[cfg(any(target_os = "linux", target_vendor = "apple"))]
             {
                 use rustix::fs::RenameFlags;
-                use rustix::io::Errno;
                 match rustix::fs::renameat_with(
-                    &self.stage,
-                    FILE,
-                    &self.dir,
-                    name,
+                    from_at,
+                    &*from,
+                    to_at,
+                    &*to,
                     RenameFlags::NOREPLACE,
                 ) {
                     Ok(()) => return Ok(()),
@@ -458,39 +491,80 @@ mod sys {
                     Err(e) => return Err(e.into()),
                 }
             }
-            // A new link fails on any existing name, as renaming would.
-            rustix::fs::linkat(&self.stage, FILE, &self.dir, name, AtFlags::empty())?;
-            let _ = rustix::fs::unlinkat(&self.stage, FILE, AtFlags::empty());
+            // A new link fails on any existing name, as renaming would. If
+            // the temporary name can't be removed now, `close` tries again.
+            rustix::fs::linkat(from_at, &*from, to_at, &*to, AtFlags::empty())?;
+            let _ = rustix::fs::unlinkat(from_at, &*from, AtFlags::empty());
             Ok(())
         }
 
-        /// Removes `file` if it wasn't persisted and is still in the private
-        /// folder, then the folder if it's still ours.
-        pub fn close(self, file: Option<File>) {
-            if let Some(file) = file
-                && self.holds(&file)
-            {
-                let _ = rustix::fs::unlinkat(&self.stage, FILE, AtFlags::empty());
-            }
-            let ours =
-                rustix::fs::statat(&self.dir, self.entry.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                    .is_ok_and(|st| id(&st) == self.id);
+        /// Removes the temporary name if it's still the file: all of it if
+        /// it wasn't persisted, or a second name a commit by linking left.
+        /// Then the private folder, if it's still ours.
+        pub fn close(self, _file: Option<File>) {
+            let (at, path) = self.file_at();
+            let ours = rustix::fs::statat(at, &*path, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|st| id(&st) == self.file_id);
             if ours {
-                // Only ever removes an empty folder.
-                let _ = rustix::fs::unlinkat(&self.dir, self.entry.as_str(), AtFlags::REMOVEDIR);
+                let _ = rustix::fs::unlinkat(at, &*path, AtFlags::empty());
+            }
+            if let Holder::Private { id: stage_id, .. } = &self.holder {
+                let (at, path) = self.dir.at(&self.entry);
+                let ours = rustix::fs::statat(at, &*path, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| id(&st) == *stage_id);
+                if ours {
+                    // Only ever removes an empty folder.
+                    let _ = rustix::fs::unlinkat(at, &*path, AtFlags::REMOVEDIR);
+                }
             }
         }
 
-        /// Whether the name in the private folder is still `file`.
-        fn holds(&self, file: &File) -> bool {
-            match (
-                rustix::fs::fstat(file),
-                rustix::fs::statat(&self.stage, FILE, AtFlags::SYMLINK_NOFOLLOW),
-            ) {
-                (Ok(ours), Ok(there)) => id(&ours) == id(&there),
-                _ => false,
+        /// Where the file is, for the `*at` calls.
+        fn file_at(&self) -> (BorrowedFd<'_>, Cow<'_, Path>) {
+            match &self.holder {
+                Holder::Private { stage, .. } => (stage.as_fd(), Cow::Borrowed(Path::new(FILE))),
+                Holder::Plain => self.dir.at(&self.entry),
             }
         }
+    }
+
+    /// Opens the folder just made at `path` and the file in it, if the
+    /// folder is private. File systems without Unix modes or owners of their
+    /// own (FAT, NTFS, SMB, NFS mapping users) can't make one, or another
+    /// user may have swapped in a folder of theirs; then the folder is
+    /// removed if it's ours, and it's `None`.
+    fn private(at: BorrowedFd<'_>, path: &Path) -> io::Result<Option<(Holder, File)>> {
+        let stage = rustix::fs::openat(
+            at,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let st = rustix::fs::fstat(&stage)?;
+        let private = st.st_uid == rustix::process::geteuid().as_raw()
+            && st.st_mode & 0o077 == 0
+            && !super::not_private();
+        if !private {
+            let ours = rustix::fs::statat(at, path, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|there| id(&there) == id(&st));
+            if ours {
+                let _ = rustix::fs::unlinkat(at, path, AtFlags::REMOVEDIR);
+            }
+            return Ok(None);
+        }
+        let file = create_file(stage.as_fd(), Path::new(FILE))?;
+        Ok(Some((Holder::Private { stage, id: id(&st) }, file)))
+    }
+
+    /// Creates the file `path` for writing, only if nothing has that name.
+    fn create_file(at: BorrowedFd<'_>, path: &Path) -> io::Result<File> {
+        let fd = rustix::fs::openat(
+            at,
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )?;
+        Ok(File::from(fd))
     }
 
     /// Device and inode.
@@ -499,6 +573,18 @@ mod sys {
         // Their types differ between systems.
         (st.st_dev as u64, st.st_ino as u64)
     }
+}
+
+/// Whether to act as if a private folder couldn't be made, as on file
+/// systems without Unix modes; set in tests, for this thread only.
+#[cfg(all(not(windows), test))]
+fn not_private() -> bool {
+    tests::NOT_PRIVATE.get()
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn not_private() -> bool {
+    false
 }
 
 /// The start of `name`, at most [`NAME_BYTES`] bytes, cut between
@@ -855,9 +941,10 @@ mod tests {
                 let dest = &dest;
                 s.spawn(move || {
                     // Windows refuses to replace a file another process
-                    // holds without delete sharing, which a virus scanner or
-                    // the indexer may briefly do to a file just written:
-                    // the product reports that, and here it's tried again.
+                    // holds without delete sharing (a sharing violation),
+                    // which a virus scanner or the indexer may briefly do to
+                    // a file just written: the product reports that, and
+                    // here it's tried again.
                     for attempt in 1.. {
                         let t = TempFile::beside(dest).unwrap();
                         let mut w = io::BufWriter::new(t.file());
@@ -868,7 +955,11 @@ mod tests {
                         drop(w);
                         match t.persist() {
                             Ok(()) => break,
-                            Err(e) if cfg!(windows) && held_elsewhere(&e) && attempt < 20 => {
+                            Err(e)
+                                if cfg!(windows)
+                                    && e.raw_os_error() == Some(32)
+                                    && attempt < 20 =>
+                            {
                                 eprintln!("retrying a rename refused while held: {e}");
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
@@ -883,9 +974,96 @@ mod tests {
         assert_eq!(names(&tmp.0), ["out.txt"]);
     }
 
-    /// Access denied or a sharing violation: the destination is open
-    /// elsewhere.
-    fn held_elsewhere(e: &io::Error) -> bool {
-        e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32)
+    thread_local! {
+        /// Makes this thread's temporary files act as if a private folder
+        /// couldn't be made.
+        pub(super) static NOT_PRIVATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Where a private folder can't be made (FAT, NTFS, SMB, NFS mapping
+    /// users), the file is made directly in the destination's folder, and
+    /// still published only if it's the file written, and only where asked.
+    #[cfg(not(windows))]
+    #[test]
+    fn without_a_private_folder_the_file_is_plain() {
+        let tmp = temp("plain");
+        NOT_PRIVATE.set(true);
+        let dest = tmp.0.join("out.csv");
+        fs::write(&dest, "old").unwrap();
+
+        let t = TempFile::beside(&dest).unwrap();
+        assert!(fs::symlink_metadata(t.path()).unwrap().is_file());
+        assert_eq!(names(&tmp.0).len(), 2);
+        t.file().write_all(b"new").unwrap();
+        t.persist().unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+        assert_eq!(names(&tmp.0), ["out.csv"]);
+
+        // Never replacing, and kept for another name.
+        let mut t = TempFile::beside(&dest).unwrap();
+        t.file().write_all(b"other").unwrap();
+        let err = t.persist_new("out.csv").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err:?}");
+        t.persist_new("second.csv").unwrap();
+        drop(t);
+        assert_eq!(names(&tmp.0), ["out.csv", "second.csv"]);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+
+        // A substitute at the temporary name isn't published or removed.
+        let t = TempFile::beside(&dest).unwrap();
+        t.file().write_all(b"ours").unwrap();
+        let path = t.path().to_owned();
+        fs::rename(&path, tmp.0.join("moved")).unwrap();
+        fs::write(&path, "substitute").unwrap();
+        assert!(t.persist().is_err());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "substitute");
+
+        // Dropped: removed.
+        let t = TempFile::beside(&dest).unwrap();
+        let path = t.path().to_owned();
+        drop(t);
+        assert!(!path.exists());
+        NOT_PRIVATE.set(false);
+    }
+
+    /// A folder this user may write to but not list still takes exports, as
+    /// it did before.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_write_only_folder_still_works() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp("write-only");
+        let drop_box = tmp.0.join("box");
+        fs::create_dir(&drop_box).unwrap();
+        fs::set_permissions(&drop_box, fs::Permissions::from_mode(0o333)).unwrap();
+        let dest = drop_box.join("out.csv");
+        let result = (|| -> io::Result<()> {
+            let t = TempFile::beside(&dest)?;
+            t.file().write_all(b"dropped")?;
+            t.persist()?;
+            let mut u = TempFile::beside(&dest)?;
+            u.file().write_all(b"second")?;
+            u.persist_new("second.csv")
+        })();
+        fs::set_permissions(&drop_box, fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "dropped");
+        assert_eq!(names(&drop_box), ["out.csv", "second.csv"]);
+    }
+
+    /// Nothing else can write into a temporary file while it's open.
+    #[cfg(windows)]
+    #[test]
+    fn no_one_else_writes_to_a_temporary_file() {
+        let tmp = temp("share");
+        let t = TempFile::new_in(&tmp.0, "x").unwrap();
+        let err = fs::OpenOptions::new()
+            .write(true)
+            .open(t.path())
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32), "{err:?}");
+        // Reading is still shared.
+        fs::read(t.path()).unwrap();
     }
 }
