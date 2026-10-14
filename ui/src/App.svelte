@@ -6,11 +6,16 @@
     compareSet,
     compareSnapshots,
     deleteItems,
+    duplicatesCancel,
+    duplicatesCheck,
+    duplicatesStart,
+    duplicatesStatus,
     errorText,
     EXPECTED_PROTOCOL_VERSION,
     exportSave,
     fileManagerName,
     nodeDetails,
+    onDuplicatesStatus,
     onExportProgress,
     onScanStatus,
     scanCancel,
@@ -37,16 +42,20 @@
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import Duplicates from "./lib/Duplicates.svelte";
   import ExportDialog, { exportFileName, localTime, type ExportChoice } from "./lib/ExportDialog.svelte";
   import ExportToast from "./lib/ExportToast.svelte";
   import FilterBox from "./lib/FilterBox.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
-  import { formatBytes, plural } from "./lib/format";
+  import { formatBytes, KILO, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
   import type { CompareSummary } from "./lib/protocol/CompareSummary";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
+  import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
+  import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
+  import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { ExportReport } from "./lib/protocol/ExportReport";
   import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
@@ -68,7 +77,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "contents" | "changes" | "results" | "small" | "omissions";
+  type PanelTab = "contents" | "changes" | "results" | "small" | "duplicates" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -116,7 +125,12 @@
   let trash = $state(trashName(""));
   /** Deleting is turned on. Never saved: every start begins with it off. */
   let allowDelete = $state(false);
-  let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
+  let confirmDelete = $state.raw<{
+    nodes: number[];
+    summary: SelectionSummary;
+    /** Groups of duplicates the delete would leave with no copy. */
+    duplicates: DuplicatesCheck | "unknown" | null;
+  } | null>(null);
   let deleting = $state(false);
   /** What the last delete did, shown in the dialog until it's closed. */
   let deleteResult = $state.raw<DeleteResult | null>(null);
@@ -140,6 +154,10 @@
   let elevating = $state(false);
   /** The list chosen below the details; the panel falls back to one that's open. */
   let tab = $state<PanelTab | null>(null);
+  /** The latest search for duplicate files in this scan, while its tab is open. */
+  let dupes = $state.raw<DuplicatesStatus | null>(null);
+  /** Smallest file size the duplicate search looks at. */
+  let dupesMinSize = $state(Math.max(KILO, Number(saved("duplicates-min-size")) || KILO ** 2));
 
   const scanning = $derived(status?.phase.kind === "scanning");
   /** Restarting with administrator rights is offered on Windows only. */
@@ -225,6 +243,7 @@
     menu = null;
     search = null;
     volume = null;
+    dupes = null;
     snapshots = [];
     endComparison();
     // Keep the filter across Refresh and new roots.
@@ -485,10 +504,89 @@
       { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
       { label: "Copy path", action: () => copyPath(it.node) },
     );
+    if (it.folder) items.push(findDuplicatesItem(it.node));
     if (it.folder) items.push(...exportItemsFor(it.node));
     items.push(...deleteItemsFor(it.node));
     return items;
   }
+
+  function duplicateMenu(f: DuplicateFile): MenuItem[] {
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap(f) },
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(f.node), separator: true },
+      { label: "Copy path", action: () => copyPath(f.node) },
+      ...deleteItemsFor(f.node),
+    ];
+  }
+
+  // ---- duplicate files ----------------------------------------------------
+
+  const duplicatesBlocked = "Duplicates can be found once the scan finishes or is cancelled.";
+
+  /** Looks for files with the same contents under `folder`, matching the
+   * filter if one is on. Only ever started by the user: it reads the files. */
+  async function findDuplicates(folder: number, minSize = dupesMinSize) {
+    const gen = generation;
+    if (gen === null) return;
+    if (scanning) {
+      flash(duplicatesBlocked);
+      return;
+    }
+    dupesMinSize = minSize;
+    remember("duplicates-min-size", String(minSize));
+    try {
+      const started = await duplicatesStart({ generation: gen, folder, search: searchId ?? null, minSize });
+      if (gen !== generation) return;
+      dupes = started;
+      tab = "duplicates";
+    } catch (e) {
+      problem = `Couldn't look for duplicates: ${errorText(e)}`;
+    }
+  }
+
+  function findDuplicatesItem(folder: number): MenuItem {
+    return {
+      label: "Find duplicates here",
+      action: () => findDuplicates(folder),
+      separator: true,
+      disabled: scanning,
+      title: scanning ? duplicatesBlocked : undefined,
+    };
+  }
+
+  function stopDuplicates() {
+    if (generation !== null && dupes) duplicatesCancel(generation, dupes.job).catch(() => {});
+  }
+
+  function closeDuplicates() {
+    if (dupes?.phase === "running") stopDuplicates();
+    dupes = null;
+  }
+
+  $effect(() => {
+    const unlisten = onDuplicatesStatus((s) => {
+      if (s.generation === generation && s.job === dupes?.job) dupes = s;
+    });
+    return () => void unlisten.then((f) => f());
+  });
+
+  /** The duplicate search shown, as a plain number so that status updates
+   * (new objects) don't rerun what depends on it. */
+  const dupesJob = $derived(dupes?.job);
+
+  // Deleting items takes them out of the groups.
+  $effect(() => {
+    const gen = generation;
+    const job = dupesJob;
+    void status?.revision;
+    if (gen === null || job === undefined) return;
+    duplicatesStatus(gen, job).then(
+      (s) => {
+        if (gen === generation && s.job === dupes?.job) dupes = s;
+      },
+      () => {},
+    );
+  });
 
   // ---- export -----------------------------------------------------------
 
@@ -674,6 +772,18 @@
     }
   }
 
+  /** How long the delete dialog waits for the duplicates check, which
+   * looks at files on disk and can be slow on a network share. */
+  const DUPLICATES_CHECK_WAIT = 2000;
+
+  /** Whether deleting `nodes` loses every copy of some duplicates;
+   * "unknown" if that couldn't be told in time. */
+  function checkDuplicates(gen: number, job: number, nodes: number[]): Promise<DuplicatesCheck | "unknown" | null> {
+    const late = new Promise<"unknown">((resolve) => setTimeout(() => resolve("unknown"), DUPLICATES_CHECK_WAIT));
+    const check = duplicatesCheck({ generation: gen, job, nodes }).catch(() => "unknown" as const);
+    return Promise.race([check, late]);
+  }
+
   async function askDelete() {
     const gen = generation;
     const nodes = deleteTargets();
@@ -687,8 +797,14 @@
       return;
     }
     try {
-      const summary = await selectionSummary({ generation: gen, nodes });
-      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary };
+      // Duplicates found may be deleted all at once, or the copy meant to
+      // stay may have gone meanwhile; the dialog says so.
+      const job = dupes?.job;
+      const [summary, duplicates] = await Promise.all([
+        selectionSummary({ generation: gen, nodes }),
+        job === undefined ? null : checkDuplicates(gen, job, nodes),
+      ]);
+      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary, duplicates };
     } catch (e) {
       problem = `Couldn't prepare the delete: ${String(e)}`;
     }
@@ -912,6 +1028,7 @@
       separator: true,
     });
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    if (kind === "folder") items.push(findDuplicatesItem(node));
     if (kind === "folder") items.push(...exportItemsFor(node));
     if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
@@ -977,6 +1094,7 @@
       comparison && generation !== null ? { id: "changes" as const, label: "Changes" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
+      dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
     ].filter((t) => t !== null),
   );
@@ -1062,12 +1180,17 @@
     <div class="group">
       <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
       {#if generation !== null}
-        <button
-          type="button"
-          onclick={() => run(scanRefresh)}
-          title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
-        >
-        <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
+        <!-- One place for both, so the toolbar stays on one row: a scan can
+             be cancelled while it runs and repeated once it's done. -->
+        {#if scanning}
+          <button type="button" onclick={cancel}>Cancel</button>
+        {:else}
+          <button
+            type="button"
+            onclick={() => run(scanRefresh)}
+            title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
+          >
+        {/if}
         {#if snapshots.length > 0 || comparison}
           <CompareControl
             {snapshots}
@@ -1081,16 +1204,18 @@
       {/if}
     </div>
     {#if generation !== null}
-      <fieldset class="group">
-        <legend>Color by</legend>
-        <label><input type="radio" bind:group={colors} value="depth" /> Depth</label>
-        <label><input type="radio" bind:group={colors} value="type" /> File type</label>
-        {#if comparison}
-          <label title="Color by how much each item changed since {since}">
-            <input type="radio" bind:group={colors} value="change" /> Change
-          </label>
-        {/if}
-      </fieldset>
+      <!-- A list rather than radio buttons keeps the toolbar on one row. -->
+      <label
+        class="group colors"
+        title={comparison ? `Change colors items by how much they changed since ${since}` : undefined}
+      >
+        Color by
+        <select bind:value={colors}>
+          <option value="depth">Depth</option>
+          <option value="type">File type</option>
+          {#if comparison}<option value="change">Change</option>{/if}
+        </select>
+      </label>
       {#if volume?.isRoot}
         <label class="group check" title="Show the drive's capacity, free space, and used space no file accounts for">
           <input type="checkbox" bind:checked={showVolume} /> Volume overview
@@ -1221,12 +1346,21 @@
           >
         </span>
       {/if}
-      <!-- Beside the path of the folder it exports; the toolbar is full at
-           1280 px. -->
+      <!-- Actions on the folder in the map sit beside its path; the toolbar
+           is full at 1280 px. -->
       <button
         type="button"
-        class="export"
+        class="folder-action"
         class:alone={!filterError && !search}
+        disabled={scanning}
+        title={scanning
+          ? duplicatesBlocked
+          : "Look for files with the same contents in the folder in the map, matching the filter if one is on. This reads the files; cloud files are skipped."}
+        onclick={() => findDuplicates(view)}>Find duplicates</button
+      >
+      <button
+        type="button"
+        class="folder-action"
         disabled={exporting !== null}
         title="Save the folder in the map as a CSV file or a text report"
         onclick={() => askExport(view)}>Export…</button
@@ -1399,6 +1533,23 @@
                 onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
               />
             {/key}
+          {:else if activeTab === "duplicates" && dupes && generation !== null}
+            <Duplicates
+              {generation}
+              status={dupes}
+              minSize={dupesMinSize}
+              canSearch={!scanning}
+              selected={pickedSet}
+              {anchor}
+              onpick={pick}
+              ondelete={askDelete}
+              onshow={showInMap}
+              onmenu={(f, x, y) => (menu = { x, y, items: duplicateMenu(f), heading: menuHeading(f.node, f.path.split(/[\\/]/).pop()) })}
+              onsearch={(min) => dupes && findDuplicates(dupes.folder, min)}
+              oncancel={stopDuplicates}
+              onclose={closeDuplicates}
+              onclear={() => pick(null)}
+            />
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
               {generation}
@@ -1443,6 +1594,7 @@
       trashName={trash}
       filtered={search !== null}
       {privileged}
+      duplicates={confirmDelete.duplicates}
       busy={deleting}
       result={deleteResult}
       onconfirm={confirmed}
@@ -1507,12 +1659,12 @@
     padding-left: 0;
     border-left: none;
   }
-  fieldset.group legend {
-    float: left;
-    padding: 0;
+  .colors {
     color: var(--muted);
   }
-  .group label,
+  .colors select {
+    color: var(--fg);
+  }
   .check {
     display: flex;
     align-items: center;
@@ -1635,13 +1787,13 @@
     min-height: 28px;
     border-bottom: 1px solid var(--line);
   }
-  .crumbs .export {
+  .crumbs .folder-action {
     flex: none;
     margin-left: var(--space-2);
     padding: 1px 8px;
     font-size: var(--fs-sm);
   }
-  .crumbs .export.alone {
+  .crumbs .folder-action.alone {
     margin-left: auto;
   }
   .filtered {

@@ -5,6 +5,7 @@
 //! for an older generation are refused so stale replies never mix scans.
 
 mod delete;
+mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
 #[cfg(windows)]
@@ -13,11 +14,13 @@ mod session;
 mod snapshots;
 
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress,
-    ExportReport, ExportRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails,
-    PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
-    SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
-    SuggestRequest, Suggestion, VolumeInfo,
+    AppInfo, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
+    FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
+    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
+    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, SuggestRequest,
+    Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -243,6 +246,74 @@ async fn selection_summary(
     request: SelectionRequest,
 ) -> Result<SelectionSummary, String> {
     state.session(request.generation)?.selection(&request.nodes)
+}
+
+/// Starts looking for duplicate files under a folder, the one command that
+/// reads file contents (never of cloud files). Progress and the final
+/// status arrive as events. Planning walks the folder, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DuplicatesRequest,
+) -> Result<DuplicatesStatus, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_start(&request, move |status| {
+            let _ = app.emit(DUPLICATES_STATUS_EVENT, status);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_status(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesStatus, String> {
+    state.session(generation)?.duplicates_status(job)
+}
+
+/// The groups of duplicates found so far. Builds every listed path, so this
+/// runs on a blocking thread.
+#[tauri::command]
+async fn duplicates_list(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesList, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicates_list(job))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Whether deleting the given items would leave a group of duplicates with
+/// no copy. Looks at the files that would stay on disk, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_check(
+    state: State<'_, AppState>,
+    request: DuplicatesCheckRequest,
+) -> Result<DuplicatesCheck, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_check(request.job, &request.nodes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_cancel(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<(), String> {
+    state.session(generation)?.duplicates_cancel(job)
 }
 
 /// Earlier scans of the current root that it can be compared with, newest
@@ -534,6 +605,11 @@ pub fn run() {
             filter_suggest,
             volume_info,
             selection_summary,
+            duplicates_start,
+            duplicates_status,
+            duplicates_list,
+            duplicates_check,
+            duplicates_cancel,
             set_delete_allowed,
             restart_elevated,
             delete_items,

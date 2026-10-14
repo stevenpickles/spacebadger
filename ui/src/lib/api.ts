@@ -8,6 +8,11 @@ import type { ChangesRequest } from "./protocol/ChangesRequest";
 import type { CompareSummary } from "./protocol/CompareSummary";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
+import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
+import type { DuplicatesList } from "./protocol/DuplicatesList";
+import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
+import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
 import type { ExportProgress } from "./protocol/ExportProgress";
 import type { ExportReport } from "./protocol/ExportReport";
 import type { ExportRequest } from "./protocol/ExportRequest";
@@ -201,4 +206,39 @@ export function changeMarks(request: ChangeMarksRequest): Promise<ArrayBuffer> {
 /** The biggest changes under a folder, including removed items. */
 export function compareChanges(request: ChangesRequest): Promise<ChangesPage> {
   return invoke<ChangesPage>("compare_changes", { request });
+}
+
+/** Must match `sb_protocol::DUPLICATES_STATUS_EVENT`. */
+const DUPLICATES_STATUS_EVENT = "duplicates-status";
+
+/**
+ * Starts looking for files with the same contents under a folder, replacing
+ * any search already running. This reads the files (never cloud files);
+ * progress arrives through `onDuplicatesStatus`. Rejects while scanning.
+ */
+export function duplicatesStart(request: DuplicatesRequest): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_start", { request });
+}
+
+export function duplicatesStatus(generation: number, job: number): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_status", { generation, job });
+}
+
+/** The groups of duplicates found so far, most reclaimable space first. */
+export function duplicatesList(generation: number, job: number): Promise<DuplicatesList> {
+  return invoke<DuplicatesList>("duplicates_list", { generation, job });
+}
+
+/** Whether deleting the items would leave a group of duplicates with no copy. */
+export function duplicatesCheck(request: DuplicatesCheckRequest): Promise<DuplicatesCheck> {
+  return invoke<DuplicatesCheck>("duplicates_check", { request });
+}
+
+/** Stops reading; the groups found so far stay. */
+export function duplicatesCancel(generation: number, job: number): Promise<void> {
+  return invoke("duplicates_cancel", { generation, job });
+}
+
+export function onDuplicatesStatus(handler: (status: DuplicatesStatus) => void): Promise<UnlistenFn> {
+  return listen<DuplicatesStatus>(DUPLICATES_STATUS_EVENT, (event) => handler(event.payload));
 }

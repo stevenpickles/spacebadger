@@ -85,6 +85,15 @@ With a filter on, only matching files are exported, with the folders that contai
 
 An export taken while scanning holds what had been scanned so far. Sizes are as of the moment each row was written, shares are of the folder's size at that moment, and each folder's contents are ordered largest first as they were when the export reached that folder, so later rows may be larger than earlier ones.
 
+**Find duplicates**, beside **Export…** at the right end of the breadcrumbs (or **Find duplicates here** on a folder's menu), looks for files with the same contents in the folder in view, among the files the filter matches if one is on: `is:video` then Find duplicates finds duplicate videos. It is the one feature that reads what's inside files, and only when you ask:
+
+- Only files that share their size with another are read. Each is compared by a hash of its first and last 64 KB, and those still alike by a hash of their whole contents (BLAKE3).
+- Cloud files are never read, so nothing is downloaded. A file is only read if it is still a plain file of the size the scan saw, never through a link it has become; files stored in a special way (deduplicated or tiered) are left out too, since reading them raw would get them wrong. Files that are gone, changed, or in use are left out and counted.
+- A hard-linked file counts once, so two of its names are never duplicates: deleting one frees nothing. A file with other names is marked "has other names", since deleting it alone may free nothing.
+- Files smaller than the size chosen in the Duplicates tab (1 KB to 100 MB; 1 MB to start) are left out.
+
+Groups appear as they're confirmed, with the most reclaimable space (the copies beyond the first) on top; Stop keeps what was found. Files in the list select like anywhere else, and **Select all but the first** selects every copy except the one with the shortest path in each group. Nothing is ever deleted for you: deleting goes through the guarded delete above, which warns if a group would lose every copy (including when the copy meant to stay has gone or changed since), and deleted files leave their groups.
+
 Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay: layout round trips, drawing, and input-to-frame latency.
 
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.

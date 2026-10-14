@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod compare;
+pub mod duplicates;
 pub mod wire;
 
 pub use compare::*;
+pub use duplicates::*;
 
 /// Incremented whenever a command or event shape changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 4;

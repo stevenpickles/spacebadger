@@ -5,7 +5,7 @@
  * Explorer takes 1 KB as 1,024 bytes, macOS Finder and Linux file managers
  * as 1,000. So a size here matches the one shown next to it there.
  */
-const KILO = /Windows/i.test(navigator.userAgent) ? 1024 : 1000;
+export const KILO = /Windows/i.test(navigator.userAgent) ? 1024 : 1000;
 
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 

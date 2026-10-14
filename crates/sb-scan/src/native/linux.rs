@@ -12,6 +12,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
+use crate::duplicates::Skip;
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
@@ -294,6 +295,30 @@ fn filesystem_name(magic: u32) -> Option<&'static str> {
 /// Whether the process runs as root, which bypasses permission checks.
 pub fn is_privileged() -> bool {
     rustix::process::geteuid().is_root()
+}
+
+/// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
+/// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
+/// blocking; anything but a plain file of the scanned size is refused.
+pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    // `O_NOATIME` spares the disk a write per file read, but only the
+    // file's owner (or root) may ask for it.
+    let fd = match rustix::fs::open(path, flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open(path, flags, Mode::empty()),
+        opened => opened,
+    }
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP => Skip::Changed,
+        e => Skip::of(&e.into()),
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
