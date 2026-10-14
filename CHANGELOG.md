@@ -36,6 +36,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Scanning
 - Folders holding hundreds of thousands of files are read a few thousand at a time: the map stays responsive while they're read, Cancel takes effect at once, and they take about half the memory they did.
+- The map is drawn quickly however many files a folder holds: files too small to see are only added up, not sorted, so a folder of 5 million small files lays out in about 10 ms instead of over half a second, and the map's memory of sibling order stays small (under 9 MiB).
 
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
@@ -48,6 +49,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - On Windows, the item Windows Explorer finds at the path must be the very one just checked, by name as well as by file (another hard-link name of the same file doesn't count). A special shell folder or a folder shortcut in the path (by its name or its `desktop.ini`) can lead Explorer to another place, such as your profile, the Recycle Bin, or the shortcut's target; such items are left alone with a message saying so.
 
 ### Fixed
+- With Folders unchecked, the Contents tab could still list files just deleted, at no size, if it refreshed as the delete finished.
 - The details could show the change of the item selected before, beside the one selected now, when its answer came back last; likewise for the folder in view.
 - The details could fall back to an earlier filter's totals, or an earlier revision's, when a slow answer arrived after a newer one.
 - The contents list could mix rows from different moments of a running scan, showing an item twice or leaving one out. The rows it shows now always come from one scan update, refreshed together as the scan goes on.
