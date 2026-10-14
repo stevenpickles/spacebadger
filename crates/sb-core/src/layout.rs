@@ -145,8 +145,8 @@ pub const REORDER_HYSTERESIS: f64 = 1.5;
 ///
 /// Only children drawn on their own are remembered, so a folder of millions
 /// of tiny files costs as little as one of a few files. The cache holds at
-/// most [`ORDER_CACHE_ENTRIES`] children in all and forgets the folders used
-/// least recently to stay within that.
+/// most [`ORDER_CACHE_ENTRIES`] children in all (about 8 MiB) and forgets the
+/// folders used least recently to stay within that.
 #[derive(Debug)]
 pub struct OrderCache {
     /// Folder → its children's ranks in the last order used.
@@ -174,10 +174,14 @@ impl Ranks {
     }
 }
 
-/// Upper bound on remembered children across all folders, 8 bytes each: a
-/// 4K view has room for about 690,000 rectangles of the minimum area, so
-/// even one folder filling such a view fits.
+/// Upper bound on remembered children across all folders, 8 bytes each, a
+/// folder counting as [`FOLDER_COST`] more: a 4K view has room for about
+/// 690,000 rectangles of the minimum area, so even one folder filling such a
+/// view fits.
 pub const ORDER_CACHE_ENTRIES: usize = 1 << 20;
+
+/// A folder's own entry in the cache, in children: about 32 bytes.
+const FOLDER_COST: usize = 4;
 
 impl Default for OrderCache {
     fn default() -> Self {
@@ -253,13 +257,14 @@ impl OrderCache {
         if let Some(old) = self.folders.remove(&dir) {
             self.entries -= old.rank.len();
         }
-        // An order larger than the whole cache isn't kept; the folder is
-        // sorted afresh each time instead.
-        if children.len() > self.limit {
+        // An empty order needs no remembering, and one larger than the whole
+        // cache isn't kept; the folder is sorted afresh each time instead.
+        let cost = children.len() + FOLDER_COST;
+        if children.is_empty() || cost > self.limit {
             return;
         }
-        if self.entries + children.len() > self.limit {
-            self.evict(self.limit - children.len());
+        if self.cost() + cost > self.limit {
+            self.evict(self.limit - cost);
         }
         let mut rank: Box<[(NodeId, u32)]> = children
             .iter()
@@ -277,15 +282,21 @@ impl OrderCache {
         );
     }
 
-    /// Forgets the least recently used folders until at most `keep` children
-    /// remain, and a quarter of the limit more, so evictions are infrequent.
+    /// Children remembered, plus each folder's own entry.
+    fn cost(&self) -> usize {
+        self.entries + FOLDER_COST * self.folders.len()
+    }
+
+    /// Forgets the least recently used folders until at most `keep` of
+    /// [`OrderCache::cost`] remains, less a quarter of the limit, so
+    /// evictions are infrequent.
     fn evict(&mut self, keep: usize) {
         let keep = keep.saturating_sub(self.limit / 4);
         let mut by_use: Vec<(u64, NodeId)> =
             self.folders.iter().map(|(&d, r)| (r.used, d)).collect();
         by_use.sort_unstable();
         for (_, dir) in by_use {
-            if self.entries <= keep {
+            if self.cost() <= keep {
                 break;
             }
             if let Some(old) = self.folders.remove(&dir) {
@@ -1431,6 +1442,7 @@ mod tests {
             .unwrap();
         assert_eq!((other.node, other.count), (wide, 200_000));
         assert_eq!(cache.entries(), 2, "the root's two children only");
+        assert_eq!(cache.folders.len(), 1, "nothing drawn in the wide folder");
     }
 
     #[test]
@@ -1504,7 +1516,7 @@ mod tests {
         let mut cache = OrderCache::with_limit(100);
         for &d in &dirs {
             layout(&t, d, Metric::Allocated, None, &params, &mut cache, true);
-            assert!(cache.entries() <= 100, "{}", cache.entries());
+            assert!(cache.cost() <= 100, "{}", cache.cost());
         }
         // The folder used last is still remembered; the first was forgotten.
         let last = *dirs.last().unwrap();
