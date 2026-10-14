@@ -186,10 +186,12 @@ impl Names {
     /// Stores `bytes` and returns where: the chunk above
     /// [`NAME_CHUNK_BITS`], the offset in it below.
     fn push(&mut self, bytes: &[u8]) -> Result<u32, CapacityExceeded> {
+        // A name must also start inside the chunk: an empty one at the end
+        // of a full chunk would have an offset that carries into the chunk.
         let fits = self
             .chunks
             .last()
-            .is_some_and(|c| c.len() + bytes.len() <= NAME_CHUNK);
+            .is_some_and(|c| c.len() < NAME_CHUNK && c.len() + bytes.len() <= NAME_CHUNK);
         if !fits {
             if self.chunks.len() >= 1 << (u32::BITS - NAME_CHUNK_BITS) {
                 return Err(CapacityExceeded);
@@ -1185,5 +1187,24 @@ mod tests {
             t.add_dir(NodeId::ROOT, too_long.as_ref()),
             Err(CapacityExceeded)
         );
+    }
+
+    #[test]
+    fn an_empty_name_after_a_full_name_chunk_starts_a_new_one() {
+        let mut t = Tree::new("/");
+        let long = "n".repeat(256);
+        let filled: Vec<_> = (0..NAME_CHUNK / long.len())
+            .map(|_| t.add_dir(NodeId::ROOT, long.as_ref()).unwrap())
+            .collect();
+        assert_eq!(t.names.chunks[0].len(), NAME_CHUNK, "exactly full");
+        let empty = t
+            .add_file(NodeId::ROOT, "".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        // Before any later name, so its chunk must already exist.
+        assert_eq!(name(&t, empty), "");
+        let after = t.add_dir(NodeId::ROOT, "after".as_ref()).unwrap();
+        assert_eq!(name(&t, empty), "");
+        assert_eq!(name(&t, after), "after");
+        assert_eq!(name(&t, filled[filled.len() - 1]), long);
     }
 }
