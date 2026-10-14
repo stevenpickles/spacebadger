@@ -1,13 +1,14 @@
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
-use sb_scan::fake::FakeFs;
+use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::{
     BATCH_ENTRIES, EntryKind, ErrorKind, OmissionReason, Progress, RootKind, Scan, ScanConfig,
     ScanState,
 };
 use std::path::Path;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 fn config() -> ScanConfig {
@@ -23,6 +24,37 @@ fn run(fs: &FakeFs) -> (Progress, Arc<std::sync::RwLock<Tree>>) {
     let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
     let tree = s.tree();
     (s.wait(), tree)
+}
+
+/// How long a test waits for something that should happen at once before
+/// it fails instead of hanging; far more than any delay a loaded machine
+/// adds.
+const HANG: Duration = Duration::from_secs(60);
+
+/// Holds a gated listing in its OS call until [`Returned::finish`], or for
+/// [`HANG`] if that never comes, so a scan that waits for the call ends the
+/// test with a failure rather than a hang.
+struct Returned {
+    finished: Sender<()>,
+    watchdog: JoinHandle<bool>,
+}
+
+impl Returned {
+    /// Releases the listing; whether it was still held until now.
+    fn finish(self) -> bool {
+        let _ = self.finished.send(());
+        self.watchdog.join().unwrap()
+    }
+}
+
+fn release_after_returning(gate: Gate) -> Returned {
+    let (finished, rx) = channel();
+    let watchdog = std::thread::spawn(move || {
+        let held = !matches!(rx.recv_timeout(HANG), Err(RecvTimeoutError::Timeout));
+        gate.release();
+        held
+    });
+    Returned { finished, watchdog }
 }
 
 fn find(tree: &Tree, path: &str) -> NodeId {
@@ -241,7 +273,7 @@ fn partial_results_are_visible_before_completion() {
     let s = Scan::start(fs.root(), fs.clone(), config(), move |p| {
         sink.lock().unwrap().push((p.state.clone(), p.files));
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     while s.progress().files < 20 {
         assert!(Instant::now() < deadline, "partial results never appeared");
         std::thread::sleep(Duration::from_millis(5));
@@ -274,24 +306,23 @@ fn cancel_is_prompt_while_an_os_call_is_blocked_and_keeps_partial_data() {
     fs.file("blocked/sub/never2.bin", 1, 4096);
 
     let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
-    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(gate.entered(HANG), "the listing never reached the gate");
+    let deadline = Instant::now() + HANG;
     while s.progress().files < 1 {
-        assert!(Instant::now() < deadline);
+        assert!(Instant::now() < deadline, "the first file never arrived");
         std::thread::sleep(Duration::from_millis(5));
     }
     let tree = s.tree();
-    let started = Instant::now();
+    let returned = release_after_returning(gate);
     s.cancel();
     let progress = s.wait();
-    let took = started.elapsed();
 
     assert_eq!(progress.state, ScanState::Cancelled);
-    assert!(took < Duration::from_millis(250), "cancel took {took:?}");
     assert_eq!(progress.files, 1, "discovered data retained");
     let tree = tree.read().unwrap();
     assert_eq!(tree.dir_state(find(&tree, "blocked")), DirState::NotScanned);
     drop(tree);
-    gate.release();
+    assert!(returned.finish(), "cancel waited for the blocked OS call");
 }
 
 #[test]
@@ -339,7 +370,7 @@ fn finished_scans_can_be_edited_as_a_new_revision() {
     let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
     assert!(s.edit_finished(|_| ()).is_none(), "no edits while scanning");
     gate.release();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     while !s.progress().state.is_finished() {
         assert!(Instant::now() < deadline, "scan never finished");
         std::thread::sleep(Duration::from_millis(5));
@@ -472,7 +503,8 @@ fn cancel_during_a_wide_listing_is_prompt_and_keeps_applied_batches() {
     let gate = fs.gate_dir_after("wide", 2 * BATCH_ENTRIES);
 
     let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
-    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(gate.entered(HANG), "the listing never reached the gate");
+    let deadline = Instant::now() + HANG;
     while (s.progress().files as usize) < BATCH_ENTRIES {
         assert!(Instant::now() < deadline, "the first batch never arrived");
         std::thread::sleep(Duration::from_millis(5));
@@ -484,14 +516,12 @@ fn cancel_during_a_wide_listing_is_prompt_and_keeps_applied_batches() {
         assert_eq!(tree.dir_state(w), DirState::Pending, "not listed yet");
         assert_eq!(tree.file_count(w) as usize, BATCH_ENTRIES);
     }
-    let started = Instant::now();
+    let returned = release_after_returning(gate);
     s.cancel();
     let progress = s.wait();
-    let took = started.elapsed();
-    gate.release();
+    assert!(returned.finish(), "cancel waited for the blocked listing");
 
     assert_eq!(progress.state, ScanState::Cancelled);
-    assert!(took < Duration::from_millis(250), "cancel took {took:?}");
     assert_eq!(progress.files as usize, BATCH_ENTRIES, "applied batch kept");
     let tree = tree.read().unwrap();
     assert_eq!(tree.dir_state(find(&tree, "wide")), DirState::NotScanned);
@@ -504,7 +534,7 @@ fn a_cancel_that_stops_the_last_listing_is_reported_as_cancelled() {
     let gate = fs.gate_dir_after("wide", 2 * BATCH_ENTRIES);
 
     let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     while (s.progress().files as usize) < BATCH_ENTRIES {
         assert!(Instant::now() < deadline, "the first batch never arrived");
         std::thread::sleep(Duration::from_millis(5));
