@@ -58,7 +58,7 @@ impl TempFile {
                         file: Some(file),
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) if taken(&e, &path) => last = Some(e),
                 Err(e) => return Err(e),
             }
         }
@@ -108,6 +108,13 @@ impl Drop for TempFile {
     }
 }
 
+/// Whether creating `path` failed with `e` because something has that
+/// name: Windows refuses a folder or junction there as access denied.
+fn taken(e: &io::Error, path: &Path) -> bool {
+    e.kind() == io::ErrorKind::AlreadyExists
+        || (e.kind() == io::ErrorKind::PermissionDenied && fs::symlink_metadata(path).is_ok())
+}
+
 /// Opens `path` for writing only if nothing has that name, never following
 /// a link there.
 fn create_new(path: &Path) -> io::Result<File> {
@@ -122,7 +129,10 @@ fn create_new(path: &Path) -> io::Result<File> {
             DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
         };
         // A link at the name, even one to nothing, is opened as itself
-        // (and so refused), never followed to create its target. DELETE lets a discarded file be removed through this handle.
+        // (and so refused), never followed to create its target. std adds
+        // this flag itself with `create_new`; it's repeated here so that
+        // doesn't rest on std's internals. DELETE lets a discarded file be
+        // removed through this handle.
         options
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
             .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0);
@@ -305,7 +315,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "someone else's");
     }
 
-    /// Makes a link at `link` to `target`, if this system allows it.
+    /// Makes a link at `link` to `target`, if this system allows it
+    /// (Windows needs a privilege or Developer Mode).
     fn symlink(target: &Path, link: &Path) -> bool {
         #[cfg(windows)]
         let made = std::os::windows::fs::symlink_file(target, link);
@@ -314,7 +325,7 @@ mod tests {
         match made {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("skipped: can't make a link here ({e})");
+                eprintln!("SKIPPED the symbolic link checks: can't make one here ({e})");
                 false
             }
         }
@@ -325,11 +336,17 @@ mod tests {
         let tmp = temp("links");
         let target = tmp.0.join("target.txt");
         fs::write(&target, "keep").unwrap();
+        // Each kind of name already there is refused, not opened.
+        assert_eq!(
+            create_new(&target).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+
         let link = tmp.0.join("link");
         if !symlink(&target, &link) {
             return;
         }
-        // Each kind of name already there is refused, not opened.
         assert_eq!(
             create_new(&link).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
@@ -342,10 +359,6 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert!(!nowhere.exists(), "a dangling link's target isn't created");
-        assert_eq!(
-            create_new(&target).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
 
         // A destination that is a link is replaced, not written through.
@@ -355,6 +368,44 @@ mod tests {
         assert!(!fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&link).unwrap(), "new");
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    /// Junctions need no privilege, so this always runs on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_never_followed() {
+        let tmp = temp("junctions");
+        let junction = |link: &Path, target: &Path| {
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        };
+        let folder = tmp.0.join("folder");
+        fs::create_dir(&folder).unwrap();
+        let to_folder = tmp.0.join("to-folder");
+        junction(&to_folder, &folder);
+        // Refused as a folder (access denied) rather than as a name taken,
+        // which `new_in` also takes as a name to skip.
+        let refused = create_new(&to_folder).unwrap_err();
+        assert!(taken(&refused, &to_folder), "{refused:?}");
+        assert_eq!(names(&folder).len(), 0);
+
+        // One to a folder that's gone: its target isn't created either.
+        let gone = tmp.0.join("gone");
+        fs::create_dir(&gone).unwrap();
+        let to_gone = tmp.0.join("to-gone");
+        junction(&to_gone, &gone);
+        fs::remove_dir(&gone).unwrap();
+        let refused = create_new(&to_gone).unwrap_err();
+        assert!(taken(&refused, &to_gone), "{refused:?}");
+        assert!(!gone.exists(), "a dangling junction's target isn't created");
+        assert!(fs::symlink_metadata(&to_gone).is_ok(), "the junction stays");
     }
 
     #[test]
