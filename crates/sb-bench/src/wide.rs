@@ -7,8 +7,8 @@
 
 use crate::{memory, mib, ms};
 use sb_scan::{
-    Entry, EntryKind, FsAdapter, Identity, Measured, NativeFs, RootKind, Scan, ScanConfig,
-    ScanError, Sink, batched,
+    BATCH_ENTRIES, Entry, EntryKind, FsAdapter, Identity, Measured, NativeFs, RootKind, Scan,
+    ScanConfig, ScanError, Sink, batched,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +17,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// A synthetic folder of `entries` entries at the root: files with
 /// distinct sizes and IDs, and one subfolder (empty) per thousand entries.
+/// `batch_delay` slows the listing down per batch, as a slow disk or share
+/// would, so listing rather than adding to the tree is the bottleneck.
 struct WideFs {
     entries: usize,
+    batch_delay: Duration,
 }
 
 const ROOT: &str = "/wide";
@@ -55,6 +58,9 @@ impl FsAdapter for WideFs {
         }
         batched(sink, |out| {
             for i in 0..self.entries {
+                if i % BATCH_ENTRIES == 0 && !self.batch_delay.is_zero() {
+                    std::thread::sleep(self.batch_delay);
+                }
                 if out.push(Self::entry(i)).is_break() {
                     break;
                 }
@@ -195,7 +201,23 @@ pub fn synthetic(entries: usize) {
     run_case(
         &format!("synthetic folder of {entries} entries"),
         PathBuf::from(ROOT),
-        || WideFs { entries },
+        || WideFs {
+            entries,
+            batch_delay: Duration::ZERO,
+        },
+    );
+}
+
+/// A synthetic folder of `entries` entries listed at 2 ms per batch, slower
+/// than the engine adds them.
+pub fn synthetic_slow(entries: usize) {
+    run_case(
+        &format!("synthetic folder of {entries} entries, listed at 2 ms per batch"),
+        PathBuf::from(ROOT),
+        || WideFs {
+            entries,
+            batch_delay: Duration::from_millis(2),
+        },
     );
 }
 

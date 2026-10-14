@@ -3,11 +3,12 @@
 //!
 //! ```text
 //! cargo run --release -p sb-bench -- [--nodes N]... [--seed S]
-//! cargo run --release -p sb-bench -- [--wide N]... [--wide-dir PATH]...
+//! cargo run --release -p sb-bench -- [--wide N]... [--wide-slow N]... [--wide-dir PATH]...
 //! ```
 //!
 //! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
-//! synthetic folder of N entries through the scan engine, and `--wide-dir` a
+//! synthetic folder of N entries through the scan engine, `--wide-slow` the
+//! same folder listed slower than the engine adds it, and `--wide-dir` a
 //! real folder with the native adapter (see [`wide`]). Each case is measured
 //! in a fresh child process so peak memory belongs to that case alone.
 //! Real-disk scans are otherwise measured with the `sb-scan` `scan` example.
@@ -31,6 +32,7 @@ const DEFAULT_SIZES: [usize; 2] = [1_000_000, 5_000_000];
 enum Case {
     Nodes(usize),
     Wide(usize),
+    WideSlow(usize),
     WideDir(PathBuf),
 }
 
@@ -39,6 +41,7 @@ impl Case {
         match self {
             Self::Nodes(n) => ["--nodes".into(), n.to_string()],
             Self::Wide(n) => ["--wide".into(), n.to_string()],
+            Self::WideSlow(n) => ["--wide-slow".into(), n.to_string()],
             Self::WideDir(p) => ["--wide-dir".into(), p.display().to_string()],
         }
     }
@@ -60,11 +63,13 @@ fn main() {
         match arg.as_str() {
             "--nodes" => cases.push(Case::Nodes(value() as usize)),
             "--wide" => cases.push(Case::Wide(value() as usize)),
+            "--wide-slow" => cases.push(Case::WideSlow(value() as usize)),
             "--wide-dir" => cases.push(Case::WideDir(PathBuf::from(text()))),
             "--seed" => seed = value(),
             "--child" => child = true,
             _ => panic!(
-                "unknown argument {arg}; usage: sb-bench [--nodes N]... [--wide N]...                  [--wide-dir PATH]... [--seed S]"
+                "unknown argument {arg}; usage: sb-bench [--nodes N]... [--wide N]... \
+                 [--wide-slow N]... [--wide-dir PATH]... [--seed S]"
             ),
         }
     }
@@ -76,6 +81,7 @@ fn main() {
             match case {
                 Case::Nodes(n) => run(*n, seed),
                 Case::Wide(n) => wide::synthetic(*n),
+                Case::WideSlow(n) => wide::synthetic_slow(*n),
                 Case::WideDir(p) => wide::real(p),
             }
         }
