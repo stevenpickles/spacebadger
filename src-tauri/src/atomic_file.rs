@@ -631,6 +631,29 @@ fn unique() -> u64 {
     h.finish()
 }
 
+/// Runs `attempt` again while it fails as `held` says, as when another
+/// program holds the destination open: Windows refuses to replace a file
+/// held without delete sharing (a sharing violation), which a virus scanner
+/// or the indexer may do to a file just written, and on a loaded machine
+/// for well over a second. The product reports that; tests writing one
+/// file from several threads try again, for up to a minute.
+#[cfg(test)]
+pub fn retry_while_held<T, E: std::fmt::Display>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    held: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match attempt() {
+            Err(e) if held(&e) && std::time::Instant::now() < deadline => {
+                eprintln!("retrying a replace refused while held: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            done => return done,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,32 +984,22 @@ mod tests {
             for text in &contents {
                 let dest = &dest;
                 s.spawn(move || {
-                    // Windows refuses to replace a file another process
-                    // holds without delete sharing (a sharing violation),
-                    // which a virus scanner or the indexer may briefly do to
-                    // a file just written: the product reports that, and
-                    // here it's tried again.
-                    for attempt in 1.. {
-                        let t = TempFile::beside(dest).unwrap();
+                    let write = || {
+                        let t = TempFile::beside(dest)?;
                         let mut w = io::BufWriter::new(t.file());
                         for chunk in text.as_bytes().chunks(4096) {
-                            w.write_all(chunk).unwrap();
+                            w.write_all(chunk)?;
                         }
-                        w.flush().unwrap();
+                        w.flush()?;
                         drop(w);
-                        match t.persist() {
-                            Ok(()) => break,
-                            Err(e)
-                                if cfg!(windows)
-                                    && e.raw_os_error() == Some(32)
-                                    && attempt < 20 =>
-                            {
-                                eprintln!("retrying a rename refused while held: {e}");
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                            Err(e) => panic!("{e:?}"),
-                        }
-                    }
+                        t.persist()
+                    };
+                    // The writers never refuse each other: only another
+                    // program holding the file does.
+                    retry_while_held(write, |e: &io::Error| {
+                        cfg!(windows) && e.raw_os_error() == Some(32)
+                    })
+                    .unwrap();
                 });
             }
         });
