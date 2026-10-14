@@ -498,7 +498,8 @@ impl Ctx<'_> {
 
         // Whether a child is drawn depends only on its own weight, so the
         // ones too small to see are counted up front and only the rest are
-        // ordered: never more than the area over `min_area`.
+        // ordered: with a positive `min_area`, never more than the area over
+        // `min_area`.
         let mut visible = Vec::new();
         let mut small = (0u64, 0u32);
         for c in tree.children(dir) {
@@ -1319,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn final_layouts_match_the_reference() {
+    fn final_and_fresh_layouts_match_the_reference() {
         let mut rng = Rng(0x5eed_1a70);
         for round in 0..40 {
             let t = random_tree(&mut rng);
