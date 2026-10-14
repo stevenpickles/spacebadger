@@ -17,7 +17,8 @@ mod snapshots;
 
 use sb_protocol::{
     AppInfo, DUPLICATES_RECHECK_EVENT, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest,
-    DuplicatesCheck, DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
     FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
     SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
@@ -279,8 +280,8 @@ async fn duplicates_status(
     state.session(generation)?.duplicates_status(job)
 }
 
-/// The groups of duplicates found so far. Builds every listed path, so this
-/// runs on a blocking thread.
+/// The groups of duplicates found so far, with the first few files of each.
+/// Builds their paths, so this runs on a blocking thread.
 #[tauri::command]
 async fn duplicates_list(
     state: State<'_, AppState>,
@@ -289,6 +290,33 @@ async fn duplicates_list(
 ) -> Result<DuplicatesList, String> {
     let session = state.session(generation)?;
     tauri::async_runtime::spawn_blocking(move || session.duplicates_list(job))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// More of a group's files. The first page asked for orders the group by
+/// path, so this runs on a blocking thread.
+#[tauri::command]
+async fn duplicate_files(
+    state: State<'_, AppState>,
+    request: DuplicateFilesRequest,
+) -> Result<DuplicateFilesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicate_files(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Every file but the first of each listed group, by node, for selecting
+/// them. Orders the groups by path, so this runs on a blocking thread.
+#[tauri::command]
+async fn duplicates_extras(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicateExtras, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicates_extras(job))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -627,6 +655,8 @@ pub fn run() {
             duplicates_start,
             duplicates_status,
             duplicates_list,
+            duplicate_files,
+            duplicates_extras,
             duplicates_check,
             duplicates_cancel,
             duplicates_recheck_cancel,
