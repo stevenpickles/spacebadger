@@ -58,7 +58,9 @@ type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 // before the tree, then `rankings`, and the order caches and
 // `search_ranked` last; waiting on `ranked` holds only `rankings`, and the
 // scanner takes the tree and then its progress. `rematching` is taken with
-// the tree read-locked, and `compare` briefly inside it. Requests only
+// the tree read-locked, and `compare` briefly inside it; `compare_set` also
+// stores the comparison inside the tree's read lock, so the revision it was
+// matched at can't move before it's in place. Requests only
 // read-lock the search; it's write-locked briefly to set a search or bring
 // it up to date once the scan has finished. The job keeping it caught up
 // while scanning read-locks the tree first and only tries the search's

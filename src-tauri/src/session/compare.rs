@@ -20,6 +20,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// comparison is matched, and the interface asks again then.
 pub const UPDATING: &str = "The comparison is being updated.";
 
+#[cfg(test)]
+thread_local! {
+    /// Run by `compare_set` on this thread just before it stores the
+    /// comparison, for testing what can happen in between.
+    static BEFORE_STORE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// How a request waits while another matches the comparison again.
 #[derive(Clone, Copy, PartialEq)]
 enum Wait {
@@ -181,13 +189,17 @@ impl Session {
             _ => Arc::new(store.load(&self.root, id)?),
         };
         let header = snapshot.header().clone();
-        let (comparison, revision) = {
-            let tree = self.scan.tree();
-            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-            let revision = self.scan.progress().revision;
-            (Arc::new(Comparison::new(&tree, &snapshot)), revision)
-        };
         let info = info(id.to_owned(), &header);
+        let tree = self.scan.tree();
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        let revision = self.scan.progress().revision;
+        let comparison = Arc::new(Comparison::new(&tree, &snapshot));
+        // Put in place before the tree's lock is let go, so a delete (which
+        // needs the write lock) can't land between matching and storing: the
+        // delete's `rematch` then finds this comparison and matches it to
+        // the revision it announces.
+        #[cfg(test)]
+        BEFORE_STORE.with_borrow_mut(|hook| hook.take().map(|f| f()));
         *self
             .compare
             .lock()
@@ -198,6 +210,7 @@ impl Session {
             comparison,
             changes: None,
         });
+        drop(tree);
         Ok(Some(proto::CompareSummary {
             generation: self.generation(),
             snapshot: info,
@@ -728,5 +741,50 @@ mod tests {
         second.compare_set(None).unwrap();
         assert!(second.compare_item(&id, log).is_err());
         assert!(second.carry().is_none());
+    }
+
+    #[test]
+    fn a_comparison_set_while_deleting_is_matched_to_the_announced_revision() {
+        let tmp = temp("race");
+        let data = tmp.0.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for i in 0..4 {
+            std::fs::write(data.join(format!("f{i}.bin")), vec![0; MB + i]).unwrap();
+        }
+        let store = Arc::new(Store::new(tmp.0.join("store")));
+        drop(scan(&data, &store));
+        let second = scan(&data, &store);
+        let id = second.snapshots()[0].id.clone();
+        for i in 0..4 {
+            let file = NodeId::from_index(find(&second, &format!("f{i}.bin")));
+            // A delete, which matches whatever comparison is on before
+            // announcing its revision, starts after turning comparing on has
+            // matched the comparison and before it stores it, and is given
+            // time to finish there. It must not get in between.
+            let announced = std::thread::scope(|s| {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                BEFORE_STORE.with_borrow_mut(|hook| {
+                    *hook = Some(Box::new(move || {
+                        tx.send(()).unwrap();
+                        std::thread::sleep(Duration::from_millis(50));
+                    }));
+                });
+                let session = &second;
+                let deleted = s.spawn(move || {
+                    rx.recv().unwrap();
+                    let (_, progress) = session.scan.edit_finished(|t| t.remove(file)).unwrap();
+                    session.rematch();
+                    progress.revision
+                });
+                second.compare_set(Some(&id)).unwrap();
+                deleted.join().unwrap()
+            });
+            // The comparison on is matched to the revision announced, so the
+            // requests that status prompts find it ready, not "updating".
+            assert!(
+                second.matched_for(&id, announced).unwrap().is_some(),
+                "round {i}: not matched to revision {announced}"
+            );
+        }
     }
 }
