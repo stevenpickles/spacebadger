@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -23,7 +23,21 @@ enum Node {
     Other(EntryKind),
 }
 
-type GateReceiver = Arc<Mutex<Receiver<()>>>;
+/// The listing's side of a [`Gate`]: says when it reaches the gate, then
+/// waits there.
+struct GateWaiter {
+    entered: Sender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl GateWaiter {
+    fn wait(&self) {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+    }
+}
+
+type GateReceiver = Arc<GateWaiter>;
 
 /// A fake filesystem rooted at [`FakeFs::ROOT`]. Paths given to the builder
 /// are relative to the root and use `/` separators.
@@ -41,11 +55,30 @@ pub struct FakeFs {
 }
 
 /// Releases a gated directory listing when dropped or sent to.
-pub struct Gate(Sender<()>);
+pub struct Gate {
+    release: Sender<()>,
+    entered: Receiver<()>,
+}
 
 impl Gate {
+    fn new() -> (Self, GateReceiver) {
+        let (release, release_rx) = channel();
+        let (entered_tx, entered) = channel();
+        let receiver = GateWaiter {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        };
+        (Self { release, entered }, Arc::new(receiver))
+    }
+
     pub fn release(self) {
-        let _ = self.0.send(());
+        let _ = self.release.send(());
+    }
+
+    /// Waits up to `timeout` for a listing to reach the gate, where it then
+    /// stays until released; whether one did.
+    pub fn entered(&self, timeout: Duration) -> bool {
+        self.entered.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -168,12 +201,9 @@ impl FakeFs {
     /// Makes listing `path` block until the returned gate is released or dropped.
     pub fn gate_dir(&self, path: &str) -> Gate {
         self.dir(path);
-        let (tx, rx) = channel();
-        self.gates
-            .lock()
-            .unwrap()
-            .insert(Self::abs(path), Arc::new(Mutex::new(rx)));
-        Gate(tx)
+        let (gate, receiver) = Gate::new();
+        self.gates.lock().unwrap().insert(Self::abs(path), receiver);
+        gate
     }
 
     /// Makes listing `path` fail after its first `entries` entries (in name
@@ -194,12 +224,12 @@ impl FakeFs {
     /// all of them to arrive first.
     pub fn gate_dir_after(&self, path: &str, entries: usize) -> Gate {
         self.dir(path);
-        let (tx, rx) = channel();
+        let (gate, receiver) = Gate::new();
         self.late_gates
             .lock()
             .unwrap()
-            .insert(Self::abs(path), (entries, Arc::new(Mutex::new(rx))));
-        Gate(tx)
+            .insert(Self::abs(path), (entries, receiver));
+        gate
     }
 
     /// Sets what [`FsAdapter::measure_file`] returns for `path`.
@@ -240,7 +270,7 @@ impl FsAdapter for FakeFs {
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
-            let _ = gate.lock().unwrap().recv();
+            gate.wait();
         }
         if let Some(err) = self.errors.lock().unwrap().get(dir) {
             return Err(err.clone());
@@ -258,7 +288,7 @@ impl FsAdapter for FakeFs {
                 if let Some((at, gate)) = &late_gate
                     && i == *at
                 {
-                    let _ = gate.lock().unwrap().recv();
+                    gate.wait();
                 }
                 if out.push(entry).is_break() {
                     return Ok(());

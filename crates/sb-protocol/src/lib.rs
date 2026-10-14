@@ -342,6 +342,10 @@ pub struct SmallItemsPage {
     /// Other children of the folder with no size in this metric, which the
     /// map never draws.
     pub empty: u32,
+    /// The scan revision the items were ranked at, so pages fetched at
+    /// different times can be told apart.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// Asks for a page of the files anywhere under a folder, largest first by
@@ -388,6 +392,9 @@ pub struct FolderFilesPage {
     pub files: Vec<FolderFile>,
     /// Other files under the folder with no size in this metric.
     pub empty: u32,
+    /// The scan revision the files were ranked at.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// What the filter's completion is suggesting.

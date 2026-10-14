@@ -25,6 +25,11 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
 - Exports and snapshots are written to a new file of their own, then renamed into place once complete: a failed export leaves the chosen file as it was, and no other file beside it is ever overwritten or written through a link. Only the file the app wrote can be put in place, even if another program swaps the temporary file for its own (on macOS and Linux, drives and shares without Unix permissions, such as USB sticks, SMB, and NTFS, only get a last-moment check that it is still the same file). Snapshots saved at the same moment, even by two copies of the app, never overwrite one another: each gets its own id, and the usual retention still applies. If the app is closed or crashes mid-export, a hidden `.<name>.….partial` file (on macOS and Linux, a folder holding it) may be left beside the chosen one; it can be deleted. When the file can't be replaced, the message says it may be open in another program or read-only.
 
+### Map
+- Moving the pointer over the map no longer redraws it: within one tile only the tooltip moves, and entering another tile just moves the hover highlight.
+- When the map changes under a resting pointer (a rescan, resize, or another folder), the highlight and tooltip show the tile now under it, not another one.
+- The map is redrawn sharp after moving the window to a monitor with different scaling.
+
 ### Toolbar
 - The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
 
@@ -38,6 +43,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Folders holding hundreds of thousands of files are read a few thousand at a time: the map stays responsive while they're read, Cancel takes effect at once, and they take about half the memory they did.
 - The map is drawn quickly however many files a folder holds: files too small to see are only added up, not sorted, so a folder of 5 million small files lays out in about 10 ms instead of over half a second, and the map's memory of sibling order stays small (under 9 MiB).
 - With a filter on while scanning, tooltips, the details, the filter's totals, and the Contents list no longer wait for each redraw of the map or for the filter to catch up with what was just scanned: the filter keeps up in the background, and its totals may trail the scan by a moment until it finishes. Suggestions for the filter no longer pause the scan while they're gathered.
+- With Folders unchecked, the Contents tab no longer slows down the map, tooltips, and details while a scan runs: the files under a folder are ranked a little at a time and only as far as you've scrolled, and kept between updates, ranked again only when that folder has changed and at most every 0.4 s. Once the scan is done the list is always exact.
 
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
@@ -51,6 +57,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Fixed
 - With Folders unchecked, the Contents tab could still list files just deleted, at no size, if it refreshed as the delete finished.
+- The details could show the change of the item selected before, beside the one selected now, when its answer came back last; likewise for the folder in view.
+- The details could fall back to an earlier filter's totals, or an earlier revision's, when a slow answer arrived after a newer one.
+- The contents list could mix rows from different moments of a running scan, showing an item twice or leaving one out. The rows it shows now always come from one scan update, refreshed together as the scan goes on.
 
 ## [0.2.0] - 2026-10-13
 

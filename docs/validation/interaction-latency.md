@@ -91,6 +91,30 @@ Run again once #39 (the layout orders only the children it draws) and #41 (revis
 
 The unfiltered layout's compute fell from 15–24 ms to about 5.4 ms, which removes most of contributor 3 at p95. Its p99 is a single stall of about 22 ms, and it reaches the other requests through the search mutex: the layout takes it before the tree, so while it waits for the tree, everything that takes the search mutex waits too. With a filter, contributors 1 and 2 are unchanged.
 
+### After the Contents list keeps its rankings
+
+Contributor 2. `small_items` and `folder_files` now share a cache of rankings (`sb_core::ranking`) keyed by folder, list (children or files under it), metric, and filter, each kept with the revision, scan state, time, and folder totals (matching totals with a filter) it was made from. After the scan a ranking is served only at the revision it was made at, so final pages are exactly a full sort's and never list deleted items; while scanning it's served as long as the folder's totals haven't changed, so scanning elsewhere doesn't invalidate it, and otherwise for 400 ms. A ranking is made by a resumable walk that looks at 100,000 nodes per hold of the search mutex and the tree's read lock (about 1 ms), letting go between holds; for the files under a folder it keeps only the largest asked for (at least 1,000, doubling for deeper pages) in a bounded heap, so neither the walk nor the kept ranking holds every file. While scanning, a request walks at most 400,000 nodes of an out-of-date ranking and then serves the one kept, so a large folder is ranked again over a few requests; after the scan, and when nothing is kept yet, a request walks to the end. Rankings take at most 2^20 items (16 bytes each) and 16 entries, least recently used dropped first. Replies carry the revision of the ranking (`revision`, as added by #38), so pages of one ranking agree and a newer one makes the Contents tab refresh.
+
+Measured on a busier machine than the baseline (other builds running: scans took 12–14 s rather than 10 s), so `dev` (849316a) was run again alternately with this change, two runs each, p95 / p99 in ms while scanning (about 80–90 requests per kind, so p99 is close to the largest):
+
+| Scenario | Request | Before | After |
+|---|---|---|---|
+| Filter on, Contents with files only | folder_files (Contents) | 35.4–36.6 / 43.8 | 12.2–14.8 / 16.1–18.9 |
+| | layout | 10.6–37.0 / 21.1–50.7 | 11.0–16.2 / 17.3–21.8 |
+| | node_details | 18.4–34.7 / 27.3–40.2 | 9.5–16.2 / 16.6–45.7 |
+| | search_summary | 2.4–33.9 / 31.4–42.8 | 3.3–10.0 / 12.1–27.2 |
+| | tooltip | 2.4–29.7 / 26.3–42.2 | 8.5–12.7 / 12.7–16.8 |
+| Filter on, Contents with folders | small_items (Contents) | 3.3–14.2 / 22.0–69.4 | 2.3–12.0 / 24.4–39.1 |
+| | layout | 12.2–15.7 / 35.3–70.2 | 12.1–12.9 / 19.7–39.4 |
+| | node_details | 4.8–10.5 / 31.8–78.6 | 4.2–8.1 / 10.6–11.9 |
+| | tooltip | 2.7–3.0 / 21.8–32.2 | 2.4–3.7 / 6.6–8.7 |
+
+With files only, `folder_files` spends 4–6 ms ranking in a request that walks (a 1 ms hold at a time) and nothing in one served from the cache, instead of 26–38 ms in a single hold every request, and the 30–40 ms search-mutex waits it caused the other requests are gone. What's left of the tail is the filtered layout's 7–10 ms hold of the search mutex (contributor 1): with a walk's steps interleaved, the slowest requests still wait 8–16 ms for it, and single stalls of 25–45 ms (waits for the tree or the runtime, on both sides of the comparison, more often on this loaded machine) set most p99s. The target of 16 ms at p99 is met at p95 and by the Contents request itself in one of two runs; it needs contributor 1 fixed too (the search overlay restructuring). With folders shown, the ranking was already cheap (0.1–0.4 ms) and is now usually served from the cache; that scenario's tail is contributor 1 alone.
+
+After the scan, the first request ranks the whole folder once, in steps (about 25–30 ms for the root of this tree, waiting for no one), so `folder_files`' p99 after the scan is that one request; the rest are served from the cache in about 1 ms.
+
+Randomized tests compare walked, cached, and partial pages with a full sort (ties, filters, both metrics, deeper pages, deletes between pages, walks across a growing tree), and test the staleness rules and the memory bound.
+
 ### After the filter is kept up in the background
 
 Branch `feature/39/derived-views` (contributor 1 and part of 5). The search is no longer caught up by requests: it sits behind a read-write lock shared with a job that, after each scan status, advances it 10,000 nodes per step (about 0.4 ms), read-locking the tree first and only trying the search's write lock, so it backs off for 1 ms while requests read. Requests read-lock the search, and only when they're given one (tooltips never touch it), so layouts, details, totals, and Contents run side by side; the layout releases it before encoding and the tree before serializing. While scanning, a request may see the search as of an earlier status (`SearchSummary::revision` says which); once the scan has finished, a request whose search is behind the tree's revision catches it up exclusively first, so final results are unchanged. The job's steps take 0.46–0.49 ms at p50 and 0.8–2.4 ms at p95 (it's timed as `search_catch_up` in the report).

@@ -6,6 +6,7 @@ pub mod compare;
 pub mod export;
 pub mod filetype;
 pub mod layout;
+pub mod ranking;
 pub mod search;
 pub mod selection;
 pub mod size;
