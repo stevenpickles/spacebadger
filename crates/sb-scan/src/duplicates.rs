@@ -1404,10 +1404,16 @@ mod tests {
 
     #[test]
     fn one_large_group_keeps_every_reader_busy() {
-        /// Holds each open a moment and counts how many overlap.
+        /// Holds each open until another overlaps it, and counts how many
+        /// do: readers that work in parallel are seen to however their
+        /// threads are scheduled, while one working alone waits out the
+        /// time (once) and the test fails.
         struct Slow {
             inner: FakeContents,
-            open: Mutex<(usize, usize)>,
+            /// Open now, the most open at once, and whether waiting for
+            /// an overlap timed out.
+            open: Mutex<(usize, usize, bool)>,
+            changed: Condvar,
         }
         impl Contents for Slow {
             type File = FakeFile;
@@ -1416,8 +1422,13 @@ mod tests {
                     let mut open = self.open.lock().unwrap();
                     open.0 += 1;
                     open.1 = open.1.max(open.0);
+                    self.changed.notify_all();
+                    let (mut open, waited) = self
+                        .changed
+                        .wait_timeout_while(open, Duration::from_secs(10), |o| o.1 < 2 && !o.2)
+                        .unwrap();
+                    open.2 |= waited.timed_out();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
                 self.open.lock().unwrap().0 -= 1;
                 self.inner.open(path, len)
             }
@@ -1436,7 +1447,8 @@ mod tests {
         assert_eq!(plan.groups.len(), 1);
         let contents = Slow {
             inner: std::mem::take(&mut f.contents),
-            open: Mutex::new((0, 0)),
+            open: Mutex::new((0, 0, false)),
+            changed: Condvar::new(),
         };
         let events = Mutex::new(Vec::new());
         let counters = Counters::default();
