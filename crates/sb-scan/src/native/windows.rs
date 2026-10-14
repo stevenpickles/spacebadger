@@ -20,7 +20,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, classify_io,
 };
-use crate::duplicates::Skip;
+use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -36,11 +36,12 @@ use windows::Win32::Security::{
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
-    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
+    FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
     FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
     GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
@@ -153,12 +154,26 @@ fn open_with(
     access: u32,
     flags: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> windows::core::Result<OwnedHandle> {
+    open_shared(
+        path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        flags,
+    )
+}
+
+fn open_shared(
+    path: &Path,
+    access: u32,
+    share: FILE_SHARE_MODE,
+    flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> windows::core::Result<OwnedHandle> {
     let path = wide(path);
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share,
             None,
             OPEN_EXISTING,
             flags,
@@ -188,14 +203,9 @@ fn io_error(err: &windows::core::Error) -> std::io::Error {
 /// (except for WOF-compressed files, which only read right through their
 /// filter) `OPEN_REPARSE_POINT`, must be the same file, and is checked
 /// again.
-pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
     let skip = |e: windows::core::Error| Skip::of(&io_error(&e));
-    let probe = open_with(
-        path,
-        FILE_READ_ATTRIBUTES.0,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
-    )
-    .map_err(skip)?;
+    let probe = probe_contents(path)?;
     let compressed = check_contents(&probe, len)?;
     let id = file_id(&probe);
     drop(probe);
@@ -212,7 +222,66 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
         return Err(Skip::Changed);
     }
     check_contents(&handle, len)?;
-    Ok(std::fs::File::from(handle))
+    let print = fingerprint(&handle)?;
+    Ok((std::fs::File::from(handle), print))
+}
+
+/// Opens the file at `path` for reading while sharing only reading, so
+/// until the handle is closed no one can write to, rename, replace, or
+/// delete it, and checks it's the file `print` describes. Refused (as in
+/// use) while another program has it open to write or delete. Checked
+/// first with an attributes-only open, as [`open_contents`] does, so a
+/// cloud file is never opened for its data.
+pub fn hold_contents(path: &Path, print: &Fingerprint) -> Result<OwnedHandle, Skip> {
+    let probe = probe_contents(path)?;
+    let compressed = check_contents(&probe, print.len)?;
+    drop(probe);
+    let mut flags = FILE_FLAG_OPEN_NO_RECALL;
+    if !compressed {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let handle = open_shared(
+        path,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ,
+        flags,
+    )
+    .map_err(|e| Skip::of(&io_error(&e)))?;
+    check_contents(&handle, print.len)?;
+    if !print.unchanged(&fingerprint(&handle)?) {
+        return Err(Skip::Changed);
+    }
+    Ok(handle)
+}
+
+/// The fingerprint of the file at `path`, read with the attributes-only
+/// open [`open_contents`] starts with, refusing what it refuses.
+pub fn examine_contents(path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+    let probe = probe_contents(path)?;
+    check_contents(&probe, len)?;
+    fingerprint(&probe)
+}
+
+/// Opens a file for its attributes only, which never recalls anything.
+fn probe_contents(path: &Path) -> Result<OwnedHandle, Skip> {
+    open_with(
+        path,
+        FILE_READ_ATTRIBUTES.0,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+    )
+    .map_err(|e| Skip::of(&io_error(&e)))
+}
+
+/// A handle's file ID, length, last write time, and number of names.
+pub fn fingerprint(handle: &impl AsRawHandle) -> Result<Fingerprint, Skip> {
+    let standard = info::<FILE_STANDARD_INFO>(handle, FileStandardInfo).map_err(info_skip)?;
+    let basic = info::<FILE_BASIC_INFO>(handle, FileBasicInfo).map_err(info_skip)?;
+    Ok(Fingerprint {
+        id: file_id(handle).map(|(volume, id)| (volume, u128::from_le_bytes(id))),
+        len: standard.EndOfFile as u64,
+        modified: filetime(basic.LastWriteTime),
+        links: Some(standard.NumberOfLinks),
+    })
 }
 
 /// Whether contents can be read from a handle with these attributes and
@@ -255,7 +324,7 @@ fn check_contents(handle: &OwnedHandle, len: u64) -> Result<bool, Skip> {
 
 /// The volume and file ID of a handle's file: the 128-bit ID where the
 /// filesystem has one, else the older 64-bit index, else `None`.
-fn file_id(handle: &OwnedHandle) -> Option<(u64, [u8; 16])> {
+fn file_id(handle: &impl AsRawHandle) -> Option<(u64, [u8; 16])> {
     if let Ok(id) = info::<FILE_ID_INFO>(handle, FileIdInfo) {
         return Some((id.VolumeSerialNumber, id.FileId.Identifier));
     }
@@ -270,12 +339,12 @@ fn file_id(handle: &OwnedHandle) -> Option<(u64, [u8; 16])> {
     Some((u64::from(by_handle.dwVolumeSerialNumber), id))
 }
 
-fn raw(handle: &OwnedHandle) -> HANDLE {
+fn raw(handle: &impl AsRawHandle) -> HANDLE {
     HANDLE(handle.as_raw_handle())
 }
 
 fn info<T: Default>(
-    handle: &OwnedHandle,
+    handle: &impl AsRawHandle,
     class: FILE_INFO_BY_HANDLE_CLASS,
 ) -> Result<T, ScanError> {
     let mut value = T::default();

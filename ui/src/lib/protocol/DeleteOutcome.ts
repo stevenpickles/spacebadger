@@ -3,4 +3,4 @@
 /**
  * What happened to one item a delete was asked for.
  */
-export type DeleteOutcome = "recycled" | "alreadyMissing" | "changed" | "failed" | "uncertain";
+export type DeleteOutcome = "recycled" | "alreadyMissing" | "changed" | "failed" | "uncertain" | "kept";

@@ -17,6 +17,10 @@ vanished: number,
  */
 changed: number, 
 /**
+ * Written to while being read.
+ */
+changing: number, 
+/**
  * Stored behind a reparse point (deduplicated, tiered, virtualized),
  * so reading it raw wouldn't give its contents.
  */
