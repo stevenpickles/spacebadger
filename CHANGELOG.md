@@ -43,6 +43,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Folders holding hundreds of thousands of files are read a few thousand at a time: the map stays responsive while they're read, Cancel takes effect at once, and they take about half the memory they did.
 - The map is drawn quickly however many files a folder holds: files too small to see are only added up, not sorted, so a folder of 5 million small files lays out in about 10 ms instead of over half a second, and the map's memory of sibling order stays small (under 9 MiB).
 - With Folders unchecked, the Contents tab no longer slows down the map, tooltips, and details while a scan runs: the files under a folder are ranked a little at a time and only as far as you've scrolled, and kept between updates, ranked again only when that folder has changed and at most every 0.4 s. Once the scan is done the list is always exact.
+- Large scans no longer make the map, tooltips, and details stall now and then: the scan's record of what it found grows a piece at a time instead of being copied whole each time it fills up, which held everything else up for 25–90 ms at a few million items. No single update now holds them up for more than about a millisecond.
 
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
