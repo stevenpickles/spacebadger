@@ -628,6 +628,7 @@ pub mod tests {
     fn names_ending_with_a_dot_or_space_are_never_mistaken() {
         let tmp = TempDir::new("dots");
         let verbatim = |name: &str| PathBuf::from(format!(r"\\?\{}\{name}", tmp.0.display()));
+        let _cleanup = Verbatim(vec![verbatim("a."), verbatim("b ")]);
         write(&tmp.0.join("a"), "plain a");
         write(&tmp.0.join("b"), "plain b");
         for name in ["a.", "b "] {
@@ -643,10 +644,6 @@ pub mod tests {
             assert!(std::fs::metadata(&path).is_ok());
         }
         assert!(tmp.0.join("a").exists() && tmp.0.join("b").exists());
-        // Removed through the verbatim path, which TempDir's cleanup can't.
-        for name in ["a.", "b "] {
-            std::fs::remove_file(verbatim(name)).unwrap();
-        }
     }
 
     /// The scan root and the folders above it are part of the path the
@@ -656,6 +653,7 @@ pub mod tests {
     fn a_scan_root_or_folder_above_it_ending_badly_is_refused() {
         let tmp = TempDir::new("badroot");
         let verbatim = |rest: &str| PathBuf::from(format!(r"\\?\{}\{rest}", tmp.0.display()));
+        let _cleanup = Verbatim(vec![verbatim("root."), verbatim("up ")]);
         write(&tmp.0.join(r"root\a.txt"), "the sibling");
         write(&tmp.0.join(r"up\root\a.txt"), "the sibling");
         for (root, file) in [(r"root.", r"root.\a.txt"), (r"up \root", r"up \root\a.txt")] {
@@ -683,9 +681,20 @@ pub mod tests {
             "the sibling"
         );
         assert!(tmp.0.join(r"up\root\a.txt").exists());
-        // Removed through verbatim paths, which TempDir's cleanup can't.
-        std::fs::remove_dir_all(verbatim("root.")).unwrap();
-        std::fs::remove_dir_all(verbatim("up ")).unwrap();
+    }
+
+    /// Removes, when dropped, items only `\\?\` paths reach, which
+    /// [`TempDir`]'s cleanup can't.
+    #[cfg(windows)]
+    struct Verbatim(Vec<PathBuf>);
+
+    #[cfg(windows)]
+    impl Drop for Verbatim {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
+            }
+        }
     }
 
     #[test]
