@@ -31,10 +31,10 @@ use sb_protocol::{
     DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
     DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
-    FolderFilesPage, FolderFilesRequest, Lane, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
-    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
-    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, SuggestRequest,
-    Suggestion, VolumeInfo,
+    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, Lane, LayoutRequest, NodeDetails,
+    PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
+    SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
+    SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -92,6 +92,10 @@ impl AppState {
                 let _ = emitter.emit(SCAN_STATUS_EVENT, status);
             },
         ));
+        let emitter = app.clone();
+        session.on_filter_updated(move |updated| {
+            let _ = emitter.emit(FILTER_UPDATED_EVENT, updated);
+        });
         let started = session.started();
         *self.session.lock().unwrap() = Some(session);
         started

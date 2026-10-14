@@ -24,11 +24,11 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,27 @@ pub struct ScanConfig {
     pub progress_interval: Duration,
     /// Example paths kept per omission reason.
     pub sample_limit: usize,
+    /// Told how long each of the scanner's holds of the tree's write lock
+    /// lasted, for timings; `None` costs nothing.
+    pub write_holds: Option<HoldProbe>,
+}
+
+/// Called after the scanner releases the tree's write lock with how long it
+/// held it and how many nodes the tree had then. Runs on the scan thread
+/// with no lock held, so it should be quick.
+#[derive(Clone)]
+pub struct HoldProbe(Arc<dyn Fn(Duration, usize) + Send + Sync>);
+
+impl HoldProbe {
+    pub fn new(probe: impl Fn(Duration, usize) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(probe))
+    }
+}
+
+impl std::fmt::Debug for HoldProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HoldProbe")
+    }
 }
 
 impl Default for ScanConfig {
@@ -53,6 +74,7 @@ impl Default for ScanConfig {
             workers: cores.clamp(2, 8),
             progress_interval: Duration::from_millis(150),
             sample_limit: 50,
+            write_holds: None,
         }
     }
 }
@@ -320,6 +342,50 @@ impl Scan {
 impl Drop for Scan {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+/// The tree's write lock as the scanner holds it, reporting the hold to
+/// [`ScanConfig::write_holds`] once released.
+struct Written<'a> {
+    /// Always `Some` until dropped.
+    guard: Option<RwLockWriteGuard<'a, Tree>>,
+    probe: Option<(HoldProbe, Instant)>,
+}
+
+fn write<'a>(tree: &'a RwLock<Tree>, probe: Option<&HoldProbe>) -> Written<'a> {
+    let guard = tree.write().unwrap();
+    Written {
+        guard: Some(guard),
+        probe: probe.map(|p| (p.clone(), Instant::now())),
+    }
+}
+
+impl Deref for Written<'_> {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        self.guard.as_ref().expect("held until dropped")
+    }
+}
+
+impl DerefMut for Written<'_> {
+    fn deref_mut(&mut self) -> &mut Tree {
+        self.guard.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for Written<'_> {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        let nodes = guard.len();
+        let held = self.probe.as_ref().map(|(_, since)| since.elapsed());
+        drop(guard);
+        if let (Some((probe, _)), Some(held)) = (&self.probe, held) {
+            (probe.0)(held, nodes);
+        }
     }
 }
 
@@ -618,10 +684,7 @@ impl<A: FsAdapter> Aggregator<A> {
                     return;
                 }
                 match result {
-                    Ok(()) => self
-                        .tree
-                        .write()
-                        .unwrap()
+                    Ok(()) => write(&self.tree, self.config.write_holds.as_ref())
                         .set_dir_state(dir, DirState::Listed),
                     Err(err) => {
                         let reason = OmissionReason::from_error(err.kind);
@@ -630,7 +693,7 @@ impl<A: FsAdapter> Aggregator<A> {
                                 path: path.clone(),
                                 detail: Some(err.message.clone()),
                             });
-                        let mut tree = self.tree.write().unwrap();
+                        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
                         if partial {
                             // Listed in part: the entries already added stay,
                             // and the folder counts as not fully read.
@@ -664,7 +727,7 @@ impl<A: FsAdapter> Aggregator<A> {
                         logical: m.logical,
                         allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
                     };
-                    self.tree.write().unwrap().update_file(file, sizes);
+                    write(&self.tree, self.config.write_holds.as_ref()).update_file(file, sizes);
                     self.revision += 1;
                 }
             }
@@ -697,7 +760,8 @@ impl<A: FsAdapter> Aggregator<A> {
             .collect();
         let mut first_names: HashMap<u128, NodeId> = HashMap::new();
         let tree_lock = Arc::clone(&self.tree);
-        let mut tree = tree_lock.write().unwrap();
+        let probe = self.config.write_holds.clone();
+        let mut tree = write(&tree_lock, probe.as_ref());
         let mut unreadable = false;
         for (entry, known) in entries.into_iter().zip(known) {
             let skipped = match entry.kind {
@@ -780,7 +844,7 @@ impl<A: FsAdapter> Aggregator<A> {
     /// Stops issuing work and marks every unlisted directory as not scanned.
     fn abandon_remaining(&mut self) {
         self.queue.close();
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
         for i in 0..tree.len() as u32 {
             let node = NodeId::from_index(i);
             if tree.is_dir(node) && tree.dir_state(node) == DirState::Pending {

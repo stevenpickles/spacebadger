@@ -24,6 +24,9 @@ pub const PROTOCOL_VERSION: u32 = 4;
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
 
+/// Name of the event that carries [`FilterUpdated`].
+pub const FILTER_UPDATED_EVENT: &str = "filter-updated";
+
 /// Static information about the running backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +126,21 @@ pub struct ScanStatus {
     #[ts(type = "number")]
     pub revision: u64,
     pub omissions: Vec<OmissionGroup>,
+}
+
+/// The filter caught up with a scan status after requests had been
+/// answered from it as of an earlier one, and the scan hasn't reported
+/// since: what's filtered (totals, map, results) is worth asking again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilterUpdated {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub search: u32,
+    /// The scan revision the filter now reflects.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// Returned when a scan starts.

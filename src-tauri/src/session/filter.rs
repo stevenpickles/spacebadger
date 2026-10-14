@@ -14,17 +14,20 @@
 //! whatever request the job queued behind.
 //!
 //! While scanning, a request can see the search as of an earlier status
-//! than the tree it reads, by a status interval at most; the search's
-//! [`ActiveSearch::revision`] says which. Once the scan has finished, a
-//! request first brings the search fully up to date (what the job hadn't
-//! reached yet, a step or so), so final results are exactly what catching
-//! up in the request gave.
+//! than the tree it reads, usually by a status interval at most; the
+//! search's [`ActiveSearch::revision`] says which. Under filtered requests
+//! that overlap without a gap, the job gets in only about once per 20 ms
+//! (one forced step after its 20 tries), so a backlog can build up while
+//! scanning. Once the scan has finished, a request first brings the search
+//! fully up to date, whatever the job hadn't reached, so final results are
+//! exactly what catching up in the request gave.
 
 use super::Session;
 use crate::metrics::{self, Held, locked};
 use sb_core::search::Search;
 use sb_core::tree::Tree;
 use sb_scan::Progress;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError, Weak};
 use std::time::Duration;
 
@@ -39,6 +42,15 @@ const BUSY_RETRY: Duration = Duration::from_millis(1);
 /// waits for its turn instead, so overlapping requests can't keep the
 /// search from catching up indefinitely.
 const BUSY_TRIES: u32 = 20;
+
+/// How long after catching up with a status that requests read behind the
+/// job waits for the next one before saying the filter caught up (see
+/// [`Filter::on_caught_up`]): while the scan keeps reporting, its next
+/// status brings the requests anyway.
+const QUIET: Duration = Duration::from_millis(400);
+
+/// Called with the search and the scan revision it caught up with.
+type CaughtUp = Box<dyn Fn(u32, u64) + Send + Sync>;
 
 pub(super) type SearchGuard<'a> = Held<RwLockReadGuard<'a, Option<ActiveSearch>>>;
 pub(super) type TreeGuard<'a> = Held<RwLockReadGuard<'a, Tree>>;
@@ -69,11 +81,17 @@ pub(super) struct Filter {
     pub active: RwLock<Option<ActiveSearch>>,
     /// Whether the job is running; without it, requests catch up themselves.
     background: bool,
-    /// Keeps the job from stepping, for tests of what requests see meanwhile.
+    /// Steps the job may still take, for tests of what requests see
+    /// meanwhile; `usize::MAX` is no limit.
     #[cfg(test)]
-    held: std::sync::atomic::AtomicBool,
+    steps_left: std::sync::atomic::AtomicUsize,
     wake: Mutex<Wake>,
     woken: Condvar,
+    /// The latest scan revision the job was asked to catch up with.
+    nudged: AtomicU64,
+    /// A request read the search behind `nudged` while scanning.
+    read_behind: AtomicBool,
+    caught_up: OnceLock<CaughtUp>,
 }
 
 #[derive(Default)]
@@ -85,8 +103,9 @@ struct Wake {
 
 /// What one step of the job did.
 enum Step {
-    /// The search is caught up, or there's none.
-    Done,
+    /// The search (its number, and the revision it reflects now) is caught
+    /// up, or there's none.
+    Done(Option<(u32, u64)>),
     More,
     /// A request is reading the search.
     Busy,
@@ -105,9 +124,12 @@ impl Filter {
                 active: RwLock::new(None),
                 background,
                 #[cfg(test)]
-                held: std::sync::atomic::AtomicBool::new(false),
+                steps_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 wake: Mutex::new(Wake::default()),
                 woken: Condvar::new(),
+                nudged: AtomicU64::new(0),
+                read_behind: AtomicBool::new(false),
+                caught_up: OnceLock::new(),
             })
         };
         let filter = new(true);
@@ -127,9 +149,19 @@ impl Filter {
     /// Has the job catch the search up with scan revision `revision`, which
     /// the tree has reached.
     pub fn nudge(&self, revision: u64) {
+        self.nudged.fetch_max(revision, Ordering::SeqCst);
         let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
         wake.due = Some(wake.due.map_or(revision, |d| d.max(revision)));
         self.woken.notify_one();
+    }
+
+    /// Has `f` called when the job catches up with a status after requests
+    /// read the search behind it, and the scan then stays quiet for
+    /// [`QUIET`]. Otherwise what those requests showed would stay behind
+    /// until the scan reports again, which a stalled listing (a slow share)
+    /// can put off for long.
+    pub fn on_caught_up(&self, f: impl Fn(u32, u64) + Send + Sync + 'static) {
+        let _ = self.caught_up.set(Box::new(f));
     }
 
     /// Ends the job.
@@ -145,6 +177,12 @@ impl Filter {
     /// `tree` is set once the scan has started, before it reports.
     fn run(&self, tree: &OnceLock<Weak<RwLock<Tree>>>) {
         let mut scan = None;
+        // Requests read behind, and the job hasn't caught up with every
+        // status since.
+        let mut owed = false;
+        // Caught up with every status after requests read behind, to be
+        // announced once the scan is quiet.
+        let mut announce: Option<(u32, u64)> = None;
         loop {
             let revision = {
                 let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
@@ -153,24 +191,49 @@ impl Filter {
                         return;
                     }
                     if let Some(revision) = wake.due.take() {
+                        // A newer status brings requests of its own.
+                        if announce.is_some_and(|(_, caught)| revision > caught) {
+                            announce = None;
+                        }
                         break revision;
                     }
-                    wake = self.woken.wait(wake).unwrap_or_else(|e| e.into_inner());
+                    let Some((search, revision)) = announce else {
+                        wake = self.woken.wait(wake).unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    };
+                    let (next, waited) = self
+                        .woken
+                        .wait_timeout(wake, QUIET)
+                        .unwrap_or_else(|e| e.into_inner());
+                    wake = next;
+                    if waited.timed_out() && wake.due.is_none() && !wake.stop {
+                        announce = None;
+                        if let Some(f) = self.caught_up.get() {
+                            f(search, revision);
+                        }
+                    }
                 }
             };
             let tree = scan.get_or_insert_with(|| tree.wait().clone());
             let mut busy = 0;
+            // One timed request per round, from its first step, so the
+            // report counts rounds rather than every step.
+            let mut timing = None;
             loop {
-                #[cfg(test)]
-                if self.held.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(BUSY_RETRY);
-                    if self.stopped() {
-                        return;
+                match self.step(tree, revision, busy >= BUSY_TRIES, &mut timing) {
+                    Step::Done(caught) => {
+                        // A request that read behind did so before this
+                        // step's write lock, so its flag is set by now.
+                        owed |= self.read_behind.swap(false, Ordering::SeqCst);
+                        // Statuses that came while it was busy are still
+                        // due; announce once it has caught up with all.
+                        let latest = self.nudged.load(Ordering::SeqCst);
+                        if owed && caught.is_none_or(|(_, revision)| revision >= latest) {
+                            owed = false;
+                            announce = caught;
+                        }
+                        break;
                     }
-                    continue;
-                }
-                match self.step(tree, revision, busy >= BUSY_TRIES) {
-                    Step::Done => break,
                     Step::Gone => return,
                     // Between steps the scanner can take the tree's lock:
                     // if it's waiting, the next read waits behind it.
@@ -198,7 +261,13 @@ impl Filter {
     /// the search's write lock instead, taking the locks in the requests'
     /// order (search, then tree), so new requests queue behind it and the
     /// search catches up a step.
-    fn step(&self, tree: &Weak<RwLock<Tree>>, revision: u64, wait: bool) -> Step {
+    fn step(
+        &self,
+        tree: &Weak<RwLock<Tree>>,
+        revision: u64,
+        wait: bool,
+        timing: &mut Option<metrics::Command>,
+    ) -> Step {
         let Some(tree) = tree.upgrade() else {
             return Step::Gone;
         };
@@ -220,17 +289,31 @@ impl Filter {
                 Err(TryLockError::Poisoned(_)) => return Step::Gone,
             }
         };
-        let Some(active) = active.as_mut() else {
-            return Step::Done;
-        };
-        let _timing = metrics::command("search_catch_up");
-        if metrics::enabled() {
-            metrics::count("catch-up", active.search.backlog(&tree));
+        // Checked under the lock, so a test that sets it and then reads
+        // the search knows no step comes in between.
+        #[cfg(test)]
+        if self.steps_left.load(Ordering::SeqCst) == 0 {
+            return Step::Busy;
         }
+        let Some(active) = active.as_mut() else {
+            return Step::Done(None);
+        };
+        if timing.is_none() {
+            *timing = Some(metrics::command("search_catch_up"));
+            if metrics::enabled() {
+                metrics::count("catch-up", active.search.backlog(&tree));
+            }
+        }
+        #[cfg(test)]
+        let _ = self
+            .steps_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n != usize::MAX).then(|| n.saturating_sub(1))
+            });
         let _catch_up = metrics::span("catch-up");
         if active.search.catch_up(&tree, CATCH_UP_STEP) {
             active.revision = active.revision.max(revision);
-            Step::Done
+            Step::Done(Some((active.id, active.revision)))
         } else {
             Step::More
         }
@@ -257,11 +340,15 @@ impl Session {
             };
             let held = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
             let progress = self.scan.progress();
-            let behind = (progress.state.is_finished() || !self.filter.background)
-                && search
-                    .as_deref()
-                    .and_then(Option::as_ref)
-                    .is_some_and(|a| a.revision != progress.revision);
+            let active = search.as_deref().and_then(Option::as_ref);
+            let finished = progress.state.is_finished();
+            let behind = (finished || !self.filter.background)
+                && active.is_some_and(|a| a.revision != progress.revision);
+            if !finished
+                && active.is_some_and(|a| a.revision < self.filter.nudged.load(Ordering::SeqCst))
+            {
+                self.filter.read_behind.store(true, Ordering::SeqCst);
+            }
             if !behind {
                 return Ok((search, held, progress));
             }
@@ -320,7 +407,7 @@ mod tests {
         }
     }
 
-    fn until(what: &str, done: impl Fn() -> bool) {
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting until {what}");
@@ -388,7 +475,7 @@ mod tests {
         let id = session.search_set("*.log").unwrap().unwrap().search;
         // While the job is held off, requests read the search as it was,
         // whole, saying which revision.
-        session.filter.held.store(true, Ordering::SeqCst);
+        session.filter.steps_left.store(0, Ordering::SeqCst);
         let first = session.search_summary(id).unwrap();
         assert_eq!(totals(&first), fresh(&session, "*.log"));
         assert_eq!(first.files, 100);
@@ -402,15 +489,20 @@ mod tests {
             first,
             "requests don't catch up while scanning"
         );
-        session.filter.held.store(false, Ordering::SeqCst);
+        session
+            .filter
+            .steps_left
+            .store(usize::MAX, Ordering::SeqCst);
 
-        until("the job catches up", || {
-            totals(&session.search_summary(id).unwrap()) == fresh(&session, "*.log")
+        // The revision is a lower bound: a round asked for at an earlier
+        // status can finish the work before the round for the newest one
+        // records it.
+        until("the job catches up, at a newer revision", || {
+            let s = session.search_summary(id).unwrap();
+            totals(&s) == fresh(&session, "*.log") && s.revision > first.revision
         });
         assert!(!finished(&session), "caught up while scanning");
-        let caught = session.search_summary(id).unwrap();
-        assert_eq!(caught.files, 3_100);
-        assert!(caught.revision > first.revision, "a newer revision");
+        assert_eq!(session.search_summary(id).unwrap().files, 3_100);
 
         c.release();
         until("the scan finishes", || finished(&session));
@@ -487,10 +579,102 @@ mod tests {
     }
 
     #[test]
+    fn says_when_the_filter_caught_up_after_requests_read_behind_and_the_scan_stalled() {
+        let (session, b, _c) = scan();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&updates);
+        session.on_filter_updated(move |u| sink.lock().unwrap().push(u));
+        let id = session.search_set("*.log").unwrap().unwrap().search;
+        let held = &session.filter.steps_left;
+        held.store(0, Ordering::SeqCst);
+        b.release();
+        until("b is listed", || listed(&session, "b"));
+        // The scan reports nothing more once `b` is in, since `c` is never
+        // listed: wait for its last status.
+        let mut last = session.scan.progress().revision;
+        until("the scan goes quiet", || {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = session.scan.progress().revision;
+            std::mem::replace(&mut last, now) == now
+        });
+        // Answered behind that status.
+        let behind = session.search_summary(id).unwrap();
+        assert!(behind.revision < last);
+        assert_eq!(behind.files, 100);
+        held.store(usize::MAX, Ordering::SeqCst);
+        until("the update is announced", || {
+            !updates.lock().unwrap().is_empty()
+        });
+        let revision = session.scan.progress().revision;
+        let u = updates.lock().unwrap()[0].clone();
+        assert_eq!(
+            (u.generation, u.search, u.revision),
+            (session.generation(), id, revision)
+        );
+        let now = session.search_summary(id).unwrap();
+        assert_eq!((now.files, now.revision), (3_100, revision));
+        // Read up to date, nothing more is announced.
+        std::thread::sleep(QUIET * 2);
+        assert_eq!(updates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replacing_or_clearing_the_filter_drops_what_was_kept_for_it() {
+        let (session, _b, _c) = scan();
+        let fill = |id| {
+            let generation = session.generation();
+            session
+                .layout(&proto::LayoutRequest {
+                    generation,
+                    request: 0,
+                    view: 0,
+                    metric: proto::Metric::Logical,
+                    width: 800.0,
+                    height: 600.0,
+                    search: Some(id),
+                })
+                .unwrap();
+            session
+                .search_results(&proto::SearchResultsRequest {
+                    generation,
+                    search: id,
+                    metric: proto::Metric::Logical,
+                    offset: 0,
+                    limit: 10,
+                })
+                .unwrap();
+            assert!(session.search_order.lock().unwrap().is_some());
+            assert!(session.search_ranked.lock().unwrap().is_some());
+        };
+        let kept = || {
+            session.search_order.lock().unwrap().is_some()
+                || session.search_ranked.lock().unwrap().is_some()
+        };
+        fill(session.search_set("*.log").unwrap().unwrap().search);
+        let txt = session.search_set("*.txt").unwrap().unwrap().search;
+        assert!(!kept(), "replaced");
+        fill(txt);
+        assert!(session.search_set("").unwrap().is_none());
+        assert!(!kept(), "cleared");
+    }
+
+    #[test]
     fn a_new_filter_replaces_the_one_being_caught_up() {
         let (session, b, c) = scan();
+        let held = &session.filter.steps_left;
+        held.store(0, Ordering::SeqCst);
         let old = session.search_set("*.log").unwrap().unwrap().search;
         b.release();
+        until("b is listed", || listed(&session, "b"));
+        // One step into b's 30,000 files, the job is held mid-way.
+        held.store(1, Ordering::SeqCst);
+        until("the job takes a step", || held.load(Ordering::SeqCst) == 0);
+        let partial = session.search_summary(old).unwrap().files;
+        assert!(
+            100 < partial && partial < 3_100,
+            "partly caught up: {partial}"
+        );
+
         let new = session.search_set("*.txt").unwrap().unwrap().search;
         assert!(new > old);
         assert!(session.search_summary(old).is_err(), "no longer current");
@@ -499,7 +683,7 @@ mod tests {
             None,
             "a replaced search gives no totals"
         );
-        until("b is listed", || listed(&session, "b"));
+        held.store(usize::MAX, Ordering::SeqCst);
         until("the job catches the new one up", || {
             totals(&session.search_summary(new).unwrap()) == fresh(&session, "*.txt")
         });
@@ -533,6 +717,13 @@ mod tests {
         b.release();
         until("b is listed", || listed(&session, "b"));
         assert_eq!(txt(), 200, "the earlier index answers meanwhile");
+        // A rebuild stopped as the session goes leaves the index as it was
+        // and can be started again.
+        session.names_cancel.store(true, Ordering::SeqCst);
+        session.refresh_names(session.scan.progress().revision);
+        until("stopped", || !session.names_building.load(Ordering::SeqCst));
+        assert_eq!(txt(), 200);
+        session.names_cancel.store(false, Ordering::SeqCst);
         session.refresh_names(session.scan.progress().revision);
         until("rebuilt", || {
             !session.names_building.load(Ordering::SeqCst) && txt() == 27_200

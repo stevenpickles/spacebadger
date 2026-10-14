@@ -55,6 +55,8 @@
     search: number | null;
     /** Scan revision; a change triggers a new layout. */
     revision: number;
+    /** A change triggers a new layout too (the filter caught up). */
+    refresh?: number;
     /** The focused item: the one with details, and where arrow keys start. */
     selection: Selection | null;
     /** Selected files and folders (actions apply to these). */
@@ -82,6 +84,7 @@
     compare = null,
     search,
     revision,
+    refresh = 0,
     selection,
     selected,
     anchor,
@@ -242,7 +245,7 @@
 
   $effect(() => {
     // Dependencies that change the layout.
-    void [generation, view, metric, search, revision, width, height];
+    void [generation, view, metric, search, revision, refresh, width, height];
     fetchLayout();
   });
 

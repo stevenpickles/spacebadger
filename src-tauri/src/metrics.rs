@@ -248,6 +248,15 @@ impl Drop for Command {
     }
 }
 
+/// For [`sb_scan::ScanConfig::write_holds`]: records each of the scanner's
+/// holds of the tree's write lock as `tree write` outside any request, so
+/// the report sets them beside the waits they cause. `None` when timings
+/// are off.
+pub fn write_holds() -> Option<sb_scan::HoldProbe> {
+    enabled()
+        .then(|| sb_scan::HoldProbe::new(|held, _| record("tree write", Kind::Hold, nanos(held))))
+}
+
 /// Times a stage of the current request until dropped.
 pub struct Span {
     name: &'static str,
