@@ -257,9 +257,12 @@ impl Session {
             req.height.clamp(0.0, 16_384.0),
         );
         let tree_lock = self.scan.tree();
+        // A newer layout for the same map may have come while this one
+        // waited for the locks; then it's left to that one.
+        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
+        crate::runner::check()?;
         // The progress is read with the tree's lock held, so the revision
         // sent describes the tree laid out (see `with_duplicates`).
-        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
         let finished = progress.state.is_finished();
         let view = node(&tree, req.view)?;
         // While scanning, keep sibling order stable; once finished, sort afresh.
@@ -292,6 +295,7 @@ impl Session {
         };
         // Encoding needs only the tree, and its last step not even that.
         drop(search);
+        crate::runner::check()?;
 
         let _encode = metrics::span("encode");
         let mut rects = Vec::with_capacity(result.rects.len());
@@ -534,6 +538,8 @@ impl Session {
         // Waited for another request's walk, whose ranking then does.
         let mut waited = false;
         loop {
+            // Superseded between steps: the walk stays for the next request.
+            crate::runner::check()?;
             // The progress is read with the tree's lock held, so the revision
             // describes the tree walked (see `with_duplicates`).
             let (search, tree, progress) = self.read_locked(&tree_lock, key.search.is_some())?;
@@ -1694,6 +1700,42 @@ mod tests {
             let got: Vec<_> = page.files.iter().map(|f| (f.node, f.weight)).collect();
             assert_eq!(got, all[p * 200..(p + 1) * 200], "page {p}");
         }
+    }
+
+    #[test]
+    fn superseded_layouts_and_rankings_stop_and_leave_the_walk_for_later() {
+        let session = load::synthetic(6, 2_000);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !session.scan.progress().state.is_finished() {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let generation = session.generation();
+        let layout = proto::LayoutRequest {
+            generation,
+            request: 1,
+            view: 0,
+            metric: proto::Metric::Logical,
+            width: 800.0,
+            height: 600.0,
+            search: None,
+        };
+        let files = proto::FolderFilesRequest {
+            generation,
+            folder: 0,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset: 0,
+            limit: 50,
+        };
+        let superseded = Some(proto::SUPERSEDED.to_owned());
+        let stopped = crate::runner::as_superseded(|| session.layout(&layout));
+        assert_eq!(stopped.err(), superseded);
+        let stopped = crate::runner::as_superseded(|| session.folder_files(&files));
+        assert_eq!(stopped.err(), superseded);
+        // Outside a superseded job both answer, the ranking from scratch.
+        assert!(session.layout(&layout).is_ok());
+        assert!(session.folder_files(&files).unwrap().total > 0);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Opt-in timings of interactive requests, to tell apart what makes them
-//! slow: waiting for a runtime thread, waiting for a lock, holding it, and
+//! slow: waiting for a worker, waiting for a lock, holding it, and
 //! the work done under it (search catch-up, ranking, layout, encoding).
 //!
 //! Off unless `SPACEBADGER_TRACE` is set: to a file to write the report to
@@ -52,7 +52,7 @@ pub fn enabled() -> bool {
 }
 
 /// Keeps timings regardless of the environment, on every thread. Only for
-/// the ignored load test, which runs alone and on runtime threads; other
+/// the ignored load test, which runs alone and on the runner's threads; other
 /// tests use [`enable_on_this_thread`], so tests running in parallel keep
 /// the off path.
 #[cfg(test)]
@@ -85,7 +85,8 @@ fn store() -> MutexGuard<'static, Store> {
 /// What a time or count is of: a stage, or waiting for or holding a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// From being asked for to starting, on the async runtime.
+    /// From being asked for to starting: in the query runner's queue, or
+    /// waiting for a blocking thread.
     Queue,
     /// The whole request on its thread, from start to finish.
     Work,
@@ -169,6 +170,14 @@ pub fn count(name: &'static str, value: usize) {
     record(name, Kind::Count, value as u64);
 }
 
+/// Notes a count against `command` from outside its requests, such as the
+/// requests of it the query runner turned away.
+pub fn tally(command: &'static str, name: &'static str, value: u64) {
+    if enabled() {
+        store().add(command, name, Kind::Count, value);
+    }
+}
+
 /// A request being worked on; finishing or dropping it records it.
 pub struct Command {
     started: Option<Instant>,
@@ -237,30 +246,6 @@ impl Drop for Command {
     fn drop(&mut self) {
         self.end();
     }
-}
-
-/// Runs a request's work on this thread, timed as `name`.
-pub fn run<R>(name: &'static str, work: impl FnOnce() -> R) -> R {
-    let _command = command(name);
-    work()
-}
-
-/// Runs a request's work on a blocking thread, timed as `name`, with the
-/// wait for a thread recorded as its queue time.
-pub async fn blocking<R: Send + 'static>(
-    name: &'static str,
-    work: impl FnOnce() -> R + Send + 'static,
-) -> Result<R, String> {
-    let asked = enabled().then(Instant::now);
-    tauri::async_runtime::spawn_blocking(move || {
-        let _command = match asked {
-            Some(at) => command_queued(name, at),
-            None => command(name),
-        };
-        work()
-    })
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Times a stage of the current request until dropped.
