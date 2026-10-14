@@ -15,10 +15,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The error of a quick comparison query (an item's change, the map's
 /// change marks) while another request matches the comparison again after
-/// a delete. Rather than hold a worker of the query runner for as long as
-/// that takes, it gives up; the delete announces its change once the
-/// comparison is matched, and the interface asks again then.
+/// a delete, past [`BRIEFLY`]. Rather than hold a worker of the query runner
+/// for as long as that takes, it gives up; the delete announces its change
+/// once the comparison is matched, and the interface asks again then.
 pub const UPDATING: &str = "The comparison is being updated.";
+
+/// How long a quick query waits for another request matching the
+/// comparison again: long enough for a small or medium comparison, so it
+/// usually answers, short enough not to hold a worker for a large one.
+const BRIEFLY: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 thread_local! {
@@ -31,8 +36,9 @@ thread_local! {
 /// How a request waits while another matches the comparison again.
 #[derive(Clone, Copy, PartialEq)]
 enum Wait {
-    /// Gives up with [`UPDATING`] (quick queries).
-    No,
+    /// Waits up to [`BRIEFLY`], then gives up with [`UPDATING`] (quick
+    /// queries); also gives up if superseded.
+    Briefly,
     /// Waits, giving up if superseded (lists, which have to answer).
     Cooperatively,
     /// Waits (the delete matching it before announcing its change).
@@ -231,7 +237,7 @@ impl Session {
     pub fn compare_item(&self, snapshot: &str, id: u32) -> Result<proto::ItemChange, String> {
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let cur = self.current(snapshot, &tree, Wait::No)?;
+        let cur = self.current(snapshot, &tree, Wait::Briefly)?;
         let n = node(&tree, id)?;
         let change = cur.comparison.change(&tree, &cur.snapshot, n);
         Ok(proto::ItemChange {
@@ -250,7 +256,7 @@ impl Session {
         use proto::change_mark as mark;
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let cur = self.current(&req.snapshot, &tree, Wait::No)?;
+        let cur = self.current(&req.snapshot, &tree, Wait::Briefly)?;
         Ok(req
             .nodes
             .iter()
@@ -388,13 +394,16 @@ impl Session {
         }
         // One request matches again; others asking meanwhile wait for it
         // and use its result, or give up.
+        let since = Instant::now();
         let _one = loop {
             let taken = match wait {
                 Wait::Blocking => self.rematching.lock().map_err(|_| ()),
                 _ => match self.rematching.try_lock() {
                     Ok(one) => Ok(one),
                     Err(TryLockError::Poisoned(_)) => Err(()),
-                    Err(TryLockError::WouldBlock) if wait == Wait::No => {
+                    Err(TryLockError::WouldBlock)
+                        if wait == Wait::Briefly && since.elapsed() >= BRIEFLY =>
+                    {
                         return Err(UPDATING.to_owned());
                     }
                     Err(TryLockError::WouldBlock) => {
