@@ -8,7 +8,7 @@
 use crate::{memory, mib, ms};
 use sb_scan::{
     Entry, EntryKind, FsAdapter, Identity, Measured, NativeFs, RootKind, Scan, ScanConfig,
-    ScanError,
+    ScanError, Sink, batched,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,11 +48,18 @@ impl FsAdapter for WideFs {
         Ok(RootKind::Directory)
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         if dir != Path::new(ROOT) {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        Ok((0..self.entries).map(Self::entry).collect())
+        batched(sink, |out| {
+            for i in 0..self.entries {
+                if out.push(Self::entry(i)).is_break() {
+                    break;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn measure_file(&self, _file: &Path) -> Result<Measured, ScanError> {
@@ -74,12 +81,12 @@ impl<A: FsAdapter> FsAdapter for Watched<A> {
         self.inner.open_root(root)
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
-        let result = self.inner.read_dir(dir);
-        if result.as_ref().is_ok_and(|e| !e.is_empty()) {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        self.inner.read_dir(dir, &mut |batch| {
+            let flow = sink(batch);
             self.delivered.store(true, Ordering::Relaxed);
-        }
-        result
+            flow
+        })
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {

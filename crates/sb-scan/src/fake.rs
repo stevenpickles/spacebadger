@@ -1,7 +1,7 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -207,7 +207,7 @@ impl FsAdapter for FakeFs {
         }
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
             let _ = gate.lock().unwrap().recv();
@@ -215,8 +215,38 @@ impl FsAdapter for FakeFs {
         if let Some(err) = self.errors.lock().unwrap().get(dir) {
             return Err(err.clone());
         }
+        let entries = self.entries(dir);
+        batched(sink, |out| {
+            for entry in entries {
+                if out.push(entry).is_break() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        if let Some(m) = self.measured.lock().unwrap().get(file) {
+            return Ok(*m);
+        }
+        match self.nodes.lock().unwrap().get(file) {
+            Some(Node::File {
+                logical, allocated, ..
+            }) => Ok(Measured {
+                logical: *logical,
+                allocated: *allocated,
+            }),
+            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
+        }
+    }
+}
+
+impl FakeFs {
+    /// The direct children of `dir` in name order.
+    fn entries(&self, dir: &Path) -> Vec<Entry> {
         let nodes = self.nodes.lock().unwrap();
-        let entries = nodes
+        nodes
             .iter()
             .filter(|(p, _)| p.parent() == Some(dir))
             .map(|(p, node)| {
@@ -257,22 +287,6 @@ impl FsAdapter for FakeFs {
                     },
                 }
             })
-            .collect();
-        Ok(entries)
-    }
-
-    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        if let Some(m) = self.measured.lock().unwrap().get(file) {
-            return Ok(*m);
-        }
-        match self.nodes.lock().unwrap().get(file) {
-            Some(Node::File {
-                logical, allocated, ..
-            }) => Ok(Measured {
-                logical: *logical,
-                allocated: *allocated,
-            }),
-            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
-        }
+            .collect()
     }
 }

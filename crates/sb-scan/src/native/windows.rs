@@ -3,6 +3,8 @@
 //! - Lists with `FileIdExtdDirectoryInfo` (falling back to
 //!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
 //!   reparse tags, and file IDs come from the listing without opening files.
+//!   Entries are passed on as each 64 KiB buffer is decoded, in batches, so
+//!   a huge folder is never held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
@@ -18,7 +20,8 @@
 //!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, classify_io,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
+    batched, classify_io,
 };
 use crate::duplicates::Skip;
 use std::ffi::{OsString, c_void};
@@ -332,17 +335,38 @@ impl WindowsFs {
         Self::default()
     }
 
-    fn list(&self, dir: &Path) -> Result<Vec<Listed>, ScanError> {
+    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let handle = open(dir, FILE_LIST_DIRECTORY.0)?;
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
-            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo) {
-                Err(err) if err.kind == ErrorKind::Unavailable => {
+            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo, out) {
+                // Only before any entry was read, so none is listed twice.
+                Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
                     self.use_both_dir_info.store(true, Ordering::Relaxed);
                 }
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo)
+        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo, out)
+    }
+}
+
+impl Listed {
+    fn entry(self) -> Entry {
+        Entry {
+            kind: classify(self.attributes, self.reparse_tag),
+            logical: self.end_of_file,
+            allocated: Some(self.allocation_size),
+            // Listings carry no link count, so every file may be shared.
+            identity: if self.file_id == 0 {
+                Identity::Unavailable
+            } else {
+                Identity::MaybeShared { key: self.file_id }
+            },
+            cloud: self.attributes & attr::CLOUD != 0
+                || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
+            modified: filetime(self.last_write),
+            name: self.name,
+        }
     }
 }
 
@@ -404,11 +428,13 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
     }
 }
 
+/// Reads a directory a buffer at a time, passing each entry on as it's
+/// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
     class: FILE_INFO_BY_HANDLE_CLASS,
-) -> Result<Vec<Listed>, ScanError> {
-    let mut out = Vec::new();
+    out: &mut Batcher<'_, '_>,
+) -> Result<(), ScanError> {
     let mut buffer = vec![0u64; 8192];
     loop {
         let result = unsafe {
@@ -421,7 +447,7 @@ fn list_with<T: DirInfo>(
         };
         match result {
             Ok(()) => {}
-            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(out),
+            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(()),
             Err(err) => return Err(scan_error(err)),
         }
         let base = buffer.as_ptr().cast::<u8>();
@@ -436,8 +462,11 @@ fn list_with<T: DirInfo>(
                     record.name_len(),
                 )
             };
-            if name != [0x2e] && name != [0x2e, 0x2e] {
-                out.push(record.listed(name));
+            if name != [0x2e]
+                && name != [0x2e, 0x2e]
+                && out.push(record.listed(name).entry()).is_break()
+            {
+                return Ok(());
             }
             if record.next() == 0 {
                 break;
@@ -462,26 +491,8 @@ impl FsAdapter for WindowsFs {
         )
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
-        Ok(self
-            .list(dir)?
-            .into_iter()
-            .map(|l| Entry {
-                kind: classify(l.attributes, l.reparse_tag),
-                logical: l.end_of_file,
-                allocated: Some(l.allocation_size),
-                // Listings carry no link count, so every file may be shared.
-                identity: if l.file_id == 0 {
-                    Identity::Unavailable
-                } else {
-                    Identity::MaybeShared { key: l.file_id }
-                },
-                cloud: l.attributes & attr::CLOUD != 0
-                    || (l.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(l.reparse_tag)),
-                modified: filetime(l.last_write),
-                name: l.name,
-            })
-            .collect())
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        batched(sink, |out| self.list(dir, out))
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {

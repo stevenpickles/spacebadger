@@ -10,7 +10,8 @@
 //! never materialized by this process, and `SF_DATALESS` marks cloud files.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
+    batched,
 };
 use crate::duplicates::Skip;
 use std::fs::Metadata;
@@ -93,19 +94,40 @@ impl FsAdapter for UnixFs {
         })
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        batched(sink, |out| self.list(dir, out))
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        let meta = std::fs::symlink_metadata(file)?;
+        if !meta.is_file() {
+            return Err(ScanError::new(
+                ErrorKind::Vanished,
+                "no longer a regular file",
+            ));
+        }
+        Ok(Measured {
+            logical: meta.size(),
+            allocated: Some(meta.blocks().saturating_mul(512)),
+        })
+    }
+}
+
+impl UnixFs {
+    /// Reads `dir`, `lstat`ing each entry and passing it on at once; stops
+    /// early when the batcher says so.
+    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let root_dev = *self
             .root_dev
             .get()
             .expect("open_root must run before read_dir");
-        let mut entries = Vec::new();
         for item in std::fs::read_dir(dir)? {
             let item = item?;
             let name = item.file_name();
             let meta = match std::fs::symlink_metadata(item.path()) {
                 Ok(meta) => meta,
                 Err(err) => {
-                    entries.push(Entry {
+                    let failed = Entry {
                         name,
                         kind: EntryKind::Failed(ScanError::from(err).kind),
                         logical: 0,
@@ -113,7 +135,10 @@ impl FsAdapter for UnixFs {
                         identity: Identity::Unavailable,
                         cloud: false,
                         modified: None,
-                    });
+                    };
+                    if out.push(failed).is_break() {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -131,7 +156,7 @@ impl FsAdapter for UnixFs {
             } else {
                 EntryKind::Special
             };
-            entries.push(Entry {
+            let entry = Entry {
                 name,
                 kind,
                 logical: meta.size(),
@@ -145,23 +170,12 @@ impl FsAdapter for UnixFs {
                 },
                 cloud: is_cloud(&meta),
                 modified: meta.modified().ok(),
-            });
+            };
+            if out.push(entry).is_break() {
+                return Ok(());
+            }
         }
-        Ok(entries)
-    }
-
-    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        let meta = std::fs::symlink_metadata(file)?;
-        if !meta.is_file() {
-            return Err(ScanError::new(
-                ErrorKind::Vanished,
-                "no longer a regular file",
-            ));
-        }
-        Ok(Measured {
-            logical: meta.size(),
-            allocated: Some(meta.blocks().saturating_mul(512)),
-        })
+        Ok(())
     }
 }
 

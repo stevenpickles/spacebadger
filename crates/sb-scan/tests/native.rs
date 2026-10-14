@@ -1,7 +1,10 @@
 //! Scans real temporary directories with the platform's native adapter.
 
 use sb_core::tree::{NodeId, Tree, flags};
-use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState};
+use sb_scan::{
+    BATCH_ENTRIES, FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState,
+};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -234,4 +237,35 @@ fn records_modified_times_from_the_listing() {
     let secs = new.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     assert_eq!(tree.modified(find(&tree, "sub/new.txt")), Some(secs as u32));
     assert_eq!(tree.modified(find(&tree, "sub")), None, "folders have none");
+}
+
+#[test]
+fn wide_folders_are_listed_in_bounded_batches() {
+    let tmp = TempDir::new("wide");
+    let n = 2 * BATCH_ENTRIES + 7;
+    for i in 0..n {
+        std::fs::File::create(tmp.0.join(format!("f{i:05}"))).unwrap();
+    }
+    let fs = NativeFs::new();
+    fs.open_root(&tmp.0).unwrap();
+
+    let mut sizes = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    fs.read_dir(&tmp.0, &mut |batch| {
+        sizes.push(batch.len());
+        names.extend(batch.into_iter().map(|e| e.name));
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert!(sizes.iter().all(|&s| s <= BATCH_ENTRIES), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<usize>(), n);
+    assert_eq!(names.len(), n, "each entry once, no . or ..");
+
+    let mut batches = 0;
+    fs.read_dir(&tmp.0, &mut |_| {
+        batches += 1;
+        ControlFlow::Break(())
+    })
+    .unwrap();
+    assert_eq!(batches, 1, "a listing stops when asked");
 }
