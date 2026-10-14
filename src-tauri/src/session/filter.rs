@@ -573,6 +573,13 @@ mod tests {
         b.release();
         until("b is listed", || listed(&session, "b"));
         assert_eq!(txt(), 200, "the earlier index answers meanwhile");
+        // A rebuild stopped as the session goes leaves the index as it was
+        // and can be started again.
+        session.names_cancel.store(true, Ordering::SeqCst);
+        session.refresh_names(session.scan.progress().revision);
+        until("stopped", || !session.names_building.load(Ordering::SeqCst));
+        assert_eq!(txt(), 200);
+        session.names_cancel.store(false, Ordering::SeqCst);
         session.refresh_names(session.scan.progress().revision);
         until("rebuilt", || {
             !session.names_building.load(Ordering::SeqCst) && txt() == 27_200

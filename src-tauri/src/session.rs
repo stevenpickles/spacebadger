@@ -89,6 +89,8 @@ pub struct Session {
     names: Arc<Mutex<Option<Names>>>,
     /// Set while the completion index is rebuilt in the background.
     names_building: Arc<AtomicBool>,
+    /// Set when the session goes, to stop a rebuild in the background.
+    names_cancel: Arc<AtomicBool>,
     /// The latest search for duplicate files.
     duplicates: Mutex<Option<Arc<Job>>>,
     /// Number of the latest search for duplicates.
@@ -216,6 +218,7 @@ impl Session {
             ranked: Condvar::new(),
             names: Arc::new(Mutex::new(None)),
             names_building: Arc::new(AtomicBool::new(false)),
+            names_cancel: Arc::new(AtomicBool::new(false)),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
             recheck_cancel: AtomicBool::new(false),
@@ -657,7 +660,10 @@ impl Session {
                 let tree = self.scan.tree();
                 // Read with the tree's lock held, so the index is kept under
                 // the revision of the tree it's built from.
-                *names = Some(build_names(&tree, || self.scan.progress().revision)?);
+                let tree = Arc::downgrade(&tree);
+                *names = Some(build_names(&tree, &self.names_cancel, || {
+                    self.scan.progress().revision
+                })?);
             }
             Arc::clone(&names.as_ref().expect("built").index)
         };
@@ -683,25 +689,32 @@ impl Session {
         if self.names_building.swap(true, Ordering::SeqCst) {
             return;
         }
+        /// Clears the flag however the build ends, a panic included.
+        struct Building(Arc<AtomicBool>);
+        impl Drop for Building {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let building = Building(Arc::clone(&self.names_building));
+        // Weak, so a rescan's new tree doesn't keep the old one alive.
         let tree = Arc::downgrade(&self.scan.tree());
         let names = Arc::clone(&self.names);
-        let building = Arc::clone(&self.names_building);
-        let spawned = std::thread::Builder::new()
+        let cancel = Arc::clone(&self.names_cancel);
+        // If the thread can't start, the closure goes, and the guard with it.
+        let _ = std::thread::Builder::new()
             .name("sb-names".into())
             .spawn(move || {
+                let _building = building;
                 let _timing = metrics::command("suggest_index");
-                let built = tree.upgrade().map(|t| build_names(&t, || revision));
-                if let (Some(Ok(built)), Ok(mut names)) = (built, names.lock()) {
+                let built = build_names(&tree, &cancel, || revision);
+                if let (Ok(built), Ok(mut names)) = (built, names.lock()) {
                     // A request may have built a newer one meanwhile.
                     if names.as_ref().is_none_or(|n| n.revision <= revision) {
                         *names = Some(built);
                     }
                 }
-                building.store(false, Ordering::SeqCst);
             });
-        if spawned.is_err() {
-            self.names_building.store(false, Ordering::SeqCst);
-        }
     }
 
     /// A page of the items merged into a small-items region.
@@ -1206,6 +1219,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.filter.stop();
+        self.names_cancel.store(true, Ordering::SeqCst);
         if let Ok(Some(job)) = self.duplicates.get_mut().map(Option::take) {
             job.cancel();
         }
@@ -1213,11 +1227,19 @@ impl Drop for Session {
 }
 
 /// Builds the completion index from `tree` a step at a time, releasing the
-/// lock in between; `revision` is read with it held at the last step and
-/// kept with the index.
-fn build_names(tree: &RwLock<Tree>, revision: impl Fn() -> u64) -> Result<Names, String> {
+/// lock (and the tree itself) in between, until `cancel` is set; `revision`
+/// is read with the lock held at the last step and kept with the index.
+fn build_names(
+    tree: &Weak<RwLock<Tree>>,
+    cancel: &AtomicBool,
+    revision: impl Fn() -> u64,
+) -> Result<Names, String> {
     let mut builder = suggest::Builder::default();
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("the scan was replaced".into());
+        }
+        let tree = tree.upgrade().ok_or("the scan was replaced")?;
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let _index = metrics::span("index");
         if builder.step(&tree, NAMES_STEP) {
