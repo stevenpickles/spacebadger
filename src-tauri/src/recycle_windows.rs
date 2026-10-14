@@ -434,7 +434,13 @@ fn quoted(text: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
+    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, IPersistFile};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::Interface;
 
     #[test]
     fn a_delete_without_a_copy_outranks_every_other_result() {
@@ -596,7 +602,7 @@ mod tests {
             format!("[.ShellClassInfo]\r\nCLSID={clsid}\r\n"),
         )
         .unwrap();
-        make_system(&system);
+        set_attributes(&system, FILE_ATTRIBUTE_SYSTEM);
         let plain = tmp.0.join("plain.txt");
         std::fs::write(&plain, "x").unwrap();
         let _com = Com::init().unwrap();
@@ -611,6 +617,93 @@ mod tests {
             );
             assert!(path.exists());
         }
+    }
+
+    /// A folder shortcut (a read-only folder whose `desktop.ini` gives
+    /// `CLSID2` and holds `target.lnk`) leads the shell to the target's
+    /// items. With a hard link, the shell's item is the same file by ID
+    /// under another name, which the move would take instead. Nothing is
+    /// moved; only the shell's reading is checked.
+    #[test]
+    fn another_name_of_the_same_file_is_refused() {
+        let tmp = Dir::new("sb-shellnsln");
+        let real = tmp.0.join("real");
+        let shortcut = tmp.0.join("fs");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&shortcut).unwrap();
+        std::fs::write(real.join("a.txt"), "x").unwrap();
+        std::fs::hard_link(real.join("a.txt"), shortcut.join("a.txt")).unwrap();
+        std::fs::write(
+            shortcut.join("desktop.ini"),
+            "[.ShellClassInfo]\r\nCLSID2={0AFACED1-E828-11D1-9187-B532F1E9575D}\r\nFlags=2\r\n",
+        )
+        .unwrap();
+        let _com = Com::init().unwrap();
+        // SAFETY: COM is initialized; the strings outlive the calls.
+        unsafe {
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetPath(&HSTRING::from(real.as_os_str())).unwrap();
+            link.cast::<IPersistFile>()
+                .unwrap()
+                .Save(
+                    &HSTRING::from(shortcut.join("target.lnk").as_os_str()),
+                    true,
+                )
+                .unwrap();
+        }
+        set_attributes(&shortcut, FILE_ATTRIBUTE_READONLY);
+        let check = |path: &Path| shell_item(path).and_then(|item| confirm(path, &item));
+        let resolved = shell_item(&shortcut.join("a.txt"))
+            .ok()
+            .and_then(|item| filesystem_path(&item));
+        let results = (check(&real.join("a.txt")), check(&shortcut.join("a.txt")));
+        // Cleared so the folder can be removed, whatever the results.
+        set_attributes(&shortcut, FILE_ATTRIBUTE_NORMAL);
+        // The shell went to the other name.
+        assert!(
+            resolved.as_deref().is_some_and(|r| {
+                crate::identity::same_object(r, &real.join("a.txt")).unwrap_or(false)
+            }),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            results,
+            (Ok(()), Err(RecycleError::Refused(ELSEWHERE.into())))
+        );
+        assert!(real.join("a.txt").exists() && shortcut.join("a.txt").exists());
+    }
+
+    /// The shell names a long path's items in 8.3 form, and the network
+    /// form of a local folder its own way; both are still the item.
+    #[test]
+    fn long_and_network_paths_are_confirmed() {
+        let tmp = Dir::new("sb-shelllong");
+        let mut long = tmp.0.clone();
+        for i in 0..6 {
+            long.push(format!("a-rather-long-folder-name-to-pass-max-path-{i}"));
+        }
+        std::fs::create_dir_all(&long).unwrap();
+        let file = long.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(file.as_os_str().len() > 260);
+        let _com = Com::init().unwrap();
+        let check = |path: &Path| shell_item(path).and_then(|item| confirm(path, &item));
+        let verbatim = PathBuf::from(format!(r"\\?\{}", file.display()));
+        assert_eq!(check(&verbatim), Ok(()));
+        let short = tmp.0.join("short.txt");
+        std::fs::write(&short, "x").unwrap();
+        let local = short.to_string_lossy().to_string();
+        let Some(rest) = local.strip_prefix("C:\\") else {
+            return;
+        };
+        let unc = PathBuf::from(format!(r"\\?\UNC\localhost\C$\{rest}"));
+        if std::fs::metadata(&unc).is_err() {
+            eprintln!("skipped: {} isn't reachable", unc.display());
+            return;
+        }
+        assert_eq!(check(&unc), Ok(()));
+        assert_eq!(check(&shell_path(&unc)), Ok(()));
     }
 
     /// A network path has no Recycle Bin, so the shell would delete the
@@ -660,10 +753,10 @@ mod tests {
         }
     }
 
-    fn make_system(folder: &Path) {
+    fn set_attributes(folder: &Path, attributes: FILE_FLAGS_AND_ATTRIBUTES) {
         let wide: Vec<u16> = folder.as_os_str().encode_wide().chain([0]).collect();
         // SAFETY: a NUL-terminated path.
-        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_SYSTEM) }.unwrap();
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), attributes) }.unwrap();
     }
 
     /// A shell folder inside a folder being recycled is never followed:
@@ -684,7 +777,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(junction.join("inner.txt"), "recycle me").unwrap();
-        make_system(&junction);
+        set_attributes(&junction, FILE_ATTRIBUTE_SYSTEM);
         let (_, inner) = crate::identity::hold(&junction.join("inner.txt"), false).unwrap();
         let result = recycle(&outer.0);
         let now = inner.whereabouts();
