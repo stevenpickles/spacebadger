@@ -137,11 +137,12 @@ fn measure(name: &str, tree: &Tree, views: &[NodeId]) {
         )
     });
     println!(
-        "{name}: {} rects; fresh final layout {}, stable repeat {}, cache after one layout {}",
+        "{name}: {} rects; fresh final layout {}, stable repeat {}, cache after one layout {} ({} children)",
         l.rects.len(),
         ms(fresh),
         ms(stable),
-        kib(first)
+        kib(first),
+        cache.entries()
     );
     if views.len() > 1 {
         let t = Instant::now();
@@ -149,10 +150,11 @@ fn measure(name: &str, tree: &Tree, views: &[NodeId]) {
             layout::layout(tree, v, Metric::Allocated, None, &params, &mut cache, true);
         }
         println!(
-            "{name}: {} views laid out in {}, cache holds {}",
+            "{name}: {} views laid out in {}, cache holds {} ({} children)",
             views.len(),
             ms(t.elapsed()),
-            kib(live().wrapping_sub(before))
+            kib(live().wrapping_sub(before)),
+            cache.entries()
         );
     }
 }
