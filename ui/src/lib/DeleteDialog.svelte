@@ -241,7 +241,8 @@
         {#if checked.keptGone > 0}
           <p>
             In {plural(checked.keptGone, "group")} of duplicates, the copies left out are gone or changed since they
-            were compared, so the files selected from {checked.keptGone === 1 ? "it" : "them"} will be kept, not moved.
+            were compared, so the duplicates you selected from {checked.keptGone === 1 ? "it" : "them"} may be kept,
+            not moved.
           </p>
         {/if}
         <ul class="small">
@@ -253,16 +254,17 @@
     {/if}
     {#if recheckGroups > 0}
       <p class="muted small" id="{id}-recheck">
-        The copies left out of {plural(recheckGroups, "group")} of duplicates look unchanged since they were compared,
-        but that's provisional: they're read again before anything moves, and a file whose copy can't be confirmed is
-        kept.
+        The copies left out of {plural(recheckGroups, "group")} of duplicates you selected from look unchanged since
+        they were compared, but that's provisional: before anything moves they're read again, and a selected duplicate
+        that has changed, or whose copy can't be confirmed, is kept. Duplicates inside selected folders go with their
+        folders.
       </p>
     {/if}
     {#if unchecked}
       <p class="muted small" id="{id}-unchecked">
-        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time. Copies left out are
-        still read before anything moves, and a file whose copy can't be confirmed is kept, but make sure you keep a
-        copy of each group you select from entirely.
+        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time. Duplicates you selected
+        are still checked before anything moves, and kept if no copy can be confirmed, but duplicates inside selected
+        folders go with them: make sure a copy of each group stays.
       </p>
     {/if}
     {#if summary.folders > 0}
