@@ -92,7 +92,12 @@
 
   const helpId = $props.id();
   let container: HTMLDivElement;
+  // Three stacked canvases, composited as if drawn in one, so hovering
+  // never repaints the map: tiles and selection, then the hover highlight,
+  // then the focus ring and labels (which stay above the highlight).
   let canvas: HTMLCanvasElement;
+  let hoverCanvas: HTMLCanvasElement;
+  let topCanvas: HTMLCanvasElement;
   let width = $state(0);
   let height = $state(0);
   let layout = $state.raw<DecodedLayout | null>(null);
@@ -148,15 +153,27 @@
     /** measureText calls in the draw under way. */
     measuring: 0,
     draws: 0,
+    hoverDraws: 0,
     moves: 0,
     /** When recent draws happened, for draws per second. */
     recent: [] as number[],
   };
 
-  /** ctx.measureText, counted while tracing. */
+  /** Label text widths and fitted labels for the current font. Both depend
+   * only on the font, the text, and (for fits) the room, so they carry over
+   * from draw to draw and across layouts. */
+  const textCache = { font: "", widths: new Map<string, number>(), fits: new Map<string, string>() };
+  const TEXT_CACHE_LIMIT = 50_000;
+
+  /** The width of `text` in the label font: cached, counted while tracing. */
   function measure(ctx: CanvasRenderingContext2D, text: string): number {
+    const known = textCache.widths.get(text);
+    if (known !== undefined) return known;
     if (trace.on) trace.measuring++;
-    return ctx.measureText(text).width;
+    const width = ctx.measureText(text).width;
+    if (textCache.widths.size >= TEXT_CACHE_LIMIT) textCache.widths.clear();
+    textCache.widths.set(text, width);
+    return width;
   }
 
   $effect(() => {
@@ -170,7 +187,7 @@
         `draw: ${stats.draw.summary()}`,
         `labels: ${trace.labels.summary()}`,
         `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
-        `draws/s: ${perSecond} · draws ${trace.draws} · moves ${trace.moves}`,
+        `draws/s: ${perSecond} · draws ${trace.draws} · hover draws ${trace.hoverDraws} · moves ${trace.moves}`,
         `input to frame: ${stats.input.summary()}`,
       ].join("\n");
     };
@@ -296,8 +313,20 @@
     return depthColor(l.depth[i]!, kind === KIND_FOLDER, dark);
   }
 
+  /** `text`, cut with an ellipsis to fit `max` pixels; cached. */
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
+    const key = `${max}\u0000${text}`;
+    let fitted = textCache.fits.get(key);
+    if (fitted === undefined) {
+      fitted = cut(ctx, text, max);
+      if (textCache.fits.size >= TEXT_CACHE_LIMIT) textCache.fits.clear();
+      textCache.fits.set(key, fitted);
+    }
+    return fitted;
+  }
+
+  function cut(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (measure(ctx, text) <= max) return text;
     let lo = 0;
     let hi = text.length;
@@ -340,22 +369,37 @@
     }
   }
 
-  function paint() {
-    const ctx = canvas?.getContext("2d");
-    if (!ctx) return;
+  /** A cleared 2D context for `c`, sized to the map at the device pixel ratio. */
+  function cleared(c: HTMLCanvasElement | undefined): CanvasRenderingContext2D | null {
+    const ctx = c?.getContext("2d");
+    if (!c || !ctx) return null;
     const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
+    if (c.width !== Math.round(width * dpr) || c.height !== Math.round(height * dpr)) {
+      c.width = Math.round(width * dpr);
+      c.height = Math.round(height * dpr);
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
+    return ctx;
+  }
+
+  /** Tiles and selection on the bottom canvas; focus ring and labels on top. */
+  function paint() {
+    const ctx = cleared(canvas);
+    const top = cleared(topCanvas);
+    if (!ctx || !top) return;
     const l = layout;
     if (!l) return;
 
     const p = palette;
-    ctx.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
-    ctx.textBaseline = "alphabetic";
+    const font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
+    if (textCache.font !== font) {
+      textCache.font = font;
+      textCache.widths.clear();
+      textCache.fits.clear();
+    }
+    top.font = font;
+    top.textBaseline = "alphabetic";
     const gap = p.gap;
 
     for (let i = 0; i < l.count; i++) {
@@ -409,16 +453,7 @@
       }
     }
 
-    // Hover: a slight lighten and a 2px line, quieter than the selection.
-    const hi = hoverIndex;
-    if (hi >= 0 && hi < l.count) {
-      ctx.globalAlpha = dark ? 0.1 : 0.22;
-      ctx.fillStyle = p.textLight;
-      ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
-      ctx.globalAlpha = 0.7;
-      band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, ink);
-      ctx.globalAlpha = 1;
-    }
+    // The hover highlight goes between the canvases (see paintHover).
 
     // The focused item: a heavy dark-and-light ring, keeping the accent
     // inside it when the item is also picked.
@@ -427,16 +462,33 @@
       const y = l.y[si]!;
       const w = l.w[si]!;
       const h = l.h[si]!;
-      band(ctx, x, y, w, h, 0, 3, ink);
-      band(ctx, x, y, w, h, 3, 1, paper);
-      if (pickedAt(si) && w > 14 && h > 14) band(ctx, x, y, w, h, 4, 2, p.accent);
+      band(top, x, y, w, h, 0, 3, ink);
+      band(top, x, y, w, h, 3, 1, paper);
+      if (pickedAt(si) && w > 14 && h > 14) band(top, x, y, w, h, 4, 2, p.accent);
     }
 
     // Labels go last, so tints and frames never hide them.
     // Labels go inside the frames of selected and focused tiles.
     const labelsAt = trace.on ? performance.now() : 0;
-    for (let i = 0; i < l.count; i++) drawLabel(ctx, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
+    for (let i = 0; i < l.count; i++) drawLabel(top, l, i, i === si ? 7 : pickedAt(i) ? 5 : 4);
     if (trace.on) trace.labels.add(performance.now() - labelsAt);
+  }
+
+  /** Hover: a slight lighten and a 2px line, quieter than the selection.
+   * Above the selection, below the focus ring and labels. */
+  function paintHover() {
+    const ctx = cleared(hoverCanvas);
+    const l = layout;
+    const hi = hoverIndex;
+    if (trace.on) trace.hoverDraws++;
+    if (!ctx || !l || hi < 0 || hi >= l.count) return;
+    const p = palette;
+    ctx.globalAlpha = dark ? 0.1 : 0.22;
+    ctx.fillStyle = p.textLight;
+    ctx.fillRect(l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!);
+    ctx.globalAlpha = 0.7;
+    band(ctx, l.x[hi]!, l.y[hi]!, l.w[hi]!, l.h[hi]!, 0, 2, dark ? p.textLight : p.textDark);
+    ctx.globalAlpha = 1;
   }
 
   function drawLabel(ctx: CanvasRenderingContext2D, l: DecodedLayout, i: number, pad: number) {
@@ -507,12 +559,43 @@
     ctx.strokeRect(x + o, y + o, w - 2 * o, h - 2 * o);
   }
 
+  // Both layers are drawn in one animation frame, each only when its
+  // inputs changed.
   let frame = 0;
+  let mapDirty = false;
+  let hoverDirty = false;
+
+  function flush() {
+    frame = 0;
+    if (mapDirty) {
+      mapDirty = false;
+      draw();
+    }
+    if (hoverDirty) {
+      hoverDirty = false;
+      paintHover();
+    }
+  }
+
+  function schedule() {
+    if (frame === 0) frame = requestAnimationFrame(flush);
+  }
+
   $effect(() => {
-    void [layout, marks, selection, selected, hoverIndex, palette, colors, width, height];
+    void [layout, marks, selection, selected, palette, colors, width, height];
+    mapDirty = true;
+    schedule();
+  });
+
+  $effect(() => {
+    void [layout, hoverIndex, palette, width, height];
+    hoverDirty = true;
+    schedule();
+  });
+
+  $effect(() => () => {
     cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
+    frame = 0;
   });
 
   // ---- interaction -----------------------------------------------------
@@ -888,13 +971,12 @@
     Delete moves the selection to the Recycle Bin once deleting is allowed. Shift+F10 shows
     actions. Escape clears the selection.
   </p>
-  <canvas
-    bind:this={canvas}
-    class:stale
-    style:width="{width}px"
-    style:height="{height}px"
-    aria-hidden="true"
-  ></canvas>
+  <!-- Dimmed as one, as a single canvas was. -->
+  <div class="layers" class:stale style:width="{width}px" style:height="{height}px" aria-hidden="true">
+    <canvas bind:this={canvas} style:width="{width}px" style:height="{height}px"></canvas>
+    <canvas bind:this={hoverCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+    <canvas bind:this={topCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+  </div>
   {#if tooltip && tipPosition}
     <div
       class="tooltip"
@@ -935,12 +1017,18 @@
   .treemap:focus-visible {
     box-shadow: inset 0 0 0 2px var(--accent);
   }
-  canvas {
-    display: block;
+  .layers {
+    position: relative;
     transition: opacity 0.15s;
   }
-  canvas.stale {
+  .layers.stale {
     opacity: 0.6;
+  }
+  canvas {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
   }
   .tooltip {
     position: absolute;
