@@ -11,6 +11,7 @@
   import { typeColor } from "./colors";
   import { contextAt, insertable, keywords, replaceTerm, types, values, type Context } from "./completion";
   import { formatBytes, plural } from "./format";
+  import { Lanes } from "./request";
   import { theme } from "./theme.svelte";
 
   interface Props {
@@ -52,6 +53,8 @@
   /** Suggestions from the scan, for the context they were asked for. */
   let remote = $state.raw<{ key: string; items: Item[] } | null>(null);
   let seq = 0;
+  /** A newer completion request supersedes the one before in the backend. */
+  const suggestLane = new Lanes();
 
   const ctx = $derived(contextAt(value, caret));
   const key = $derived(ctx ? `${generation}/${ctx.kind}/${ctx.typed.toLowerCase()}` : "");
@@ -86,7 +89,10 @@
     if (!c || gen === null || (c.kind !== "folder" && c.kind !== "extension")) return;
     const mine = ++seq;
     const timer = setTimeout(() => {
-      filterSuggest({ generation: gen, kind: c.kind === "folder" ? "folder" : "extension", typed: c.typed, limit: LIMIT })
+      filterSuggest(
+        { generation: gen, kind: c.kind === "folder" ? "folder" : "extension", typed: c.typed, limit: LIMIT },
+        suggestLane.next(),
+      )
         .then((found) => {
           if (mine !== seq) return;
           const what = c.kind === "folder" ? "folder" : "file";
