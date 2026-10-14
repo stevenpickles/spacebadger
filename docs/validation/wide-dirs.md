@@ -38,19 +38,38 @@ Before, a whole listing waited in memory until it was added, and on Windows it e
 ### What was changed
 
 1. **Batched listings.** `FsAdapter::read_dir` hands entries to a sink in batches of at most 4,096 as it reads them, instead of returning the directory. Windows passes entries on as each 64 KiB `GetFileInformationByHandleEx` buffer is decoded, Linux per `getdents`/`statx` entry, the portable Unix adapter per `readdir` entry. The sink returns `Break` to stop a listing; the worker does so when the scan is cancelled. Each batch is one message in the bounded channel, so the channel bounds entries rather than listings, and the aggregator takes the write lock once per batch and checks for a cancel between batches.
-2. **Hard-link owners outside the lock.** With batching alone, the 5M case still had reader waits of 137–160 ms. Instrumenting the lock showed them at 0.23M, 0.46M, 0.92M, 1.8M, and 3.7M nodes: the owner map (one entry per file on Windows, where every listed file may be shared) growing, 139 ms at 3.7M entries. Owners are now looked up after the batch's entries are added and the lock released; the lock is taken again only when an alias is found.
+2. **Hard-link owners outside the lock.** With batching alone, the 5M case still had reader waits of 137–160 ms. Instrumenting the lock showed them at 0.23M, 0.46M, 0.92M, 1.8M, and 3.7M nodes: the owner map (one entry per file on Windows, where every listed file may be shared) growing, 139 ms at 3.7M entries. The map is no longer grown with the lock held (see the follow-up below for how aliases are marked).
 
 The remaining 40 ms at 5M entries is the tree's own arrays doubling as they pass 4.2M nodes (21 ms at 2.1M, 11 ms at 1M). That happens in any scan of that many nodes, wide folders or not, and is left as is: avoiding it means growing the tree's arrays off the lock.
 
 ## Correctness
 
 - A folder becomes `Listed` only with its last batch. The last batch travels with the listing's end, so most directories still cost one message and one lock.
-- A listing that fails after some batches keeps the entries already added and their subfolders are scanned; the folder is `Listed` with unreadable entries, so `Tree::fully_listed` is false and comparisons treat it as read in part (nothing in it is called removed). The error is counted under its omission reason with the folder's path. A folder that fails before any entry is `Failed`, as before, and a root that fails part way no longer fails the scan.
-- A listing stopped by a cancel stays pending and ends as not scanned, keeping the batches already applied.
+- A listing that fails after some batches keeps the entries already added and their subfolders are scanned; the folder is `Listed` with unreadable entries, so `Tree::fully_listed` is false, comparisons treat it as read in part (nothing in it is called removed), and the map and details show it as not fully read (see the follow-up below). The error is counted under its omission reason with the folder's path. A folder that fails before any entry is `Failed`, as before, and a root that fails part way no longer fails the scan.
+- A listing stopped by a cancel stays pending and ends as not scanned, keeping the batches already applied, and the scan reports Cancelled even if that listing was its last work.
 - If the tree's capacity runs out mid-listing, the folder ends as not scanned (it was marked listed before).
 - On Windows the fallback from `FileIdExtdDirectoryInfo` to `FileIdBothDirectoryInfo` happens only before any entry was read, so no entry is listed twice.
 
 Tests: batch sizes, the final partial batch, entries before an error, and stopping (adapter unit tests); a real folder of 8,199 files listed in bounded batches with each name once, and stopping when asked (native test); and, through the fake filesystem, hard links and omissions across batches, a folder and the root failing part way, and a cancel while a wide listing is blocked between batches (engine tests).
+
+## Follow-up from review
+
+A review of the change found three problems, now fixed:
+
+1. **A cancel could be reported as Complete.** A worker that saw the cancel flag mid-listing told the aggregator it had stopped, which counted the job as done. If that was the last outstanding job and the aggregator hadn't yet seen the flag itself, it declared the scan Complete: the folder stayed Pending, and the app would have saved the truncated scan as a snapshot to compare against. The same could happen with a job skipped for a cancel, which predates this change. Dropped work now marks the scan cancelled, and completion is declared only after checking the cancel flag. A deterministic test reproduces the race (it failed before the fix), and another cancels 40 scans at spread-out moments and checks that no folder is left pending and that a cancelled scan never reports Complete.
+2. **Folders read in part looked complete.** A folder whose listing failed part way, or with entries that couldn't be read, is `Listed` but not fully listed. The map now draws it with the incomplete outline, like failed and cancelled folders. The details say "Partly read; some of its contents couldn't be read" (a new `partial` folder state in the protocol) instead of "Scanned", and the tooltip says "Not fully scanned" without "yet".
+3. **Aliases were briefly counted twice.** Hard-link aliases were marked in a second lock hold after their batch, so readers could briefly see a linked file's allocation twice. Known owners are now looked up before taking the lock, names sharing a file within the batch are matched under the lock through a map bounded by the batch, and only recording new owners (which grows the large map) happens after release. The lock waits are unchanged (5.8–6.8 ms at 1M entries, 47 ms at 5M).
+
+`--wide-slow N` lists the synthetic folder at 2 ms per batch, so listing is slower than adding to the tree, and a cancel usually lands while the aggregator is idle (the case the race affected). Measured after the fixes and after merging per-node filesystem IDs from `dev` (which raise the tree estimate to 73 MiB at 1M nodes and 584 MiB at 5M), two runs each:
+
+| Case | Scan time | Peak memory | Longest reader wait | Cancel |
+|---|---|---|---|---|
+| 1M entries | 339–341 ms | 173–175 MiB | 5.8–5.9 ms | Cancelled in 3.1–3.2 ms |
+| 5M entries | 1.81–1.95 s | 666–667 MiB | 47 ms | Cancelled in 2.6–3.3 ms |
+| 1M entries, slow listing | 671–672 ms | 179–180 MiB | 7.0–7.1 ms | Cancelled in 1.1–1.5 ms |
+| 5M entries, slow listing | 3.45–3.48 s | 682 MiB | 47 ms | Cancelled in 1.7–3.1 ms |
+
+Scan times are higher than in the first table because other builds were running on the machine; the fast cases ran before and after the slow ones in the same runs.
 
 ## Ordinary trees
 
