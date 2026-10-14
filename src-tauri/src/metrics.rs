@@ -16,6 +16,8 @@
 //! count towards it. The session's methods are synchronous, so a request
 //! never moves between threads while a guard is alive.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
@@ -33,6 +35,10 @@ const SLOWEST: usize = 5;
 
 /// Whether timings are being kept.
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if ON_THIS_THREAD.with(Cell::get) {
+        return true;
+    }
     match STATE.load(Ordering::Relaxed) {
         2 => true,
         1 => false,
@@ -45,10 +51,31 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Keeps timings regardless of the environment, for tests and benchmarks.
+/// Keeps timings regardless of the environment, on every thread. Only for
+/// the ignored load test, which runs alone and on runtime threads; other
+/// tests use [`enable_on_this_thread`], so tests running in parallel keep
+/// the off path.
 #[cfg(test)]
 pub fn enable() {
     STATE.store(2, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Keeps timings on the calling thread until the guard is dropped.
+#[cfg(test)]
+pub fn enable_on_this_thread() -> impl Drop {
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            ON_THIS_THREAD.with(|on| on.set(false));
+        }
+    }
+    ON_THIS_THREAD.with(|on| on.set(true));
+    Off
 }
 
 fn store() -> MutexGuard<'static, Store> {
@@ -565,7 +592,7 @@ mod tests {
 
     #[test]
     fn requests_collect_their_locks_and_stages() {
-        enable();
+        let _on = enable_on_this_thread();
         let lock = Mutex::new(5);
         let request = {
             let command = command("metrics-test");
