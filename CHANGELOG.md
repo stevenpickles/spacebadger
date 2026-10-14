@@ -4,6 +4,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
 ### Filter
 - Size terms: `size:>500MB`, `size:>=1GB`, `size:<10KB`, `size:<=2GB`, and ranges like `size:10MB..1GB`. Units are B, KB, MB, GB, and TB, counted like the sizes on screen (1,024 bytes per KB on Windows, 1,000 on macOS and Linux).
 - Age terms: `older:1y` and `newer:30d` (with `h`, `d`, `w`, `mo`, or `y`), or a date: `older:2024-01-01`. Files whose modified time is unknown never match one.
