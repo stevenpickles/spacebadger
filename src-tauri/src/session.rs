@@ -16,13 +16,15 @@ use sb_core::suggest::NameIndex;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::plan;
-use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
+use sb_scan::{FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 mod compare;
+#[cfg(test)]
+mod load;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -124,6 +126,20 @@ impl Session {
         carried: Option<compare::Carried>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        let config = native::scan_config(&root);
+        Self::start_on(root, NativeFs::new(), config, snapshots, carried, on_status)
+    }
+
+    /// [`Session::start_with`] scanning through `adapter`, for tests and
+    /// benchmarks with a synthetic filesystem.
+    fn start_on(
+        root: PathBuf,
+        adapter: impl FsAdapter,
+        config: ScanConfig,
+        snapshots: Option<Arc<Store>>,
+        carried: Option<compare::Carried>,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
         let started_ms = compare::now_ms();
         let root_found = identity::hold(&root, false).ok().map(|(found, _)| found);
         let on_status: StatusSink = Arc::new(on_status);
@@ -138,17 +154,12 @@ impl Session {
             saved: Arc::clone(&saved_snapshot),
             protect: carried.as_ref().map(|c| c.id().to_owned()),
         });
-        let scan = Scan::start(
-            root.clone(),
-            NativeFs::new(),
-            native::scan_config(&root),
-            move |p| {
-                sink(status(&display, p));
-                if let Some(saver) = &saver {
-                    saver.progress(&p.state);
-                }
-            },
-        );
+        let scan = Scan::start(root.clone(), adapter, config, move |p| {
+            sink(status(&display, p));
+            if let Some(saver) = &saver {
+                saver.progress(&p.state);
+            }
+        });
         let _ = tree_cell.set(Arc::downgrade(&scan.tree()));
         Self {
             root,
