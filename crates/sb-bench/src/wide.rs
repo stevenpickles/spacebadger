@@ -37,6 +37,7 @@ impl WideFs {
             allocated: Some(((i as u64 * 7919) % 1_000_000).div_ceil(4096) * 4096),
             // Windows listings mark every file as possibly shared.
             identity: Identity::MaybeShared { key: i as u128 + 1 },
+            id: i as u128 + 1,
             cloud: false,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
         }

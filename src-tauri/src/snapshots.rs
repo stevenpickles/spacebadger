@@ -4,8 +4,10 @@
 //! Each scan root has its own folder, named by a hash of the root's
 //! absolute path (compared as the file system compares names), holding
 //! `<finished ms>.sbsnap` files in the format of `sb_core::snapshot`. A
-//! snapshot is written to a temporary file and renamed into place, so a
-//! crash leaves either the whole file or none.
+//! snapshot is written to a new temporary file (see [`crate::atomic_file`])
+//! and renamed into place, so a crash leaves either the whole file or none,
+//! and saves at once never write into each other's files. Temporary files a
+//! crash left behind are removed by a later prune once an hour old.
 //!
 //! After each save, a root keeps its newest [`KEEP_NEWEST`] snapshots, the
 //! first of every other day (UTC), and always its first, so rescanning a
@@ -13,6 +15,7 @@
 //! while all snapshots together exceed [`MAX_TOTAL_BYTES`], the oldest go,
 //! the daily ones before the newest and a root's first last of all.
 
+use crate::atomic_file::{self, TempFile};
 use sb_core::snapshot::{self, Snapshot, SnapshotHeader};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -28,7 +31,8 @@ pub const MAX_TOTAL_BYTES: u64 = 256 << 20;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const EXTENSION: &str = "sbsnap";
-const TEMP_EXTENSION: &str = "tmp";
+/// Temporary files of earlier versions.
+const OLD_TEMP_EXTENSION: &str = "tmp";
 
 /// Temporary files older than this are left over from a crash.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
@@ -80,7 +84,7 @@ impl Store {
         // Another save's prune may remove the folder while it's empty, just
         // after it was made here; then it's made again.
         let mut retried = false;
-        let (id, temp, mut file) = loop {
+        let (id, temp) = loop {
             fs::create_dir_all(&dir)?;
             let mut id = base.clone();
             let mut n = 1;
@@ -88,24 +92,16 @@ impl Store {
                 id = format!("{base}-{n}");
                 n += 1;
             }
-            let temp = dir.join(format!("{id}.{TEMP_EXTENSION}"));
-            match File::create(&temp) {
-                Ok(file) => break (id, temp, file),
+            match TempFile::new_in(&dir, &format!("{id}.{EXTENSION}")) {
+                Ok(temp) => break (id, temp),
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !retried => retried = true,
                 Err(e) => return Err(e),
             }
         };
         let path = dir.join(format!("{id}.{EXTENSION}"));
-        let written = (|| {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, &path)
-        })();
-        if let Err(e) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(e);
-        }
+        // Removed when dropped unless persisted.
+        temp.file().write_all(&bytes)?;
+        temp.persist(&path)?;
         let mut keep = vec![path];
         keep.extend(protect.map(|p| dir.join(format!("{p}.{EXTENSION}"))));
         self.prune(&keep);
@@ -221,13 +217,17 @@ fn snapshot_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// Removes temporary files in `dir` too old to be still being written.
 fn remove_stale_temps(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for e in entries.flatten() {
         let path = e.path();
-        if path.extension().is_none_or(|x| x != TEMP_EXTENSION) {
+        let temp = path
+            .extension()
+            .is_some_and(|x| x == atomic_file::EXTENSION || x == OLD_TEMP_EXTENSION);
+        if !temp {
             continue;
         }
         let old = e
@@ -447,6 +447,51 @@ mod tests {
         fs::remove_dir_all(store.root_dir(a)).unwrap();
         store.save(a, &snap("/data/a", 2000, 1), None).unwrap();
         assert_eq!(store.list(a).len(), 1);
+    }
+
+    #[test]
+    fn saves_through_a_temporary_file_and_clears_old_ones() {
+        let tmp = temp("temps");
+        let store = Store::new(tmp.0.clone());
+        let a = Path::new("/data/a");
+        store.save(a, &snap("/data/a", 1000, 1), None).unwrap();
+        let dir = store.root_dir(a);
+        // As if left by a crash, or being written by another save now.
+        let stale = dir.join(".2000.sbsnap.1-0.partial");
+        let old = dir.join("3000.tmp");
+        let fresh = dir.join(".4000.sbsnap.1-0.partial");
+        // A fixed name the new snapshot's temporary file might once have had.
+        let taken = dir.join(".5000.sbsnap.partial");
+        let hour_ago = SystemTime::now() - STALE_TEMP - Duration::from_secs(60);
+        for (path, aged) in [
+            (&stale, true),
+            (&old, true),
+            (&fresh, false),
+            (&taken, false),
+        ] {
+            let mut f = File::create(path).unwrap();
+            f.write_all(b"not ours").unwrap();
+            if aged {
+                f.set_modified(hour_ago).unwrap();
+            }
+        }
+        store.save(a, &snap("/data/a", 5000, 1), None).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".4000.sbsnap.1-0.partial",
+                ".5000.sbsnap.partial",
+                "1000.sbsnap",
+                "5000.sbsnap"
+            ]
+        );
+        assert_eq!(fs::read(&taken).unwrap(), b"not ours");
+        assert_eq!(fs::read(&fresh).unwrap(), b"not ours");
     }
 
     #[test]

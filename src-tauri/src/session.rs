@@ -3,8 +3,9 @@
 
 mod export;
 
-use crate::delete::{self, Outcome};
+use crate::delete::{self, Outcome, Scanned, Target};
 use crate::duplicates::{self, Job};
+use crate::identity::{self, Found};
 use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
@@ -69,6 +70,9 @@ pub struct Session {
     rematching: Mutex<()>,
     /// The earlier scan carried over from the previous scan of this root.
     carried: Option<compare::Carried>,
+    /// The scan root as found when the scan started, so a delete can tell
+    /// it hasn't been replaced since; `None` if it couldn't be read.
+    root_found: Option<Found>,
 }
 
 struct Names {
@@ -118,6 +122,7 @@ impl Session {
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
         let started_ms = compare::now_ms();
+        let root_found = identity::hold(&root, false).ok().map(|(found, _)| found);
         let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
@@ -160,6 +165,7 @@ impl Session {
             compare: Mutex::new(None),
             rematching: Mutex::new(()),
             carried,
+            root_found,
         }
     }
 
@@ -612,6 +618,7 @@ impl Session {
             logical: r.logical,
             allocated: r.allocated,
             unknown_allocation_files: r.unknown,
+            hardlinked: r.hardlinked,
             missing: r.missing as u32,
             samples: r
                 .items
@@ -634,9 +641,11 @@ impl Session {
         })
     }
 
-    /// Deletes the selected items from disk and removes those now gone from
-    /// the scan, which is published as a new revision. Refused while the
-    /// scan runs, since the scanner may still be adding to them.
+    /// Moves the selected items to the Recycle Bin or Trash, each only if
+    /// it is still the item the scan found, and removes those no longer
+    /// where they were from the scan, which is published as a new revision.
+    /// Refused while the scan runs, since the scanner may still be adding
+    /// to them.
     pub fn delete(&self, nodes: &[u32]) -> Result<proto::DeleteReport, String> {
         self.delete_using(nodes, delete::delete)
     }
@@ -645,7 +654,7 @@ impl Session {
     fn delete_using(
         &self,
         nodes: &[u32],
-        delete_one: impl Fn(&Path, bool) -> Outcome,
+        delete_one: impl Fn(&Target) -> Outcome,
     ) -> Result<proto::DeleteReport, String> {
         let _one_at_a_time = self
             .deleting
@@ -654,56 +663,99 @@ impl Session {
         if !self.scan.progress().state.is_finished() {
             return Err("Items can be deleted once the scan finishes or is cancelled.".into());
         }
-        let targets: Vec<(NodeId, PathBuf, bool)> = {
+        let targets: Vec<(NodeId, Target)> = {
             let tree = self.scan.tree();
             let tree = tree.read().map_err(|_| "scan data is unavailable")?;
             selection::resolve(&tree, nodes)
                 .items
                 .into_iter()
-                .map(|n| (n, tree.path(n), tree.is_dir(n)))
+                .map(|n| (n, self.target(&tree, n)))
                 .collect()
         };
-        let mut gone = Vec::new();
-        let mut already_gone = 0;
-        let mut failed = Vec::new();
-        for (n, path, folder) in targets {
-            match delete_one(&path, folder) {
-                Outcome::Deleted => gone.push(n),
-                Outcome::AlreadyGone => {
-                    already_gone += 1;
-                    gone.push(n);
-                }
-                Outcome::Failed(message) => failed.push(proto::DeleteFailure {
-                    node: n.index() as u32,
-                    path: display_path(&path),
-                    message,
-                }),
-            }
-        }
         let mut report = proto::DeleteReport {
             generation: self.generation(),
-            deleted: Vec::new(),
-            already_gone,
-            failed,
+            recycled: Vec::new(),
+            removed: Vec::new(),
+            others: Vec::new(),
             files: 0,
             logical: 0,
             allocated: 0,
         };
-        if gone.is_empty() {
+        let mut recycled = Vec::new();
+        let mut removed = Vec::new();
+        for (n, target) in targets {
+            let (outcome, message) = match delete_one(&target) {
+                Outcome::Recycled => {
+                    recycled.push(n);
+                    removed.push(n);
+                    continue;
+                }
+                Outcome::AlreadyMissing => {
+                    removed.push(n);
+                    (proto::DeleteOutcome::AlreadyMissing, String::new())
+                }
+                Outcome::Uncertain { reason, gone } => {
+                    // What's left at its path stays in the scan.
+                    if gone {
+                        removed.push(n);
+                    }
+                    (proto::DeleteOutcome::Uncertain, reason)
+                }
+                Outcome::Changed(message) => (proto::DeleteOutcome::Changed, message),
+                Outcome::Failed(message) => (proto::DeleteOutcome::Failed, message),
+            };
+            report.others.push(proto::DeleteItem {
+                node: n.index() as u32,
+                path: display_path(target.path()),
+                outcome,
+                message,
+            });
+        }
+        if removed.is_empty() {
             return Ok(report);
         }
         let edited = self.scan.edit_finished(|tree| {
-            for &n in &gone {
+            for &n in &recycled {
                 report.files += u64::from(tree.file_count(n));
                 report.logical += tree.logical(n);
                 report.allocated += tree.allocated(n);
+            }
+            for &n in &removed {
                 tree.remove(n);
             }
         });
         let ((), progress) = edited.ok_or("scan data is unavailable")?;
-        report.deleted = gone.iter().map(|n| n.index() as u32).collect();
+        report.recycled = recycled.iter().map(|n| n.index() as u32).collect();
+        report.removed = removed.iter().map(|n| n.index() as u32).collect();
         (self.on_status)(status(&display_path(&self.root), &progress));
         Ok(report)
+    }
+
+    /// What the scan recorded for `node` and every folder above it.
+    fn target(&self, tree: &Tree, node: NodeId) -> Target {
+        let mut chain = Vec::new();
+        let mut at = Some(node);
+        while let Some(n) = at {
+            let ids = match (&self.root_found, n == NodeId::ROOT) {
+                (Some(root), true) => root.ids,
+                (None, true) => [0; 2],
+                _ => [tree.id(n).unwrap_or(0), 0],
+            };
+            chain.push(Scanned {
+                path: tree.path(n),
+                folder: tree.is_dir(n),
+                ids,
+                len: tree.logical(n),
+                modified: tree.modified(n),
+                hardlinked: tree.flags(n) & (flags::HARDLINKED | flags::HARDLINK_ALIAS) != 0,
+            });
+            at = tree.parent(n);
+        }
+        chain.reverse();
+        Target {
+            chain,
+            volume: self.root_found.as_ref().map(|r| r.volume),
+        }
     }
 
     /// Starts looking for duplicate files, replacing any search already
@@ -1001,15 +1053,8 @@ mod tests {
     }
 
     /// Stands in for the trash.
-    fn remove(path: &Path, folder: bool) -> Outcome {
-        delete::delete_with(path, folder, |p| {
-            let r = if folder {
-                std::fs::remove_dir_all(p)
-            } else {
-                std::fs::remove_file(p)
-            };
-            r.map_err(|e| e.to_string())
-        })
+    fn remove(target: &Target) -> Outcome {
+        delete::delete_with(target, &delete::tests::TestBin::new())
     }
 
     fn child(tree: &Tree, parent: NodeId, name: &str) -> NodeId {
@@ -1239,8 +1284,9 @@ mod tests {
 
         let before = session.scan.progress().revision;
         let report = session.delete_using(&[id(a), id(old)], remove).unwrap();
-        assert_eq!(report.deleted, [id(old)]);
-        assert!(report.failed.is_empty());
+        assert_eq!(report.recycled, [id(old)]);
+        assert_eq!(report.removed, [id(old)]);
+        assert!(report.others.is_empty());
         assert_eq!((report.files, report.logical), (2, 8000));
         assert!(!tmp.0.join("old").exists());
         assert!(tmp.0.join("keep.txt").exists());
@@ -1253,11 +1299,46 @@ mod tests {
         let summary = session.search_summary(search.search).unwrap();
         assert_eq!(summary.files, 0);
 
-        // Already gone: removed from the scan without an error.
+        // Already gone: removed from the scan, never counted as recycled.
         std::fs::remove_file(tmp.0.join("keep.txt")).unwrap();
         let report = session.delete_using(&[id(keep)], remove).unwrap();
-        assert_eq!((report.deleted.len(), report.already_gone), (1, 1));
+        assert!(report.recycled.is_empty());
+        assert_eq!(report.removed, [id(keep)]);
+        assert_eq!(report.others.len(), 1);
+        assert_eq!(
+            report.others[0].outcome,
+            proto::DeleteOutcome::AlreadyMissing
+        );
+        assert_eq!((report.files, report.logical), (0, 0));
         assert_eq!(session.status().files, 0);
+    }
+
+    #[test]
+    fn leaves_an_item_replaced_since_the_scan_in_place_and_in_the_scan() {
+        let tmp = fixture_named("replaced");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let keep = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "keep.txt").index() as u32
+        };
+        let file = tmp.0.join("keep.txt");
+        let text = std::fs::read(&file).unwrap();
+        std::fs::rename(&file, tmp.0.join("scanned.txt")).unwrap();
+        std::fs::write(&file, text).unwrap();
+        let report = session.delete_using(&[keep], remove).unwrap();
+        assert!(report.recycled.is_empty() && report.removed.is_empty());
+        assert_eq!(report.others[0].outcome, proto::DeleteOutcome::Changed);
+        assert_eq!(report.others[0].message, "It was replaced since the scan.");
+        assert!(file.exists());
+        assert!(session.details(keep, None).is_ok(), "still in the scan");
     }
 
     #[test]
@@ -1345,6 +1426,7 @@ mod tests {
             "a selected folder takes the copies in it"
         );
         let kept = tmp.0.join("copy.bin");
+        let scanned_time = std::fs::metadata(&kept).unwrap().modified().unwrap();
         std::fs::write(&kept, b"changed").unwrap();
         let risky = check(&nodes[1..]);
         assert_eq!((risky.all_selected, risky.kept_gone), (0, 1));
@@ -1353,6 +1435,13 @@ mod tests {
             [display_path(&tmp.0.join("old").join("copy-2.bin"))]
         );
         std::fs::write(&kept, &copy).unwrap();
+        // As scanned again, so it can be deleted below.
+        std::fs::File::options()
+            .write(true)
+            .open(&kept)
+            .unwrap()
+            .set_modified(scanned_time)
+            .unwrap();
 
         // With a filter, only matching files count.
         let search = session.search_set("*.bin").unwrap().unwrap().search;

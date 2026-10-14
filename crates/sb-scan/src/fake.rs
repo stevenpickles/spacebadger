@@ -300,6 +300,7 @@ impl FakeFs {
                         logical: 0,
                         allocated: Some(0),
                         identity: Identity::Unique,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     },
@@ -315,6 +316,11 @@ impl FakeFs {
                         logical: *logical,
                         allocated: *allocated,
                         identity: *identity,
+                        // Linked files stand in for objects with an ID.
+                        id: match identity {
+                            Identity::MaybeShared { key } => *key,
+                            _ => 0,
+                        },
                         cloud: *cloud,
                         modified: *modified,
                     },
@@ -324,6 +330,7 @@ impl FakeFs {
                         logical: 0,
                         allocated: Some(0),
                         identity: Identity::Unique,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     },

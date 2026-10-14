@@ -17,6 +17,7 @@ use crate::duplicates::Skip;
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
+use sb_core::tree::unix_object_id;
 use std::collections::HashSet;
 use std::ffi::{CStr, OsStr, OsString};
 use std::os::fd::AsFd;
@@ -26,7 +27,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
-const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
+// The birth time comes with the same call where the filesystem keeps one.
+const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS
+    .union(StatxFlags::MNT_ID)
+    .union(StatxFlags::BTIME);
 
 struct Boundary {
     dev: u64,
@@ -56,6 +60,11 @@ impl LinuxFs {
 
 fn dev(stx: &Statx) -> u64 {
     (u64::from(stx.stx_dev_major) << 32) | u64::from(stx.stx_dev_minor)
+}
+
+/// The birth time in whole seconds, when statx filled it in.
+fn birth(stx: &Statx) -> Option<i64> {
+    (stx.stx_mask & StatxFlags::BTIME.bits() != 0).then_some(stx.stx_btime.tv_sec)
 }
 
 fn mount_id(stx: &Statx) -> Option<u64> {
@@ -188,6 +197,7 @@ impl LinuxFs {
                         logical: 0,
                         allocated: None,
                         identity: Identity::Unavailable,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     };
@@ -231,6 +241,8 @@ impl LinuxFs {
                 } else {
                     Identity::Unique
                 },
+                // The device is the scan's, checked at delete time.
+                id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
                 modified: modified(&stx),
             };

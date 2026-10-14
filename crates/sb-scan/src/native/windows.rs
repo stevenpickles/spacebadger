@@ -362,6 +362,7 @@ impl Listed {
             } else {
                 Identity::MaybeShared { key: self.file_id }
             },
+            id: self.file_id,
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),

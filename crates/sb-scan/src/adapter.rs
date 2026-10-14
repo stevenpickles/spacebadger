@@ -54,6 +54,10 @@ pub struct Entry {
     /// Locally allocated bytes, or `None` if the platform couldn't say.
     pub allocated: Option<u64>,
     pub identity: Identity,
+    /// The filesystem object's ID (file ID with Windows, inode number
+    /// elsewhere), so a later delete can tell it from a replacement; 0 when
+    /// unknown.
+    pub id: u128,
     /// The entry belongs to a cloud provider (placeholder or synced file).
     pub cloud: bool,
     /// Last write time, if the listing gave one. Recorded for files.
@@ -251,6 +255,7 @@ mod tests {
             logical: i as u64,
             allocated: Some(0),
             identity: Identity::Unique,
+            id: 0,
             cloud: false,
             modified: None,
         }

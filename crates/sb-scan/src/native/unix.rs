@@ -14,6 +14,7 @@ use crate::adapter::{
     batched,
 };
 use crate::duplicates::Skip;
+use sb_core::tree::{birth_secs, unix_object_id};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -133,6 +134,7 @@ impl UnixFs {
                         logical: 0,
                         allocated: None,
                         identity: Identity::Unavailable,
+                        id: 0,
                         cloud: false,
                         modified: None,
                     };
@@ -168,6 +170,8 @@ impl UnixFs {
                 } else {
                     Identity::Unique
                 },
+                // The device is the scan's, checked at delete time.
+                id: unix_object_id(meta.ino(), birth_secs(&meta)),
                 cloud: is_cloud(&meta),
                 modified: meta.modified().ok(),
             };
