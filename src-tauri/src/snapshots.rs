@@ -109,7 +109,9 @@ impl Store {
         let mut n = snapshot_files(&dir)
             .iter()
             .map(|(id, _)| order_of(id))
-            .filter(|&(c, _)| c == created)
+            // A number no save would reach is someone else's file; it's
+            // skipped, so counting on from it can't overflow.
+            .filter(|&(c, n)| c == created && n < u64::from(u32::MAX))
             .map(|(_, n)| n + 1)
             .max()
             .unwrap_or(0);
@@ -119,7 +121,7 @@ impl Store {
             match temp.persist_new(&format!("{id}.{EXTENSION}")) {
                 Ok(()) => break id,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < MAX_SAME_TIME => {
-                    n += 1;
+                    n = n.saturating_add(1);
                     tries += 1;
                 }
                 Err(e) => return Err(e),
@@ -578,6 +580,13 @@ mod tests {
         // The first, and the newest three: `1000-10` is newer than `1000-9`.
         assert_eq!(ids, ["1000-11", "1000-10", "1000-9", "1000"]);
         assert_eq!(order_of("1000-10"), (1000, 10));
+
+        // A huge number isn't counted on from.
+        let huge = store.root_dir(a).join(format!("1000-{}.sbsnap", u64::MAX));
+        fs::write(&huge, b"not a snapshot").unwrap();
+        let next = store.save(a, &snap("/data/a", 1000, 99), None).unwrap();
+        assert_eq!(next, "1000-12");
+        fs::remove_file(&huge).unwrap();
         assert_eq!(order_of("1000"), (1000, 0));
     }
 
