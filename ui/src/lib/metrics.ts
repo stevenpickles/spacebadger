@@ -1,5 +1,5 @@
-// Opt-in timings of what the interface waits for: request round trips,
-// decoding replies, and (from the map) painting. Kept only when the backend
+// Opt-in timings of what the interface waits for: request round trips and
+// decoding layouts (painting is left to the map). Kept only when the backend
 // keeps its own (`SPACEBADGER_TRACE` is set), so normal runs pay one boolean
 // check per call. Read them from the developer tools with
 // `await spacebadgerTrace.full()`, which adds the backend's table (queue,
