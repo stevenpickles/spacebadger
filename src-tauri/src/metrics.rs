@@ -2,9 +2,11 @@
 //! slow: waiting for a runtime thread, waiting for a lock, holding it, and
 //! the work done under it (search catch-up, ranking, layout, encoding).
 //!
-//! Off unless `SPACEBADGER_TRACE` is set (to `1`, or to a file to write the
-//! report to at exit); when off, every helper costs one atomic load and the
-//! guards carry no timestamps. Timings are kept per command in log-linear
+//! Off unless `SPACEBADGER_TRACE` is set: to a file to write the report to
+//! at exit, or to `1` for the standard error stream. Release builds on
+//! Windows have no console (`windows_subsystem = "windows"`), so they need a
+//! file. Empty or `0` is off. When off, every helper costs one atomic load
+//! and the guards carry no timestamps. Timings are kept per command in log-linear
 //! histograms (8 buckets per doubling, so percentiles are within 12.5%),
 //! with the slowest requests of each command kept whole, so the report says
 //! where a slow request spent its time.
@@ -35,7 +37,8 @@ pub fn enabled() -> bool {
         2 => true,
         1 => false,
         _ => {
-            let on = std::env::var_os("SPACEBADGER_TRACE").is_some_and(|v| !v.is_empty());
+            let on =
+                std::env::var_os("SPACEBADGER_TRACE").is_some_and(|v| !v.is_empty() && v != "0");
             STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -506,7 +509,8 @@ pub fn describe(r: &Request) -> String {
 }
 
 /// Writes the report where `SPACEBADGER_TRACE` says: a file, or with `1`
-/// the standard error stream.
+/// the standard error stream (lost in Windows release builds, which have no
+/// console).
 pub fn write_report() {
     let Some(text) = report() else {
         return;
