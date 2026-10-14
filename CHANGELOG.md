@@ -44,6 +44,11 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The result says what happened to each item: moved, already gone, changed, couldn't be moved, or gone without being confirmed in the Recycle Bin (a warning). Items that were already gone are no longer counted as moved.
 - The confirmation gives the content size, and how much disk space is freed only when that can be known (not with hard links or unmeasured files).
 
+### Fixed
+- The details could show the change of the item selected before, beside the one selected now, when its answer came back last; likewise for the folder in view.
+- The details could fall back to an earlier filter's totals, or an earlier revision's, when a slow answer arrived after a newer one.
+- The contents list could mix rows from different moments of a running scan, showing an item twice or leaving one out. Its visible rows are now refreshed together for the latest scan update.
+
 ## [0.2.0] - 2026-10-13
 
 A redesigned interface, a much more capable filter, and sizes in familiar units.
