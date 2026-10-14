@@ -273,6 +273,8 @@
           ) {
             stats.layout.add(performance.now() - started);
             layout = reply;
+            // The tile under a resting pointer may be another one now.
+            if (rest) hoverAt(rest.x, rest.y);
             if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
             shown = { generation: want.generation, view: want.view, search: want.search };
             error = null;
@@ -567,21 +569,29 @@
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
-  function onMove(e: MouseEvent) {
+  /** Where the pointer last rested over the map while it hovers, or null:
+   * a new layout is hit-tested there, so the highlight and tooltip follow
+   * the tile now under the pointer. */
+  let rest: { x: number; y: number } | null = null;
+
+  function hoverAt(x: number, y: number) {
     const l = layout;
-    if (!l) return;
-    const [x, y] = point(e);
-    const index = hitTest(l, x, y);
-    if (trace.on) {
-      trace.moves++;
-      if (index !== hoverIndex) trace.hoverChanges++;
-    }
+    const index = l ? hitTest(l, x, y) : -1;
+    if (trace.on && index !== hoverIndex) trace.hoverChanges++;
     hoverIndex = index;
     pointer = index >= 0 ? { x, y } : null;
+  }
+
+  function onMove(e: MouseEvent) {
+    const [x, y] = point(e);
+    rest = { x, y };
+    if (trace.on) trace.moves++;
+    hoverAt(x, y);
     keyTip = false;
   }
 
   function onLeave() {
+    rest = null;
     hoverIndex = -1;
     pointer = null;
   }
@@ -755,8 +765,7 @@
       if (i >= 0) {
         onpick(only(i));
         keyTip = true;
-        hoverIndex = -1;
-        pointer = null;
+        onLeave();
         announceAt(i);
       }
     } else if (e.key === "Enter") {
