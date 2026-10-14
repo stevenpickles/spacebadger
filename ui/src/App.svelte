@@ -427,8 +427,8 @@
   // ---- filename search ------------------------------------------------
 
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Counts requests so only the newest reply is used. */
-  let searchSeq = 0;
+  /** Only the newest search's reply is used. */
+  const searches = latest();
 
   function onQueryInput() {
     clearTimeout(searchTimer);
@@ -449,36 +449,42 @@
   async function applySearch(text: string) {
     const gen = generation;
     if (gen === null) return;
-    const seq = ++searchSeq;
+    const t = searches.begin(queryKey(gen, text));
     searching = text !== "";
     try {
       const summary = await searchSet(gen, text);
-      if (seq !== searchSeq || gen !== generation) return;
+      if (!searches.current(t) || gen !== generation) return;
       search = summary;
       filterError = null;
       menu = null;
     } catch (e) {
       // A newer search replaced this one; its reply will arrive instead.
       // The one that failed is the query as typed, e.g. an unknown type.
-      if (seq === searchSeq && gen === generation) filterError = errorText(e);
+      if (searches.current(t) && gen === generation) filterError = errorText(e);
     } finally {
-      if (seq === searchSeq) searching = false;
+      if (searches.current(t)) searching = false;
     }
   }
 
   const searchId = $derived(search?.search);
 
-  // Matching totals follow the scan.
+  // Matching totals follow the scan; an earlier revision's reply arriving
+  // late is dropped.
+  const searchTotals = latest();
   $effect(() => {
     const gen = generation;
     const id = searchId;
-    void status?.revision;
-    if (gen === null || id === undefined) return;
-    searchSummary(gen, id).then(
+    const revision = status?.revision;
+    if (gen === null || id === undefined) {
+      searchTotals.cancel();
+      return;
+    }
+    searchTotals.run(
+      queryKey(gen, revision, id),
+      () => searchSummary(gen, id),
       (s) => {
-        if (gen === generation && search?.search === s.search) search = s;
+        if (search?.search === s.search) search = s;
       },
-      () => {},
     );
   });
 
