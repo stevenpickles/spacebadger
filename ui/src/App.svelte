@@ -308,19 +308,20 @@
 
   const searchId = $derived(search?.search);
 
-  // Matching totals follow the scan; an earlier revision's reply arriving
-  // late is dropped.
+  // Matching totals follow the scan; a reply for an earlier revision than
+  // one already shown is dropped.
   const searchTotals = latest();
   $effect(() => {
     const gen = generation;
     const id = searchId;
-    const revision = status?.revision;
+    const revision = status?.revision ?? 0;
     if (gen === null || id === undefined) {
       searchTotals.cancel();
       return;
     }
     searchTotals.run(
-      queryKey(gen, revision, id),
+      queryKey(gen, id),
+      revision,
       () => searchSummary(gen, id),
       (s) => {
         if (search?.search === s.search) search = s;
@@ -543,13 +544,13 @@
     untrack(() => pick(null));
   });
 
-  // Totals for several selected items follow the scan; an earlier
-  // revision's reply arriving late is dropped.
+  // Totals for several selected items follow the scan; a reply for an
+  // earlier revision than one already shown is dropped.
   const multiRequest = latest();
   $effect(() => {
     const gen = generation;
     const nodes = picked;
-    const revision = status?.revision;
+    const revision = status?.revision ?? 0;
     if (gen === null || nodes.length < 2) {
       multiRequest.cancel();
       multi = null;
@@ -558,7 +559,8 @@
     }
     multiUpdating = true;
     multiRequest.run(
-      queryKey(gen, revision, ...nodes),
+      queryKey(gen, ...nodes),
+      revision,
       () => selectionSummary({ generation: gen, nodes }),
       (s) => {
         multi = s;
@@ -646,9 +648,10 @@
   /** What a folder adds up to in the map: its matching files when filtered. */
   const shownSize = (d: NodeDetails) => d.matching?.logical ?? d.logical;
 
-  // Each of the details below takes only its newest reply: a reply to an
-  // earlier filter, revision, or item (A, then B, then A again) is dropped,
-  // however late it arrives.
+  // Each of the details below follows one item and filter: a reply about
+  // an earlier one (A, then B, then A again) is dropped, however late it
+  // arrives. While the scan runs, newer revisions queue behind the request
+  // in flight rather than dropping it, so slow replies still land.
   const viewDetailsRequest = latest();
   const selectedDetailsRequest = latest();
   const parentSizeRequest = latest();
@@ -661,13 +664,14 @@
     const gen = generation;
     const node = view;
     const filter = searchId ?? null;
-    const revision = status?.revision;
+    const revision = status?.revision ?? 0;
     if (gen === null) {
       viewDetailsRequest.cancel();
       return;
     }
     viewDetailsRequest.run(
-      queryKey(gen, revision, node, filter),
+      queryKey(gen, node, filter),
+      revision,
       () => nodeDetails(gen, node, filter),
       (d) => {
         if (d.generation === gen && d.node === node) viewDetails = d;
@@ -680,7 +684,7 @@
     const gen = generation;
     const sel = selection;
     const filter = searchId ?? null;
-    const revision = status?.revision;
+    const revision = status?.revision ?? 0;
     void detailsRetry;
     detailsError = null;
     if (gen === null || !sel) {
@@ -690,7 +694,8 @@
     }
     const node = sel.node;
     selectedDetailsRequest.run(
-      queryKey(gen, revision, node, filter),
+      queryKey(gen, node, filter),
+      revision,
       () => nodeDetails(gen, node, filter),
       (d) => {
         if (d.generation === gen && d.node === node) selectedDetails = d;
@@ -709,15 +714,23 @@
     const d = selectedDetails;
     const parent = d?.ancestors.at(-2)?.node;
     const filter = searchId ?? null;
-    parentSize = null;
-    parentSizeRequest.cancel();
-    if (gen === null || !d || parent === undefined || selection?.other) return;
+    const revision = untrack(() => status?.revision ?? 0);
+    if (gen === null || !d || parent === undefined || selection?.other) {
+      parentSizeRequest.cancel();
+      parentSize = null;
+      return;
+    }
     if (parent === view && viewDetails?.node === view) {
+      parentSizeRequest.cancel();
       parentSize = shownSize(viewDetails);
       return;
     }
+    // The share stays while the scan updates it, until the item changes.
+    const key = queryKey(gen, d.node, parent, filter);
+    if (!parentSizeRequest.follows(key)) parentSize = null;
     parentSizeRequest.run(
-      queryKey(gen, d.node, parent, filter),
+      key,
+      revision,
       () => nodeDetails(gen, parent, filter),
       (p) => (parentSize = shownSize(p)),
     );
@@ -730,11 +743,17 @@
     const d = viewDetails;
     const parent = d?.ancestors.at(-2)?.node;
     const filter = searchId ?? null;
-    viewParentSize = null;
-    viewParentSizeRequest.cancel();
-    if (gen === null || !d || parent === undefined) return;
+    const revision = untrack(() => status?.revision ?? 0);
+    if (gen === null || !d || parent === undefined) {
+      viewParentSizeRequest.cancel();
+      viewParentSize = null;
+      return;
+    }
+    const key = queryKey(gen, d.node, parent, filter);
+    if (!viewParentSizeRequest.follows(key)) viewParentSize = null;
     viewParentSizeRequest.run(
-      queryKey(gen, d.node, parent, filter),
+      key,
+      revision,
       () => nodeDetails(gen, parent, filter),
       (p) => (viewParentSize = shownSize(p)),
     );

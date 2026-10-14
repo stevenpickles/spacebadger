@@ -1,11 +1,18 @@
 // Request identity for replies that arrive out of order. Backend calls run
 // concurrently, so a reply can come back after a newer request for the same
 // thing, or after the component that asked is gone. Every place that applies
-// a reply to state asks a `Latest` first: only the newest request it started
-// is still wanted, and none once it's disposed.
+// a reply to state asks a `Latest` first, and none is applied once it's
+// disposed.
+//
+// A request has an identity, every input that decides what is asked (scan,
+// node, filter, comparison), and usually the scan revision it was asked at.
+// A new identity supersedes everything before it. A newer revision of the
+// same identity doesn't: while a scan runs, revisions come faster than some
+// replies, so the request in flight is kept, the newest one waits behind it,
+// and a reply is applied unless a newer revision's already was.
 import { onDestroy } from "svelte";
 
-/** One request as `Latest` handed it out. */
+/** One request as `Latest.begin` handed it out. */
 export interface Ticket {
   readonly seq: number;
   /** Everything the answer depends on; see `queryKey`. */
@@ -13,23 +20,47 @@ export interface Ticket {
 }
 
 /**
- * The identity of a query: every input that affects its answer, such as the
- * scan generation, revision, node, filter, metric, and comparison. Two
- * requests with the same key would get the same answer.
+ * The identity of a query: every input that affects its answer apart from
+ * the scan revision, such as the scan generation, node, filter, metric, and
+ * comparison. Two requests with the same key ask the same question.
  */
 export function queryKey(...parts: (string | number | boolean | null | undefined)[]): string {
   return JSON.stringify(parts);
 }
 
-/** Latest request wins: starting one supersedes every earlier one. */
 export class Latest {
-  #seq = 0;
-  #key: string | null = null;
   #disposed = false;
+  /** The identity asked about; `null` when nothing is. */
+  #key: string | null = null;
+  /** Counts identities, so going A, B, then A again drops A's first replies. */
+  #epoch = 0;
+  /** Counts `begin` calls; only the newest ticket is current. */
+  #seq = 0;
+  /** The newest revision applied for this identity. */
+  #applied = -Infinity;
+  #inFlight = false;
+  #pending: (() => void) | null = null;
 
-  /** Starts a request; replies to earlier ones are no longer wanted. */
-  begin(key = ""): Ticket {
+  #identify(key: string | null) {
+    if (key === this.#key) return;
     this.#key = key;
+    this.#epoch++;
+    this.#applied = -Infinity;
+    this.#inFlight = false;
+    this.#pending = null;
+  }
+
+  /** Whether `key` is the identity being asked about. */
+  follows(key: string): boolean {
+    return !this.#disposed && key === this.#key;
+  }
+
+  /**
+   * Starts a request that supersedes every earlier one, whatever its
+   * identity; for requests applied in steps, such as a search.
+   */
+  begin(key = ""): Ticket {
+    this.#identify(key);
     return { seq: ++this.#seq, key };
   }
 
@@ -38,36 +69,54 @@ export class Latest {
     return !this.#disposed && t.seq === this.#seq;
   }
 
-  /** Whether an answer for `key` is what the newest request asked for, for
-   * replies that say themselves what they answer (a revision, a token). */
-  accepts(key: string): boolean {
-    return !this.#disposed && key === this.#key;
+  /**
+   * Asks `request` about `key` at `revision` and passes the outcome on
+   * while `key` is still the identity asked about and no newer revision's
+   * reply was applied. One request per identity runs at a time; asking
+   * again meanwhile replaces the one waiting.
+   */
+  run<T>(
+    key: string,
+    revision: number,
+    request: () => Promise<T>,
+    onvalue: (value: T) => void,
+    onerror?: (e: unknown) => void,
+  ) {
+    if (this.#disposed) return;
+    this.#identify(key);
+    const epoch = this.#epoch;
+    const settle = (apply: () => void) => {
+      if (this.#disposed || epoch !== this.#epoch) return;
+      this.#inFlight = false;
+      if (revision >= this.#applied) {
+        this.#applied = revision;
+        apply();
+      }
+      const next = this.#pending;
+      this.#pending = null;
+      next?.();
+    };
+    const start = () => {
+      this.#inFlight = true;
+      request().then(
+        (v) => settle(() => onvalue(v)),
+        (e: unknown) => settle(() => onerror?.(e)),
+      );
+    };
+    if (this.#inFlight) this.#pending = start;
+    else start();
   }
 
   /** Nothing is wanted any more, e.g. the thing asked about went away. */
   cancel() {
     this.#seq++;
-    this.#key = null;
+    this.#identify(null);
   }
 
   /** For good: the owner is gone. */
   dispose() {
     this.cancel();
     this.#disposed = true;
-  }
-
-  /** Starts `request` and passes its outcome on only while it's the newest. */
-  run<T>(key: string, request: () => Promise<T>, onvalue: (value: T) => void, onerror?: (e: unknown) => void): Ticket {
-    const t = this.begin(key);
-    request().then(
-      (v) => {
-        if (this.current(t)) onvalue(v);
-      },
-      (e: unknown) => {
-        if (this.current(t)) onerror?.(e);
-      },
-    );
-    return t;
   }
 }
 

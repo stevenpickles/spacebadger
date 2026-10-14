@@ -82,14 +82,15 @@ export class ComparisonController {
       const gen = scan.generation;
       const cmp = this.id;
       const node = selected();
-      const revision = scan.status?.revision;
+      const revision = scan.status?.revision ?? 0;
       if (gen === null || cmp === null || node === null) {
         selectedRequest.cancel();
         this.selectedChange = null;
         return;
       }
       selectedRequest.run(
-        queryKey(gen, revision, cmp, node),
+        queryKey(gen, cmp, node),
+        revision,
         () => compareItem(gen, cmp, node),
         (c) => {
           if (c.generation === gen && c.node === node) this.selectedChange = c;
@@ -100,14 +101,15 @@ export class ComparisonController {
       const gen = scan.generation;
       const cmp = this.id;
       const node = view();
-      const revision = scan.status?.revision;
+      const revision = scan.status?.revision ?? 0;
       if (gen === null || cmp === null) {
         viewRequest.cancel();
         this.viewChange = null;
         return;
       }
       viewRequest.run(
-        queryKey(gen, revision, cmp, node),
+        queryKey(gen, cmp, node),
+        revision,
         () => compareItem(gen, cmp, node),
         (c) => {
           if (c.generation === gen && c.node === node) this.viewChange = c;
