@@ -16,6 +16,12 @@ folder: FolderState | null, logical: number,
  */
 allocated: number | null, unknownAllocationFiles: number, files: number, cloud: boolean, hardlinked: boolean, 
 /**
+ * A file's last-modified time in seconds since the Unix epoch; `None`
+ * for folders, when the filesystem didn't say, and for times before
+ * 1970 or after 2106, which the scan doesn't keep exactly.
+ */
+modified: number | null, 
+/**
  * For a hard-link alias, the path that owns the allocation.
  */
 aliasOf: string | null, 

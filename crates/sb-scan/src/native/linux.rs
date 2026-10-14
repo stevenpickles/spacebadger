@@ -12,6 +12,7 @@
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
+use crate::duplicates::Skip;
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags, openat, statx,
 };
@@ -21,6 +22,7 @@ use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
 const STAT_MASK: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
@@ -57,6 +59,19 @@ fn dev(stx: &Statx) -> u64 {
 
 fn mount_id(stx: &Statx) -> Option<u64> {
     (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id)
+}
+
+/// The last write time, when statx filled it in (part of `BASIC_STATS`).
+fn modified(stx: &Statx) -> Option<SystemTime> {
+    if stx.stx_mask & StatxFlags::MTIME.bits() == 0 {
+        return None;
+    }
+    let t = &stx.stx_mtime;
+    let nanos = Duration::new(0, t.tv_nsec);
+    match u64::try_from(t.tv_sec) {
+        Ok(secs) => UNIX_EPOCH.checked_add(Duration::from_secs(secs) + nanos),
+        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(t.tv_sec.unsigned_abs()) - nanos),
+    }
 }
 
 fn kind_of(stx: &Statx) -> FileType {
@@ -152,6 +167,7 @@ impl FsAdapter for LinuxFs {
                         allocated: None,
                         identity: Identity::Unavailable,
                         cloud: false,
+                        modified: None,
                     });
                     continue;
                 }
@@ -191,6 +207,7 @@ impl FsAdapter for LinuxFs {
                     Identity::Unique
                 },
                 cloud: false,
+                modified: modified(&stx),
             });
         }
         Ok(entries)
@@ -278,6 +295,30 @@ fn filesystem_name(magic: u32) -> Option<&'static str> {
 /// Whether the process runs as root, which bypasses permission checks.
 pub fn is_privileged() -> bool {
     rustix::process::geteuid().is_root()
+}
+
+/// Opens a file to read its contents for finding duplicates. `O_NOFOLLOW`
+/// refuses a link, and `O_NONBLOCK` keeps a FIFO that replaced the file from
+/// blocking; anything but a plain file of the scanned size is refused.
+pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    // `O_NOATIME` spares the disk a write per file read, but only the
+    // file's owner (or root) may ask for it.
+    let fd = match rustix::fs::open(path, flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open(path, flags, Mode::empty()),
+        opened => opened,
+    }
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP => Skip::Changed,
+        e => Skip::of(&e.into()),
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(|e| Skip::of(&e))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(file)
 }
 
 #[cfg(test)]

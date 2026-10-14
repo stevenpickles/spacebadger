@@ -2,11 +2,21 @@
   import { untrack } from "svelte";
   import {
     appInfo,
+    compareItem,
+    compareSet,
+    compareSnapshots,
     deleteItems,
+    duplicatesCancel,
+    duplicatesCheck,
+    duplicatesStart,
+    duplicatesStatus,
     errorText,
     EXPECTED_PROTOCOL_VERSION,
+    exportSave,
     fileManagerName,
     nodeDetails,
+    onDuplicatesStatus,
+    onExportProgress,
     onScanStatus,
     scanCancel,
     scanChoose,
@@ -14,6 +24,7 @@
     scanStatus,
     restartElevated,
     reveal,
+    revealExport,
     searchSet,
     searchSummary,
     selectionSummary,
@@ -22,19 +33,31 @@
     volumeInfo,
   } from "./lib/api";
   import Breadcrumbs from "./lib/Breadcrumbs.svelte";
+  import Changes from "./lib/Changes.svelte";
+  import { formatWhen } from "./lib/compare";
+  import CompareControl from "./lib/CompareControl.svelte";
   import type { ColorMode } from "./lib/colors";
   import Legend from "./lib/Legend.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Contents, { type ContentsRow } from "./lib/Contents.svelte";
   import DeleteDialog, { type DeleteResult } from "./lib/DeleteDialog.svelte";
   import Details from "./lib/Details.svelte";
+  import Duplicates from "./lib/Duplicates.svelte";
+  import ExportDialog, { exportFileName, localTime, type ExportChoice } from "./lib/ExportDialog.svelte";
+  import ExportToast from "./lib/ExportToast.svelte";
   import FilterBox from "./lib/FilterBox.svelte";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
-  import { formatBytes, plural } from "./lib/format";
+  import { formatBytes, KILO, plural } from "./lib/format";
   import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
+  import type { CompareSummary } from "./lib/protocol/CompareSummary";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
+  import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
+  import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
+  import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
+  import type { ExportReport } from "./lib/protocol/ExportReport";
+  import type { ItemChange } from "./lib/protocol/ItemChange";
   import type { Metric } from "./lib/protocol/Metric";
   import type { NodeDetails } from "./lib/protocol/NodeDetails";
   import type { ScanStarted } from "./lib/protocol/ScanStarted";
@@ -43,6 +66,7 @@
   import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
+  import type { SnapshotInfo } from "./lib/protocol/SnapshotInfo";
   import SearchResults from "./lib/SearchResults.svelte";
   import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
@@ -53,7 +77,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "contents" | "results" | "small" | "omissions";
+  type PanelTab = "contents" | "changes" | "results" | "small" | "duplicates" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -63,6 +87,11 @@
     ["*.js; !dir:node_modules", "JavaScript files, except inside node_modules"],
     ["is:video", "videos; also audio, image, document, archive, diskimage, program, code, other"],
     ["is:image; dir:Photos", "images inside Photos folders"],
+    ["size:>500MB", "files over 500 MB; also <, >=, <="],
+    ["size:10MB..1GB", "from 10 MB to 1 GB, both included"],
+    ["older:1y", "modified over a year ago; also h, d, w, mo"],
+    ["newer:2024-06-30", "modified on or after a date"],
+    ["*.iso; size:>1GB; older:1y", "disk images over 1 GB, untouched for a year"],
   ];
 
   let generation = $state<number | null>(null);
@@ -96,7 +125,12 @@
   let trash = $state(trashName(""));
   /** Deleting is turned on. Never saved: every start begins with it off. */
   let allowDelete = $state(false);
-  let confirmDelete = $state.raw<{ nodes: number[]; summary: SelectionSummary } | null>(null);
+  let confirmDelete = $state.raw<{
+    nodes: number[];
+    summary: SelectionSummary;
+    /** Groups of duplicates the delete would leave with no copy. */
+    duplicates: DuplicatesCheck | "unknown" | null;
+  } | null>(null);
   let deleting = $state(false);
   /** What the last delete did, shown in the dialog until it's closed. */
   let deleteResult = $state.raw<DeleteResult | null>(null);
@@ -120,6 +154,10 @@
   let elevating = $state(false);
   /** The list chosen below the details; the panel falls back to one that's open. */
   let tab = $state<PanelTab | null>(null);
+  /** The latest search for duplicate files in this scan, while its tab is open. */
+  let dupes = $state.raw<DuplicatesStatus | null>(null);
+  /** Smallest file size the duplicate search looks at. */
+  let dupesMinSize = $state(Math.max(KILO, Number(saved("duplicates-min-size")) || KILO ** 2));
 
   const scanning = $derived(status?.phase.kind === "scanning");
   /** Restarting with administrator rights is offered on Windows only. */
@@ -179,7 +217,10 @@
     }
   }
 
-  $effect(() => remember("colors", colors));
+  // Change colors last only as long as the comparison, so aren't remembered.
+  $effect(() => {
+    if (colors !== "change") remember("colors", colors);
+  });
   $effect(() => remember("volume", showVolume ? "on" : "off"));
 
   /** The contents list shows folders too; off, it lists files from every level. */
@@ -189,6 +230,9 @@
   /** Switches to a newer scan; view and selection start over at its root. */
   function adopt(next: number) {
     if (generation !== null && next <= generation) return;
+    // Rescanning the same folder goes on comparing with the same earlier
+    // scan once the new one completes.
+    carried = comparison && status ? { snapshot: comparison.snapshot, root: status.root } : null;
     generation = next;
     status = null;
     view = ROOT;
@@ -199,6 +243,9 @@
     menu = null;
     search = null;
     volume = null;
+    dupes = null;
+    snapshots = [];
+    endComparison();
     // Keep the filter across Refresh and new roots.
     if (query) applySearch(query);
   }
@@ -247,6 +294,116 @@
     volumeInfo(gen).then(
       (v) => {
         if (gen === generation) volume = v;
+      },
+      () => {},
+    );
+  });
+
+  // ---- comparing with an earlier scan -------------------------------------
+
+  /** Earlier scans of this root, newest first, offered once a scan completes. */
+  let snapshots = $state.raw<SnapshotInfo[]>([]);
+  /** The comparison that's on. Nothing about it is remembered across restarts. */
+  let comparison = $state.raw<CompareSummary | null>(null);
+  let comparing = $state(false);
+  /** The colors to go back to when comparing stops. */
+  let colorsBefore: ColorMode = "depth";
+  /** List folders in the Changes tab, not only files. */
+  let changesFolders = $state(true);
+  let selectedChange = $state.raw<ItemChange | null>(null);
+  let viewChange = $state.raw<ItemChange | null>(null);
+  const compareId = $derived(comparison?.snapshot.id ?? null);
+  const since = $derived(comparison ? formatWhen(comparison.snapshot.createdMs) : "");
+  /** Only a completed scan is saved, and only it can be compared. */
+  const completed = $derived(status?.phase.kind === "complete" || status?.phase.kind === "completeWithOmissions");
+
+  $effect(() => {
+    const gen = generation;
+    if (gen === null || !completed) return;
+    compareSnapshots(gen).then(
+      (list) => {
+        if (gen === generation) snapshots = list;
+      },
+      () => {},
+    );
+  });
+
+  /** The comparison to take up again after a rescan of the same folder. */
+  let carried: { snapshot: SnapshotInfo; root: string } | null = null;
+
+  $effect(() => {
+    const gen = generation;
+    if (gen === null || !completed || !status) return;
+    const root = status.root;
+    untrack(() => {
+      const c = carried;
+      carried = null;
+      // Quietly: the earlier scan may have been pruned meanwhile.
+      if (c && c.root === root) void startComparison(c.snapshot, true);
+    });
+  });
+
+  async function startComparison(s: SnapshotInfo, again = false) {
+    const gen = generation;
+    if (gen === null || comparing) return;
+    comparing = true;
+    try {
+      const summary = await compareSet(gen, s.id);
+      if (gen !== generation || !summary) return;
+      comparison = summary;
+      if (colors !== "change") colorsBefore = colors;
+      colors = "change";
+      if (!again) tab = "changes";
+      announce(`Comparing with the scan of ${formatWhen(s.createdMs)}`);
+    } catch (e) {
+      if (!again) problem = `Couldn't compare: ${errorText(e)}`;
+    } finally {
+      comparing = false;
+    }
+  }
+
+  function stopComparison() {
+    const gen = generation;
+    if (gen !== null) compareSet(gen, null).catch(() => {});
+    endComparison();
+  }
+
+  function endComparison() {
+    comparison = null;
+    selectedChange = null;
+    viewChange = null;
+    if (colors === "change") colors = colorsBefore;
+  }
+
+  // How the selected item and the viewed folder changed, for the details.
+  $effect(() => {
+    const gen = generation;
+    const cmp = compareId;
+    const node = selection && !selection.other ? selection.node : null;
+    void status?.revision;
+    if (gen === null || cmp === null || node === null) {
+      selectedChange = null;
+      return;
+    }
+    compareItem(gen, cmp, node).then(
+      (c) => {
+        if (gen === generation && compareId === cmp) selectedChange = c;
+      },
+      () => {},
+    );
+  });
+  $effect(() => {
+    const gen = generation;
+    const cmp = compareId;
+    const node = view;
+    void status?.revision;
+    if (gen === null || cmp === null) {
+      viewChange = null;
+      return;
+    }
+    compareItem(gen, cmp, node).then(
+      (c) => {
+        if (gen === generation && compareId === cmp) viewChange = c;
       },
       () => {},
     );
@@ -346,9 +503,158 @@
     items.push(
       { label: `Show in ${fileManager}`, action: () => showInFileManager(it.node), separator: it.folder },
       { label: "Copy path", action: () => copyPath(it.node) },
-      ...deleteItemsFor(it.node),
     );
+    if (it.folder) items.push(findDuplicatesItem(it.node));
+    if (it.folder) items.push(...exportItemsFor(it.node));
+    items.push(...deleteItemsFor(it.node));
     return items;
+  }
+
+  function duplicateMenu(f: DuplicateFile): MenuItem[] {
+    return [
+      { label: "Show in map", hint: "Enter", action: () => showInMap(f) },
+      { label: `Show in ${fileManager}`, action: () => showInFileManager(f.node), separator: true },
+      { label: "Copy path", action: () => copyPath(f.node) },
+      ...deleteItemsFor(f.node),
+    ];
+  }
+
+  // ---- duplicate files ----------------------------------------------------
+
+  const duplicatesBlocked = "Duplicates can be found once the scan finishes or is cancelled.";
+
+  /** Looks for files with the same contents under `folder`, matching the
+   * filter if one is on. Only ever started by the user: it reads the files. */
+  async function findDuplicates(folder: number, minSize = dupesMinSize) {
+    const gen = generation;
+    if (gen === null) return;
+    if (scanning) {
+      flash(duplicatesBlocked);
+      return;
+    }
+    dupesMinSize = minSize;
+    remember("duplicates-min-size", String(minSize));
+    try {
+      const started = await duplicatesStart({ generation: gen, folder, search: searchId ?? null, minSize });
+      if (gen !== generation) return;
+      dupes = started;
+      tab = "duplicates";
+    } catch (e) {
+      problem = `Couldn't look for duplicates: ${errorText(e)}`;
+    }
+  }
+
+  function findDuplicatesItem(folder: number): MenuItem {
+    return {
+      label: "Find duplicates here",
+      action: () => findDuplicates(folder),
+      separator: true,
+      disabled: scanning,
+      title: scanning ? duplicatesBlocked : undefined,
+    };
+  }
+
+  function stopDuplicates() {
+    if (generation !== null && dupes) duplicatesCancel(generation, dupes.job).catch(() => {});
+  }
+
+  function closeDuplicates() {
+    if (dupes?.phase === "running") stopDuplicates();
+    dupes = null;
+  }
+
+  $effect(() => {
+    const unlisten = onDuplicatesStatus((s) => {
+      if (s.generation === generation && s.job === dupes?.job) dupes = s;
+    });
+    return () => void unlisten.then((f) => f());
+  });
+
+  /** The duplicate search shown, as a plain number so that status updates
+   * (new objects) don't rerun what depends on it. */
+  const dupesJob = $derived(dupes?.job);
+
+  // Deleting items takes them out of the groups.
+  $effect(() => {
+    const gen = generation;
+    const job = dupesJob;
+    void status?.revision;
+    if (gen === null || job === undefined) return;
+    duplicatesStatus(gen, job).then(
+      (s) => {
+        if (gen === generation && s.job === dupes?.job) dupes = s;
+      },
+      () => {},
+    );
+  });
+
+  // ---- export -----------------------------------------------------------
+
+  /** The folder the export dialog is open for. */
+  let exportOf = $state.raw<{ node: number; name: string } | null>(null);
+  /** An export is running: rows written so far, `null` until the file is chosen. */
+  let exporting = $state<{ rows: number | null } | null>(null);
+  /** The last finished export, shown until dismissed. */
+  let exported = $state.raw<ExportReport | null>(null);
+
+  async function askExport(node: number) {
+    const gen = generation;
+    if (gen === null || exporting) return;
+    try {
+      const d = await nodeDetails(gen, node);
+      if (gen === generation) exportOf = { node, name: d.name };
+    } catch (e) {
+      problem = `Couldn't export: ${errorText(e)}`;
+    }
+  }
+
+  async function runExport(choice: ExportChoice) {
+    const target = exportOf;
+    const gen = generation;
+    exportOf = null;
+    if (!target || gen === null || exporting) return;
+    exporting = { rows: null };
+    exported = null;
+    // Listening before asking, so even a small export's progress is seen.
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await onExportProgress((p) => {
+        if (p.generation === gen && exporting) exporting = { rows: p.rows };
+      });
+      const report = await exportSave({
+        generation: gen,
+        folder: target.node,
+        scope: choice.scope,
+        format: choice.format,
+        metric,
+        search: searchId ?? null,
+        fileName: exportFileName(target.name, choice.format),
+        exportedAt: localTime(),
+      });
+      if (report) {
+        exported = report;
+        announce(
+          report.format === "csv"
+            ? `Exported ${plural(report.rows, "row")} to ${report.path}`
+            : `Saved the report to ${report.path}`,
+        );
+      }
+    } catch (e) {
+      problem = `Couldn't export: ${errorText(e)}`;
+    } finally {
+      exporting = null;
+      unlisten?.();
+    }
+  }
+
+  /** Where focus goes when the export dialog closes and the control that
+   * opened it is gone or disabled. */
+  function focusMap() {
+    document.querySelector<HTMLElement>(".map .treemap")?.focus();
+  }
+
+  function showExport() {
+    revealExport().catch((e: unknown) => (problem = errorText(e)));
   }
 
   // ---- selection and delete -------------------------------------------
@@ -439,6 +745,18 @@
     ];
   }
 
+  /** Menu entry to export a folder; unavailable while an export runs. */
+  function exportItemsFor(node: number): MenuItem[] {
+    return [
+      {
+        label: "Export…",
+        action: () => askExport(node),
+        disabled: exporting !== null,
+        title: exporting ? "An export is running." : undefined,
+      },
+    ];
+  }
+
   /** What a menu acts on, named in its heading. */
   function menuHeading(node: number, name: string | undefined): string | undefined {
     if (pickedSet.has(node) && picked.length > 1) return `${picked.length} selected items`;
@@ -454,6 +772,18 @@
     }
   }
 
+  /** How long the delete dialog waits for the duplicates check, which
+   * looks at files on disk and can be slow on a network share. */
+  const DUPLICATES_CHECK_WAIT = 2000;
+
+  /** Whether deleting `nodes` loses every copy of some duplicates;
+   * "unknown" if that couldn't be told in time. */
+  function checkDuplicates(gen: number, job: number, nodes: number[]): Promise<DuplicatesCheck | "unknown" | null> {
+    const late = new Promise<"unknown">((resolve) => setTimeout(() => resolve("unknown"), DUPLICATES_CHECK_WAIT));
+    const check = duplicatesCheck({ generation: gen, job, nodes }).catch(() => "unknown" as const);
+    return Promise.race([check, late]);
+  }
+
   async function askDelete() {
     const gen = generation;
     const nodes = deleteTargets();
@@ -467,8 +797,14 @@
       return;
     }
     try {
-      const summary = await selectionSummary({ generation: gen, nodes });
-      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary };
+      // Duplicates found may be deleted all at once, or the copy meant to
+      // stay may have gone meanwhile; the dialog says so.
+      const job = dupes?.job;
+      const [summary, duplicates] = await Promise.all([
+        selectionSummary({ generation: gen, nodes }),
+        job === undefined ? null : checkDuplicates(gen, job, nodes),
+      ]);
+      if (gen === generation && summary.items > 0) confirmDelete = { nodes, summary, duplicates };
     } catch (e) {
       problem = `Couldn't prepare the delete: ${String(e)}`;
     }
@@ -692,6 +1028,8 @@
       separator: true,
     });
     if (kind !== "other") items.push({ label: "Copy path", action: () => copyPath(node) });
+    if (kind === "folder") items.push(findDuplicatesItem(node));
+    if (kind === "folder") items.push(...exportItemsFor(node));
     if (kind !== "other" && node !== view && node !== ROOT) items.push(...deleteItemsFor(node));
     return items;
   }
@@ -753,8 +1091,10 @@
   const tabs = $derived(
     [
       generation !== null ? { id: "contents" as const, label: "Contents" } : null,
+      comparison && generation !== null ? { id: "changes" as const, label: "Changes" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
+      dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
     ].filter((t) => t !== null),
   );
@@ -840,20 +1180,42 @@
     <div class="group">
       <button type="button" class="primary" onclick={() => run(scanChoose)}>Choose folder or drive…</button>
       {#if generation !== null}
-        <button
-          type="button"
-          onclick={() => run(scanRefresh)}
-          title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
-        >
-        <button type="button" onclick={cancel} disabled={!scanning}>Cancel</button>
+        <!-- One place for both, so the toolbar stays on one row: a scan can
+             be cancelled while it runs and repeated once it's done. -->
+        {#if scanning}
+          <button type="button" onclick={cancel}>Cancel</button>
+        {:else}
+          <button
+            type="button"
+            onclick={() => run(scanRefresh)}
+            title={status ? `Scan ${status.root} again` : "Scan again"}>Rescan</button
+          >
+        {/if}
+        {#if snapshots.length > 0 || comparison}
+          <CompareControl
+            {snapshots}
+            current={comparison?.snapshot ?? null}
+            now={status?.logical ?? 0}
+            busy={comparing}
+            onchoose={startComparison}
+            onstop={stopComparison}
+          />
+        {/if}
       {/if}
     </div>
     {#if generation !== null}
-      <fieldset class="group">
-        <legend>Color by</legend>
-        <label><input type="radio" bind:group={colors} value="depth" /> Depth</label>
-        <label><input type="radio" bind:group={colors} value="type" /> File type</label>
-      </fieldset>
+      <!-- A list rather than radio buttons keeps the toolbar on one row. -->
+      <label
+        class="group colors"
+        title={comparison ? `Change colors items by how much they changed since ${since}` : undefined}
+      >
+        Color by
+        <select bind:value={colors}>
+          <option value="depth">Depth</option>
+          <option value="type">File type</option>
+          {#if comparison}<option value="change">Change</option>{/if}
+        </select>
+      </label>
       {#if volume?.isRoot}
         <label class="group check" title="Show the drive's capacity, free space, and used space no file accounts for">
           <input type="checkbox" bind:checked={showVolume} /> Volume overview
@@ -880,7 +1242,8 @@
             <div class="popover" role="note">
               <p>
                 Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names, or
-                <code>is:</code> for a file type. Press ↓ for suggestions.
+                <code>is:</code> for a file type. <code>size:</code>, <code>older:</code>, and <code>newer:</code> narrow
+                the matches by size and modified date. Press ↓ for suggestions.
               </p>
               <dl>
                 {#each FILTER_HELP as [pattern, meaning] (pattern)}
@@ -983,6 +1346,25 @@
           >
         </span>
       {/if}
+      <!-- Actions on the folder in the map sit beside its path; the toolbar
+           is full at 1280 px. -->
+      <button
+        type="button"
+        class="folder-action"
+        class:alone={!filterError && !search}
+        disabled={scanning}
+        title={scanning
+          ? duplicatesBlocked
+          : "Look for files with the same contents in the folder in the map, matching the filter if one is on. This reads the files; cloud files are skipped."}
+        onclick={() => findDuplicates(view)}>Find duplicates</button
+      >
+      <button
+        type="button"
+        class="folder-action"
+        disabled={exporting !== null}
+        title="Save the folder in the map as a CSV file or a text report"
+        onclick={() => askExport(view)}>Export…</button
+      >
     </div>
   {/if}
 
@@ -1003,6 +1385,7 @@
           {view}
           {metric}
           {colors}
+          compare={compareId}
           search={search?.search ?? null}
           revision={status?.revision ?? 0}
           {selection}
@@ -1023,7 +1406,7 @@
             {/if}
           </div>
         {/if}
-        <Legend mode={colors} />
+        <Legend mode={colors} {since} filtered={search !== null} />
       {/if}
     </main>
     <aside>
@@ -1049,6 +1432,9 @@
           onreveal={showInFileManager}
           oncopy={copyPath}
           ondelete={askDelete}
+          change={selectedChange}
+          viewedChange={viewChange}
+          {since}
         />
       </div>
       {#if activeTab && tabs.length > 1}
@@ -1102,6 +1488,26 @@
                 onmenu={(r, x, y) => (menu = { x, y, items: contentsMenu(r), heading: menuHeading(r.node, r.name) })}
               />
             {/key}
+          {:else if activeTab === "changes" && comparison && generation !== null}
+            {#key `${view}:${comparison.snapshot.id}`}
+              <Changes
+                {generation}
+                snapshot={comparison.snapshot.id}
+                {since}
+                folder={view}
+                folderName={viewDetails?.node === view ? viewDetails.name : ""}
+                revision={status?.revision ?? 0}
+                folders={changesFolders}
+                onfolders={(on) => (changesFolders = on)}
+                selected={pickedSet}
+                {anchor}
+                onpick={pick}
+                onclear={() => pick(null)}
+                ondelete={askDelete}
+                onopen={openFolder}
+                onshow={(node, parent) => showInMap({ node, parent })}
+              />
+            {/key}
           {:else if activeTab === "omissions" && status}
             <Omissions
               groups={status.omissions}
@@ -1127,6 +1533,23 @@
                 onmenu={(it, x, y) => (menu = { x, y, items: smallItemMenu(it), heading: menuHeading(it.node, it.name) })}
               />
             {/key}
+          {:else if activeTab === "duplicates" && dupes && generation !== null}
+            <Duplicates
+              {generation}
+              status={dupes}
+              minSize={dupesMinSize}
+              canSearch={!scanning}
+              selected={pickedSet}
+              {anchor}
+              onpick={pick}
+              ondelete={askDelete}
+              onshow={showInMap}
+              onmenu={(f, x, y) => (menu = { x, y, items: duplicateMenu(f), heading: menuHeading(f.node, f.path.split(/[\\/]/).pop()) })}
+              onsearch={(min) => dupes && findDuplicates(dupes.folder, min)}
+              oncancel={stopDuplicates}
+              onclose={closeDuplicates}
+              onclear={() => pick(null)}
+            />
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
               {generation}
@@ -1171,6 +1594,7 @@
       trashName={trash}
       filtered={search !== null}
       {privileged}
+      duplicates={confirmDelete.duplicates}
       busy={deleting}
       result={deleteResult}
       onconfirm={confirmed}
@@ -1179,6 +1603,25 @@
         confirmDelete = null;
         deleteResult = null;
       }}
+    />
+  {/if}
+  {#if exportOf}
+    <ExportDialog
+      folderName={exportOf.name}
+      filter={search?.query ?? null}
+      onexport={runExport}
+      oncancel={() => (exportOf = null)}
+      fallbackFocus={focusMap}
+    />
+  {/if}
+  <!-- Progress shows once the file is chosen, not while the save dialog is open. -->
+  {#if exporting ? exporting.rows !== null : exported}
+    <ExportToast
+      rows={exporting?.rows ?? null}
+      report={exporting ? null : exported}
+      {fileManager}
+      onreveal={showExport}
+      onclose={() => (exported = null)}
     />
   {/if}
   {#if showShortcuts}
@@ -1216,12 +1659,12 @@
     padding-left: 0;
     border-left: none;
   }
-  fieldset.group legend {
-    float: left;
-    padding: 0;
+  .colors {
     color: var(--muted);
   }
-  .group label,
+  .colors select {
+    color: var(--fg);
+  }
   .check {
     display: flex;
     align-items: center;
@@ -1232,9 +1675,9 @@
      dangle at the row's start. */
   .filter {
     border-left: none;
-    flex: 1 1 200px;
+    flex: 1 1 150px;
     max-width: 420px;
-    min-width: 180px;
+    min-width: 150px;
   }
   .filter-help {
     position: relative;
@@ -1343,6 +1786,15 @@
     padding: 2px 8px;
     min-height: 28px;
     border-bottom: 1px solid var(--line);
+  }
+  .crumbs .folder-action {
+    flex: none;
+    margin-left: var(--space-2);
+    padding: 1px 8px;
+    font-size: var(--fs-sm);
+  }
+  .crumbs .folder-action.alone {
+    margin-left: auto;
   }
   .filtered {
     display: flex;

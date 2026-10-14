@@ -11,7 +11,12 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub mod compare;
+pub mod duplicates;
 pub mod wire;
+
+pub use compare::*;
+pub use duplicates::*;
 
 /// Incremented whenever a command or event shape changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 4;
@@ -193,6 +198,11 @@ pub struct NodeDetails {
     pub files: u64,
     pub cloud: bool,
     pub hardlinked: bool,
+    /// A file's last-modified time in seconds since the Unix epoch; `None`
+    /// for folders, when the filesystem didn't say, and for times before
+    /// 1970 or after 2106, which the scan doesn't keep exactly.
+    #[ts(type = "number | null")]
+    pub modified: Option<u64>,
     /// For a hard-link alias, the path that owns the allocation.
     pub alias_of: Option<String>,
     /// From the scan root down to and including this node.
@@ -530,6 +540,79 @@ pub struct DeleteReport {
     pub logical: u64,
     #[ts(type = "number")]
     pub allocated: u64,
+}
+
+/// Name of the event that carries [`ExportProgress`] updates.
+pub const EXPORT_PROGRESS_EVENT: &str = "export-progress";
+
+/// What a CSV export lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportScope {
+    /// The folder's own files and folders.
+    Contents,
+    /// Every file and folder at any depth under it.
+    Everything,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ExportFormat {
+    /// One row per file and folder.
+    Csv,
+    /// A readable summary: totals and the largest folders and files.
+    Report,
+}
+
+/// Saves what's under a folder to a file the user chooses in the native
+/// save dialog. With `search`, only what that filter matches is exported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportRequest {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub folder: u32,
+    /// Ignored for a report, which always covers everything under the folder.
+    pub scope: ExportScope,
+    pub format: ExportFormat,
+    pub metric: Metric,
+    pub search: Option<u32>,
+    /// The name the save dialog suggests.
+    pub file_name: String,
+    /// When the export was asked for, in the user's local time, for the
+    /// report's header.
+    pub exported_at: String,
+}
+
+/// Sent while an export is written, once the file has been chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportProgress {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Rows written so far; for a report, items examined.
+    #[ts(type = "number")]
+    pub rows: u64,
+}
+
+/// A finished export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportReport {
+    #[ts(type = "number")]
+    pub generation: u64,
+    /// Where the file was saved.
+    pub path: String,
+    pub format: ExportFormat,
+    /// CSV rows written, not counting the header; for a report, the folders
+    /// and files it lists.
+    #[ts(type = "number")]
+    pub rows: u64,
 }
 
 #[cfg(test)]

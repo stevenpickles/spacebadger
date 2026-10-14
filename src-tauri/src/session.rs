@@ -1,7 +1,11 @@
 //! One scan and the view state derived from it, plus conversions from the
 //! scanner's types to the protocol's.
 
+mod export;
+
 use crate::delete::{self, Outcome};
+use crate::duplicates::{self, Job};
+use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
@@ -9,11 +13,14 @@ use sb_core::selection;
 use sb_core::suggest::NameIndex;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
+use sb_scan::duplicates::plan;
 use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime};
+
+mod compare;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -27,8 +34,9 @@ const MAX_PAGE: u32 = 500;
 
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
-// Lock order: `deleting` first, `search` before the tree, then
-// `folder_files`, and `order` last.
+// Lock order: `deleting` first, `search` and `compare` before the tree,
+// then `folder_files`, and `order` last. `rematching` is taken with the
+// tree read-locked, and `compare` briefly inside it.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -43,6 +51,24 @@ pub struct Session {
     folder_files: Mutex<Option<FolderFiles>>,
     /// Folder names and extensions for the filter's completion.
     names: Mutex<Option<Names>>,
+    /// The latest search for duplicate files.
+    duplicates: Mutex<Option<Arc<Job>>>,
+    /// Number of the latest search for duplicates.
+    latest_duplicates: AtomicU32,
+    /// Where snapshots of completed scans are kept; `None` in tests.
+    snapshots: Option<Arc<Store>>,
+    /// The snapshot saved for this scan once it completed.
+    saved_snapshot: Arc<Mutex<Option<String>>>,
+    /// When the scan started (ms since the Unix epoch): only snapshots from
+    /// before then are earlier scans.
+    started_ms: u64,
+    /// The comparison with an earlier scan, when on.
+    compare: Mutex<Option<compare::Active>>,
+    /// Held while the comparison is matched again after the scan changed,
+    /// so only one request does it.
+    rematching: Mutex<()>,
+    /// The earlier scan carried over from the previous scan of this root.
+    carried: Option<compare::Carried>,
 }
 
 struct Names {
@@ -72,19 +98,50 @@ struct ActiveSearch {
 }
 
 impl Session {
+    /// Starts scanning without saving a snapshot at the end.
+    #[cfg(test)]
     pub fn start(
         root: PathBuf,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with(root, None, None, on_status)
+    }
+
+    /// Starts scanning; once the scan completes, a snapshot of it is saved
+    /// in `snapshots`, so later scans can be compared with it. `carried` is
+    /// the earlier scan a previous scan of this root was compared with, kept
+    /// so comparing can go on after the rescan (see [`Session::carry`]).
+    pub fn start_with(
+        root: PathBuf,
+        snapshots: Option<Arc<Store>>,
+        carried: Option<compare::Carried>,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
+        let started_ms = compare::now_ms();
         let on_status: StatusSink = Arc::new(on_status);
         let display = display_path(&root);
         let sink = Arc::clone(&on_status);
+        let tree_cell = Arc::new(OnceLock::new());
+        let saved_snapshot = Arc::new(Mutex::new(None));
+        let saver = snapshots.as_ref().map(|store| compare::Saver {
+            store: Arc::clone(store),
+            root: root.clone(),
+            tree: Arc::clone(&tree_cell),
+            saved: Arc::clone(&saved_snapshot),
+            protect: carried.as_ref().map(|c| c.id().to_owned()),
+        });
         let scan = Scan::start(
             root.clone(),
             NativeFs::new(),
             native::scan_config(&root),
-            move |p| sink(status(&display, p)),
+            move |p| {
+                sink(status(&display, p));
+                if let Some(saver) = &saver {
+                    saver.progress(&p.state);
+                }
+            },
         );
+        let _ = tree_cell.set(Arc::downgrade(&scan.tree()));
         Self {
             root,
             scan,
@@ -95,6 +152,14 @@ impl Session {
             deleting: Mutex::new(()),
             folder_files: Mutex::new(None),
             names: Mutex::new(None),
+            duplicates: Mutex::new(None),
+            latest_duplicates: AtomicU32::new(0),
+            snapshots,
+            saved_snapshot,
+            started_ms,
+            compare: Mutex::new(None),
+            rematching: Mutex::new(()),
+            carried,
         }
     }
 
@@ -210,7 +275,7 @@ impl Session {
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
         let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
         let superseded = || format!("search {id} was replaced by a newer one");
-        let Some(matcher) = Matcher::parse(query)? else {
+        let Some(matcher) = Matcher::parse_at(query, SystemTime::now(), &local_midnight)? else {
             let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
@@ -522,6 +587,12 @@ impl Session {
             files: u64::from(tree.file_count(n)),
             cloud: node_flags & flags::CLOUD != 0,
             hardlinked: node_flags & flags::HARDLINKED != 0,
+            // 1 and u32::MAX stand for any time before 1970 or after 2106,
+            // which would show as a misleading exact date.
+            modified: tree
+                .modified(n)
+                .filter(|&s| s != 1 && s != u32::MAX)
+                .map(u64::from),
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
@@ -635,11 +706,142 @@ impl Session {
         Ok(report)
     }
 
+    /// Starts looking for duplicate files, replacing any search already
+    /// running, and reports progress through `emit` until it ends. Refused
+    /// while the scan runs, since files are still being added.
+    pub fn duplicates_start(
+        self: &Arc<Self>,
+        req: &proto::DuplicatesRequest,
+        emit: impl Fn(proto::DuplicatesStatus) + Send + Sync + 'static,
+    ) -> Result<proto::DuplicatesStatus, String> {
+        if !self.scan.progress().state.is_finished() {
+            return Err("Duplicates can be found once the scan finishes or is cancelled.".into());
+        }
+        let (scope, plan) = {
+            let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+            let tree = self.scan.tree();
+            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let folder = node(&tree, req.folder)?;
+            let filter = match req.search {
+                Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
+                None => None,
+            };
+            let scope = duplicates::Scope {
+                generation: self.generation(),
+                folder: req.folder,
+                path: display_path(&tree.path(folder)),
+                query: filter.map(|s| s.matcher().query().to_owned()),
+                min_size: req.min_size,
+            };
+            (scope, plan(&tree, folder, filter, req.min_size))
+        };
+        let id = self.latest_duplicates.fetch_add(1, Ordering::SeqCst) + 1;
+        let job = Arc::new(Job::new(id, scope, plan));
+        {
+            let mut slot = self
+                .duplicates
+                .lock()
+                .map_err(|_| "duplicates are unavailable")?;
+            if let Some(old) = slot.replace(Arc::clone(&job)) {
+                old.cancel();
+            }
+        }
+        let session = Arc::downgrade(self);
+        let reading = Arc::clone(&job);
+        std::thread::Builder::new()
+            .name("sb-duplicates".into())
+            .spawn(move || {
+                std::thread::scope(|s| {
+                    s.spawn(|| report_duplicates(&session, &reading, &emit));
+                    reading.run(&native::NativeContents);
+                });
+                if let Some(status) = session.upgrade().and_then(|s| s.duplicates_status(id).ok()) {
+                    emit(status);
+                }
+            })
+            .map_err(|e| format!("Couldn't start looking for duplicates: {e}"))?;
+        self.duplicates_status(id)
+    }
+
+    /// The search for duplicates numbered `job`, if it's the latest.
+    fn duplicates_job(&self, job: u32) -> Result<Arc<Job>, String> {
+        self.duplicates
+            .lock()
+            .map_err(|_| "duplicates are unavailable")?
+            .clone()
+            .filter(|j| j.id == job)
+            .ok_or_else(|| format!("search for duplicates {job} is no longer current"))
+    }
+
+    pub fn duplicates_status(&self, job: u32) -> Result<proto::DuplicatesStatus, String> {
+        let job = self.duplicates_job(job)?;
+        let revision = self.scan.progress().revision;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        Ok(job.status(&tree, revision))
+    }
+
+    /// The duplicates found so far, leaving out files deleted since.
+    pub fn duplicates_list(&self, job: u32) -> Result<proto::DuplicatesList, String> {
+        let job = self.duplicates_job(job)?;
+        let revision = self.scan.progress().revision;
+        let tree = self.scan.tree();
+        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        Ok(job.list(&tree, revision))
+    }
+
+    /// Whether deleting `nodes` would leave a group of duplicates with no copy.
+    pub fn duplicates_check(
+        &self,
+        job: u32,
+        nodes: &[u32],
+    ) -> Result<proto::DuplicatesCheck, String> {
+        let job = self.duplicates_job(job)?;
+        let pending = {
+            let tree = self.scan.tree();
+            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            job.check(&tree, nodes)
+        };
+        // The disk is looked at with no lock held.
+        Ok(pending.finish())
+    }
+
+    /// Stops reading; the groups found so far stay.
+    pub fn duplicates_cancel(&self, job: u32) -> Result<(), String> {
+        self.duplicates_job(job)?.cancel();
+        Ok(())
+    }
+
     /// The native path of a node, for file manager actions.
     pub fn path(&self, id: u32) -> Result<PathBuf, String> {
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
         Ok(tree.path(node(&tree, id)?))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Ok(Some(job)) = self.duplicates.get_mut().map(Option::take) {
+            job.cancel();
+        }
+    }
+}
+
+/// Sends the status of a search for duplicates every so often while it reads.
+fn report_duplicates(session: &Weak<Session>, job: &Job, emit: &impl Fn(proto::DuplicatesStatus)) {
+    loop {
+        std::thread::sleep(duplicates::REPORT_EVERY);
+        if !job.is_running() {
+            return;
+        }
+        let Some(status) = session
+            .upgrade()
+            .and_then(|s| s.duplicates_status(job.id).ok())
+        else {
+            return;
+        };
+        emit(status);
     }
 }
 
@@ -673,6 +875,19 @@ fn node(tree: &Tree, id: u32) -> Result<NodeId, String> {
     } else {
         Ok(n)
     }
+}
+
+/// Local midnight of a date, so a filter such as `newer:2024-06-30` starts
+/// the day when the details, which show local times, would. Where a
+/// daylight-saving change skips midnight, the day starts at 1:00.
+fn local_midnight(year: i32, month: u32, day: u32) -> Option<i64> {
+    use chrono::TimeZone;
+    [0, 1].into_iter().find_map(|hour| {
+        chrono::Local
+            .with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .earliest()
+            .map(|t| t.timestamp())
+    })
 }
 
 /// A node's display name; the root shows its full path.
@@ -801,6 +1016,71 @@ mod tests {
         tree.children(parent)
             .find(|&c| tree.name(c) == name)
             .unwrap()
+    }
+
+    #[test]
+    fn dates_start_at_local_midnight() {
+        use chrono::{Datelike, TimeZone, Timelike};
+        let secs = local_midnight(2024, 6, 30).unwrap();
+        let t = chrono::Local.timestamp_opt(secs, 0).unwrap();
+        assert_eq!((t.year(), t.month(), t.day()), (2024, 6, 30));
+        assert_eq!((t.hour(), t.minute()), (0, 0));
+        assert_eq!(local_midnight(2024, 2, 30), None);
+    }
+
+    #[test]
+    fn details_give_modified_times_except_clamped_ones() {
+        let tmp = fixture_named("modified");
+        let set = |name: &str, time| {
+            std::fs::File::options()
+                .write(true)
+                .open(tmp.0.join(name))
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        set(
+            "keep.txt",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        // Before 1970; filesystems without such times make the test moot.
+        let ancient = SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(86_400 * 3_650));
+        if let Some(ancient) = ancient {
+            set(&format!("old{}b.log", std::path::MAIN_SEPARATOR), ancient);
+        }
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (keep, b) = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let old = child(&tree, NodeId::ROOT, "old");
+            (
+                child(&tree, NodeId::ROOT, "keep.txt").index() as u32,
+                child(&tree, old, "b.log").index() as u32,
+            )
+        };
+        assert_eq!(
+            session.details(keep, None).unwrap().modified,
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            session.details(0, None).unwrap().modified,
+            None,
+            "folders have none"
+        );
+        let stored = std::fs::metadata(tmp.0.join("old").join("b.log"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        if stored < SystemTime::UNIX_EPOCH {
+            assert_eq!(session.details(b, None).unwrap().modified, None);
+        }
     }
 
     #[test]
@@ -978,5 +1258,122 @@ mod tests {
         let report = session.delete_using(&[id(keep)], remove).unwrap();
         assert_eq!((report.deleted.len(), report.already_gone), (1, 1));
         assert_eq!(session.status().files, 0);
+    }
+
+    #[test]
+    fn finds_duplicates_and_drops_deleted_ones() {
+        let tmp = fixture_named("duplicates");
+        let copy: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(tmp.0.join("copy.bin"), &copy).unwrap();
+        std::fs::write(tmp.0.join("old").join("copy-2.bin"), &copy).unwrap();
+        std::fs::write(tmp.0.join("old").join("logs").join("copy-3.dat"), &copy).unwrap();
+        let mut other = copy.clone();
+        other[100_000] ^= 1;
+        std::fs::write(tmp.0.join("other.bin"), &other).unwrap();
+
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Arc::new(Session::start(tmp.0.clone(), move |s| {
+            sink.lock().unwrap().push(s)
+        }));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let find = |search: Option<u32>, candidates: u32| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let request = proto::DuplicatesRequest {
+                generation: session.generation(),
+                folder: 0,
+                search,
+                min_size: 1000,
+            };
+            let started = session
+                .duplicates_start(&request, move |s| {
+                    let _ = tx.send(s);
+                })
+                .unwrap();
+            assert_eq!(started.candidates, candidates);
+            loop {
+                let s = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if s.phase != proto::DuplicatesPhase::Running {
+                    return s;
+                }
+            }
+        };
+
+        // Same size and at least 1000 bytes.
+        let done = find(None, 4);
+        assert_eq!(done.phase, proto::DuplicatesPhase::Complete);
+        assert_eq!((done.groups, done.files), (1, 3));
+        assert_eq!(done.reclaimable, 400_000);
+        assert_eq!(done.done_bytes, done.total_bytes);
+        let list = session.duplicates_list(done.job).unwrap();
+        let paths: Vec<_> = list.groups[0]
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                display_path(&tmp.0.join("copy.bin")),
+                display_path(&tmp.0.join("old").join("copy-2.bin")),
+                display_path(&tmp.0.join("old").join("logs").join("copy-3.dat")),
+            ],
+            "shortest path first"
+        );
+
+        // Deleting every copy, or all but one that has gone meanwhile, is
+        // flagged; keeping one that's still there isn't.
+        let nodes: Vec<u32> = list.groups[0].files.iter().map(|f| f.node).collect();
+        let check = |picked: &[u32]| session.duplicates_check(done.job, picked).unwrap();
+        assert_eq!(
+            check(&nodes[1..]).all_selected + check(&nodes[1..]).kept_gone,
+            0
+        );
+        assert_eq!(check(&nodes).all_selected, 1);
+        let old = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            child(&tree, NodeId::ROOT, "old").index() as u32
+        };
+        assert_eq!(
+            check(&[old, nodes[0]]).all_selected,
+            1,
+            "a selected folder takes the copies in it"
+        );
+        let kept = tmp.0.join("copy.bin");
+        std::fs::write(&kept, b"changed").unwrap();
+        let risky = check(&nodes[1..]);
+        assert_eq!((risky.all_selected, risky.kept_gone), (0, 1));
+        assert_eq!(
+            risky.examples,
+            [display_path(&tmp.0.join("old").join("copy-2.bin"))]
+        );
+        std::fs::write(&kept, &copy).unwrap();
+
+        // With a filter, only matching files count.
+        let search = session.search_set("*.bin").unwrap().unwrap().search;
+        let filtered = find(Some(search), 3);
+        assert_eq!((filtered.groups, filtered.files), (1, 2));
+        assert_eq!(filtered.query.as_deref(), Some("*.bin"));
+
+        // Deleting one copy leaves a group of one, which is no group.
+        let list = session.duplicates_list(filtered.job).unwrap();
+        let first = list.groups[0].files[0].node;
+        session.delete_using(&[first], remove).unwrap();
+        let after = session.duplicates_status(filtered.job).unwrap();
+        assert_eq!((after.groups, after.reclaimable), (0, 0));
+        assert_ne!(after.version, filtered.version);
+        // Deleting the copy left would still lose the last of them.
+        let last = list.groups[0].files[1].node;
+        let check = session.duplicates_check(filtered.job, &[last]).unwrap();
+        assert_eq!((check.all_selected, check.kept_gone), (1, 0));
+        assert!(
+            session.duplicates_list(done.job).is_err(),
+            "replaced by the newer search"
+        );
     }
 }

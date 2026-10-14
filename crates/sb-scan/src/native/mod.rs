@@ -1,5 +1,6 @@
 //! Native filesystem adapters. [`NativeFs`] is the adapter for the current OS.
 
+use crate::duplicates::{Contents, Skip};
 use crate::engine::ScanConfig;
 use std::path::Path;
 
@@ -84,4 +85,58 @@ pub fn privileged_access() -> bool {
     return linux::is_privileged();
     #[cfg(all(unix, not(target_os = "linux")))]
     false
+}
+
+/// Opens files to read their contents, for finding duplicates: never
+/// through a link, never a cloud file, and only a plain file of the size
+/// the scan measured.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeContents;
+
+impl Contents for NativeContents {
+    type File = std::fs::File;
+
+    fn open(&self, path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+        #[cfg(windows)]
+        return windows::open_contents(path, len);
+        #[cfg(target_os = "linux")]
+        return linux::open_contents(path, len);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        return unix::open_contents(path, len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn opens_plain_files_of_the_scanned_size_only() {
+        let dir = std::env::temp_dir().join(format!("sb-contents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let mut text = String::new();
+        NativeContents
+            .open(&file, 5)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "hello");
+        assert_eq!(NativeContents.open(&file, 4).unwrap_err(), Skip::Changed);
+        assert_eq!(
+            NativeContents.open(&dir.join("gone"), 5).unwrap_err(),
+            Skip::Vanished
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert_eq!(NativeContents.open(&link, 5).unwrap_err(), Skip::Changed);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

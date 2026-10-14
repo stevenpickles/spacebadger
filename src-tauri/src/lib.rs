@@ -5,17 +5,22 @@
 //! for an older generation are refused so stale replies never mix scans.
 
 mod delete;
+mod duplicates;
 #[cfg(windows)]
 mod elevate_windows;
 #[cfg(windows)]
 mod recycle_windows;
 mod session;
+mod snapshots;
 
 use sb_protocol::{
-    AppInfo, DeleteReport, DeleteRequest, FolderFilesPage, FolderFilesRequest, LayoutRequest,
-    NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage,
-    SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage,
-    SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
+    AppInfo, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest, DuplicatesCheck,
+    DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
+    EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
+    FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails, PROTOCOL_VERSION,
+    SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest, SearchSummary,
+    SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest, SuggestRequest,
+    Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -23,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[derive(Default)]
@@ -32,6 +37,11 @@ struct AppState {
     /// Deleting was turned on in this run of the app. Never saved, so every
     /// start begins with it off.
     delete_allowed: AtomicBool,
+    /// The file last exported, which "Show in Explorer" can reveal.
+    last_export: Mutex<Option<PathBuf>>,
+    /// Where snapshots of completed scans are saved, for comparing later
+    /// scans with; `None` if the app has no data folder.
+    snapshots: Option<Arc<snapshots::Store>>,
 }
 
 impl AppState {
@@ -48,10 +58,24 @@ impl AppState {
 
     /// Replaces the current scan; dropping the old session cancels it.
     fn start(&self, app: &AppHandle, root: PathBuf) -> ScanStarted {
+        // `spacebadger .` names the folder it was started in; snapshots are
+        // kept by absolute path, so another folder's never match.
+        let root = std::path::absolute(&root).unwrap_or(root);
+        // Rescanning the same folder goes on comparing with the same
+        // earlier scan, held in memory in case its file is pruned.
+        let carried = self
+            .current()
+            .filter(|s| s.root == root)
+            .and_then(|s| s.carry());
         let emitter = app.clone();
-        let session = Arc::new(Session::start(root, move |status| {
-            let _ = emitter.emit(SCAN_STATUS_EVENT, status);
-        }));
+        let session = Arc::new(Session::start_with(
+            root,
+            self.snapshots.clone(),
+            carried,
+            move |status| {
+                let _ = emitter.emit(SCAN_STATUS_EVENT, status);
+            },
+        ));
         let started = session.started();
         *self.session.lock().unwrap() = Some(session);
         started
@@ -74,11 +98,13 @@ fn app_info() -> AppInfo {
 #[tauri::command]
 async fn scan_choose(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<ScanStarted>, String> {
     let picked = app
         .dialog()
         .file()
+        .set_parent(&window)
         .set_title("Choose a folder or drive to scan")
         .blocking_pick_folder();
     let Some(picked) = picked else {
@@ -222,6 +248,144 @@ async fn selection_summary(
     state.session(request.generation)?.selection(&request.nodes)
 }
 
+/// Starts looking for duplicate files under a folder, the one command that
+/// reads file contents (never of cloud files). Progress and the final
+/// status arrive as events. Planning walks the folder, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DuplicatesRequest,
+) -> Result<DuplicatesStatus, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_start(&request, move |status| {
+            let _ = app.emit(DUPLICATES_STATUS_EVENT, status);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_status(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesStatus, String> {
+    state.session(generation)?.duplicates_status(job)
+}
+
+/// The groups of duplicates found so far. Builds every listed path, so this
+/// runs on a blocking thread.
+#[tauri::command]
+async fn duplicates_list(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<DuplicatesList, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.duplicates_list(job))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Whether deleting the given items would leave a group of duplicates with
+/// no copy. Looks at the files that would stay on disk, so this runs on a
+/// blocking thread.
+#[tauri::command]
+async fn duplicates_check(
+    state: State<'_, AppState>,
+    request: DuplicatesCheckRequest,
+) -> Result<DuplicatesCheck, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session.duplicates_check(request.job, &request.nodes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn duplicates_cancel(
+    state: State<'_, AppState>,
+    generation: u64,
+    job: u32,
+) -> Result<(), String> {
+    state.session(generation)?.duplicates_cancel(job)
+}
+
+/// Earlier scans of the current root that it can be compared with, newest
+/// first. Reads each snapshot's header, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_snapshots(
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<Vec<sb_protocol::SnapshotInfo>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.snapshots())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Compares the scan with an earlier one, or with `None` stops comparing.
+/// Reading a large snapshot and matching it takes a moment, so this runs on
+/// a blocking thread.
+#[tauri::command]
+async fn compare_set(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: Option<String>,
+) -> Result<Option<sb_protocol::CompareSummary>, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_set(snapshot.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// How one item changed since the earlier scan. After a delete the scan
+/// is matched again first, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_item(
+    state: State<'_, AppState>,
+    generation: u64,
+    snapshot: String,
+    node: u32,
+) -> Result<sb_protocol::ItemChange, String> {
+    let session = state.session(generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.compare_item(&snapshot, node))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One byte per node of a drawn layout, for the "Change" colors. Runs on a
+/// blocking thread, like `compare_item`.
+#[tauri::command]
+async fn change_marks(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangeMarksRequest,
+) -> Result<Response, String> {
+    let session = state.session(request.generation)?;
+    let marks = tauri::async_runtime::spawn_blocking(move || session.change_marks(&request))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Response::new(marks))
+}
+
+/// The biggest changes under a folder since the earlier scan. The first
+/// page walks the folder, so this runs on a blocking thread.
+#[tauri::command]
+async fn compare_changes(
+    state: State<'_, AppState>,
+    request: sb_protocol::ChangesRequest,
+) -> Result<sb_protocol::ChangesPage, String> {
+    let session = state.session(request.generation)?;
+    tauri::async_runtime::spawn_blocking(move || session.changes(&request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Asks first, then starts SpaceBadger again with administrator rights,
 /// scanning the same folder, and closes this copy. Returns `false` if the
 /// user said no, here or at the Windows elevation prompt.
@@ -297,6 +461,75 @@ async fn reveal(state: State<'_, AppState>, generation: u64, node: u32) -> Resul
         .map_err(|e| e.to_string())?
 }
 
+/// Asks where to save, then exports what's under a folder there as CSV or
+/// a report. Returns `None` if the save dialog was dismissed. Writing runs
+/// on a blocking thread and reports its progress as events; it stops if a
+/// new scan replaces this one meanwhile.
+#[tauri::command]
+async fn export_save(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request: ExportRequest,
+) -> Result<Option<ExportReport>, String> {
+    let generation = request.generation;
+    // Not held across the dialog, so a scan started meanwhile isn't kept alive.
+    state.session(generation)?;
+    let (kind, extension) = match request.format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Report => ("Text", "txt"),
+    };
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Export")
+        .set_file_name(Session::export_file_name(
+            &request.file_name,
+            request.format,
+        ))
+        .add_filter(kind, &[extension])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let session = state
+        .session(generation)
+        .map_err(|_| "A new scan started, so nothing was exported.".to_owned())?;
+    let emitter = app.clone();
+    let target = path.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let current = || {
+            emitter
+                .state::<AppState>()
+                .current()
+                .is_some_and(|s| s.generation() == generation)
+        };
+        session.export(&request, &target, current, |rows| {
+            let _ = emitter.emit(EXPORT_PROGRESS_EVENT, ExportProgress { generation, rows });
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.last_export.lock().unwrap() = Some(path);
+    Ok(Some(report))
+}
+
+/// Shows the file last exported selected in the system file manager.
+#[tauri::command]
+async fn reveal_export(state: State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .last_export
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("Nothing has been exported yet.")?;
+    tauri::async_runtime::spawn_blocking(move || reveal_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn reveal_path(path: &Path) -> Result<(), String> {
     let shown = session::display_path(path);
     // The item may have been moved or deleted since it was scanned.
@@ -333,7 +566,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let state = AppState::default();
+            let state = AppState {
+                snapshots: app
+                    .path()
+                    .app_local_data_dir()
+                    .ok()
+                    .map(|dir| Arc::new(snapshots::Store::new(dir.join("snapshots")))),
+                ..AppState::default()
+            };
             // `spacebadger <folder>` starts scanning that folder right away.
             if let Some(root) = std::env::args_os().nth(1) {
                 state.start(app.handle(), PathBuf::from(root));
@@ -355,6 +595,8 @@ pub fn run() {
             layout,
             node_details,
             reveal,
+            export_save,
+            reveal_export,
             search_set,
             search_summary,
             search_results,
@@ -363,9 +605,19 @@ pub fn run() {
             filter_suggest,
             volume_info,
             selection_summary,
+            duplicates_start,
+            duplicates_status,
+            duplicates_list,
+            duplicates_check,
+            duplicates_cancel,
             set_delete_allowed,
             restart_elevated,
-            delete_items
+            delete_items,
+            compare_snapshots,
+            compare_set,
+            compare_item,
+            change_marks,
+            compare_changes
         ])
         .run(tauri::generate_context!())
         .expect("error while running SpaceBadger");

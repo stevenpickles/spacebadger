@@ -3,6 +3,7 @@
 //! behind each adapter's choices.
 
 pub mod adapter;
+pub mod duplicates;
 pub mod engine;
 pub mod fake;
 pub mod native;

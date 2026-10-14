@@ -2,10 +2,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "./protocol/AppInfo";
+import type { ChangeMarksRequest } from "./protocol/ChangeMarksRequest";
+import type { ChangesPage } from "./protocol/ChangesPage";
+import type { ChangesRequest } from "./protocol/ChangesRequest";
+import type { CompareSummary } from "./protocol/CompareSummary";
 import type { DeleteReport } from "./protocol/DeleteReport";
 import type { DeleteRequest } from "./protocol/DeleteRequest";
+import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
+import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
+import type { DuplicatesList } from "./protocol/DuplicatesList";
+import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
+import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
+import type { ExportProgress } from "./protocol/ExportProgress";
+import type { ExportReport } from "./protocol/ExportReport";
+import type { ExportRequest } from "./protocol/ExportRequest";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
+import type { ItemChange } from "./protocol/ItemChange";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -17,6 +30,7 @@ import type { SelectionRequest } from "./protocol/SelectionRequest";
 import type { SelectionSummary } from "./protocol/SelectionSummary";
 import type { SmallItemsPage } from "./protocol/SmallItemsPage";
 import type { SmallItemsRequest } from "./protocol/SmallItemsRequest";
+import type { SnapshotInfo } from "./protocol/SnapshotInfo";
 import type { SuggestRequest } from "./protocol/SuggestRequest";
 import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
@@ -25,6 +39,9 @@ export const EXPECTED_PROTOCOL_VERSION = 4;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
+
+/** Must match `sb_protocol::EXPORT_PROGRESS_EVENT`. */
+const EXPORT_PROGRESS_EVENT = "export-progress";
 
 export function appInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("app_info");
@@ -92,6 +109,24 @@ export function reveal(generation: number, node: number): Promise<void> {
   return invoke("reveal", { generation, node });
 }
 
+/**
+ * Asks where to save with the native dialog, then writes the export there;
+ * `null` if the dialog was dismissed. Progress arrives as events once the
+ * file is chosen.
+ */
+export function exportSave(request: ExportRequest): Promise<ExportReport | null> {
+  return invoke<ExportReport | null>("export_save", { request });
+}
+
+/** Shows the file last exported selected in the system file manager. */
+export function revealExport(): Promise<void> {
+  return invoke("reveal_export");
+}
+
+export function onExportProgress(handler: (progress: ExportProgress) => void): Promise<UnlistenFn> {
+  return listen<ExportProgress>(EXPORT_PROGRESS_EVENT, (event) => handler(event.payload));
+}
+
 /** What a set of selected items amounts to. */
 export function selectionSummary(request: SelectionRequest): Promise<SelectionSummary> {
   return invoke<SelectionSummary>("selection_summary", { request });
@@ -145,4 +180,65 @@ export function errorText(e: unknown): string {
 /** Folder names or extensions in the scan, for the filter's completion. */
 export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
   return invoke<Suggestion[]>("filter_suggest", { request });
+}
+
+// ---- comparing with an earlier scan ------------------------------------
+
+/** Earlier scans of the current root to compare with, newest first. */
+export function compareSnapshots(generation: number): Promise<SnapshotInfo[]> {
+  return invoke<SnapshotInfo[]>("compare_snapshots", { generation });
+}
+
+/** Compares with an earlier scan; `null` turns comparing off. */
+export function compareSet(generation: number, snapshot: string | null): Promise<CompareSummary | null> {
+  return invoke<CompareSummary | null>("compare_set", { generation, snapshot });
+}
+
+export function compareItem(generation: number, snapshot: string, node: number): Promise<ItemChange> {
+  return invoke<ItemChange>("compare_item", { generation, snapshot, node });
+}
+
+/** One byte per node; see `sb_protocol::change_mark` and `changeColor`. */
+export function changeMarks(request: ChangeMarksRequest): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("change_marks", { request });
+}
+
+/** The biggest changes under a folder, including removed items. */
+export function compareChanges(request: ChangesRequest): Promise<ChangesPage> {
+  return invoke<ChangesPage>("compare_changes", { request });
+}
+
+/** Must match `sb_protocol::DUPLICATES_STATUS_EVENT`. */
+const DUPLICATES_STATUS_EVENT = "duplicates-status";
+
+/**
+ * Starts looking for files with the same contents under a folder, replacing
+ * any search already running. This reads the files (never cloud files);
+ * progress arrives through `onDuplicatesStatus`. Rejects while scanning.
+ */
+export function duplicatesStart(request: DuplicatesRequest): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_start", { request });
+}
+
+export function duplicatesStatus(generation: number, job: number): Promise<DuplicatesStatus> {
+  return invoke<DuplicatesStatus>("duplicates_status", { generation, job });
+}
+
+/** The groups of duplicates found so far, most reclaimable space first. */
+export function duplicatesList(generation: number, job: number): Promise<DuplicatesList> {
+  return invoke<DuplicatesList>("duplicates_list", { generation, job });
+}
+
+/** Whether deleting the items would leave a group of duplicates with no copy. */
+export function duplicatesCheck(request: DuplicatesCheckRequest): Promise<DuplicatesCheck> {
+  return invoke<DuplicatesCheck>("duplicates_check", { request });
+}
+
+/** Stops reading; the groups found so far stay. */
+export function duplicatesCancel(generation: number, job: number): Promise<void> {
+  return invoke("duplicates_cancel", { generation, job });
+}
+
+export function onDuplicatesStatus(handler: (status: DuplicatesStatus) => void): Promise<UnlistenFn> {
+  return listen<DuplicatesStatus>(DUPLICATES_STATUS_EVENT, (event) => handler(event.payload));
 }
