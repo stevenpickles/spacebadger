@@ -11,6 +11,7 @@ import type { DeleteRequest } from "./protocol/DeleteRequest";
 import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
 import type { DuplicatesCheckRequest } from "./protocol/DuplicatesCheckRequest";
 import type { DuplicatesList } from "./protocol/DuplicatesList";
+import type { DuplicatesRecheck } from "./protocol/DuplicatesRecheck";
 import type { DuplicatesRequest } from "./protocol/DuplicatesRequest";
 import type { DuplicatesStatus } from "./protocol/DuplicatesStatus";
 import type { ExportProgress } from "./protocol/ExportProgress";
@@ -241,4 +242,17 @@ export function duplicatesCancel(generation: number, job: number): Promise<void>
 
 export function onDuplicatesStatus(handler: (status: DuplicatesStatus) => void): Promise<UnlistenFn> {
   return listen<DuplicatesStatus>(DUPLICATES_STATUS_EVENT, (event) => handler(event.payload));
+}
+
+/** Must match `sb_protocol::DUPLICATES_RECHECK_EVENT`. */
+const DUPLICATES_RECHECK_EVENT = "duplicates-recheck";
+
+/** Progress of a delete reading the copies of duplicates that would stay. */
+export function onDuplicatesRecheck(handler: (progress: DuplicatesRecheck) => void): Promise<UnlistenFn> {
+  return listen<DuplicatesRecheck>(DUPLICATES_RECHECK_EVENT, (event) => handler(event.payload));
+}
+
+/** Stops that reading; files whose copy wasn't confirmed yet are kept. */
+export function duplicatesRecheckCancel(generation: number): Promise<void> {
+  return invoke("duplicates_recheck_cancel", { generation });
 }

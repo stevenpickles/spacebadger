@@ -129,7 +129,7 @@
     const found =
       status.groups === 0
         ? "No duplicates found"
-        : `${plural(status.groups, "group")} of duplicates, ${formatBytes(status.reclaimable)} reclaimable`;
+        : `${plural(status.groups, "group")} of duplicates, ${formatBytes(status.reclaimable)} of content in extra copies`;
     announce(status.phase === "cancelled" ? `Stopped. ${found} so far` : found);
   });
 
@@ -164,7 +164,7 @@
     if (nodes.length === 0) return;
     onpick({ focus: { node: nodes[0]!, other: false }, nodes, mode: "replace", keepAnchor: false });
     const size = groups.reduce((sum, g) => sum + g.size * (g.files.length - 1), 0);
-    announce(`Selected ${plural(nodes.length, "file")}, ${formatBytes(size)}`);
+    announce(`Selected ${plural(nodes.length, "file")}, ${formatBytes(size)} of content`);
   }
 
   function rowTitle(r: Row): string {
@@ -200,6 +200,7 @@
       s.inUse > 0 ? `${formatCount(s.inUse)} in use by another program` : "",
       s.denied > 0 ? `${formatCount(s.denied)} without permission to read` : "",
       s.changed > 0 ? `${formatCount(s.changed)} changed since the scan` : "",
+      s.changing > 0 ? `${formatCount(s.changing)} written to while being read` : "",
       s.special > 0
         ? `${formatCount(s.special)} stored in a special way (deduplicated, tiered, or virtualized), which reading raw would get wrong`
         : "",
@@ -207,6 +208,23 @@
       s.unreadable > 0 ? `${formatCount(s.unreadable)} unreadable` : "",
     ].filter(Boolean);
   });
+
+  /** What deleting the extra copies might free on disk, which can be far
+   * less than their content: sparse or compressed files, other hard-link
+   * names, and shared storage. */
+  const onDisk = $derived.by(() => {
+    if (status.onDiskUnknown === 0) return `at most ${formatBytes(status.reclaimableOnDisk)} on disk`;
+    if (status.onDiskUnknown === status.groups) return "space on disk unknown";
+    return `at most ${formatBytes(status.reclaimableOnDisk)} on disk in ${plural(status.groups - status.onDiskUnknown, "group")}; unknown for the rest`;
+  });
+  const onDiskTitle =
+    "Deleting may free less than the content: sparse and compressed files take less space, a file with other hard-link names frees nothing until every name goes, and storage shared by block cloning or deduplication stays in use. Unknown where a copy's allocation is unknown or it has other names.";
+
+  function groupTitle(g: DuplicateGroup): string {
+    const content = `${exactBytes(g.size * (g.files.length - 1))} of content in the copies beyond the first`;
+    const disk = g.onDisk === null ? "space on disk unknown" : `at most ${exactBytes(g.onDisk)} on disk`;
+    return `${content}; ${disk}`;
+  }
 
   const skippedCount = $derived(Object.values(status.skipped).reduce((a, b) => a + b, 0));
 </script>
@@ -225,9 +243,9 @@
     {/if}
     <p class="small summary">
       {#if status.groups > 0}
-        <strong>{formatBytes(status.reclaimable)}</strong> reclaimable in {plural(status.groups, "group")} ({formatCount(
-          status.files,
-        )} files)
+        <strong title={exactBytes(status.reclaimable)}>{formatBytes(status.reclaimable)}</strong> of content in extra
+        copies, in {plural(status.groups, "group")} ({formatCount(status.files)} files)
+        <span class="muted" title={onDiskTitle}>· {onDisk}</span>
       {:else if running}
         Looking for files with the same contents…
       {:else}
@@ -332,7 +350,7 @@
     {/snippet}
     {#snippet size(r)}
       {#if r.kind === "group"}
-        <span title="{exactBytes(r.group.size * (r.group.files.length - 1))} in the copies beyond the first"
+        <span title={groupTitle(r.group)}
           >{formatBytes(r.group.size * (r.group.files.length - 1))}</span
         >
       {:else}

@@ -8,6 +8,7 @@
     deleteItems,
     duplicatesCancel,
     duplicatesCheck,
+    duplicatesRecheckCancel,
     duplicatesStart,
     duplicatesStatus,
     errorText,
@@ -15,6 +16,7 @@
     exportSave,
     fileManagerName,
     nodeDetails,
+    onDuplicatesRecheck,
     onDuplicatesStatus,
     onExportProgress,
     onScanStatus,
@@ -55,6 +57,7 @@
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
   import type { DuplicatesCheck } from "./lib/protocol/DuplicatesCheck";
+  import type { DuplicatesRecheck } from "./lib/protocol/DuplicatesRecheck";
   import type { DuplicatesStatus } from "./lib/protocol/DuplicatesStatus";
   import type { ExportReport } from "./lib/protocol/ExportReport";
   import type { ItemChange } from "./lib/protocol/ItemChange";
@@ -132,6 +135,9 @@
     duplicates: DuplicatesCheck | "unknown" | null;
   } | null>(null);
   let deleting = $state(false);
+  /** How far the running delete has got reading copies of duplicates
+   * that would stay, before moving anything. */
+  let recheck = $state.raw<DuplicatesRecheck | null>(null);
   /** What the last delete did, shown in the dialog until it's closed. */
   let deleteResult = $state.raw<DeleteResult | null>(null);
   let detailsError = $state<string | null>(null);
@@ -570,6 +576,13 @@
     return () => void unlisten.then((f) => f());
   });
 
+  $effect(() => {
+    const unlisten = onDuplicatesRecheck((p) => {
+      if (p.generation === generation && deleting) recheck = p;
+    });
+    return () => void unlisten.then((f) => f());
+  });
+
   /** The duplicate search shown, as a plain number so that status updates
    * (new objects) don't rerun what depends on it. */
   const dupesJob = $derived(dupes?.job);
@@ -815,6 +828,7 @@
     const gen = generation;
     if (!c || gen === null || deleting) return;
     deleting = true;
+    recheck = null;
     try {
       const report = await deleteItems({ generation: gen, nodes: c.nodes });
       // The dialog stays open on its result screen until closed.
@@ -825,6 +839,7 @@
       problem = `Couldn't move to the ${trash}: ${errorText(e)}`;
     } finally {
       deleting = false;
+      recheck = null;
     }
   }
 
@@ -1596,6 +1611,10 @@
       {privileged}
       duplicates={confirmDelete.duplicates}
       busy={deleting}
+      {recheck}
+      onstoprecheck={() => {
+        if (generation !== null) duplicatesRecheckCancel(generation).catch(() => {});
+      }}
       result={deleteResult}
       onconfirm={confirmed}
       oncancel={() => (confirmDelete = null)}

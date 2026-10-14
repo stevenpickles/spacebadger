@@ -20,6 +20,7 @@
   import { untrack } from "svelte";
   import { describeItems, exactBytes, formatBytes, plural } from "./format";
   import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
+  import type { DuplicatesRecheck } from "./protocol/DuplicatesRecheck";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
   import SampleList from "./SampleList.svelte";
 
@@ -35,6 +36,11 @@
     duplicates?: DuplicatesCheck | "unknown" | null;
     /** The delete is running. */
     busy: boolean;
+    /** While it runs, how far it has got reading the copies of duplicates
+     * that would stay, before moving anything. */
+    recheck?: DuplicatesRecheck | null;
+    /** Stops that reading; files whose copy isn't confirmed are kept. */
+    onstoprecheck?: () => void;
     /** Set once the delete has finished: the dialog then shows the outcome. */
     result?: DeleteResult | null;
     onconfirm: () => void;
@@ -50,6 +56,8 @@
     privileged,
     duplicates = null,
     busy,
+    recheck = null,
+    onstoprecheck,
     result = null,
     onconfirm,
     oncancel,
@@ -74,8 +82,15 @@
 
   const matches = $derived(typed.trim().toLowerCase() === WORD);
   const ready = $derived(matches && left === 0 && !busy);
+  /** Reading copies of duplicates that would stay, before moving. */
+  const rechecking = $derived(busy && recheck !== null && !recheck.finished);
+  let stopped = $state(false);
   const missing = $derived.by(() => {
     // The field's label already asks for the word; this adds the wait.
+    if (rechecking && recheck) {
+      if (stopped) return "Stopping…";
+      return `Checking the copies that stay: ${formatBytes(recheck.doneBytes)} of ${formatBytes(recheck.totalBytes)}`;
+    }
     if (busy) return "Moving…";
     if (left > 0) return `You can confirm in ${left} s`;
     return matches ? "" : `Type ${WORD} above`;
@@ -88,6 +103,8 @@
 
   const checked = $derived(typeof duplicates === "object" ? duplicates : null);
   const lostGroups = $derived(checked ? checked.allSelected + checked.keptGone : 0);
+  /** Groups keeping copies that look unchanged, read again before moving. */
+  const recheckGroups = $derived(checked ? checked.toRecheck - checked.keptGone - checked.unchecked : 0);
   /** Some groups of duplicates weren't checked; say so. */
   const unchecked = $derived(duplicates === "unknown" || (checked?.unchecked ?? 0) > 0);
 
@@ -96,6 +113,7 @@
     [
       `${id}-what`,
       lostGroups > 0 ? `${id}-duplicates` : "",
+      recheckGroups > 0 ? `${id}-recheck` : "",
       unchecked ? `${id}-unchecked` : "",
       summary.folders > 0 ? `${id}-folders` : "",
       `${id}-skip`,
@@ -214,13 +232,18 @@
     </div>
     {#if checked && lostGroups > 0}
       <div class="warning" id="{id}-duplicates">
-        <p>
-          This deletes every copy in {plural(lostGroups, "group")} of duplicates{#if checked.keptGone > 0}{checked.allSelected >
-            0
-              ? `; in ${plural(checked.keptGone, "group")}, the copies left out`
-              : ": the copies left out"} are gone or changed since they were compared{/if}. Nothing of
-          {lostGroups === 1 ? "it" : "them"} would remain outside the {trashName}.
-        </p>
+        {#if checked.allSelected > 0}
+          <p>
+            This deletes every copy in {plural(checked.allSelected, "group")} of duplicates. Nothing of
+            {checked.allSelected === 1 ? "it" : "them"} would remain outside the {trashName}.
+          </p>
+        {/if}
+        {#if checked.keptGone > 0}
+          <p>
+            In {plural(checked.keptGone, "group")} of duplicates, the copies left out are gone or changed since they
+            were compared, so the files selected from {checked.keptGone === 1 ? "it" : "them"} will be kept, not moved.
+          </p>
+        {/if}
         <ul class="small">
           {#each checked.examples as path (path)}
             <li class="selectable"><PathText {path} /></li>
@@ -228,10 +251,18 @@
         </ul>
       </div>
     {/if}
+    {#if recheckGroups > 0}
+      <p class="muted small" id="{id}-recheck">
+        The copies left out of {plural(recheckGroups, "group")} of duplicates look unchanged since they were compared,
+        but that's provisional: they're read again before anything moves, and a file whose copy can't be confirmed is
+        kept.
+      </p>
+    {/if}
     {#if unchecked}
       <p class="muted small" id="{id}-unchecked">
-        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time: make sure a copy of
-        each stays.
+        Couldn't check {lostGroups > 0 ? "every" : "whether any"} group of duplicates in time. Copies left out are
+        still read before anything moves, and a file whose copy can't be confirmed is kept, but make sure you keep a
+        copy of each group you select from entirely.
       </p>
     {/if}
     {#if summary.folders > 0}
@@ -262,7 +293,19 @@
     <div class="buttons">
       <!-- Always present, so the dialog doesn't change height as it counts down. -->
       <span class="muted small hint" role={busy ? "status" : undefined}>{missing}</span>
-      <button type="button" disabled={busy} onclick={oncancel}>Cancel</button>
+      {#if rechecking}
+        <button
+          type="button"
+          disabled={stopped}
+          title="Files whose copy isn't confirmed yet are kept; the rest still move"
+          onclick={() => {
+            stopped = true;
+            onstoprecheck?.();
+          }}>Stop checking</button
+        >
+      {:else}
+        <button type="button" disabled={busy} onclick={oncancel}>Cancel</button>
+      {/if}
       <button type="button" class="danger filled" disabled={!ready} onclick={confirm}>
         Move to the {trashName}
       </button>
