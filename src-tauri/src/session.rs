@@ -389,10 +389,12 @@ impl Session {
         &self,
         req: &proto::FolderFilesRequest,
     ) -> Result<proto::FolderFilesPage, String> {
-        let revision = self.scan.progress().revision;
         let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
         let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        // Read with the tree's lock held, so the ranking is cached under the
+        // revision of the tree it's made from (see `with_duplicates`).
+        let revision = self.scan.progress().revision;
         let folder = node(&tree, req.folder)?;
         let filter = match req.search {
             Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
@@ -1369,6 +1371,64 @@ mod tests {
         let page = session.folder_files(&request(old, 0)).unwrap();
         assert_eq!(page.total, 2, "only files under the folder");
         assert_eq!(page.files[0].subfolder, "logs");
+    }
+
+    /// Runs `ask` on another thread while `remove` is deleted from the
+    /// scan, so it waits for the tree's lock while the edit holds it, and
+    /// returns what it got.
+    fn during_delete<R: Send>(
+        session: &Session,
+        remove: NodeId,
+        ask: impl FnOnce() -> R + Send,
+    ) -> R {
+        std::thread::scope(|s| {
+            let mut asked = None;
+            session
+                .scan
+                .edit_finished(|tree| {
+                    asked = Some(s.spawn(ask));
+                    // Time for the request to get as far as the tree's lock.
+                    std::thread::sleep(Duration::from_millis(100));
+                    tree.remove(remove);
+                })
+                .unwrap();
+            asked.unwrap().join().unwrap()
+        })
+    }
+
+    #[test]
+    fn folder_files_asked_during_a_delete_are_ranked_from_the_edited_tree() {
+        let tmp = fixture_named("files-delete");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let a = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let logs = child(&tree, child(&tree, NodeId::ROOT, "old"), "logs");
+            child(&tree, logs, "a.log")
+        };
+        let request = proto::FolderFilesRequest {
+            generation: session.generation(),
+            folder: 0,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset: 0,
+            limit: 10,
+        };
+        assert_eq!(session.folder_files(&request).unwrap().total, 3);
+
+        // The ranking cached for the old revision isn't served for the
+        // edited tree.
+        let page = during_delete(&session, a, || session.folder_files(&request)).unwrap();
+        let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["b.log", "keep.txt"]);
+        assert_eq!(session.folder_files(&request).unwrap().total, 2);
     }
 
     #[test]
