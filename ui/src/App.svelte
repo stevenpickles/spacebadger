@@ -83,7 +83,7 @@
     ["*.iso; size:>1GB; older:1y", "disk images over 1 GB, untouched for a year"],
   ];
 
-  const scan = new ScanController({ onadopt: adopted, onerror: (message) => (problem = message) });
+  const scan = new ScanController((message) => (problem = message));
   const generation = $derived(scan.generation);
   const status = $derived(scan.status);
   let view = $state(ROOT);
@@ -380,6 +380,10 @@
       ...deleteItemsFor(f.node),
     ];
   }
+
+  // Status is followed only from here: a newer scan resets the comparison
+  // and filter search above, so they must exist first.
+  scan.follow(adopted);
 
   // ---- duplicate files ----------------------------------------------------
 

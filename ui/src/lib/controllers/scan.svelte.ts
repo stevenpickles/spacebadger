@@ -6,18 +6,16 @@ import { onScanStatus, scanCancel, scanStatus } from "../api";
 import type { ScanStarted } from "../protocol/ScanStarted";
 import type { ScanStatus } from "../protocol/ScanStatus";
 
-interface Hooks {
-  /** A newer scan replaced the one shown; `previous` was its last status. */
-  onadopt: (previous: ScanStatus | null) => void;
-  onerror: (message: string) => void;
-}
+/** A newer scan replaced the one shown; `previous` was its last status. */
+type OnAdopt = (previous: ScanStatus | null) => void;
 
 export class ScanController {
   generation = $state<number | null>(null);
   status = $state.raw<ScanStatus | null>(null);
   #statusAt = $state(0);
   #now = $state(performance.now());
-  #hooks: Hooks;
+  #onerror: (message: string) => void;
+  #onadopt: OnAdopt = () => {};
 
   readonly scanning = $derived(this.status?.phase.kind === "scanning");
   readonly finished = $derived(this.status !== null && this.status.phase.kind !== "scanning");
@@ -31,9 +29,17 @@ export class ScanController {
       : 0,
   );
 
-  /** Call during component setup: it listens for status while mounted. */
-  constructor(hooks: Hooks) {
-    this.#hooks = hooks;
+  constructor(onerror: (message: string) => void) {
+    this.#onerror = onerror;
+  }
+
+  /**
+   * Starts following the backend's scans, calling `onadopt` whenever a
+   * newer one is shown. Call during component setup, once everything
+   * `onadopt` uses is in place: status may arrive as soon as it mounts.
+   */
+  follow(onadopt: OnAdopt) {
+    this.#onadopt = onadopt;
 
     $effect(() => {
       const unlisten = onScanStatus((s) => this.receive(s));
@@ -55,7 +61,7 @@ export class ScanController {
     const previous = this.status;
     this.generation = next;
     this.status = null;
-    this.#hooks.onadopt(previous);
+    this.#onadopt(previous);
   }
 
   receive(s: ScanStatus) {
@@ -73,11 +79,11 @@ export class ScanController {
       const started = await action();
       if (started) this.adopt(started.generation);
     } catch (e) {
-      this.#hooks.onerror(String(e));
+      this.#onerror(String(e));
     }
   }
 
   cancel() {
-    if (this.generation !== null) scanCancel(this.generation).catch((e: unknown) => this.#hooks.onerror(String(e)));
+    if (this.generation !== null) scanCancel(this.generation).catch((e: unknown) => this.#onerror(String(e)));
   }
 }
