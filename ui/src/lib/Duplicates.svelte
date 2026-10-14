@@ -96,9 +96,11 @@
     stale = true;
     if (!fetching) untrack(() => void fetchList());
   });
-  // Another search starts with only the first files of each group.
+  // Another search starts with only the first files of each group, and
+  // none folded: group IDs start again from 0.
   $effect(() => {
     void [generation, job];
+    folded = new Set();
     more = new Map();
     loading = new Set();
   });
