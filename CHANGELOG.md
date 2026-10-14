@@ -25,6 +25,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - Large exports are written in the background while the map and scan carry on; when done, Show in Explorer shows the file.
 - Exports and snapshots are written to a new file of their own, then renamed into place once complete: a failed export leaves the chosen file as it was, and no other file beside it is ever overwritten or written through a link. If the app is closed or crashes mid-export, a hidden `.<name>.….partial` file may be left beside the chosen one; it can be deleted. When the file can't be replaced, the message says it may be open in another program or read-only.
 
+### Map
+- Moving the pointer over the map no longer redraws it: within one tile only the tooltip moves, and entering another tile redraws just the hover highlight.
+
 ### Toolbar
 - The toolbar fits on one row at 1280 pixels again: Rescan and Cancel share one place (Cancel while scanning), and "Color by" is a list.
 
