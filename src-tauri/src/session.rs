@@ -844,7 +844,10 @@ impl Session {
             }
         });
         let ((), progress) = edited.ok_or("scan data is unavailable")?;
+        // Derived views are brought up to date before the change is
+        // announced, so the requests it prompts find them ready.
         self.filter.nudge(progress.revision);
+        self.rematch();
         report.recycled = recycled.iter().map(|n| n.index() as u32).collect();
         report.removed = removed.iter().map(|n| n.index() as u32).collect();
         (self.on_status)(status(&display_path(&self.root), &progress));
