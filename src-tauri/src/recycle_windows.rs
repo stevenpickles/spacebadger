@@ -7,6 +7,7 @@
 //! sink here aborts any delete that wouldn't be.
 
 use crate::delete::RecycleError;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -255,6 +256,102 @@ fn shell_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Why the shell might reach something other than the exact item at
+/// `path`, if it might. The checks read `\\?\` paths exactly, but the shell
+/// parses them the way Win32 does, so every name in the path, from the
+/// drive down, must mean the same to both: none ending with a dot or a
+/// space (Win32 drops them), none that is a device such as `NUL` or `COM1`,
+/// no `.` or `..`, no `:` (a data stream) or wildcard, and Win32 must give
+/// back the shell form of the path unchanged.
+pub fn misread(path: &Path) -> Option<String> {
+    let inexact = || {
+        Some(format!(
+            "Its path {} can't be given to the Recycle Bin exactly as it is, so it could reach another item; nothing was moved.",
+            quoted(path.as_os_str())
+        ))
+    };
+    let mut components = path.components();
+    let verbatim = match components.next() {
+        Some(Component::Prefix(p)) if path.is_absolute() => match p.kind() {
+            Prefix::Disk(_) | Prefix::UNC(..) => false,
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..) => true,
+            _ => return inexact(),
+        },
+        _ => return inexact(),
+    };
+    for c in components {
+        let part = match c {
+            Component::RootDir => continue,
+            Component::Normal(part) => part,
+            _ => return inexact(),
+        };
+        let name = part.to_string_lossy();
+        if name.ends_with(['.', ' ']) {
+            return Some(format!(
+                "The name {} in its path ends with a dot or a space, which the Recycle Bin would mistake for another item; nothing was moved.",
+                quoted(part)
+            ));
+        }
+        if device(&name) {
+            return Some(format!(
+                "The name {} in its path is reserved by Windows for a device, so the Recycle Bin can't reach it safely; nothing was moved.",
+                quoted(part)
+            ));
+        }
+        if name.chars().any(|c| c < ' ' || r#"<>:"/\|?*"#.contains(c)) {
+            return inexact();
+        }
+    }
+    // Anything else Win32 would rewrite: `absolute` calls `GetFullPathNameW`
+    // for a path without `\\?\`, as `shell_path` already did for one that
+    // never had it. A `/` is a separator to both (the checks read it as
+    // one too).
+    let shell = shell_path(path);
+    let rewritten = |p: &Path| {
+        std::path::absolute(p).ok().as_deref().map(Path::as_os_str) != Some(p.as_os_str())
+    };
+    let differs = || {
+        let wide = path.as_os_str().encode_wide().map(|c| {
+            if c == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                c
+            }
+        });
+        !wide.eq(shell.as_os_str().encode_wide())
+    };
+    if rewritten(&shell) || (!verbatim && differs()) {
+        return inexact();
+    }
+    None
+}
+
+/// Whether Win32 takes a name for a device, as it does `nul` and `COM1`,
+/// with any extension or trailing spaces before it.
+fn device(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let mut chars = upper.chars();
+            let start: String = chars.by_ref().take(3).collect();
+            let digit = chars.next();
+            (start == "COM" || start == "LPT")
+                && chars.next().is_none()
+                && digit.is_some_and(|d| d.is_ascii_digit() || "¹²³".contains(d))
+        }
+    }
+}
+
+fn quoted(text: &std::ffi::OsStr) -> String {
+    format!("“{}”", text.to_string_lossy())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +398,81 @@ mod tests {
             Path::new(r"C:\dir\file.txt")
         );
         assert!(shell_path(Path::new("relative.txt")).is_absolute());
+    }
+
+    /// Every name in the path counts, the drive's folders included, in
+    /// each form a path can take.
+    #[test]
+    fn paths_the_shell_would_read_differently_are_refused() {
+        let fine = [
+            r"C:\dir\file.txt",
+            r"\\?\C:\dir\file.txt",
+            r"\\host\share\dir\f",
+            r"\\?\UNC\host\share\dir\f",
+            r"C:\",
+            r"\\?\C:\",
+            r"C:\.git\a b\file.tar.gz",
+            r"C:\dir\console\COM10\LPT\nul-ish\auxiliary.txt",
+            r"C:\PROGRA~1\file",
+            "C:/dir/file.txt",
+        ];
+        for path in fine {
+            assert_eq!(misread(Path::new(path)), None, "{path}");
+        }
+        let trailing = [
+            r"C:\root.\file.txt",
+            r"\\?\C:\root.\file.txt",
+            r"\\?\C:\up \root\file.txt",
+            r"\\?\C:\dir\file.",
+            r"\\?\C:\dir\file ",
+            r"\\?\UNC\host\share\root.\f",
+            r"\\?\C:\...\f",
+        ];
+        for path in trailing {
+            assert!(
+                misread(Path::new(path)).is_some_and(|m| m.contains("ends with a dot or a space")),
+                "{path}"
+            );
+        }
+        let devices = [
+            r"\\?\C:\dir\NUL",
+            r"\\?\C:\con\file",
+            r"\\?\C:\dir\aux.txt",
+            r"\\?\C:\dir\Com1",
+            r"\\?\C:\dir\lpt9.log",
+            r"\\?\C:\dir\COM¹",
+            r"\\?\C:\dir\nul .txt",
+            r"\\?\C:\dir\CONOUT$",
+        ];
+        for path in devices {
+            assert!(
+                misread(Path::new(path)).is_some_and(|m| m.contains("reserved by Windows")),
+                "{path}"
+            );
+        }
+        let inexact = [
+            r"\\?\C:\dir\..\file",
+            r"\\?\C:\dir\.\file",
+            // A `.` here is skipped by `components`; Win32 rewriting the
+            // path gives it away.
+            r"C:\dir\.\file",
+            r"C:\dir\..\file",
+            r"\\?\C:\dir\file:stream",
+            r"\\?\C:\dir\a/b",
+            r"\\?\C:\dir\a*",
+            r"\\?\C:\dir\a?b",
+            "\\\\?\\C:\\dir\\a\tb",
+            r"\\?\Volume{0b1c2d3e-0000-0000-0000-000000000000}\dir\f",
+            r"\\.\C:\dir\f",
+            r"C:dir\f",
+            r"dir\f",
+        ];
+        for path in inexact {
+            assert!(
+                misread(Path::new(path)).is_some_and(|m| m.contains("exactly as it is")),
+                "{path}"
+            );
+        }
     }
 
     /// A network path has no Recycle Bin, so the shell would delete the
