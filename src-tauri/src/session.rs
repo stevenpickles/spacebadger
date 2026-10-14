@@ -1516,6 +1516,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_totals_asked_during_a_delete_count_the_edited_tree() {
+        let tmp = fixture_named("filter-delete");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let a = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let logs = child(&tree, child(&tree, NodeId::ROOT, "old"), "logs");
+            child(&tree, logs, "a.log")
+        };
+        let search = session.search_set("*.log").unwrap().unwrap().search;
+        // Read with the search caught up before the edit; it's brought up
+        // to date again rather than counting the deleted file.
+        let details = during_delete(&session, a, || session.details(0, Some(search))).unwrap();
+        assert_eq!(
+            details.matching,
+            Some(proto::Matching {
+                files: 1,
+                logical: 3000
+            })
+        );
+        let summary = session.search_summary(search).unwrap();
+        assert_eq!((summary.files, summary.logical), (1, 3000));
+        assert_eq!(summary.revision, session.scan.progress().revision);
+    }
+
+    #[test]
     fn suggestions_asked_during_a_delete_are_kept_under_the_edited_revision() {
         let tmp = fixture_named("suggest-delete");
         let statuses = Arc::new(Mutex::new(Vec::new()));
