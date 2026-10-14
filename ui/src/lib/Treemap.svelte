@@ -162,21 +162,11 @@
     recent: [] as number[],
   };
 
-  /** Label text widths and fitted labels for the current font. Both depend
-   * only on the font, the text, and (for fits) the room, so they carry over
-   * from draw to draw and across layouts. */
-  const textCache = { font: "", widths: new Map<string, number>(), fits: new Map<string, string>() };
-  const TEXT_CACHE_LIMIT = 50_000;
-
-  /** The width of `text` in the label font: cached, counted while tracing. */
+  /** ctx.measureText, counted while tracing. Label widths aren't cached:
+   * measuring was a small part of the label pass (docs/validation/treemap-paint.md). */
   function measure(ctx: CanvasRenderingContext2D, text: string): number {
-    const known = textCache.widths.get(text);
-    if (known !== undefined) return known;
     if (trace.on) trace.measuring++;
-    const width = ctx.measureText(text).width;
-    if (textCache.widths.size >= TEXT_CACHE_LIMIT) textCache.widths.clear();
-    textCache.widths.set(text, width);
-    return width;
+    return ctx.measureText(text).width;
   }
 
   $effect(() => {
@@ -326,20 +316,8 @@
     return depthColor(l.depth[i]!, kind === KIND_FOLDER, dark);
   }
 
-  /** `text`, cut with an ellipsis to fit `max` pixels; cached. */
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
-    const key = `${max}\u0000${text}`;
-    let fitted = textCache.fits.get(key);
-    if (fitted === undefined) {
-      fitted = cut(ctx, text, max);
-      if (textCache.fits.size >= TEXT_CACHE_LIMIT) textCache.fits.clear();
-      textCache.fits.set(key, fitted);
-    }
-    return fitted;
-  }
-
-  function cut(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (measure(ctx, text) <= max) return text;
     let lo = 0;
     let hi = text.length;
@@ -406,13 +384,7 @@
     if (!l) return;
 
     const p = palette;
-    const font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
-    if (textCache.font !== font) {
-      textCache.font = font;
-      textCache.widths.clear();
-      textCache.fits.clear();
-    }
-    top.font = font;
+    top.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
     top.textBaseline = "alphabetic";
     const gap = p.gap;
 
