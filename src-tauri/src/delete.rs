@@ -150,12 +150,9 @@ fn checked_move(
     let Some((item, above)) = target.chain.split_last() else {
         return Err(Outcome::Failed("Nothing to delete.".into()));
     };
-    if cfg!(windows) && below_root_ends_badly(target) {
-        // The shell parses paths the way Win32 does, dropping a trailing dot
-        // or space, so it would reach a different item.
-        return Err(Outcome::Failed(
-            "Its name, or a folder name above it, ends with a dot or a space, which the Recycle Bin can't handle safely.".into(),
-        ));
+    // The whole path the move is given, the scan root and above included.
+    if let Some(why) = misread(&item.path) {
+        return Err(Outcome::Failed(why));
     }
     let mut folders = Vec::with_capacity(above.len());
     for (i, folder) in above.iter().enumerate() {
@@ -212,14 +209,17 @@ fn checked_move(
     Ok((result, place))
 }
 
-/// Whether a name below the scan root ends with a dot or a space.
-fn below_root_ends_badly(target: &Target) -> bool {
-    target.chain.iter().skip(1).any(|s| {
-        s.path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .is_some_and(|n| n.ends_with('.') || n.ends_with(' '))
-    })
+/// Why the move could reach something other than the item at `path`: the
+/// shell parses paths differently from the checks' exact `\\?\` paths.
+#[cfg(windows)]
+fn misread(path: &Path) -> Option<String> {
+    crate::recycle_windows::misread(path)
+}
+
+/// The Trash is given the path as the checks read it.
+#[cfg(not(windows))]
+fn misread(_: &Path) -> Option<String> {
+    None
 }
 
 /// Why an item or a folder above it is left alone.
@@ -647,6 +647,45 @@ pub mod tests {
         for name in ["a.", "b "] {
             std::fs::remove_file(verbatim(name)).unwrap();
         }
+    }
+
+    /// The scan root and the folders above it are part of the path the
+    /// shell parses too: `root.\a.txt` would reach `root\a.txt`.
+    #[cfg(windows)]
+    #[test]
+    fn a_scan_root_or_folder_above_it_ending_badly_is_refused() {
+        let tmp = TempDir::new("badroot");
+        let verbatim = |rest: &str| PathBuf::from(format!(r"\\?\{}\{rest}", tmp.0.display()));
+        write(&tmp.0.join(r"root\a.txt"), "the sibling");
+        write(&tmp.0.join(r"up\root\a.txt"), "the sibling");
+        for (root, file) in [(r"root.", r"root.\a.txt"), (r"up \root", r"up \root\a.txt")] {
+            let (root, file) = (verbatim(root), verbatim(file));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(&file, "trailing").unwrap();
+            let t = target(&root, &file);
+            let moved = std::cell::Cell::new(false);
+            let outcome = delete_with(
+                &t,
+                &Fake(|_: &Path| {
+                    moved.set(true);
+                    Ok(())
+                }),
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed(m) if m.contains("ends with a dot or a space")),
+                "{outcome:?}"
+            );
+            assert!(!moved.get(), "{}", file.display());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "trailing");
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join(r"root\a.txt")).unwrap(),
+            "the sibling"
+        );
+        assert!(tmp.0.join(r"up\root\a.txt").exists());
+        // Removed through verbatim paths, which TempDir's cleanup can't.
+        std::fs::remove_dir_all(verbatim("root.")).unwrap();
+        std::fs::remove_dir_all(verbatim("up ")).unwrap();
     }
 
     #[test]
