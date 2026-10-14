@@ -8,9 +8,10 @@
 //! Now a background job advances the search after each scan status, in
 //! bounded steps that release both locks in between, and requests only read
 //! it, under a read lock, so layouts, details, totals, and tooltips run side
-//! by side. The job never waits for the search's lock: when a request is
-//! reading, it backs off and tries again, so a request waits at most for one
-//! step.
+//! by side. While requests read, the job backs off and tries again, and
+//! only after 20 tries in a row (requests overlapping without a gap) does it
+//! queue for the lock, so a request waits for one step at most, plus
+//! whatever request the job queued behind.
 //!
 //! While scanning, a request can see the search as of an earlier status
 //! than the tree it reads, by a status interval at most; the search's
@@ -33,6 +34,11 @@ const CATCH_UP_STEP: usize = 10_000;
 
 /// How long the job waits before trying again while requests read the search.
 const BUSY_RETRY: Duration = Duration::from_millis(1);
+
+/// Tries in a row the job makes while requests read the search before it
+/// waits for its turn instead, so overlapping requests can't keep the
+/// search from catching up indefinitely.
+const BUSY_TRIES: u32 = 20;
 
 pub(super) type SearchGuard<'a> = Held<RwLockReadGuard<'a, Option<ActiveSearch>>>;
 pub(super) type TreeGuard<'a> = Held<RwLockReadGuard<'a, Tree>>;
@@ -63,6 +69,9 @@ pub(super) struct Filter {
     pub active: RwLock<Option<ActiveSearch>>,
     /// Whether the job is running; without it, requests catch up themselves.
     background: bool,
+    /// Keeps the job from stepping, for tests of what requests see meanwhile.
+    #[cfg(test)]
+    held: std::sync::atomic::AtomicBool,
     wake: Mutex<Wake>,
     woken: Condvar,
 }
@@ -95,6 +104,8 @@ impl Filter {
             Arc::new(Self {
                 active: RwLock::new(None),
                 background,
+                #[cfg(test)]
+                held: std::sync::atomic::AtomicBool::new(false),
                 wake: Mutex::new(Wake::default()),
                 woken: Condvar::new(),
             })
@@ -148,14 +159,29 @@ impl Filter {
                 }
             };
             let tree = scan.get_or_insert_with(|| tree.wait().clone());
+            let mut busy = 0;
             loop {
-                match self.step(tree, revision) {
+                #[cfg(test)]
+                if self.held.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(BUSY_RETRY);
+                    if self.stopped() {
+                        return;
+                    }
+                    continue;
+                }
+                match self.step(tree, revision, busy >= BUSY_TRIES) {
                     Step::Done => break,
                     Step::Gone => return,
                     // Between steps the scanner can take the tree's lock:
                     // if it's waiting, the next read waits behind it.
-                    Step::More => std::thread::yield_now(),
-                    Step::Busy => std::thread::sleep(BUSY_RETRY),
+                    Step::More => {
+                        busy = 0;
+                        std::thread::yield_now();
+                    }
+                    Step::Busy => {
+                        busy += 1;
+                        std::thread::sleep(BUSY_RETRY);
+                    }
                 }
                 if self.stopped() {
                     return;
@@ -164,21 +190,35 @@ impl Filter {
         }
     }
 
-    /// Examines up to [`CATCH_UP_STEP`] nodes. The tree is read-locked
-    /// first, which may wait for the scanner, and the search only tried, so
-    /// requests never wait while the job waits; that's also why taking them
-    /// in the opposite order to requests can't deadlock.
-    fn step(&self, tree: &Weak<RwLock<Tree>>, revision: u64) -> Step {
+    /// Examines up to [`CATCH_UP_STEP`] nodes. Normally the tree is
+    /// read-locked first, which may wait for the scanner, and the search
+    /// only tried, so requests never wait while the job waits; that's also
+    /// why taking them in the opposite order to requests can't deadlock.
+    /// After requests kept it off for [`BUSY_TRIES`] tries, it `wait`s for
+    /// the search's write lock instead, taking the locks in the requests'
+    /// order (search, then tree), so new requests queue behind it and the
+    /// search catches up a step.
+    fn step(&self, tree: &Weak<RwLock<Tree>>, revision: u64, wait: bool) -> Step {
         let Some(tree) = tree.upgrade() else {
             return Step::Gone;
         };
-        let Ok(tree) = tree.read() else {
-            return Step::Gone;
-        };
-        let mut active = match self.active.try_write() {
-            Ok(active) => active,
-            Err(TryLockError::WouldBlock) => return Step::Busy,
-            Err(TryLockError::Poisoned(_)) => return Step::Gone,
+        let (mut active, tree) = if wait {
+            let Ok(active) = self.active.write() else {
+                return Step::Gone;
+            };
+            let Ok(tree) = tree.read() else {
+                return Step::Gone;
+            };
+            (active, tree)
+        } else {
+            let Ok(tree) = tree.read() else {
+                return Step::Gone;
+            };
+            match self.active.try_write() {
+                Ok(active) => (active, tree),
+                Err(TryLockError::WouldBlock) => return Step::Busy,
+                Err(TryLockError::Poisoned(_)) => return Step::Gone,
+            }
         };
         let Some(active) = active.as_mut() else {
             return Step::Done;
@@ -268,8 +308,17 @@ mod tests {
     use sb_protocol as proto;
     use sb_scan::ScanConfig;
     use sb_scan::fake::{FakeFs, Gate};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// Sets the flag when dropped, including while unwinding.
+    struct Stop<'a>(&'a AtomicBool);
+
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 
     fn until(what: &str, done: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -333,19 +382,14 @@ mod tests {
         (s.files, s.logical)
     }
 
-    /// Asked on another thread, so the test can hold the search's lock.
-    fn summary_elsewhere(session: &Session, id: u32) -> proto::SearchSummary {
-        std::thread::scope(|s| s.spawn(|| session.search_summary(id).unwrap()).join()).unwrap()
-    }
-
     #[test]
     fn requests_read_the_filter_while_a_job_keeps_it_caught_up() {
         let (session, b, c) = scan();
         let id = session.search_set("*.log").unwrap().unwrap().search;
-        // While a request reads the search, the job stays off it, and
-        // other requests read it as it was, whole, saying which revision.
-        let reading = session.filter.active.read().unwrap();
-        let first = summary_elsewhere(&session, id);
+        // While the job is held off, requests read the search as it was,
+        // whole, saying which revision.
+        session.filter.held.store(true, Ordering::SeqCst);
+        let first = session.search_summary(id).unwrap();
         assert_eq!(totals(&first), fresh(&session, "*.log"));
         assert_eq!(first.files, 100);
         b.release();
@@ -354,11 +398,11 @@ mod tests {
             session.scan.progress().revision > first.revision
         });
         assert_eq!(
-            summary_elsewhere(&session, id),
+            session.search_summary(id).unwrap(),
             first,
             "requests don't catch up while scanning"
         );
-        drop(reading);
+        session.filter.held.store(false, Ordering::SeqCst);
 
         until("the job catches up", || {
             totals(&session.search_summary(id).unwrap()) == fresh(&session, "*.log")
@@ -385,11 +429,15 @@ mod tests {
         let (session, b, c) = scan();
         let id = session.search_set("*.log").unwrap().unwrap().search;
         let stop = AtomicBool::new(false);
+        let reading = AtomicUsize::new(0);
         let reads = std::thread::scope(|s| {
+            // Stops the readers however this ends, so a failure below
+            // isn't followed by the scope waiting for them forever.
+            let _stop = Stop(&stop);
             let readers: Vec<_> = (0..4)
                 .map(|_| {
                     s.spawn(|| {
-                        let (mut reads, mut revision) = (0, 0);
+                        let (mut reads, mut revision) = (0u64, 0);
                         while !stop.load(Ordering::Relaxed) {
                             let tree = session.scan.tree();
                             let (search, tree, _) = session.read_locked(&tree, true).unwrap();
@@ -404,12 +452,20 @@ mod tests {
                             assert_eq!((root.files, root.logical), (files, logical));
                             assert!(active.revision >= revision, "never goes back");
                             revision = active.revision;
+                            if reads == 0 {
+                                reading.fetch_add(1, Ordering::SeqCst);
+                            }
                             reads += 1;
+                            drop((search, tree));
+                            // Back to back, but leaving the other threads
+                            // the processor on a machine with few cores.
+                            std::thread::yield_now();
                         }
                         reads
                     })
                 })
                 .collect();
+            until("every reader reads", || reading.load(Ordering::SeqCst) == 4);
             b.release();
             until("b is listed", || listed(&session, "b"));
             until("the job catches up", || {

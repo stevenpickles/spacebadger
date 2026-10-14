@@ -62,7 +62,9 @@ type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 // read-lock the search; it's write-locked briefly to set a search or bring
 // it up to date once the scan has finished. The job keeping it caught up
 // while scanning read-locks the tree first and only tries the search's
-// write lock, so it never waits holding either (see `filter`).
+// write lock, so it never waits holding either; when requests keep it off,
+// it waits for the search's write lock, then the tree, in request order
+// (see `filter`).
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
