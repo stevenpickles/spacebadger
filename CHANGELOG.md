@@ -32,6 +32,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The Duplicates tab lists groups as they're found, most reclaimable space first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at, from 1 KB to 100 MB (1 MB to start).
 - Select duplicates like any other items, or use "Select all but the first" to select every copy except the one with the shortest path in each group. Deleting still goes through the guarded delete, which warns if a group would lose every copy, and deleted files leave their groups.
 
+### Packages
+- winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
+
 ## [0.2.0] - 2026-10-13
 
 A redesigned interface, a much more capable filter, and sizes in familiar units.
