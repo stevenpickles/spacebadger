@@ -1,12 +1,15 @@
 <script lang="ts" module>
+  import type { DeleteItem } from "./protocol/DeleteItem";
+
   export interface DeleteResult {
-    /** Items moved (or already gone). */
-    moved: number;
     /** Items asked for. */
     total: number;
-    /** Size of the moved items, in bytes. */
+    /** Items moved to the Recycle Bin or Trash. */
+    recycled: number;
+    /** Size of the recycled items, in bytes. */
     size: number;
-    failures: { path: string; message: string }[];
+    /** Every item not recycled, with what happened to it. */
+    others: DeleteItem[];
   }
 </script>
 
@@ -16,7 +19,9 @@
   // it covers. The confirm button stays disabled until the word "delete" is
   // typed and a short countdown has run, so a reflexive Enter or click can't
   // go through. When the move is done the dialog stays open to report what
-  // moved and what couldn't.
+  // moved and, separately, what was already gone, what had changed since
+  // the scan and was left alone, what couldn't be moved, and what is gone
+  // without being confirmed in the bin.
   import { untrack } from "svelte";
   import { describeItems, exactBytes, formatBytes, plural } from "./format";
   import type { DuplicatesCheck } from "./protocol/DuplicatesCheck";
@@ -138,6 +143,20 @@
     else if (!busy) oncancel();
   }
 
+  /** The result's items not recycled, by outcome. */
+  const outcomes = $derived.by(() => {
+    const of = (o: DeleteItem["outcome"]) => result?.others.filter((i) => i.outcome === o) ?? [];
+    return {
+      uncertain: of("uncertain"),
+      changed: of("changed"),
+      failed: of("failed"),
+      missing: of("alreadyMissing"),
+    };
+  });
+
+  /** "it"/"they" style wording for `n` items. */
+  const one = (n: number, single: string, several: string) => (n === 1 ? single : several);
+
   /** Escape: the parent decides when the dialog goes away. */
   function onCancel(e: Event) {
     e.preventDefault();
@@ -172,34 +191,62 @@
   onclose={onClosed}
 >
   {#if result}
-    {@const all = result.failures.length === 0 && result.moved === result.total}
+    {@const { uncertain, changed, failed, missing } = outcomes}
     <h2 id="{id}-title">
-      {#if all}
-        Moved {plural(result.moved, "item")} ({formatBytes(result.size)})
+      {#if result.recycled === result.total}
+        Moved {plural(result.recycled, "item")} ({formatBytes(result.size)}) to the {trashName}
+      {:else if result.recycled > 0}
+        Moved {result.recycled.toLocaleString()} of {plural(result.total, "item")} to the {trashName}
       {:else}
-        Moved {result.moved.toLocaleString()} of {plural(result.total, "item")} to the {trashName}
+        Nothing was moved to the {trashName}
       {/if}
     </h2>
-    <p id="{id}-result">
-      {#if all}
-        They're in the {trashName}. The space is freed when it's emptied.
-      {:else if result.failures.length > 0}
-        {plural(result.failures.length, "item")} couldn't be moved and {result.failures.length === 1 ? "is" : "are"}
-        still where {result.failures.length === 1 ? "it was" : "they were"}:
-      {:else}
-        The rest were no longer there.
+    <div id="{id}-result">
+      {#if result.recycled > 0}
+        <p>
+          {one(result.recycled, "It's", "They're")} in the {trashName}{result.recycled < result.total
+            ? ` (${formatBytes(result.size)})`
+            : ""}. The space is freed when it's emptied.
+        </p>
       {/if}
-    </p>
-    {#if result.failures.length > 0}
-      <ul class="failures">
-        {#each result.failures as failure, i (i)}
-          <li>
-            <div class="selectable path"><PathText path={failure.path} /></div>
-            <div class="muted small selectable">{failure.message}</div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
+      {#if uncertain.length > 0}
+        <p class="warning">
+          {plural(uncertain.length, "item")}
+          {one(uncertain.length, "is", "are")} gone from where {one(uncertain.length, "it was", "they were")}, but
+          {one(uncertain.length, "isn't", "aren't")} confirmed to be in the {trashName}: {one(
+            uncertain.length,
+            "it",
+            "they",
+          )} may have been deleted without a copy.
+        </p>
+        {@render items(uncertain)}
+      {/if}
+      {#if changed.length > 0}
+        <p>
+          {plural(changed.length, "item")} changed since the scan and {one(changed.length, "was", "were")} left alone.
+          Scan again to see {one(changed.length, "it as it is", "them as they are")} now.
+        </p>
+        {@render items(changed)}
+      {/if}
+      {#if failed.length > 0}
+        <p>
+          {plural(failed.length, "item")} couldn't be moved and {one(failed.length, "is", "are")} still where
+          {one(failed.length, "it was", "they were")}.
+        </p>
+        {@render items(failed)}
+      {/if}
+      {#if missing.length > 0}
+        <p>
+          {plural(missing.length, "item")}
+          {one(missing.length, "was", "were")} no longer there, so nothing was moved for {one(
+            missing.length,
+            "it",
+            "them",
+          )}.
+        </p>
+        {@render items(missing)}
+      {/if}
+    </div>
     <div class="buttons">
       <button type="button" bind:this={closeButton} onclick={() => onclose?.()}>Close</button>
     </div>
@@ -277,6 +324,17 @@
     </div>
   {/if}
 </dialog>
+
+{#snippet items(list: DeleteItem[])}
+  <ul class="failures">
+    {#each list as item (item.node)}
+      <li>
+        <div class="selectable path"><PathText path={item.path} /></div>
+        {#if item.message}<div class="muted small selectable">{item.message}</div>{/if}
+      </li>
+    {/each}
+  </ul>
+{/snippet}
 
 <style>
   dialog {

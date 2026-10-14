@@ -6,6 +6,7 @@
 //! deleted, the shell tells a progress sink whether it will be recycled; the
 //! sink here aborts any delete that wouldn't be.
 
+use crate::delete::RecycleError;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,8 +175,8 @@ pub const NOT_RECYCLABLE: &str = "It can't go to the Recycle Bin here (it may be
 
 /// Moves `path` to the Recycle Bin. Fails, leaving the item alone, if
 /// Windows would delete it permanently instead.
-pub fn recycle(path: &Path) -> std::result::Result<(), String> {
-    let _com = Com::init()?;
+pub fn recycle(path: &Path) -> std::result::Result<(), RecycleError> {
+    let _com = Com::init().map_err(RecycleError::Failed)?;
     let seen = Arc::new(Seen::default());
     let name = HSTRING::from(shell_path(path).as_os_str());
     // SAFETY: COM is initialized on this thread; every pointer passed is
@@ -194,19 +195,36 @@ pub fn recycle(path: &Path) -> std::result::Result<(), String> {
             done.map(|()| !aborted)
         })()
     };
-    if seen.refused.load(Ordering::SeqCst) {
-        return Err(NOT_RECYCLABLE.into());
+    classify(
+        seen.refused.load(Ordering::SeqCst),
+        seen.unrecycled.load(Ordering::SeqCst),
+        performed.map_err(|e| e.message()),
+    )
+}
+
+/// The result of a move from what the progress sink saw (a delete it
+/// stopped, a delete without a copy) and what the operation returned
+/// (whether it ran unaborted, or its error). A delete without a copy is
+/// reported above everything else, since nothing can bring it back.
+fn classify(
+    refused: bool,
+    unrecycled: bool,
+    performed: std::result::Result<bool, String>,
+) -> std::result::Result<(), RecycleError> {
+    if unrecycled {
+        return Err(RecycleError::Unrecycled);
     }
-    if seen.unrecycled.load(Ordering::SeqCst) {
-        return Err("Windows deleted it without keeping a copy in the Recycle Bin.".into());
+    if refused {
+        return Err(RecycleError::Refused(NOT_RECYCLABLE.into()));
     }
     match performed {
         Ok(true) => Ok(()),
-        Ok(false) => Err("The move was cancelled or blocked. It may be in use.".into()),
-        Err(e) => Err(format!(
-            "Couldn't move it to the Recycle Bin: {}",
-            e.message()
+        Ok(false) => Err(RecycleError::Failed(
+            "The move was cancelled or blocked. It may be in use.".into(),
         )),
+        Err(message) => Err(RecycleError::Failed(format!(
+            "Couldn't move it to the Recycle Bin: {message}"
+        ))),
     }
 }
 
@@ -240,6 +258,33 @@ fn shell_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delete_without_a_copy_outranks_every_other_result() {
+        assert_eq!(classify(false, false, Ok(true)), Ok(()));
+        assert_eq!(
+            classify(false, true, Ok(true)),
+            Err(RecycleError::Unrecycled)
+        );
+        assert_eq!(
+            classify(true, true, Err("aborted".into())),
+            Err(RecycleError::Unrecycled)
+        );
+        assert_eq!(
+            classify(true, false, Ok(false)),
+            Err(RecycleError::Refused(NOT_RECYCLABLE.into()))
+        );
+        assert!(matches!(
+            classify(false, false, Ok(false)),
+            Err(RecycleError::Failed(m)) if m.contains("cancelled or blocked")
+        ));
+        assert_eq!(
+            classify(false, false, Err("Access is denied.".into())),
+            Err(RecycleError::Failed(
+                "Couldn't move it to the Recycle Bin: Access is denied.".into()
+            ))
+        );
+    }
 
     #[test]
     fn verbatim_paths_become_shell_paths() {
@@ -280,7 +325,10 @@ mod tests {
         let result = recycle(&unc);
         let survived = file.exists();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(result, Err(NOT_RECYCLABLE.to_owned()));
+        assert_eq!(
+            result,
+            Err(RecycleError::Refused(NOT_RECYCLABLE.to_owned()))
+        );
         assert!(survived, "the file was deleted");
     }
 
