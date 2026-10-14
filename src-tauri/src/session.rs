@@ -58,7 +58,9 @@ type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 // before the tree, then `rankings`, and the order caches and
 // `search_ranked` last; waiting on `ranked` holds only `rankings`, and the
 // scanner takes the tree and then its progress. `rematching` is taken with
-// the tree read-locked, and `compare` briefly inside it. Requests only
+// the tree read-locked, and `compare` briefly inside it; `compare_set` also
+// stores the comparison inside the tree's read lock, so the revision it was
+// matched at can't move before it's in place. Requests only
 // read-lock the search; it's write-locked briefly to set a search or bring
 // it up to date once the scan has finished. The job keeping it caught up
 // while scanning read-locks the tree first and only tries the search's
@@ -275,9 +277,12 @@ impl Session {
             req.height.clamp(0.0, 16_384.0),
         );
         let tree_lock = self.scan.tree();
+        // A newer layout for the same map may have come while this one
+        // waited for the locks; then it's left to that one.
+        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
+        crate::runner::check()?;
         // The progress is read with the tree's lock held, so the revision
         // sent describes the tree laid out (see `with_duplicates`).
-        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
         let finished = progress.state.is_finished();
         let view = node(&tree, req.view)?;
         // While scanning, keep sibling order stable; once finished, sort afresh.
@@ -310,6 +315,7 @@ impl Session {
         };
         // Encoding needs only the tree, and its last step not even that.
         drop(search);
+        crate::runner::check()?;
 
         let _encode = metrics::span("encode");
         let mut rects = Vec::with_capacity(result.rects.len());
@@ -365,8 +371,26 @@ impl Session {
     /// Starts filtering by `query`, replacing any earlier search; an empty
     /// query clears the filter. Examines the tree in steps and gives up early
     /// if a newer search is requested meanwhile.
+    #[cfg(test)]
     pub fn search_set(&self, query: &str) -> Result<Option<proto::SearchSummary>, String> {
-        let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
+        self.search_set_as(self.search_begin(), query)
+    }
+
+    /// Numbers a new search, replacing any earlier one; numbered when it's
+    /// asked for, not when it starts, so of two asked for at nearly the same
+    /// time the later one always wins.
+    pub fn search_begin(&self) -> u32 {
+        self.latest_search.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// [`Session::search_set`] for a search numbered by
+    /// [`Session::search_begin`]; gives up at once if a newer one was asked
+    /// for meanwhile.
+    pub fn search_set_as(
+        &self,
+        id: u32,
+        query: &str,
+    ) -> Result<Option<proto::SearchSummary>, String> {
         let superseded = || format!("search {id} was replaced by a newer one");
         let Some(matcher) = Matcher::parse_at(query, SystemTime::now(), &local_midnight)? else {
             let mut current = locked("search", || self.filter.active.write())
@@ -567,6 +591,8 @@ impl Session {
         // Waited for another request's walk, whose ranking then does.
         let mut waited = false;
         loop {
+            // Superseded between steps: the walk stays for the next request.
+            crate::runner::check()?;
             // The progress is read with the tree's lock held, so the revision
             // describes the tree walked (see `with_duplicates`).
             let (search, tree, progress) = self.read_locked(&tree_lock, key.search.is_some())?;
@@ -584,10 +610,14 @@ impl Session {
             let mut rankings = locked("rankings", || self.rankings.lock())
                 .map_err(|_| "rankings are unavailable")?;
             let entry = rankings.entry(key);
+            // While scanning, a ranking kept is served rather than waiting
+            // for another request's walk, so pages don't hold workers of
+            // the query runner just waiting.
             let serve_kept = entry.ranking().is_some_and(|r| {
                 r.covers(end)
                     && (r.current(&now, ranking::REFRESH)
-                        || (!now.finished && (waited || walked >= RANK_BUDGET)))
+                        || (!now.finished
+                            && (waited || walked >= RANK_BUDGET || entry.finishing())))
             });
             if serve_kept {
                 drop(search);
@@ -641,17 +671,28 @@ impl Session {
     }
 
     /// Waits while another request finishes a walk for `key`, for at most
-    /// [`RANK_WAIT`]. Takes only the rankings' lock.
+    /// [`RANK_WAIT`], giving up if this request is superseded meanwhile.
+    /// Takes only the rankings' lock.
     fn wait_for_ranking(&self, key: Key) -> Result<(), String> {
         let _wait = metrics::span("rank wait");
-        let rankings = self
+        let until = Instant::now() + RANK_WAIT;
+        let mut rankings = self
             .rankings
             .lock()
             .map_err(|_| "rankings are unavailable")?;
-        let _ = self
-            .ranked
-            .wait_timeout_while(rankings, RANK_WAIT, |r| r.finishing(key))
-            .map_err(|_| "rankings are unavailable")?;
+        while rankings.finishing(key) {
+            crate::runner::check()?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // Short slices, so a superseded page lets its worker go soon.
+            rankings = self
+                .ranked
+                .wait_timeout(rankings, left.min(Duration::from_millis(10)))
+                .map_err(|_| "rankings are unavailable")?
+                .0;
+        }
         Ok(())
     }
 
@@ -849,7 +890,11 @@ impl Session {
     pub fn selection(&self, nodes: &[u32]) -> Result<proto::SelectionSummary, String> {
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        // A large selection takes a moment to total, and another selection
+        // may have replaced it while this one waited for the tree.
+        crate::runner::check()?;
         let r = selection::resolve(&tree, nodes);
+        crate::runner::check()?;
         Ok(proto::SelectionSummary {
             generation: self.generation(),
             items: r.items.len() as u32,
@@ -1746,6 +1791,62 @@ mod tests {
             let got: Vec<_> = page.files.iter().map(|f| (f.node, f.weight)).collect();
             assert_eq!(got, all[p * 200..(p + 1) * 200], "page {p}");
         }
+    }
+
+    #[test]
+    fn a_search_asked_for_later_wins_even_if_it_starts_first() {
+        let tmp = fixture_named("search-order");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (older, newer) = (session.search_begin(), session.search_begin());
+        let summary = session.search_set_as(newer, "*.log").unwrap().unwrap();
+        assert_eq!(summary.search, newer);
+        assert!(session.search_set_as(older, "*.bin").is_err());
+        assert!(session.search_set_as(older, "").is_ok());
+        // The newer search is still the one in effect.
+        assert_eq!(session.search_summary(newer).unwrap().files, summary.files);
+    }
+
+    #[test]
+    fn superseded_layouts_and_rankings_stop_and_leave_the_walk_for_later() {
+        let session = load::synthetic(6, 2_000);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !session.scan.progress().state.is_finished() {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let generation = session.generation();
+        let layout = proto::LayoutRequest {
+            generation,
+            request: 1,
+            view: 0,
+            metric: proto::Metric::Logical,
+            width: 800.0,
+            height: 600.0,
+            search: None,
+        };
+        let files = proto::FolderFilesRequest {
+            generation,
+            folder: 0,
+            metric: proto::Metric::Logical,
+            search: None,
+            offset: 0,
+            limit: 50,
+        };
+        let superseded = Some(proto::SUPERSEDED.to_owned());
+        let stopped = crate::runner::as_superseded(|| session.layout(&layout));
+        assert_eq!(stopped.err(), superseded);
+        let stopped = crate::runner::as_superseded(|| session.folder_files(&files));
+        assert_eq!(stopped.err(), superseded);
+        // Outside a superseded job both answer, the ranking from scratch.
+        assert!(session.layout(&layout).is_ok());
+        assert!(session.folder_files(&files).unwrap().total > 0);
     }
 
     #[test]

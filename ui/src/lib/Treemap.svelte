@@ -1,10 +1,13 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
   // Canvas treemap. Pulls a layout from the backend whenever its inputs
-  // change; at most one request is in flight, and changes that arrive
-  // meanwhile are folded into one follow-up request (natural backpressure).
+  // change. Another view, metric, filter, or scan supersedes the request in
+  // flight (the backend drops or stops it); a newer revision or size waits
+  // for it, folded into one follow-up request (natural backpressure).
   import { announce } from "./announce.svelte";
   import { changeMarks, nodeDetails, requestLayout } from "./api";
+  import type { Lane } from "./protocol/Lane";
+  import { Lanes, latest, queryKey } from "./request";
   import {
     changeColor,
     depthColor,
@@ -215,10 +218,13 @@
   let marks = $state.raw<{ layout: DecodedLayout; compare: string; bytes: Uint8Array } | null>(null);
   const changeMode = $derived(colors === "change" && compare !== null);
 
-  async function fetchMarks(l: DecodedLayout, cmp: string): Promise<Uint8Array> {
+  async function fetchMarks(l: DecodedLayout, cmp: string, lane: Lane): Promise<Uint8Array> {
     const nodes = Array.from(l.node.subarray(0, l.count));
-    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }));
+    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }, lane));
   }
+
+  /** Marks for the map already drawn: newer ones supersede older ones. */
+  const marksLane = new Lanes();
 
   // Switching to change colors, or to another comparison, marks the map
   // already drawn; new layouts come with their marks (see fetchLayout).
@@ -226,7 +232,7 @@
     const l = layout;
     const cmp = changeMode ? compare : null;
     if (!l || cmp === null || (marks?.layout === l && marks.compare === cmp)) return;
-    fetchMarks(l, cmp).then(
+    fetchMarks(l, cmp, marksLane.next()).then(
       (bytes) => {
         if (layout === l && compare === cmp) marks = { layout: l, compare: cmp, bytes };
       },
@@ -235,8 +241,7 @@
   });
 
   let nextRequest = 1;
-  let inFlight = false;
-  let again = false;
+  const layouts = latest();
 
   $effect(() => {
     // Dependencies that change the layout.
@@ -244,52 +249,51 @@
     fetchLayout();
   });
 
-  async function fetchLayout() {
-    if (inFlight) {
-      again = true;
-      return;
-    }
-    inFlight = true;
-    try {
-      do {
-        again = false;
-        if (width < 1 || height < 1) break;
-        const want = { generation, view, metric, search };
-        const request = nextRequest++;
-        try {
-          const started = performance.now();
-          const reply = decodeLayout(
-            await requestLayout({ ...want, request, width, height }),
-          );
-          // In change mode the marks arrive with the layout, so tiles never
-          // flash in neutral colors first.
-          const cmp = changeMode ? compare : null;
-          let replyMarks: Uint8Array | null = null;
-          if (cmp !== null) replyMarks = await fetchMarks(reply, cmp).catch(() => null);
-          // Drop replies for a view, metric, search, or scan no longer shown.
-          if (
-            want.generation === generation &&
-            want.view === view &&
-            want.metric === metric &&
-            want.search === search &&
-            reply.generation === generation
-          ) {
-            stats.layout.add(performance.now() - started);
-            layout = reply;
-            // The tile under a resting pointer may be another one now.
-            if (rest) hoverAt(rest.x, rest.y);
-            if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
-            shown = { generation: want.generation, view: want.view, search: want.search };
-            error = null;
-            onlayout?.(reply);
-          }
-        } catch (e) {
-          if (want.generation === generation && want.search === search) error = String(e);
+  function fetchLayout() {
+    if (width < 1 || height < 1) return;
+    const want = { generation, view, metric, search };
+    layouts.run(
+      queryKey(want.generation, want.view, want.metric, want.search),
+      revision,
+      async (lane) => {
+        // The size is read when the request starts, so one waiting behind
+        // the request in flight asks for the newest.
+        const started = performance.now();
+        const reply = decodeLayout(
+          await requestLayout({ ...want, request: nextRequest++, width, height }, lane),
+        );
+        // In change mode the marks arrive with the layout, so tiles never
+        // flash in neutral colors first.
+        const cmp = changeMode ? compare : null;
+        let replyMarks: Uint8Array | null = null;
+        // Asked in the layout's lane, so another view supersedes them too.
+        if (cmp !== null) replyMarks = await fetchMarks(reply, cmp, lane).catch(() => null);
+        return { reply, cmp, replyMarks, started };
+      },
+      ({ reply, cmp, replyMarks, started }) => {
+        // Drop replies for a view, metric, search, or scan no longer shown.
+        if (
+          want.generation !== generation ||
+          want.view !== view ||
+          want.metric !== metric ||
+          want.search !== search ||
+          reply.generation !== generation
+        ) {
+          return;
         }
-      } while (again);
-    } finally {
-      inFlight = false;
-    }
+        stats.layout.add(performance.now() - started);
+        layout = reply;
+        // The tile under a resting pointer may be another one now.
+        if (rest) hoverAt(rest.x, rest.y);
+        if (replyMarks && cmp !== null) marks = { layout: reply, compare: cmp, bytes: replyMarks };
+        shown = { generation: want.generation, view: want.view, search: want.search };
+        error = null;
+        onlayout?.(reply);
+      },
+      (e) => {
+        if (want.generation === generation && want.search === search) error = String(e);
+      },
+    );
   }
 
   // ---- sizing ----------------------------------------------------------
@@ -828,13 +832,16 @@
     tipIndex >= 0 && layout && layout.kind[tipIndex] !== KIND_OTHER ? layout.node[tipIndex]! : -1,
   );
 
+  /** Each tooltip supersedes the one before, if it isn't answered yet. */
+  const tipLane = new Lanes();
+
   $effect(() => {
     const node = tipNode;
     const gen = generation;
     tipDetails = null;
     if (node < 0) return;
     const timer = setTimeout(() => {
-      nodeDetails(gen, node).then(
+      nodeDetails(gen, node, null, tipLane.next()).then(
         (d) => {
           if (d.node === tipNode && d.generation === generation) tipDetails = d;
         },

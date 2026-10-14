@@ -32,6 +32,7 @@
   import { errorText, folderFiles, smallItems } from "./api";
   import { exactBytes, formatBytes, percent, plural } from "./format";
   import ItemList from "./ItemList.svelte";
+  import type { Lane } from "./protocol/Lane";
   import { Coalescer, latest, queryKey, type Ticket } from "./request";
   import type { Pick } from "./selection";
 
@@ -107,15 +108,17 @@
     rows: ContentsRow[];
   }
 
-  function fetchPage(offset: number): Promise<Page & { generation: number }> {
+  /** Asks with the lane of the set it belongs to, so starting another set
+   * supersedes its pages still waiting in the backend. */
+  function fetchPage(offset: number, lane: Lane): Promise<Page & { generation: number }> {
     const base = { generation, folder, metric: "logical" as const, search, offset, limit: PAGE };
     if (folders) {
-      return smallItems({ ...base, count: ALL }).then((p) => ({
+      return smallItems({ ...base, count: ALL }, lane).then((p) => ({
         ...p,
         rows: p.items.map((it) => ({ ...it, parent: null, subfolder: null })),
       }));
     }
-    return folderFiles(base).then((p) => ({
+    return folderFiles(base, lane).then((p) => ({
       ...p,
       rows: p.files.map((f) => ({ ...f, folder: false })),
     }));
@@ -188,7 +191,7 @@
    * ranked at its revision; `tries` bounds asking again for a page ranked
    * before it. */
   function loadPage(set: { ticket: Ticket; revision: number | null }, p: number, tries: number) {
-    fetchPage(p * PAGE).then(
+    fetchPage(p * PAGE, set.ticket.lane).then(
       (page) => {
         if (!sets.current(set.ticket)) return;
         if (set.revision === null) {
@@ -252,11 +255,11 @@
   });
 
   /** Fetches `pages`, a few at a time, each with its page number. */
-  async function fetchPages(pages: number[]): Promise<(Page & { number: number })[]> {
+  async function fetchPages(pages: number[], lane: Lane): Promise<(Page & { number: number })[]> {
     const got: (Page & { number: number })[] = [];
     for (let i = 0; i < pages.length; i += PARALLEL) {
       const batch = pages.slice(i, i + PARALLEL);
-      const replies = await Promise.all(batch.map((p) => fetchPage(p * PAGE)));
+      const replies = await Promise.all(batch.map((p) => fetchPage(p * PAGE, lane)));
       replies.forEach((page, k) => got.push({ ...page, number: batch[k]! }));
     }
     return got;
@@ -280,12 +283,15 @@
       let seen: (Page & { number: number })[] = [];
       for (let n = 0; n < ATTEMPTS; n++) {
         visible = visiblePages();
-        seen = await fetchPages(visible);
+        seen = await fetchPages(visible, ticket.lane);
         if (!sets.current(ticket)) return;
         if (new Set(seen.map((pg) => pg.revision)).size <= 1) break;
       }
       const newest = Math.max(before.revision, ...seen.map((pg) => pg.revision));
-      const others = await fetchPages([...loaded].filter((p) => !visible.includes(p)).sort((a, b) => a - b));
+      const others = await fetchPages(
+        [...loaded].filter((p) => !visible.includes(p)).sort((a, b) => a - b),
+        ticket.lane,
+      );
       if (!sets.current(ticket)) return;
       const kept = [...seen, ...others].filter((pg) => pg.revision === newest);
       const next = new Map<number, ContentsRow>();

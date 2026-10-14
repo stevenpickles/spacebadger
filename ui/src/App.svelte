@@ -326,7 +326,7 @@
     searchTotals.run(
       queryKey(gen, id),
       revision,
-      () => searchSummary(gen, id),
+      (lane) => searchSummary(gen, id, lane),
       (s) => {
         if (search?.search === s.search) search = s;
       },
@@ -569,7 +569,7 @@
     multiRequest.run(
       queryKey(gen, ...nodes),
       revision,
-      () => selectionSummary({ generation: gen, nodes }),
+      (lane) => selectionSummary({ generation: gen, nodes }, lane),
       (s) => {
         multi = s;
         multiUpdating = false;
@@ -681,7 +681,7 @@
     viewDetailsRequest.run(
       queryKey(gen, node, filter),
       revision,
-      () => nodeDetails(gen, node, filter),
+      (lane) => nodeDetails(gen, node, filter, lane),
       (d) => {
         if (d.generation === gen && d.node === node) viewDetails = d;
       },
@@ -706,7 +706,7 @@
     selectedDetailsRequest.run(
       queryKey(gen, node, filter),
       revision,
-      () => nodeDetails(gen, node, filter),
+      (lane) => nodeDetails(gen, node, filter, lane),
       (d) => {
         if (d.generation === gen && d.node === node) selectedDetails = d;
       },
@@ -741,7 +741,7 @@
     parentSizeRequest.run(
       key,
       revision,
-      () => nodeDetails(gen, parent, filter),
+      (lane) => nodeDetails(gen, parent, filter, lane),
       (p) => (parentSize = shownSize(p)),
     );
   });
@@ -764,7 +764,7 @@
     viewParentSizeRequest.run(
       key,
       revision,
-      () => nodeDetails(gen, parent, filter),
+      (lane) => nodeDetails(gen, parent, filter, lane),
       (p) => (viewParentSize = shownSize(p)),
     );
   });

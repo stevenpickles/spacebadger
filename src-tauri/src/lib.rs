@@ -3,6 +3,14 @@
 //! Commands that touch scan data are `async` so they run off the main
 //! (UI) thread. Every scan-specific request names its generation; requests
 //! for an older generation are refused so stale replies never mix scans.
+//!
+//! Queries of the scan run on the query runner ([`runner`]), each in a class
+//! by urgency, and most with the interface's [`Lane`] so a newer request
+//! supersedes older ones. Work that reads the disk or runs long with its own
+//! progress and cancelling (planning duplicates, deleting, exporting,
+//! comparing, revealing) uses blocking threads instead, so it can't occupy
+//! the runner's few workers. Commands that only read or set a flag or a
+//! status stay inline, and the dialogs stay off the main thread.
 
 mod atomic_file;
 mod delete;
@@ -13,15 +21,17 @@ mod identity;
 mod metrics;
 #[cfg(windows)]
 mod recycle_windows;
+mod runner;
 mod session;
 mod snapshots;
 
+use runner::{Class, Runner};
 use sb_protocol::{
     AppInfo, DUPLICATES_RECHECK_EVENT, DUPLICATES_STATUS_EVENT, DeleteReport, DeleteRequest,
     DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
     DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
-    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, LayoutRequest, NodeDetails,
+    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, Lane, LayoutRequest, NodeDetails,
     PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
     SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
     SuggestRequest, Suggestion, VolumeInfo,
@@ -46,6 +56,8 @@ struct AppState {
     /// Where snapshots of completed scans are saved, for comparing later
     /// scans with; `None` if the app has no data folder.
     snapshots: Option<Arc<snapshots::Store>>,
+    /// Runs the queries of the scan.
+    runner: Runner,
 }
 
 impl AppState {
@@ -149,11 +161,19 @@ async fn scan_status(state: State<'_, AppState>) -> Result<Option<ScanStatus>, S
 
 /// The treemap for one view, as the binary format in `sb_protocol::wire`.
 #[tauri::command]
-async fn layout(state: State<'_, AppState>, request: LayoutRequest) -> Result<Response, String> {
+async fn layout(
+    state: State<'_, AppState>,
+    request: LayoutRequest,
+    lane: Option<Lane>,
+) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    Ok(Response::new(metrics::run("layout", || {
-        session.layout(&request)
-    })?))
+    let wire = state
+        .runner
+        .submit(Class::View, "layout", lane, move || {
+            session.layout(&request)
+        })
+        .await?;
+    Ok(Response::new(wire))
 }
 
 /// Details of a scanned item; with `search`, also what that filter matches
@@ -164,14 +184,22 @@ async fn node_details(
     generation: u64,
     node: u32,
     search: Option<u32>,
+    lane: Option<Lane>,
 ) -> Result<NodeDetails, String> {
     let session = state.session(generation)?;
-    metrics::run("node_details", || session.details(node, search))
+    state
+        .runner
+        .submit(Class::Interactive, "node_details", lane, move || {
+            session.details(node, search)
+        })
+        .await
 }
 
 /// Filters by file name; an empty query clears the filter and returns `None`.
-/// Large trees take a moment, so this runs on a blocking thread; a newer
-/// call makes an older one return an error.
+/// A newer call makes an older one return an error: the search is numbered
+/// here, as it's asked for, so a newer one always wins even if an older one
+/// starts later. Large trees take a moment, so it runs with the layouts,
+/// ahead of the lists that wait for it.
 #[tauri::command]
 async fn search_set(
     state: State<'_, AppState>,
@@ -179,7 +207,13 @@ async fn search_set(
     query: String,
 ) -> Result<Option<SearchSummary>, String> {
     let session = state.session(generation)?;
-    metrics::blocking("search_set", move || session.search_set(&query)).await?
+    let id = session.search_begin();
+    state
+        .runner
+        .submit(Class::View, "search_set", None, move || {
+            session.search_set_as(id, &query)
+        })
+        .await
 }
 
 #[tauri::command]
@@ -187,41 +221,65 @@ async fn search_summary(
     state: State<'_, AppState>,
     generation: u64,
     search: u32,
+    lane: Option<Lane>,
 ) -> Result<SearchSummary, String> {
     let session = state.session(generation)?;
-    metrics::run("search_summary", || session.search_summary(search))
+    state
+        .runner
+        .submit(Class::Interactive, "search_summary", lane, move || {
+            session.search_summary(search)
+        })
+        .await
 }
 
 #[tauri::command]
 async fn search_results(
     state: State<'_, AppState>,
     request: SearchResultsRequest,
+    lane: Option<Lane>,
 ) -> Result<SearchPage, String> {
     let session = state.session(request.generation)?;
-    metrics::run("search_results", || session.search_results(&request))
+    state
+        .runner
+        .submit(Class::Lists, "search_results", lane, move || {
+            session.search_results(&request)
+        })
+        .await
 }
 
 /// The largest files anywhere under a folder. Ranking a large folder takes a
-/// moment, so this runs on a blocking thread.
+/// moment, and stops between steps once superseded.
 #[tauri::command]
 async fn folder_files(
     state: State<'_, AppState>,
     request: FolderFilesRequest,
+    lane: Option<Lane>,
 ) -> Result<FolderFilesPage, String> {
     let session = state.session(request.generation)?;
-    metrics::blocking("folder_files", move || session.folder_files(&request)).await?
+    state
+        .runner
+        .submit(Class::Lists, "folder_files", lane, move || {
+            session.folder_files(&request)
+        })
+        .await
 }
 
 /// Folder names or extensions from the scan for the filter's completion.
-/// The first call after a change indexes the whole tree, so this runs on a
-/// blocking thread.
+/// The first call after a change indexes the whole tree, so this runs
+/// after everything else waiting.
 #[tauri::command]
 async fn filter_suggest(
     state: State<'_, AppState>,
     request: SuggestRequest,
+    lane: Option<Lane>,
 ) -> Result<Vec<Suggestion>, String> {
     let session = state.session(request.generation)?;
-    metrics::blocking("filter_suggest", move || session.suggest(&request)).await?
+    state
+        .runner
+        .submit(Class::Background, "filter_suggest", lane, move || {
+            session.suggest(&request)
+        })
+        .await
 }
 
 /// The files and folders merged into an "other small items" region.
@@ -229,12 +287,19 @@ async fn filter_suggest(
 async fn small_items(
     state: State<'_, AppState>,
     request: SmallItemsRequest,
+    lane: Option<Lane>,
 ) -> Result<SmallItemsPage, String> {
     let session = state.session(request.generation)?;
-    metrics::run("small_items", || session.small_items(&request))
+    state
+        .runner
+        .submit(Class::Lists, "small_items", lane, move || {
+            session.small_items(&request)
+        })
+        .await
 }
 
 /// Capacity and free space of the scanned volume; `None` where unavailable.
+/// Asks the system about the disk, so this runs on a blocking thread.
 #[tauri::command]
 async fn volume_info(
     state: State<'_, AppState>,
@@ -252,9 +317,15 @@ async fn volume_info(
 async fn selection_summary(
     state: State<'_, AppState>,
     request: SelectionRequest,
+    lane: Option<Lane>,
 ) -> Result<SelectionSummary, String> {
     let session = state.session(request.generation)?;
-    metrics::run("selection_summary", || session.selection(&request.nodes))
+    state
+        .runner
+        .submit(Class::Interactive, "selection_summary", lane, move || {
+            session.selection(&request.nodes)
+        })
+        .await
 }
 
 /// Starts looking for duplicate files under a folder, the one command that
@@ -287,7 +358,7 @@ async fn duplicates_status(
 }
 
 /// The groups of duplicates found so far, with the first few files of each.
-/// Builds their paths, so this runs on a blocking thread.
+/// Builds their paths, so this runs with the lists.
 #[tauri::command]
 async fn duplicates_list(
     state: State<'_, AppState>,
@@ -295,26 +366,32 @@ async fn duplicates_list(
     job: u32,
 ) -> Result<DuplicatesList, String> {
     let session = state.session(generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.duplicates_list(job))
+    state
+        .runner
+        .submit(Class::Lists, "duplicates_list", None, move || {
+            session.duplicates_list(job)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 /// More of a group's files. The first page asked for orders the group by
-/// path, so this runs on a blocking thread.
+/// path, so this runs with the lists.
 #[tauri::command]
 async fn duplicate_files(
     state: State<'_, AppState>,
     request: DuplicateFilesRequest,
 ) -> Result<DuplicateFilesPage, String> {
     let session = state.session(request.generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.duplicate_files(&request))
+    state
+        .runner
+        .submit(Class::Lists, "duplicate_files", None, move || {
+            session.duplicate_files(&request)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 /// Every file but the first of each listed group, by node, for selecting
-/// them. Orders the groups by path, so this runs on a blocking thread.
+/// them. Orders the groups by path, so this runs with the lists.
 #[tauri::command]
 async fn duplicates_extras(
     state: State<'_, AppState>,
@@ -322,14 +399,17 @@ async fn duplicates_extras(
     job: u32,
 ) -> Result<DuplicateExtras, String> {
     let session = state.session(generation)?;
-    tauri::async_runtime::spawn_blocking(move || session.duplicates_extras(job))
+    state
+        .runner
+        .submit(Class::Lists, "duplicates_extras", None, move || {
+            session.duplicates_extras(job)
+        })
         .await
-        .map_err(|e| e.to_string())?
 }
 
 /// Whether deleting the given items would leave a group of duplicates with
 /// no copy. Looks at the files that would stay on disk, so this runs on a
-/// blocking thread.
+/// blocking thread rather than holding up the query runner.
 #[tauri::command]
 async fn duplicates_check(
     state: State<'_, AppState>,
@@ -381,42 +461,57 @@ async fn compare_set(
 }
 
 /// How one item changed since the earlier scan. After a delete the scan
-/// is matched again first, so this runs on a blocking thread.
+/// may be matched again first.
 #[tauri::command]
 async fn compare_item(
     state: State<'_, AppState>,
     generation: u64,
     snapshot: String,
     node: u32,
+    lane: Option<Lane>,
 ) -> Result<sb_protocol::ItemChange, String> {
     let session = state.session(generation)?;
-    metrics::blocking("compare_item", move || {
-        session.compare_item(&snapshot, node)
-    })
-    .await?
+    state
+        .runner
+        .submit(Class::Interactive, "compare_item", lane, move || {
+            session.compare_item(&snapshot, node)
+        })
+        .await
 }
 
-/// One byte per node of a drawn layout, for the "Change" colors. Runs on a
-/// blocking thread, like `compare_item`.
+/// One byte per node of a drawn layout, for the "Change" colors. Runs with
+/// the layouts.
 #[tauri::command]
 async fn change_marks(
     state: State<'_, AppState>,
     request: sb_protocol::ChangeMarksRequest,
+    lane: Option<Lane>,
 ) -> Result<Response, String> {
     let session = state.session(request.generation)?;
-    let marks = metrics::blocking("change_marks", move || session.change_marks(&request)).await??;
+    let marks = state
+        .runner
+        .submit(Class::View, "change_marks", lane, move || {
+            session.change_marks(&request)
+        })
+        .await?;
     Ok(Response::new(marks))
 }
 
 /// The biggest changes under a folder since the earlier scan. The first
-/// page walks the folder, so this runs on a blocking thread.
+/// page walks the folder, so this runs with the lists.
 #[tauri::command]
 async fn compare_changes(
     state: State<'_, AppState>,
     request: sb_protocol::ChangesRequest,
+    lane: Option<Lane>,
 ) -> Result<sb_protocol::ChangesPage, String> {
     let session = state.session(request.generation)?;
-    metrics::blocking("compare_changes", move || session.changes(&request)).await?
+    state
+        .runner
+        .submit(Class::Lists, "compare_changes", lane, move || {
+            session.changes(&request)
+        })
+        .await
 }
 
 /// Whether request timings are kept (`SPACEBADGER_TRACE` is set), so the
@@ -694,8 +789,13 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while running SpaceBadger")
-        .run(|_, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Queries still running are asked to stop; one stuck in a
+                // long step is left behind rather than holding up the exit.
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.runner.shutdown(std::time::Duration::from_secs(2));
+                }
                 metrics::write_report();
             }
         });

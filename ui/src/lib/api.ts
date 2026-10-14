@@ -24,6 +24,7 @@ import type { FilterUpdated } from "./protocol/FilterUpdated";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
 import type { ItemChange } from "./protocol/ItemChange";
+import type { Lane } from "./protocol/Lane";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
 import type { NodeDetails } from "./protocol/NodeDetails";
 import type { ScanStarted } from "./protocol/ScanStarted";
@@ -51,6 +52,23 @@ const FILTER_UPDATED_EVENT = "filter-updated";
 
 /** Must match `sb_protocol::EXPORT_PROGRESS_EVENT`. */
 const EXPORT_PROGRESS_EVENT = "export-progress";
+
+/** Must match `sb_protocol::SUPERSEDED`. */
+const SUPERSEDED = "superseded by a newer request";
+
+/**
+ * Whether a query failed only because a newer request in its lane replaced
+ * it. That's not a failure to show: the newer request's reply is the one
+ * wanted, so callers drop it silently (`Latest` does).
+ */
+export function isSuperseded(e: unknown): boolean {
+  return errorText(e) === SUPERSEDED;
+}
+
+// The query commands below take an optional `lane` (see `Lane` and
+// `Latest`): a newer request in the same lane supersedes older ones still
+// waiting or running in the backend, which then reject with `SUPERSEDED`.
+// Without one, a request is never superseded.
 
 // Request timings are kept only when the backend keeps its own.
 invoke<boolean>("trace_enabled").then(
@@ -80,13 +98,21 @@ export function scanStatus(): Promise<ScanStatus | null> {
 }
 
 /** Binary layout; decode with `decodeLayout`. */
-export function requestLayout(request: LayoutRequest): Promise<ArrayBuffer> {
-  return timed("layout", invoke<ArrayBuffer>("layout", { request }));
+export function requestLayout(request: LayoutRequest, lane?: Lane): Promise<ArrayBuffer> {
+  return timed("layout", invoke<ArrayBuffer>("layout", { request, lane: lane ?? null }));
 }
 
 /** With `search`, the details also say what that filter matches there. */
-export function nodeDetails(generation: number, node: number, search?: number | null): Promise<NodeDetails> {
-  return timed("node_details", invoke<NodeDetails>("node_details", { generation, node, search: search ?? null }));
+export function nodeDetails(
+  generation: number,
+  node: number,
+  search?: number | null,
+  lane?: Lane,
+): Promise<NodeDetails> {
+  return timed(
+    "node_details",
+    invoke<NodeDetails>("node_details", { generation, node, search: search ?? null, lane: lane ?? null }),
+  );
 }
 
 /**
@@ -97,21 +123,21 @@ export function searchSet(generation: number, query: string): Promise<SearchSumm
   return timed("search_set", invoke<SearchSummary | null>("search_set", { generation, query }));
 }
 
-export function searchSummary(generation: number, search: number): Promise<SearchSummary> {
-  return timed("search_summary", invoke<SearchSummary>("search_summary", { generation, search }));
+export function searchSummary(generation: number, search: number, lane?: Lane): Promise<SearchSummary> {
+  return timed("search_summary", invoke<SearchSummary>("search_summary", { generation, search, lane: lane ?? null }));
 }
 
-export function searchResults(request: SearchResultsRequest): Promise<SearchPage> {
-  return timed("search_results", invoke<SearchPage>("search_results", { request }));
+export function searchResults(request: SearchResultsRequest, lane?: Lane): Promise<SearchPage> {
+  return timed("search_results", invoke<SearchPage>("search_results", { request, lane: lane ?? null }));
 }
 
-export function smallItems(request: SmallItemsRequest): Promise<SmallItemsPage> {
-  return timed("small_items", invoke<SmallItemsPage>("small_items", { request }));
+export function smallItems(request: SmallItemsRequest, lane?: Lane): Promise<SmallItemsPage> {
+  return timed("small_items", invoke<SmallItemsPage>("small_items", { request, lane: lane ?? null }));
 }
 
 /** The largest files anywhere under a folder. */
-export function folderFiles(request: FolderFilesRequest): Promise<FolderFilesPage> {
-  return timed("folder_files", invoke<FolderFilesPage>("folder_files", { request }));
+export function folderFiles(request: FolderFilesRequest, lane?: Lane): Promise<FolderFilesPage> {
+  return timed("folder_files", invoke<FolderFilesPage>("folder_files", { request, lane: lane ?? null }));
 }
 
 /** Capacity of the scanned volume; `null` where unavailable. */
@@ -143,8 +169,8 @@ export function onExportProgress(handler: (progress: ExportProgress) => void): P
 }
 
 /** What a set of selected items amounts to. */
-export function selectionSummary(request: SelectionRequest): Promise<SelectionSummary> {
-  return timed("selection_summary", invoke<SelectionSummary>("selection_summary", { request }));
+export function selectionSummary(request: SelectionRequest, lane?: Lane): Promise<SelectionSummary> {
+  return timed("selection_summary", invoke<SelectionSummary>("selection_summary", { request, lane: lane ?? null }));
 }
 
 /** Turns deleting on or off for this run of the app. It always starts off. */
@@ -198,8 +224,8 @@ export function errorText(e: unknown): string {
 }
 
 /** Folder names or extensions in the scan, for the filter's completion. */
-export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
-  return timed("filter_suggest", invoke<Suggestion[]>("filter_suggest", { request }));
+export function filterSuggest(request: SuggestRequest, lane?: Lane): Promise<Suggestion[]> {
+  return timed("filter_suggest", invoke<Suggestion[]>("filter_suggest", { request, lane: lane ?? null }));
 }
 
 // ---- comparing with an earlier scan ------------------------------------
@@ -214,18 +240,18 @@ export function compareSet(generation: number, snapshot: string | null): Promise
   return invoke<CompareSummary | null>("compare_set", { generation, snapshot });
 }
 
-export function compareItem(generation: number, snapshot: string, node: number): Promise<ItemChange> {
-  return timed("compare_item", invoke<ItemChange>("compare_item", { generation, snapshot, node }));
+export function compareItem(generation: number, snapshot: string, node: number, lane?: Lane): Promise<ItemChange> {
+  return timed("compare_item", invoke<ItemChange>("compare_item", { generation, snapshot, node, lane: lane ?? null }));
 }
 
 /** One byte per node; see `sb_protocol::change_mark` and `changeColor`. */
-export function changeMarks(request: ChangeMarksRequest): Promise<ArrayBuffer> {
-  return timed("change_marks", invoke<ArrayBuffer>("change_marks", { request }));
+export function changeMarks(request: ChangeMarksRequest, lane?: Lane): Promise<ArrayBuffer> {
+  return timed("change_marks", invoke<ArrayBuffer>("change_marks", { request, lane: lane ?? null }));
 }
 
 /** The biggest changes under a folder, including removed items. */
-export function compareChanges(request: ChangesRequest): Promise<ChangesPage> {
-  return timed("compare_changes", invoke<ChangesPage>("compare_changes", { request }));
+export function compareChanges(request: ChangesRequest, lane?: Lane): Promise<ChangesPage> {
+  return timed("compare_changes", invoke<ChangesPage>("compare_changes", { request, lane: lane ?? null }));
 }
 
 /** Must match `sb_protocol::DUPLICATES_STATUS_EVENT`. */

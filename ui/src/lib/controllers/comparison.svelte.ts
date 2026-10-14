@@ -91,7 +91,7 @@ export class ComparisonController {
       selectedRequest.run(
         queryKey(gen, cmp, node),
         revision,
-        () => compareItem(gen, cmp, node),
+        (lane) => compareItem(gen, cmp, node, lane),
         (c) => {
           if (c.generation === gen && c.node === node) this.selectedChange = c;
         },
@@ -110,7 +110,7 @@ export class ComparisonController {
       viewRequest.run(
         queryKey(gen, cmp, node),
         revision,
-        () => compareItem(gen, cmp, node),
+        (lane) => compareItem(gen, cmp, node, lane),
         (c) => {
           if (c.generation === gen && c.node === node) this.viewChange = c;
         },

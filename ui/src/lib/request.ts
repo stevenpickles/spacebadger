@@ -10,13 +10,42 @@
 // same identity doesn't: while a scan runs, revisions come faster than some
 // replies, so the request in flight is kept, the newest one waits behind it,
 // and a reply is applied unless a newer revision's already was.
+//
+// The backend can drop superseded work too: a request asked with a `Lane`
+// supersedes the older ones of its lane still waiting or running, which
+// reject with a "superseded" error. Every `Latest` has lanes of its own and
+// numbers them so that only requests whose replies it would drop anyway
+// are superseded, never the newest one; it drops that error silently.
 import { onDestroy } from "svelte";
+import { isSuperseded } from "./api";
+import type { Lane } from "./protocol/Lane";
 
 /** One request as `Latest.begin` handed it out. */
 export interface Ticket {
   readonly seq: number;
   /** Everything the answer depends on; see `queryKey`. */
   readonly key: string;
+  /** For the ticket's requests: a newer ticket supersedes them. */
+  readonly lane: Lane;
+}
+
+// Lane keys start with a prefix of this page load, so after the webview
+// reloads, requests of the old page still in the backend never share a lane
+// with (and supersede or outrank) the new page's.
+const page = Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join("");
+let lanes = 0;
+
+/**
+ * A lane of its own for requests whose newest alone matters, such as the
+ * tooltip: each `next()` supersedes the requests asked with earlier ones.
+ */
+export class Lanes {
+  readonly #key = `${page}-lane${++lanes}`;
+  #seq = 0;
+
+  next(): Lane {
+    return { key: this.#key, seq: ++this.#seq };
+  }
 }
 
 /**
@@ -29,6 +58,8 @@ export function queryKey(...parts: (string | number | boolean | null | undefined
 }
 
 export class Latest {
+  /** Lanes for `run` (numbered by identity) and `begin` (by ticket). */
+  readonly #lane = `${page}-latest${++lanes}`;
   #disposed = false;
   /** The identity asked about; `null` when nothing is. */
   #key: string | null = null;
@@ -61,7 +92,8 @@ export class Latest {
    */
   begin(key = ""): Ticket {
     this.#identify(key);
-    return { seq: ++this.#seq, key };
+    const seq = ++this.#seq;
+    return { seq, key, lane: { key: `${this.#lane}b`, seq } };
   }
 
   /** Whether the reply to `t` should still be applied. */
@@ -73,22 +105,26 @@ export class Latest {
    * Asks `request` about `key` at `revision` and passes the outcome on
    * while `key` is still the identity asked about and no newer revision's
    * reply was applied. One request per identity runs at a time; asking
-   * again meanwhile replaces the one waiting.
+   * again meanwhile replaces the one waiting. `request` is given the lane
+   * to ask with, so a new identity supersedes the old one's in the backend.
    */
   run<T>(
     key: string,
     revision: number,
-    request: () => Promise<T>,
+    request: (lane: Lane) => Promise<T>,
     onvalue: (value: T) => void,
     onerror?: (e: unknown) => void,
   ) {
     if (this.#disposed) return;
     this.#identify(key);
     const epoch = this.#epoch;
-    const settle = (apply: () => void) => {
+    const lane: Lane = { key: `${this.#lane}r`, seq: epoch };
+    const settle = (apply: () => void, dropped = false) => {
       if (this.#disposed || epoch !== this.#epoch) return;
       this.#inFlight = false;
-      if (revision >= this.#applied) {
+      // Only an older identity's requests are superseded, and those never
+      // get here; should one anyway, it's dropped like them.
+      if (!dropped && revision >= this.#applied) {
         this.#applied = revision;
         apply();
       }
@@ -98,9 +134,9 @@ export class Latest {
     };
     const start = () => {
       this.#inFlight = true;
-      request().then(
+      request(lane).then(
         (v) => settle(() => onvalue(v)),
-        (e: unknown) => settle(() => onerror?.(e)),
+        (e: unknown) => settle(() => onerror?.(e), isSuperseded(e)),
       );
     };
     if (this.#inFlight) this.#pending = start;
