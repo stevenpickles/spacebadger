@@ -175,11 +175,12 @@ impl Session {
     fn start_on(
         root: PathBuf,
         adapter: impl FsAdapter,
-        config: ScanConfig,
+        mut config: ScanConfig,
         snapshots: Option<Arc<Store>>,
         carried: Option<compare::Carried>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        config.write_holds = metrics::write_holds();
         let started_ms = compare::now_ms();
         let root_found = identity::hold(&root, false).ok().map(|(found, _)| found);
         let on_status: StatusSink = Arc::new(on_status);

@@ -21,6 +21,7 @@ mod synth;
 mod wide;
 
 use sb_core::layout::{self, LayoutParams, Metric, OrderCache, RectKind};
+use sb_core::ranking::{self, Scope, Walk};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::suggest::NameIndex;
 use sb_core::tree::{FileSizes, NodeId, Tree};
@@ -256,6 +257,33 @@ fn run(nodes: usize, seed: u64) {
         "widest:  folder with {width} children: layout {}, listing {other} small items {}",
         ms(wide),
         ms(small)
+    );
+
+    // What the Contents list asks for: the largest files anywhere under the
+    // root, and the root's own children, each in one walk.
+    let rank = |scope: Scope, want: usize| {
+        let key = ranking::Key {
+            scope,
+            folder: NodeId::ROOT,
+            metric: Metric::Allocated,
+            search: None,
+        };
+        let basis = ranking::Basis {
+            revision: 1,
+            finished: true,
+            signature: ranking::Signature::of(&tree, NodeId::ROOT, None),
+            at: Instant::now(),
+        };
+        let mut walk = Walk::new(key, basis, want);
+        walk.step(&tree, None, usize::MAX);
+        walk.finish().items().len()
+    };
+    let (files, ranked) = time(5, || rank(Scope::Files, ranking::MIN_RANKED));
+    let (children, listed) = time(5, || rank(Scope::Children, usize::MAX));
+    println!(
+        "ranking: top {ranked} files under the root {}; root's {listed} children {}",
+        ms(files),
+        ms(children)
     );
 
     let (indexed, index) = time(3, || NameIndex::build(&tree));

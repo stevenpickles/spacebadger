@@ -2,8 +2,8 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
 use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::{
-    BATCH_ENTRIES, EntryKind, ErrorKind, OmissionReason, Progress, RootKind, Scan, ScanConfig,
-    ScanState,
+    BATCH_ENTRIES, EntryKind, ErrorKind, HoldProbe, OmissionReason, Progress, RootKind, Scan,
+    ScanConfig, ScanState,
 };
 use std::path::Path;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -16,6 +16,7 @@ fn config() -> ScanConfig {
         workers: 3,
         progress_interval: Duration::from_millis(10),
         sample_limit: 2,
+        write_holds: None,
     }
 }
 
@@ -66,6 +67,36 @@ fn find(tree: &Tree, path: &str) -> NodeId {
             .unwrap_or_else(|| panic!("{path}: missing {part}"));
     }
     node
+}
+
+#[test]
+fn reports_each_write_lock_hold() {
+    let fs = FakeFs::new();
+    for d in 0..20 {
+        fs.file(&format!("d{d}/f"), 1, 1);
+    }
+    let holds = Arc::new(Mutex::new(Vec::new()));
+    let probe = {
+        let holds = Arc::clone(&holds);
+        HoldProbe::new(move |held, nodes| holds.lock().unwrap().push((held, nodes)))
+    };
+    let s = Scan::start(
+        fs.root(),
+        fs.clone(),
+        ScanConfig {
+            write_holds: Some(probe),
+            ..config()
+        },
+        |_| {},
+    );
+    let tree = s.tree();
+    s.wait();
+    let holds = holds.lock().unwrap();
+    // One batch and one end of listing per folder, root included.
+    assert!(holds.len() >= 21, "{} holds", holds.len());
+    let sizes: Vec<usize> = holds.iter().map(|h| h.1).collect();
+    assert!(sizes.is_sorted(), "the tree only grows during a scan");
+    assert_eq!(sizes.last(), Some(&tree.read().unwrap().len()));
 }
 
 #[test]
