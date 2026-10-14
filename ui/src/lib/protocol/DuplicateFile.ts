@@ -6,7 +6,7 @@ export type DuplicateFile = { node: number,
  */
 parent: number, path: string, 
 /**
- * It has other hard-link names, so deleting this one alone may free
- * nothing.
+ * It has other hard-link names, in the scan or not, so deleting this
+ * one alone may free nothing.
  */
 hardlinked: boolean, };

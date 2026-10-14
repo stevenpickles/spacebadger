@@ -14,6 +14,13 @@
 //! slow (virus scanners look at each one first), so several are opened at
 //! once, but only a couple of large files are read whole at a time:
 //! spinning disks and network shares read fastest a stream or two at a time.
+//!
+//! Each file is fingerprinted (which file it is, its length, and when it
+//! was last written) as it's opened and again once read, through the same
+//! handle; a file that changed in between is left out. A group keeps its
+//! contents' hash and each file's fingerprint, so a copy can be checked
+//! again later, contents included, with [`recheck`], or held and checked
+//! by a pool of readers with [`confirm`].
 
 use sb_core::layout::{self, Metric};
 use sb_core::search::Search;
@@ -23,7 +30,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Bytes hashed from each end of a file to tell same-size files apart.
 pub const SAMPLE: u64 = 64 * 1024;
@@ -50,6 +57,8 @@ pub enum Skip {
     Vanished,
     /// Changed since the scan: another size, or no longer a plain file.
     Changed,
+    /// Written to while it was being read.
+    Changing,
     /// Stored behind a reparse point (deduplicated, tiered, or
     /// virtualized), so reading it raw wouldn't give its contents.
     Special,
@@ -77,15 +86,62 @@ impl Skip {
     }
 }
 
+/// What tells whether a file's contents may have changed without reading
+/// them: which file it is, its length, and when it was last written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// The volume and file ID (Windows) or device and inode; `None` where
+    /// the filesystem gives none.
+    pub id: Option<(u64, u128)>,
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+    /// Names the file has (hard links), where known. Not part of
+    /// [`Fingerprint::unchanged`]: adding a name doesn't change contents.
+    pub links: Option<u32>,
+}
+
+impl Fingerprint {
+    /// Whether `now` is the same file, of the same length, last written at
+    /// the same time. An ID or time missing on both sides counts as equal,
+    /// so filesystems without them rely on the rest.
+    pub fn unchanged(&self, now: &Fingerprint) -> bool {
+        self.id == now.id && self.len == now.len && self.modified == now.modified
+    }
+}
+
 /// Opens files to read their contents. The native implementation never
 /// follows links and never recalls cloud content; tests use a fake.
 pub trait Contents: Sync {
     type File: Read + Seek;
 
-    /// Opens the file at `path`, which the scan measured at `len` bytes.
-    /// Refuses one that is no longer a plain file of that length.
-    fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip>;
+    /// Opens the file at `path`, which the scan measured at `len` bytes,
+    /// with its fingerprint as opened. Refuses one that is no longer a
+    /// plain file of that length.
+    fn open(&self, path: &Path, len: u64) -> Result<(Self::File, Fingerprint), Skip>;
+
+    /// The fingerprint of an opened file as it is now, through the handle
+    /// it was read with.
+    fn fingerprint(&self, file: &Self::File) -> Result<Fingerprint, Skip>;
+
+    /// The fingerprint of the file at `path` without reading it, refusing
+    /// what [`Contents::open`] refuses. Much cheaper than opening it to
+    /// read, which virus scanners look at.
+    fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip>;
+
+    /// Keeps the file at `path`, which must still be the one `print`
+    /// describes, from being written to, replaced, or deleted until the
+    /// returned value is dropped, where the platform allows it (Windows);
+    /// elsewhere this only checks it. Other programs may still read it.
+    fn hold(&self, path: &Path, print: &Fingerprint) -> Result<Held, Skip> {
+        match self.examine(path, print.len)? {
+            now if print.unchanged(&now) => Ok(Box::new(())),
+            _ => Err(Skip::Changed),
+        }
+    }
 }
+
+/// What [`Contents::hold`] holds on to.
+pub type Held = Box<dyn Send>;
 
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -183,8 +239,13 @@ pub fn plan(tree: &Tree, folder: NodeId, filter: Option<&Search>, min_size: u64)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub size: u64,
+    /// The hash of the contents.
+    pub digest: Digest,
     /// In the order of the plan.
     pub files: Vec<NodeId>,
+    /// Each file's fingerprint as it was read whole, in the order of
+    /// `files`.
+    pub prints: Vec<Fingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,12 +282,7 @@ pub fn run<C: Contents>(
     std::thread::scope(|s| {
         for _ in 0..readers {
             s.spawn(|| {
-                let mut reader = Reader {
-                    contents,
-                    cancel,
-                    counters,
-                    buf: vec![0; BUFFER],
-                };
+                let mut reader = Reader::new(contents, cancel, counters);
                 while let Some(task) = work.next(plan, cancel) {
                     // Hands the task back even if reading panics, so the
                     // other readers don't wait for it forever.
@@ -246,7 +302,199 @@ pub fn run<C: Contents>(
 
 struct Cancelled;
 
-type Digest = [u8; 32];
+/// A BLAKE3 hash.
+pub type Digest = [u8; 32];
+
+/// What reading a file of a group again found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recheck {
+    /// The same file, unchanged, with the group's contents.
+    Same,
+    /// Gone, another file, written to since, or other contents.
+    Changed,
+    /// It couldn't be read to tell.
+    Unknown(Skip),
+    /// `cancel` was set first.
+    Cancelled,
+}
+
+/// Reads the file at `path` whole again to tell whether it still is the
+/// file `print` describes, with the contents `digest`. Opens it as [`run`]
+/// does, so a file that has become a cloud file, a link, or a special file
+/// is [`Recheck::Unknown`]. Bytes read are added to `counters.read`.
+pub fn recheck<C: Contents>(
+    contents: &C,
+    path: &Path,
+    print: &Fingerprint,
+    digest: &Digest,
+    cancel: &AtomicBool,
+    counters: &Counters,
+) -> Recheck {
+    Reader::new(contents, cancel, counters).recheck(path, print, digest)
+}
+
+/// One group's copies to confirm before a delete relies on them: any one
+/// still unchanged with the group's contents will do.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub size: u64,
+    pub digest: Digest,
+    /// Paths and fingerprints as compared, in the order to try them.
+    pub copies: Vec<(PathBuf, Fingerprint)>,
+}
+
+/// What [`confirm`] found for a group.
+pub enum Confirmed {
+    /// This copy is unchanged, and held (see [`Contents::hold`]) until the
+    /// value is dropped.
+    Copy(usize, Held),
+    /// Every copy is gone or has changed.
+    Changed,
+    /// Some copy couldn't be read or held to tell.
+    Unknown,
+    /// `cancel` was set first.
+    Cancelled,
+}
+
+/// How far [`confirm`] has got, readable while it runs.
+#[derive(Debug, Default)]
+pub struct ConfirmProgress {
+    /// Bytes read so far (only `read` is used).
+    pub counters: Counters,
+    /// Bytes of copies tried or still to try; grows when a copy isn't
+    /// confirmed and the next is tried.
+    pub total: AtomicU64,
+    /// Bytes of copies dealt with without being read whole.
+    unread: AtomicU64,
+}
+
+impl ConfirmProgress {
+    /// Bytes dealt with, never more than [`ConfirmProgress::total`].
+    pub fn done(&self) -> u64 {
+        self.counters.read.load(Ordering::Relaxed) + self.unread.load(Ordering::Relaxed)
+    }
+}
+
+/// Holds and reads again, by `readers` threads, a copy of each group until
+/// one is confirmed unchanged, trying a group's next copy only when one
+/// isn't; at most [`STREAMS`] large files are read at once. Each copy is
+/// held before it's read, so a confirmed copy can't change until its
+/// [`Confirmed::Copy`] is dropped.
+pub fn confirm<C: Contents>(
+    contents: &C,
+    groups: &[Confirm],
+    readers: usize,
+    cancel: &AtomicBool,
+    progress: &ConfirmProgress,
+) -> Vec<Confirmed> {
+    progress.total.store(
+        groups
+            .iter()
+            .filter(|g| !g.copies.is_empty())
+            .map(|g| g.size)
+            .sum(),
+        Ordering::Relaxed,
+    );
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let streams = (Mutex::new(0usize), Condvar::new());
+    let results: Vec<Mutex<Option<Confirmed>>> = groups.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..readers.clamp(1, groups.len().max(1)) {
+            s.spawn(|| {
+                let mut reader = Reader::new(contents, cancel, &progress.counters);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(g) = groups.get(i) else { break };
+                    let found = confirm_group(&mut reader, g, &streams, progress);
+                    *results[i].lock().unwrap() = Some(found);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.into_inner().unwrap().unwrap_or(Confirmed::Cancelled))
+        .collect()
+}
+
+/// Tries a group's copies in order; see [`confirm`].
+fn confirm_group<C: Contents>(
+    reader: &mut Reader<'_, C>,
+    g: &Confirm,
+    (taken, freed): &(Mutex<usize>, Condvar),
+    progress: &ConfirmProgress,
+) -> Confirmed {
+    let mut found = Confirmed::Changed;
+    for (i, (path, print)) in g.copies.iter().enumerate() {
+        if i > 0 {
+            progress.total.fetch_add(g.size, Ordering::Relaxed);
+        }
+        if reader.cancel.load(Ordering::Relaxed) {
+            return Confirmed::Cancelled;
+        }
+        let held = match reader.contents.hold(path, print) {
+            Ok(held) => held,
+            Err(why) => {
+                progress.unread.fetch_add(g.size, Ordering::Relaxed);
+                if !matches!(why, Skip::Vanished | Skip::Changed) {
+                    found = Confirmed::Unknown;
+                }
+                continue;
+            }
+        };
+        let large = g.size > LARGE;
+        if large {
+            let mut n = freed
+                .wait_while(taken.lock().unwrap(), |n| *n >= STREAMS)
+                .unwrap();
+            *n += 1;
+        }
+        let checked = reader.recheck(path, print, &g.digest);
+        if large {
+            *taken.lock().unwrap() -= 1;
+            freed.notify_one();
+        }
+        progress
+            .unread
+            .fetch_add(g.size - reader.last, Ordering::Relaxed);
+        match checked {
+            Recheck::Same => return Confirmed::Copy(i, held),
+            Recheck::Changed => {}
+            Recheck::Unknown(_) => found = Confirmed::Unknown,
+            Recheck::Cancelled => return Confirmed::Cancelled,
+        }
+    }
+    found
+}
+
+impl<'a, C: Contents> Reader<'a, C> {
+    fn new(contents: &'a C, cancel: &'a AtomicBool, counters: &'a Counters) -> Self {
+        Self {
+            contents,
+            cancel,
+            counters,
+            buf: vec![0; BUFFER],
+            last: 0,
+        }
+    }
+
+    /// See [`recheck`].
+    fn recheck(&mut self, path: &Path, print: &Fingerprint, digest: &Digest) -> Recheck {
+        self.last = 0;
+        // Written to since is told before reading.
+        match self.contents.examine(path, print.len) {
+            Ok(now) if print.unchanged(&now) => {}
+            Ok(_) | Err(Skip::Vanished | Skip::Changed) => return Recheck::Changed,
+            Err(why) => return Recheck::Unknown(why),
+        }
+        match self.read(path, print.len, false) {
+            Err(Cancelled) => Recheck::Cancelled,
+            Ok(Ok((d, now))) if print.unchanged(&now) && d == *digest => Recheck::Same,
+            Ok(Ok(_) | Err(Skip::Vanished | Skip::Changed | Skip::Changing)) => Recheck::Changed,
+            Ok(Err(why)) => Recheck::Unknown(why),
+        }
+    }
+}
 
 /// One file to hash.
 enum Task {
@@ -294,8 +542,8 @@ struct Bucket {
 /// Digests of a set of files, and how many are still being read.
 struct Results {
     left: usize,
-    /// Digest and index of the file in its group.
-    digests: Vec<(Digest, usize)>,
+    /// Digest, index of the file in its group, and its fingerprint.
+    digests: Vec<(Digest, usize, Fingerprint)>,
 }
 
 impl Results {
@@ -392,7 +640,7 @@ impl Work {
         &self,
         plan: &Plan,
         task: Task,
-        result: Result<Result<Digest, Skip>, Cancelled>,
+        result: Result<Hashed, Cancelled>,
         counters: &Counters,
         on_event: &impl Fn(Event),
         more: &mut Vec<(Arc<Bucket>, usize)>,
@@ -414,8 +662,8 @@ impl Work {
             };
             let mut r = results.lock().unwrap();
             let skipped = match result {
-                Ok(digest) => {
-                    r.digests.push((digest, file));
+                Ok((digest, print)) => {
+                    r.digests.push((digest, file, print));
                     None
                 }
                 Err(why) => Some(why),
@@ -427,7 +675,7 @@ impl Work {
                 finish(1);
                 on_event(Event::Skipped(g.files[file].node, why));
             }
-            for same in all.map(alike).unwrap_or_default() {
+            for (digest, same) in all.map(alike).unwrap_or_default() {
                 match &task {
                     // Small files were read whole by the sample.
                     Task::Sample { .. } if same.len() >= 2 && g.size > 2 * SAMPLE => {
@@ -435,14 +683,16 @@ impl Work {
                             group,
                             results: Mutex::new(Results::new(same.len())),
                         });
-                        more.extend(same.into_iter().map(|f| (Arc::clone(&bucket), f)));
+                        more.extend(same.into_iter().map(|(f, _)| (Arc::clone(&bucket), f)));
                     }
                     _ => {
                         finish(same.len());
                         if same.len() >= 2 {
                             on_event(Event::Found(Group {
                                 size: g.size,
-                                files: same.iter().map(|&f| g.files[f].node).collect(),
+                                digest,
+                                files: same.iter().map(|&(f, _)| g.files[f].node).collect(),
+                                prints: same.iter().map(|&(_, p)| p).collect(),
                             }));
                         }
                     }
@@ -452,17 +702,18 @@ impl Work {
     }
 }
 
-/// Files with equal digests, each set in plan order.
-fn alike(digests: Vec<(Digest, usize)>) -> Vec<Vec<usize>> {
-    let mut by_digest: BTreeMap<Digest, Vec<usize>> = BTreeMap::new();
-    for (digest, file) in digests {
-        by_digest.entry(digest).or_default().push(file);
+/// Files with equal digests, each set in plan order with the files'
+/// fingerprints.
+fn alike(digests: Vec<(Digest, usize, Fingerprint)>) -> Vec<(Digest, Vec<(usize, Fingerprint)>)> {
+    let mut by_digest: BTreeMap<Digest, Vec<(usize, Fingerprint)>> = BTreeMap::new();
+    for (digest, file, print) in digests {
+        by_digest.entry(digest).or_default().push((file, print));
     }
     by_digest
-        .into_values()
-        .map(|mut files| {
-            files.sort_unstable();
-            files
+        .into_iter()
+        .map(|(digest, mut files)| {
+            files.sort_unstable_by_key(|&(f, _)| f);
+            (digest, files)
         })
         .collect()
 }
@@ -472,31 +723,34 @@ struct Reader<'a, C> {
     cancel: &'a AtomicBool,
     counters: &'a Counters,
     buf: Vec<u8>,
+    /// Bytes the last read hashed.
+    last: u64,
 }
 
+/// A file's digest with its fingerprint once read, or why it couldn't be
+/// read.
+type Hashed = Result<(Digest, Fingerprint), Skip>;
+
 impl<C: Contents> Reader<'_, C> {
-    fn perform(&mut self, plan: &Plan, task: &Task) -> Result<Result<Digest, Skip>, Cancelled> {
+    fn perform(&mut self, plan: &Plan, task: &Task) -> Result<Hashed, Cancelled> {
         match task {
             Task::Sample { group, file } => {
                 let g = &plan.groups[*group];
-                self.digest(&g.files[*file], g.size, g.size > 2 * SAMPLE)
+                self.read(&g.files[*file].path, g.size, g.size > 2 * SAMPLE)
             }
             Task::Whole { bucket, file } => {
                 let g = &plan.groups[bucket.group];
-                self.digest(&g.files[*file], g.size, false)
+                self.read(&g.files[*file].path, g.size, false)
             }
         }
     }
 
-    /// Hashes the file's first and last [`SAMPLE`] bytes, or all of it.
-    fn digest(
-        &mut self,
-        c: &Candidate,
-        size: u64,
-        sample: bool,
-    ) -> Result<Result<Digest, Skip>, Cancelled> {
-        let mut file = match self.contents.open(&c.path, size) {
-            Ok(file) => file,
+    /// Hashes the file's first and last [`SAMPLE`] bytes, or all of it,
+    /// failing if it was written to meanwhile.
+    fn read(&mut self, path: &Path, size: u64, sample: bool) -> Result<Hashed, Cancelled> {
+        self.last = 0;
+        let (mut file, opened) = match self.contents.open(path, size) {
+            Ok(opened) => opened,
             Err(why) => return Ok(Err(why)),
         };
         let ranges = if sample {
@@ -512,9 +766,15 @@ impl<C: Contents> Reader<'_, C> {
         }
         // Both ways end at the scanned size; more there means it grew.
         match file.read(&mut self.buf[..1]) {
-            Ok(0) => Ok(Ok(*hasher.finalize().as_bytes())),
-            Ok(_) => Ok(Err(Skip::Changed)),
-            Err(e) => Ok(Err(Skip::of(&e))),
+            Ok(0) => {}
+            Ok(_) => return Ok(Err(Skip::Changed)),
+            Err(e) => return Ok(Err(Skip::of(&e))),
+        }
+        // Asked through the handle it was read with, so it's this file.
+        match self.contents.fingerprint(&file) {
+            Ok(now) if opened.unchanged(&now) => Ok(Ok((*hasher.finalize().as_bytes(), now))),
+            Ok(_) => Ok(Err(Skip::Changing)),
+            Err(why) => Ok(Err(why)),
         }
     }
 
@@ -544,6 +804,7 @@ impl<C: Contents> Reader<'_, C> {
             }
             hasher.update(&self.buf[..n]);
             self.counters.read.fetch_add(n as u64, Ordering::Relaxed);
+            self.last += n as u64;
             left -= n as u64;
         }
         Ok(Ok(()))
@@ -564,15 +825,56 @@ mod tests {
     #[derive(Default)]
     struct FakeContents {
         files: HashMap<PathBuf, Result<Vec<u8>, Skip>>,
+        /// When each file was last written, in seconds; 0 if not set.
+        written: Mutex<HashMap<PathBuf, u64>>,
         opened: Mutex<Vec<PathBuf>>,
         /// Sets the flag after this many opens, to cancel mid-run.
         cancel_after: Option<(usize, &'static AtomicBool)>,
     }
 
-    impl Contents for FakeContents {
-        type File = Cursor<Vec<u8>>;
+    struct FakeFile {
+        path: PathBuf,
+        data: Cursor<Vec<u8>>,
+    }
 
-        fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
+    impl Read for FakeFile {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl Seek for FakeFile {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.data.seek(pos)
+        }
+    }
+
+    impl FakeContents {
+        fn print(&self, path: &Path, len: u64) -> Fingerprint {
+            let written = self.written.lock().unwrap().get(path).copied();
+            Fingerprint {
+                id: Some((1, {
+                    use std::hash::{BuildHasher, RandomState};
+                    // One state for every file, so each path keeps its ID.
+                    static STATE: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
+                    u128::from(STATE.get_or_init(RandomState::new).hash_one(path))
+                })),
+                len,
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(written.unwrap_or(0))),
+                links: Some(1),
+            }
+        }
+
+        /// Marks a file written to now.
+        fn touch(&self, path: &Path) {
+            *self.written.lock().unwrap().entry(path.into()).or_default() += 1;
+        }
+    }
+
+    impl Contents for FakeContents {
+        type File = FakeFile;
+
+        fn open(&self, path: &Path, len: u64) -> Result<(FakeFile, Fingerprint), Skip> {
             let mut opened = self.opened.lock().unwrap();
             opened.push(path.to_owned());
             if let Some((after, flag)) = self.cancel_after
@@ -580,13 +882,34 @@ mod tests {
             {
                 flag.store(true, Ordering::Relaxed);
             }
+            let print = self.examine(path, len)?;
+            let Some(Ok(bytes)) = self.files.get(path) else {
+                unreachable!("examined");
+            };
+            let file = FakeFile {
+                path: path.to_owned(),
+                data: Cursor::new(bytes.clone()),
+            };
+            Ok((file, print))
+        }
+
+        fn fingerprint(&self, file: &FakeFile) -> Result<Fingerprint, Skip> {
+            Ok(self.print(&file.path, file.data.get_ref().len() as u64))
+        }
+
+        fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
             match self.files.get(path) {
                 None => Err(Skip::Vanished),
                 Some(Err(why)) => Err(*why),
                 Some(Ok(bytes)) if bytes.len() as u64 != len => Err(Skip::Changed),
-                Some(Ok(bytes)) => Ok(Cursor::new(bytes.clone())),
+                Some(Ok(_)) => Ok(self.print(path, len)),
             }
         }
+    }
+
+    /// Groups as their size and files.
+    fn found(groups: &[Group]) -> Vec<(u64, Vec<NodeId>)> {
+        groups.iter().map(|g| (g.size, g.files.clone())).collect()
     }
 
     struct Fixture {
@@ -687,12 +1010,13 @@ mod tests {
 
         let (groups, skipped, done) = f.run(0);
         assert!(done && skipped.is_empty());
+        assert_eq!(found(&groups), [(5000, vec![a, b])]);
+        assert_eq!(groups[0].digest, *blake3::hash(&bytes(5000, 1)).as_bytes());
+        let paths = [f.tree.path(a), f.tree.path(b)];
         assert_eq!(
-            groups,
-            [Group {
-                size: 5000,
-                files: vec![a, b]
-            }]
+            groups[0].prints,
+            paths.map(|p| f.contents.print(&p, 5000)),
+            "each file's fingerprint as read"
         );
         let _ = c;
         // Only the small files' samples were read: they are the whole file.
@@ -729,13 +1053,8 @@ mod tests {
 
         let (groups, skipped, done) = f.run(0);
         assert!(done && skipped.is_empty());
-        assert_eq!(
-            groups,
-            [Group {
-                size: BIG as u64,
-                files: vec![same1, same2]
-            }]
-        );
+        assert_eq!(found(&groups), [(BIG as u64, vec![same1, same2])]);
+        assert_eq!(groups[0].digest, *blake3::hash(&bytes(BIG, 1)).as_bytes());
         let opened = f.contents.opened.lock().unwrap();
         // Five samples, then whole reads of the three that sampled alike.
         assert_eq!(opened.len(), 8);
@@ -836,13 +1155,19 @@ mod tests {
         // The fake checks length on open; grow it behind its back.
         struct Growing(FakeContents);
         impl Contents for Growing {
-            type File = Cursor<Vec<u8>>;
-            fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
-                let mut file = self.0.open(path, len)?;
+            type File = FakeFile;
+            fn open(&self, path: &Path, len: u64) -> Result<(FakeFile, Fingerprint), Skip> {
+                let (mut file, print) = self.0.open(path, len)?;
                 if path.ends_with("b") {
-                    file.get_mut().push(0);
+                    file.data.get_mut().push(0);
                 }
-                Ok(file)
+                Ok((file, print))
+            }
+            fn fingerprint(&self, file: &FakeFile) -> Result<Fingerprint, Skip> {
+                self.0.fingerprint(file)
+            }
+            fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+                self.0.examine(path, len)
             }
         }
         let plan = plan(&f.tree, NodeId::ROOT, None, 0);
@@ -861,6 +1186,157 @@ mod tests {
             [Event::Skipped(b, Skip::Changed)]
         );
         let _ = a;
+    }
+
+    /// Marks the file at a path written to while it's read, as seen when
+    /// its fingerprint is taken again after reading.
+    struct WrittenWhileRead(FakeContents, &'static str);
+
+    impl Contents for WrittenWhileRead {
+        type File = FakeFile;
+        fn open(&self, path: &Path, len: u64) -> Result<(FakeFile, Fingerprint), Skip> {
+            self.0.open(path, len)
+        }
+        fn fingerprint(&self, file: &FakeFile) -> Result<Fingerprint, Skip> {
+            if file.path.ends_with(self.1) {
+                self.0.touch(&file.path);
+            }
+            self.0.fingerprint(file)
+        }
+        fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+            self.0.examine(path, len)
+        }
+    }
+
+    #[test]
+    fn a_file_written_to_while_read_is_skipped() {
+        let mut f = Fixture::new();
+        let a = f.file("a", bytes(BIG, 1));
+        let b = f.file("b", bytes(BIG, 1));
+        let c = f.file("c", bytes(BIG, 1));
+        let plan = plan(&f.tree, NodeId::ROOT, None, 0);
+        let events = Mutex::new(Vec::new());
+        let contents = WrittenWhileRead(std::mem::take(&mut f.contents), "b");
+        run(
+            &plan,
+            &contents,
+            1,
+            &AtomicBool::new(false),
+            &Counters::default(),
+            |e| events.lock().unwrap().push(e),
+        );
+        let events = events.into_inner().unwrap();
+        assert_eq!(events[0], Event::Skipped(b, Skip::Changing));
+        assert!(matches!(&events[1..], [Event::Found(g)] if g.files == [a, c]));
+    }
+
+    #[test]
+    fn rechecking_confirms_only_an_unchanged_copy() {
+        let mut f = Fixture::new();
+        let a = f.file("a", bytes(BIG, 1));
+        let b = f.file("b", bytes(BIG, 1));
+        let (groups, _, _) = f.run(0);
+        let g = &groups[0];
+        let (pa, pb) = (f.tree.path(a), f.tree.path(b));
+        let cancel = AtomicBool::new(false);
+        let counters = Counters::default();
+        let recheck_with = |contents: &FakeContents, path: &Path, i: usize| {
+            recheck(contents, path, &g.prints[i], &g.digest, &cancel, &counters)
+        };
+        assert_eq!(recheck_with(&f.contents, &pa, 0), Recheck::Same);
+        assert_eq!(counters.read.load(Ordering::Relaxed), BIG as u64);
+
+        // Overwritten with other bytes of the same length.
+        let mut edited = bytes(BIG, 1);
+        edited[BIG / 2] ^= 0xFF;
+        f.contents.files.insert(pa.clone(), Ok(edited.clone()));
+        f.contents.touch(&pa);
+        assert_eq!(recheck_with(&f.contents, &pa, 0), Recheck::Changed);
+        // Even with its modified time put back, the contents tell.
+        f.contents.written.lock().unwrap().remove(&pa);
+        assert_eq!(recheck_with(&f.contents, &pa, 0), Recheck::Changed);
+        // Another file's fingerprint never confirms this one.
+        assert_eq!(recheck_with(&f.contents, &pb, 0), Recheck::Changed);
+
+        f.contents.files.insert(pa.clone(), Err(Skip::InUse));
+        assert_eq!(
+            recheck_with(&f.contents, &pa, 0),
+            Recheck::Unknown(Skip::InUse),
+            "unreadable is unknown, not proof"
+        );
+        f.contents.files.remove(&pa);
+        assert_eq!(recheck_with(&f.contents, &pa, 0), Recheck::Changed);
+
+        let written = WrittenWhileRead(std::mem::take(&mut f.contents), "b");
+        assert_eq!(
+            recheck(&written, &pb, &g.prints[1], &g.digest, &cancel, &counters),
+            Recheck::Changed,
+            "written to while rechecked"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        let contents = written.0;
+        contents.written.lock().unwrap().clear();
+        assert_eq!(recheck_with(&contents, &pb, 1), Recheck::Cancelled);
+    }
+
+    #[test]
+    fn confirming_tries_another_copy_only_when_needed() {
+        let mut f = Fixture::new();
+        let names = ["a1", "a2", "a3", "b1", "b2", "c1", "c2"];
+        let nodes: Vec<NodeId> = names
+            .iter()
+            .map(|n| {
+                let seed = n.as_bytes()[0];
+                let len = BIG + usize::from(seed - b'a');
+                f.file(n, bytes(len, seed))
+            })
+            .collect();
+        let (groups, _, _) = f.run(0);
+        assert_eq!(groups.len(), 3);
+        // Each group as a delete would keep it: every copy, plan order.
+        let confirming = |g: &Group| Confirm {
+            size: g.size,
+            digest: g.digest,
+            copies: g
+                .files
+                .iter()
+                .zip(&g.prints)
+                .map(|(&n, &p)| (f.tree.path(n), p))
+                .collect(),
+        };
+        let mut groups: Vec<Confirm> = groups.iter().map(confirming).collect();
+        groups.sort_by_key(|g| g.size);
+        let path = |i: usize| f.tree.path(nodes[i]);
+        // a1 is edited, so a2 is tried; b1 can't be read and b2 is gone;
+        // c1 is fine.
+        let mut edited = bytes(BIG, b'a');
+        edited[7] ^= 1;
+        f.contents.files.insert(path(0), Ok(edited));
+        f.contents.files.insert(path(3), Err(Skip::InUse));
+        f.contents.files.remove(&path(4));
+        f.contents.opened.lock().unwrap().clear();
+
+        let progress = ConfirmProgress::default();
+        let found = confirm(&f.contents, &groups, 3, &AtomicBool::new(false), &progress);
+        assert!(matches!(found[0], Confirmed::Copy(1, _)), "a2");
+        assert!(
+            matches!(found[1], Confirmed::Unknown),
+            "unreadable is no proof"
+        );
+        assert!(matches!(found[2], Confirmed::Copy(0, _)), "c1");
+        let opened = f.contents.opened.lock().unwrap().clone();
+        assert!(!opened.contains(&path(2)), "a3 was never needed");
+        assert!(!opened.contains(&path(6)), "nor c2");
+        let total = progress.total.load(Ordering::Relaxed);
+        assert_eq!(
+            total,
+            groups.iter().map(|g| g.size).sum::<u64>() + groups[0].size + groups[1].size
+        );
+        assert_eq!(progress.done(), total, "every copy tried is dealt with");
+
+        let stop = AtomicBool::new(true);
+        let found = confirm(&f.contents, &groups, 2, &stop, &ConfirmProgress::default());
+        assert!(found.iter().all(|c| matches!(c, Confirmed::Cancelled)));
     }
 
     #[test]
@@ -919,12 +1395,9 @@ mod tests {
             events.lock().unwrap().push(e)
         });
         assert!(!done);
-        assert_eq!(
-            events.into_inner().unwrap(),
-            [Event::Found(Group {
-                size: BIG as u64 * 2,
-                files: vec![a, b]
-            })]
+        let events = events.into_inner().unwrap();
+        assert!(
+            matches!(&events[..], [Event::Found(g)] if g.size == BIG as u64 * 2 && g.files == [a, b])
         );
         assert_eq!(f.contents.opened.lock().unwrap().len(), 5, "nothing after");
     }
@@ -937,8 +1410,8 @@ mod tests {
             open: Mutex<(usize, usize)>,
         }
         impl Contents for Slow {
-            type File = Cursor<Vec<u8>>;
-            fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
+            type File = FakeFile;
+            fn open(&self, path: &Path, len: u64) -> Result<(FakeFile, Fingerprint), Skip> {
                 {
                     let mut open = self.open.lock().unwrap();
                     open.0 += 1;
@@ -947,6 +1420,12 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 self.open.lock().unwrap().0 -= 1;
                 self.inner.open(path, len)
+            }
+            fn fingerprint(&self, file: &FakeFile) -> Result<Fingerprint, Skip> {
+                self.inner.fingerprint(file)
+            }
+            fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+                self.inner.examine(path, len)
             }
         }
         let mut f = Fixture::new();
@@ -971,13 +1450,8 @@ mod tests {
         );
         assert!(done);
         assert_eq!(counters.done.load(Ordering::Relaxed), plan.bytes);
-        assert_eq!(
-            events.into_inner().unwrap(),
-            [Event::Found(Group {
-                size: BIG as u64,
-                files
-            })]
-        );
+        let events = events.into_inner().unwrap();
+        assert!(matches!(&events[..], [Event::Found(g)] if g.files == files));
         assert!(
             contents.open.lock().unwrap().1 > 1,
             "the group's files were read in parallel"
@@ -988,10 +1462,16 @@ mod tests {
     fn a_reader_that_panics_lets_the_others_finish() {
         struct Panics(FakeContents);
         impl Contents for Panics {
-            type File = Cursor<Vec<u8>>;
-            fn open(&self, path: &Path, len: u64) -> Result<Self::File, Skip> {
+            type File = FakeFile;
+            fn open(&self, path: &Path, len: u64) -> Result<(FakeFile, Fingerprint), Skip> {
                 assert!(!path.ends_with("bad"), "reading failed badly");
                 self.0.open(path, len)
+            }
+            fn fingerprint(&self, file: &FakeFile) -> Result<Fingerprint, Skip> {
+                self.0.fingerprint(file)
+            }
+            fn examine(&self, path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+                self.0.examine(path, len)
             }
         }
         let mut f = Fixture::new();

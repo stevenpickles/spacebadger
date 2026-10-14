@@ -13,7 +13,7 @@ use crate::adapter::{
     Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
     batched,
 };
-use crate::duplicates::Skip;
+use crate::duplicates::{Fingerprint, Skip};
 use sb_core::tree::{birth_secs, unix_object_id};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
@@ -212,15 +212,9 @@ mod open_flags {
 /// link and never blocks, and the opened file must be that same file, so a
 /// link is never read through. Dataless (cloud-only) files are refused, and
 /// this process never materializes them anyway (see `open_root`).
-pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
+pub fn open_contents(path: &Path, len: u64) -> Result<(std::fs::File, Fingerprint), Skip> {
     use std::os::unix::fs::OpenOptionsExt;
-    let before = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
-    if is_cloud(&before) {
-        return Err(Skip::Cloud);
-    }
-    if !before.is_file() || before.size() != len {
-        return Err(Skip::Changed);
-    }
+    let before = examined(path, len)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(open_flags::NOFOLLOW_NONBLOCK)
@@ -239,5 +233,22 @@ pub fn open_contents(path: &Path, len: u64) -> Result<std::fs::File, Skip> {
     {
         return Err(Skip::Changed);
     }
-    Ok(file)
+    Ok((file, super::fingerprint(&meta)))
+}
+
+/// The fingerprint of the file at `path`, without opening it, refusing
+/// what [`open_contents`] refuses before it opens.
+pub fn examine_contents(path: &Path, len: u64) -> Result<Fingerprint, Skip> {
+    examined(path, len).map(|meta| super::fingerprint(&meta))
+}
+
+fn examined(path: &Path, len: u64) -> Result<Metadata, Skip> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| Skip::of(&e))?;
+    if is_cloud(&meta) {
+        return Err(Skip::Cloud);
+    }
+    if !meta.is_file() || meta.size() != len {
+        return Err(Skip::Changed);
+    }
+    Ok(meta)
 }

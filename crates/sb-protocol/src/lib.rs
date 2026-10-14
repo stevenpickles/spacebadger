@@ -535,6 +535,10 @@ pub enum DeleteOutcome {
     /// Not confirmed in the Recycle Bin or Trash: some or all of it may
     /// have been deleted without a copy.
     Uncertain,
+    /// A duplicate selected itself, kept because it may be the last copy:
+    /// it changed since compared, or no copy that stays was confirmed. The
+    /// message says which.
+    Kept,
 }
 
 /// An item a delete didn't simply recycle, and why.
