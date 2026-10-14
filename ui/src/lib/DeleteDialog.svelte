@@ -206,8 +206,16 @@
   {:else}
     <h2 id="{id}-title">Move {what} to the {trashName}?</h2>
     <p id="{id}-what">
-      {contents}. Frees about <span title={exactBytes(summary.logical)}>{formatBytes(summary.logical)}</span> when the
-      {trashName} is emptied.
+      {contents}, <span title={exactBytes(summary.logical)}>{formatBytes(summary.logical)}</span> of content.
+      {#if summary.unknownAllocationFiles > 0}
+        How much disk space this frees isn't known: {plural(summary.unknownAllocationFiles, "file")} couldn't be
+        measured on disk.
+      {:else if summary.hardlinked}
+        Some files have other hard links, so their disk space is freed only once every link is gone.
+      {:else}
+        Frees up to about <span title={exactBytes(summary.allocated)}>{formatBytes(summary.allocated)}</span> on disk
+        when the {trashName} is emptied.
+      {/if}
     </p>
     <div class="samples">
       <SampleList samples={summary.samples} total={summary.items} paths />

@@ -489,6 +489,10 @@ pub struct SelectionSummary {
     pub allocated: u64,
     #[ts(type = "number")]
     pub unknown_allocation_files: u64,
+    /// Some files in the items have other hard-link names, so deleting
+    /// them may free less disk space than they're allocated (none while
+    /// another name remains).
+    pub hardlinked: bool,
     /// Entries left out because they're no longer in the scan.
     pub missing: u32,
     /// The largest items, at most [`SELECTION_SAMPLES`].

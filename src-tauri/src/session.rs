@@ -612,6 +612,7 @@ impl Session {
             logical: r.logical,
             allocated: r.allocated,
             unknown_allocation_files: r.unknown,
+            hardlinked: r.hardlinked,
             missing: r.missing as u32,
             samples: r
                 .items
