@@ -159,7 +159,9 @@ impl<T> Column<T> {
     }
 }
 
-/// Bounds-checked against the chunks, for the tree's own updates.
+/// Bounds-checked against the chunks, not the tree's length, so only for
+/// the tree's own updates of nodes it knows are in it: ones reached through
+/// links, or checked with [`Tree::checked`] first.
 impl<T> std::ops::Index<usize> for Column<T> {
     type Output = T;
 
@@ -343,6 +345,7 @@ impl Tree {
         if id == NONE {
             return Err(CapacityExceeded);
         }
+        let parent_slot = (parent != NONE).then(|| self.checked(NodeId(parent)).0);
         let start = self.names.push(bytes)?;
         let i = id as usize;
         if i & SLOT == 0 {
@@ -366,8 +369,7 @@ impl Tree {
         self.name_start[i] = start;
         self.name_len[i] = len;
         self.flags[i] = node_flags;
-        if parent != NONE {
-            let p = parent as usize;
+        if let Some(p) = parent_slot {
             self.next_sibling[i] = self.first_child[p];
             self.first_child[p] = id;
         }
@@ -470,14 +472,16 @@ impl Tree {
 
     pub fn set_dir_state(&mut self, dir: NodeId, state: DirState) {
         debug_assert!(self.is_dir(dir));
-        self.dir_state[dir.index()] = state as u8;
+        let i = self.checked(dir).0;
+        self.dir_state[i] = state as u8;
     }
 
     /// Notes that some of `dir`'s entries couldn't be read (see
     /// [`flags::UNREADABLE_ENTRIES`]).
     pub fn mark_unreadable_entries(&mut self, dir: NodeId) {
         debug_assert!(self.is_dir(dir));
-        self.flags[dir.index()] |= flags::UNREADABLE_ENTRIES;
+        let i = self.checked(dir).0;
+        self.flags[i] |= flags::UNREADABLE_ENTRIES;
     }
 
     /// Whether `dir` was listed with every entry read, so all its children
@@ -598,7 +602,8 @@ impl Tree {
 
     /// Records the [`fingerprint`] of the node's filesystem object.
     pub fn set_id(&mut self, node: NodeId, id: u64) {
-        self.ids[node.index()] = id;
+        let i = self.checked(node).0;
+        self.ids[i] = id;
     }
 
     /// Files at or under this node.
@@ -1206,5 +1211,41 @@ mod tests {
         assert_eq!(name(&t, empty), "");
         assert_eq!(name(&t, after), "after");
         assert_eq!(name(&t, filled[filled.len() - 1]), long);
+    }
+
+    #[test]
+    fn writes_to_nodes_not_in_the_tree_panic() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let mut t = Tree::new("/");
+        // Past the end, but inside the root's chunk.
+        let ghost = NodeId::from_index(5);
+        let writes: [&dyn Fn(&mut Tree); 7] = [
+            &|t| t.set_id(ghost, 42),
+            &|t| t.set_dir_state(ghost, DirState::Listed),
+            &|t| t.mark_unreadable_entries(ghost),
+            &|t| t.update_file(ghost, sizes(1, 1)),
+            &|t| t.mark_alias(ghost, NodeId::ROOT),
+            &|t| {
+                let _ = t.add_dir(ghost, "d".as_ref());
+            },
+            &|t| {
+                let _ = t.add_file(ghost, "f".as_ref(), sizes(1, 1), None, 0);
+            },
+        ];
+        for (n, write) in writes.iter().enumerate() {
+            let result = catch_unwind(AssertUnwindSafe(|| write(&mut t)));
+            assert!(result.is_err(), "write {n} went through");
+        }
+        assert!(!t.remove(ghost));
+        assert_eq!(t.len(), 1);
+
+        // Nothing was left behind for the nodes added there later.
+        for i in 0..5 {
+            t.add_dir(NodeId::ROOT, format!("d{i}").as_ref()).unwrap();
+        }
+        assert_eq!(t.id(ghost), None);
+        assert_eq!(t.dir_state(ghost), DirState::Pending);
+        assert_eq!(t.flags(ghost), flags::DIRECTORY);
+        assert_eq!(t.children(ghost).count(), 0);
     }
 }
