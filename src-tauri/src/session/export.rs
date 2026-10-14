@@ -89,12 +89,16 @@ impl Session {
             proto::ExportFormat::Report => self.export_report(&job, &mut out, &progress, &failed),
         }?;
         out.into_inner().map_err(|e| failed(e.into_error()))?;
-        temp.persist(path).map_err(|e| match e.kind() {
-            // Typically Windows refusing to replace a file in use.
-            std::io::ErrorKind::PermissionDenied => {
+        temp.persist().map_err(|e| {
+            // Typically Windows refusing to replace a file in use: access
+            // denied, or a sharing violation (32) renaming through a handle.
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || (cfg!(windows) && e.raw_os_error() == Some(32))
+            {
                 format!("Couldn't replace {shown}: it may be open in another program or read-only.")
+            } else {
+                failed(e)
             }
-            _ => failed(e),
         })?;
         Ok(proto::ExportReport {
             generation: self.generation(),
