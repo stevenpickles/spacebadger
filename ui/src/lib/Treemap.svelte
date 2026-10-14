@@ -148,7 +148,10 @@
   })();
   const trace = {
     on: traceFlag,
+    /** Since tracing started: whole-map draws, their label passes, hover draws. */
+    full: new Samples(),
     labels: new Samples(),
+    hover: new Samples(),
     measures: new Samples(),
     /** measureText calls in the draw under way. */
     measuring: 0,
@@ -179,13 +182,23 @@
   $effect(() => {
     trace.on = traceFlag || showPerf;
     if (!showPerf) return;
+    if (!traceFlag) {
+      // Count from when the overlay opens.
+      trace.full = new Samples();
+      trace.labels = new Samples();
+      trace.hover = new Samples();
+      trace.measures = new Samples();
+      trace.draws = trace.hoverDraws = trace.moves = 0;
+    }
     const update = () => {
       const now = performance.now();
       const perSecond = trace.recent.filter((t) => now - t <= 1000).length;
       perfText = [
         `layout round trip: ${stats.layout.summary()}`,
         `draw: ${stats.draw.summary()}`,
+        `traced draw: ${trace.full.summary()}`,
         `labels: ${trace.labels.summary()}`,
+        `hover draw: ${trace.hover.summary()}`,
         `measureText per draw: ${trace.measures.summary().replace(" ms", "")}`,
         `draws/s: ${perSecond} · draws ${trace.draws} · hover draws ${trace.hoverDraws} · moves ${trace.moves}`,
         `input to frame: ${stats.input.summary()}`,
@@ -359,6 +372,7 @@
     stats.draw.add(now - started);
     if (trace.on) {
       trace.draws++;
+      trace.full.add(now - started);
       trace.measures.add(trace.measuring);
       trace.recent.push(now);
       while (trace.recent.length > 0 && now - trace.recent[0]! > 1000) trace.recent.shift();
@@ -480,7 +494,6 @@
     const ctx = cleared(hoverCanvas);
     const l = layout;
     const hi = hoverIndex;
-    if (trace.on) trace.hoverDraws++;
     if (!ctx || !l || hi < 0 || hi >= l.count) return;
     const p = palette;
     ctx.globalAlpha = dark ? 0.1 : 0.22;
@@ -573,7 +586,12 @@
     }
     if (hoverDirty) {
       hoverDirty = false;
+      const started = performance.now();
       paintHover();
+      if (trace.on) {
+        trace.hoverDraws++;
+        trace.hover.add(performance.now() - started);
+      }
     }
   }
 
