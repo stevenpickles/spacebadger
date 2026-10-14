@@ -161,6 +161,63 @@ The completion index is now built in steps of 50,000 nodes, with the tree's lock
 
 Not covered by this baseline: IPC transfer, JSON serialization, decoding, and painting, which need the real app (`SPACEBADGER_TRACE` and `spacebadgerTrace.full()`). The app was only checked to write the report at exit.
 
+### After queries get an execution policy
+
+Branch `feature/43/query-runner`, on top of `feature/39/derived-views`; architecture review item 2. The query commands used to run inline on the async runtime's workers (`layout`, `node_details`, `search_summary`, `search_results`, `small_items`, `selection_summary`) or on its unbounded blocking threads (`folder_files`, `search_set`, `filter_suggest`, `compare_item`, `change_marks`, `compare_changes`, the duplicates pages). Neither kind could be prioritized or cancelled, and nothing bounded the work queued.
+
+They now run on the query runner (`src-tauri/src/runner.rs`). It is a fixed pool of threads (half the hardware threads, 3 to 6; 6 here) apart from the async runtime, the scanner, and the session's background jobs.
+
+- **Classes.** Every query has one: Interactive (tooltips and details, the filter's totals, a selection's totals, an item's change) before View (layouts, change marks), before Lists (Contents pages, search results, changes, duplicates pages, `search_set`), before Background (the filter's completion). An idle worker takes the oldest job of the most urgent class waiting. One worker is kept for Interactive, so a tooltip never waits behind layouts and lists however many there are, and one Background job runs at a time.
+- **Lanes.** The interface names a lane per consumer: the map's layouts, its tooltips, each details panel, each Contents set, the completion. It numbers requests whenever its earlier replies stop mattering. A newer number in a lane turns the waiting older requests away at once and asks running ones to stop: layouts check after taking the locks and after computing, ranking walks before every step. These requests fail with `SUPERSEDED`, which `Latest` drops silently. A newer revision of the same identity keeps the same number, so slow replies during a scan aren't starved, as before.
+- **Bounds.** Each class has a bounded queue (64, 16, 64, 8). When one is full, its oldest job is turned away; the interface coalesces, so this isn't reached in use. A panic fails only its request. At exit the runner turns away what's waiting and asks running jobs to stop, then joins its workers for up to 2 s.
+- **Queue time** is now recorded for every query: from submitting to the runner to starting.
+
+The load test now submits through the runner in each request's class and lane, as the app does; `SB_LOAD_RUNNER=0` issues the same load as before. It has a fifth scenario as well. A pointer sweeps across tiles, asking for a tooltip every 5 ms without waiting for the last. A second map is resized, asking for a layout every 4 ms, faster than one takes, each superseding the last.
+
+Before and after were run alternately on the same build, three times each, on a 24-thread machine shared with other builds (scans of 9.3–9.8 s). The table gives ranges with the median in brackets, in ms while scanning; superseded requests are counted, not timed.
+
+| Scenario | Request | Before p95 | After p95 | Before p99 | After p99 |
+|---|---|---|---|---|---|
+| Filter on, Contents with folders | tooltip | 4.5–8.2 (5.8) | 0.2–5.8 (5.7) | 5.9–9.9 (6.6) | 6.1–7.3 (6.3) |
+| | node_details | 5.5–9.3 (6.1) | 0.1–6.1 (5.9) | 6.3–17.1 (13.0) | 4.8–7.2 (6.5) |
+| | search_summary | 5.6–8.8 (6.1) | 5.3–6.1 (5.9) | 7.6–17.2 (14.2) | 6.3–7.8 (6.6) |
+| | small_items (Contents) | 5.5–9.0 (6.4) | 5.8–6.8 (6.6) | 7.7–17.4 (13.7) | 6.9–9.2 (7.0) |
+| | layout | 6.4–10.8 (7.0) | 6.8–7.8 (7.3) | 8.4–23.1 (14.6) | 7.5–10.0 (7.9) |
+| Filter on, Contents with files only | tooltip | 1.2–6.0 (5.4) | 5.0–5.6 (5.4) | 6.3–8.0 (6.6) | 6.1–6.6 (6.4) |
+| | node_details | 0.1–6.5 (5.6) | 5.7–5.8 (5.7) | 5.9–16.0 (6.9) | 6.4–8.7 (6.6) |
+| | folder_files (Contents) | 9.1–15.3 (10.2) | 9.3–9.6 (9.3) | 9.9–28.4 (11.6) | 10.5–14.1 (11.3) |
+| | layout | 6.7–10.0 (7.7) | 6.7–6.8 (6.7) | 7.1–24.6 (8.7) | 7.4–14.1 (9.0) |
+| No filter, Contents with folders | tooltip | 3.2–3.7 (3.6) | 1.9–3.5 (3.4) | 4.4–4.6 (4.5) | 4.5–4.8 (4.6) |
+| | small_items (Contents) | 4.8–5.0 (4.9) | 4.8–5.3 (5.2) | 5.3–6.0 (5.5) | 5.5–7.5 (6.0) |
+| | layout | 4.9–5.2 (5.1) | 4.8–5.4 (5.2) | 6.2–10.5 (9.1) | 5.0–6.1 (6.0) |
+| Filter typed 5 s into the scan | tooltip | 5.1–6.2 (5.4) | 4.9–5.3 (5.0) | 6.4–7.7 (6.6) | 5.7–6.4 (6.0) |
+| | small_items (Contents) | 5.4–7.2 (5.8) | 4.3–6.0 (5.2) | 6.6–8.1 (6.6) | 5.7–6.3 (5.8) |
+| | search_set | 59.9 (one each) | 55.4 | | |
+| Pointer sweeping and a map resized (filter on, folders) | hover (every 5 ms) | 2.5–5.4 (3.0) | 1.8–2.3 (2.2) | 4.5–31.0 (5.2) | 3.4–3.8 (3.7) |
+| | resize layout (every 4 ms) | 4.3–11.2 (5.5) | 2.8–3.5 (3.4) | 6.2–50.2 (10.3) | 3.9–4.3 (4.2) |
+| | tooltip | 3.4–5.0 (3.8) | 2.8–3.4 (3.0) | 4.5–23.0 (5.0) | 3.6–5.0 (4.2) |
+| | node_details | 4.5–5.0 (5.0) | 3.5–4.7 (3.6) | 5.2–24.3 (5.2) | 4.6–5.3 (5.0) |
+| | search_summary | 4.7–5.3 (5.1) | 3.6–4.1 (3.9) | 5.5–44.8 (5.7) | 4.6–5.3 (4.9) |
+| | small_items (Contents) | 6.9–11.2 (7.9) | 4.9–7.0 (6.1) | 10.0–34.5 (12.6) | 7.3–8.9 (8.0) |
+| | layout | 5.9–12.8 (8.9) | 4.5–7.0 (5.8) | 8.1–41.2 (13.5) | 5.7–7.6 (5.9) |
+
+Queue delay as the backend recorded it, p99 (and the largest) over a whole run, after the runner:
+
+- **Interactive:** 0.07–0.14 ms in the four ordinary scenarios (at most 0.6 ms with the sweep, against 18–23 ms before, when the sweep's unbounded threads crowded the runtime).
+- **Layouts:** 0.08–0.27 ms.
+- **Lists:** 0.1–0.3 ms. With the sweep they waited up to 27.6 ms once behind a burst of layouts, as their class allows; tooltips and details didn't.
+
+In the sweep, about 3 % of resized layouts were superseded per run: 3–4 turned away while waiting, the rest stopped running, mostly after computing and before encoding. Tooltips finished before the next one came, so 1–3 per run were superseded.
+
+What this shows:
+
+- **Supersession and bounds.** In the ordinary scenarios the machine wasn't saturated, so queues stayed empty and p95s are unchanged. What the runner removed there is the single stalls of 16–28 ms at p99 (worst run) that the inline commands picked up on the runtime. With work arriving faster than it can be done, the sweep, the runner keeps every interactive p99 under 5.3 ms, against up to 23–45 ms before. Obsolete layouts are dropped or stopped instead of all running, so the resized map's own p99 falls from 6–50 ms to about 4 ms.
+- **Priority.** Interactive requests never queue behind lists or layouts. Their tails are what remains: waiting for the tree's read lock behind the scanner's writes (4–7 ms in the slowest requests, as the report's `tree wait` shows). Engine work removes those (`feature/42/tree-storage`), not the runner.
+
+After the scan, every scenario answers tooltips, details, and the filter's totals in under 0.5 ms at p99 with either path.
+
+The app was started on `C:\Windows\System32` with `SPACEBADGER_TRACE` set, and the pointer swept across the map. Layouts, details, and the Contents list went through the runner with their lanes (the report shows queue times of 0.03–0.08 ms), and the app exited cleanly, the runner joined.
+
 ## Recommendations for the restructuring
 
 - Don't hold the search mutex across layout compute and encoding. Snapshot what the layout needs (an `Arc` of the caught-up overlay, or a read lock with catch-up taking a short write), and have `details` take the search lock only when it's given a search.
