@@ -264,11 +264,11 @@
 
   /**
    * Fetches the loaded pages again and replaces the rows with them, all at
-   * once, so ranges and Select all still reach every row seen and the
-   * Shift anchor stays. The visible pages come first and must agree on a
-   * revision, which becomes the set's; other pages ranked at another
-   * revision (the scan moved on meanwhile) are left out and fetched again
-   * when they come into view.
+   * once, so ranges, Select all, and the Shift anchor keep reaching the rows
+   * seen. The visible pages come first and must agree on a revision, which
+   * becomes the set's; other pages ranked at another revision (the scan
+   * moved on meanwhile) are left out, so during a scan ranges may not reach
+   * them until they come into view and are fetched again.
    */
   async function refresh() {
     const before = shownSet;
