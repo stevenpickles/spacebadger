@@ -89,7 +89,13 @@ impl Session {
             proto::ExportFormat::Report => self.export_report(&job, &mut out, &progress, &failed),
         }?;
         out.into_inner().map_err(|e| failed(e.into_error()))?;
-        temp.persist(path).map_err(failed)?;
+        temp.persist(path).map_err(|e| match e.kind() {
+            // Typically Windows refusing to replace a file in use.
+            std::io::ErrorKind::PermissionDenied => {
+                format!("Couldn't replace {shown}: it may be open in another program or read-only.")
+            }
+            _ => failed(e),
+        })?;
         Ok(proto::ExportReport {
             generation: self.generation(),
             path: shown,
@@ -580,6 +586,33 @@ mod tests {
             assert!(text.contains(&expected), "missing {expected:?} in\n{text}");
         }
         assert!(!text.contains("keep.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_use_is_reported_plainly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (tmp, session) = scanned("in-use");
+        let path = tmp.0.join("out").join("open.csv");
+        std::fs::write(&path, "in use").unwrap();
+        // As a spreadsheet holds a file open: no sharing.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let req = request(&session, proto::ExportFormat::Csv);
+        let err = session.export(&req, &path, || true, |_| {}).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "Couldn't replace {}: it may be open in another program or read-only.",
+                display_path(&path)
+            )
+        );
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "in use");
+        assert_eq!(std::fs::read_dir(tmp.0.join("out")).unwrap().count(), 1);
     }
 
     #[test]
