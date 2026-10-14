@@ -246,6 +246,11 @@ pub struct SearchSummary {
     pub allocated: u64,
     #[ts(type = "number")]
     pub unknown_allocation_files: u64,
+    /// The scan revision (see [`ScanStatus::revision`]) the totals were last
+    /// fully caught up with. The filter keeps up with a scan in the
+    /// background, so while scanning this can trail the latest status.
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 /// Asks for a page of matching files, largest first by `metric`.
