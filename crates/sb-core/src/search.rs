@@ -943,8 +943,9 @@ impl Search {
         self.next
     }
 
-    /// What [`Search::catch_up`] has left to do on `tree`: nodes not yet
-    /// examined plus changed files not yet replayed.
+    /// An upper bound on what [`Search::catch_up`] has left to do on
+    /// `tree`: nodes not yet examined plus change-log entries not yet
+    /// replayed, some of which it skips (files not yet examined, repeats).
     pub fn backlog(&self, tree: &Tree) -> usize {
         tree.len().saturating_sub(self.next)
             + tree.changed_files().len().saturating_sub(self.changes_seen)
