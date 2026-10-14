@@ -14,14 +14,14 @@ use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::selection;
-use sb_core::suggest::NameIndex;
+use sb_core::suggest::{self, NameIndex};
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::plan;
 use sb_scan::{FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 mod compare;
@@ -67,7 +67,9 @@ pub struct Session {
     /// The files under the folder last asked for, ranked by size.
     folder_files: Mutex<Option<FolderFiles>>,
     /// Folder names and extensions for the filter's completion.
-    names: Mutex<Option<Names>>,
+    names: Arc<Mutex<Option<Names>>>,
+    /// Set while the completion index is rebuilt in the background.
+    names_building: Arc<AtomicBool>,
     /// The latest search for duplicate files.
     duplicates: Mutex<Option<Arc<Job>>>,
     /// Number of the latest search for duplicates.
@@ -101,6 +103,9 @@ struct Names {
 
 /// While scanning, the completion index is rebuilt at most this often.
 const NAMES_REFRESH: Duration = Duration::from_secs(5);
+
+/// Nodes the completion index takes in per hold of the tree's lock.
+const NAMES_STEP: usize = 50_000;
 
 struct FolderFiles {
     /// What the ranking was made from: folder, scan revision, search and
@@ -179,7 +184,8 @@ impl Session {
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
             folder_files: Mutex::new(None),
-            names: Mutex::new(None),
+            names: Arc::new(Mutex::new(None)),
+            names_building: Arc::new(AtomicBool::new(false)),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
             recheck_cancel: AtomicBool::new(false),
@@ -500,7 +506,9 @@ impl Session {
 
     /// Folder names or extensions for the filter's completion, largest
     /// first. The index is rebuilt when the scan has changed, but during a
-    /// scan at most every [`NAMES_REFRESH`].
+    /// scan at most every [`NAMES_REFRESH`], and then in the background
+    /// while the previous index answers. It's built in steps, so the
+    /// scanner isn't held up meanwhile.
     pub fn suggest(&self, req: &proto::SuggestRequest) -> Result<Vec<proto::Suggestion>, String> {
         let progress = self.scan.progress();
         let scanning = matches!(progress.state, ScanState::Scanning);
@@ -510,21 +518,15 @@ impl Session {
             let fresh = names.as_ref().is_some_and(|n| {
                 n.revision == progress.revision || (scanning && n.built.elapsed() < NAMES_REFRESH)
             });
-            if !fresh {
+            if !fresh && scanning && names.is_some() {
+                self.refresh_names(progress.revision);
+            } else if !fresh {
                 let tree = self.scan.tree();
-                let tree =
-                    locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-                // Read again with the tree's lock held, so the index is kept
-                // under the revision of the tree it's built from.
-                let revision = self.scan.progress().revision;
-                let _index = metrics::span("index");
-                *names = Some(Names {
-                    revision,
-                    built: Instant::now(),
-                    index: Arc::new(NameIndex::build(&tree)),
-                });
+                // Read with the tree's lock held, so the index is kept under
+                // the revision of the tree it's built from.
+                *names = Some(build_names(&tree, || self.scan.progress().revision)?);
             }
-            Arc::clone(&names.as_ref().expect("just built").index)
+            Arc::clone(&names.as_ref().expect("built").index)
         };
         let limit = req.limit.min(50) as usize;
         let found = match req.kind {
@@ -539,6 +541,34 @@ impl Session {
                 logical: e.logical,
             })
             .collect())
+    }
+
+    /// Rebuilds the completion index on another thread, unless that's
+    /// already happening; `revision` is the scan's when asked, which the
+    /// index reflects at least.
+    fn refresh_names(&self, revision: u64) {
+        if self.names_building.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let tree = Arc::downgrade(&self.scan.tree());
+        let names = Arc::clone(&self.names);
+        let building = Arc::clone(&self.names_building);
+        let spawned = std::thread::Builder::new()
+            .name("sb-names".into())
+            .spawn(move || {
+                let _timing = metrics::command("suggest_index");
+                let built = tree.upgrade().map(|t| build_names(&t, || revision));
+                if let (Some(Ok(built)), Ok(mut names)) = (built, names.lock()) {
+                    // A request may have built a newer one meanwhile.
+                    if names.as_ref().is_none_or(|n| n.revision <= revision) {
+                        *names = Some(built);
+                    }
+                }
+                building.store(false, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            self.names_building.store(false, Ordering::SeqCst);
+        }
     }
 
     /// A page of the items merged into a small-items region.
@@ -1046,6 +1076,26 @@ impl Drop for Session {
         self.filter.stop();
         if let Ok(Some(job)) = self.duplicates.get_mut().map(Option::take) {
             job.cancel();
+        }
+    }
+}
+
+/// Builds the completion index from `tree` a step at a time, releasing the
+/// lock in between; `revision` is read with it held at the last step and
+/// kept with the index.
+fn build_names(tree: &RwLock<Tree>, revision: impl Fn() -> u64) -> Result<Names, String> {
+    let mut builder = suggest::Builder::default();
+    loop {
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        let _index = metrics::span("index");
+        if builder.step(&tree, NAMES_STEP) {
+            let revision = revision();
+            drop(tree);
+            return Ok(Names {
+                revision,
+                built: Instant::now(),
+                index: Arc::new(builder.finish()),
+            });
         }
     }
 }
