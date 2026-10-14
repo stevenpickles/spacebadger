@@ -4,15 +4,18 @@
 //! ```text
 //! cargo run --release -p sb-bench -- [--nodes N]... [--seed S]
 //! cargo run --release -p sb-bench -- [--wide N]... [--wide-slow N]... [--wide-dir PATH]...
+//! cargo run --release -p sb-bench -- [--lod N]...
 //! ```
 //!
 //! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
 //! synthetic folder of N entries through the scan engine, `--wide-slow` the
 //! same folder listed slower than the engine adds it, and `--wide-dir` a
-//! real folder with the native adapter (see [`wide`]). Each case is measured
+//! real folder with the native adapter (see [`wide`]). `--lod` lays out a
+//! folder of N equal small files and a mixed tree of N nodes (see [`lod`]). Each case is measured
 //! in a fresh child process so peak memory belongs to that case alone.
 //! Real-disk scans are otherwise measured with the `sb-scan` `scan` example.
 
+mod lod;
 mod memory;
 mod synth;
 mod wide;
@@ -26,6 +29,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[global_allocator]
+static ALLOC: lod::Counting = lod::Counting;
+
 const DEFAULT_SIZES: [usize; 2] = [1_000_000, 5_000_000];
 
 /// One measurement, run in its own process.
@@ -34,6 +40,7 @@ enum Case {
     Wide(usize),
     WideSlow(usize),
     WideDir(PathBuf),
+    Lod(usize),
 }
 
 impl Case {
@@ -43,6 +50,7 @@ impl Case {
             Self::Wide(n) => ["--wide".into(), n.to_string()],
             Self::WideSlow(n) => ["--wide-slow".into(), n.to_string()],
             Self::WideDir(p) => ["--wide-dir".into(), p.display().to_string()],
+            Self::Lod(n) => ["--lod".into(), n.to_string()],
         }
     }
 }
@@ -65,11 +73,12 @@ fn main() {
             "--wide" => cases.push(Case::Wide(value() as usize)),
             "--wide-slow" => cases.push(Case::WideSlow(value() as usize)),
             "--wide-dir" => cases.push(Case::WideDir(PathBuf::from(text()))),
+            "--lod" => cases.push(Case::Lod(value() as usize)),
             "--seed" => seed = value(),
             "--child" => child = true,
             _ => panic!(
                 "unknown argument {arg}; usage: sb-bench [--nodes N]... [--wide N]... \
-                 [--wide-slow N]... [--wide-dir PATH]... [--seed S]"
+                 [--wide-slow N]... [--wide-dir PATH]... [--lod N]... [--seed S]"
             ),
         }
     }
@@ -83,6 +92,7 @@ fn main() {
                 Case::Wide(n) => wide::synthetic(*n),
                 Case::WideSlow(n) => wide::synthetic_slow(*n),
                 Case::WideDir(p) => wide::real(p),
+                Case::Lod(n) => lod::run(*n, seed),
             }
         }
         return;
