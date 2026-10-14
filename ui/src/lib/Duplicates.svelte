@@ -213,16 +213,16 @@
    * less than their content: sparse or compressed files, other hard-link
    * names, and shared storage. */
   const onDisk = $derived.by(() => {
-    if (status.onDiskUnknown === 0) return `at most ${formatBytes(status.reclaimableOnDisk)} on disk`;
+    if (status.onDiskUnknown === 0) return `up to ${formatBytes(status.reclaimableOnDisk)} on disk`;
     if (status.onDiskUnknown === status.groups) return "space on disk unknown";
-    return `at most ${formatBytes(status.reclaimableOnDisk)} on disk in ${plural(status.groups - status.onDiskUnknown, "group")}; unknown for the rest`;
+    return `up to ${formatBytes(status.reclaimableOnDisk)} on disk in ${plural(status.groups - status.onDiskUnknown, "group")}; unknown for the rest`;
   });
   const onDiskTitle =
     "Deleting may free less than the content: sparse and compressed files take less space, a file with other hard-link names frees nothing until every name goes, and storage shared by block cloning or deduplication stays in use. Unknown where a copy's allocation is unknown or it has other names.";
 
   function groupTitle(g: DuplicateGroup): string {
     const content = `${exactBytes(g.size * (g.files.length - 1))} of content in the copies beyond the first`;
-    const disk = g.onDisk === null ? "space on disk unknown" : `at most ${exactBytes(g.onDisk)} on disk`;
+    const disk = g.onDisk === null ? "space on disk unknown" : `up to ${exactBytes(g.onDisk)} on disk`;
     return `${content}; ${disk}`;
   }
 

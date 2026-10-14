@@ -98,7 +98,7 @@ pub struct DuplicatesStatus {
     #[ts(type = "number")]
     pub reclaimable: u64,
     /// Of the groups with a known [`DuplicateGroup::on_disk`], the space
-    /// their copies beyond the first take on disk, at most.
+    /// their copies beyond the first could free on disk: up to this much.
     #[ts(type = "number")]
     pub reclaimable_on_disk: u64,
     /// Groups whose space on disk can't be estimated.
@@ -129,8 +129,8 @@ pub struct DuplicateGroup {
     /// Each file's size: the length of its contents.
     #[ts(type = "number")]
     pub size: u64,
-    /// The most space on disk deleting all but the largest copy could
-    /// free, from the scan's allocated sizes. `None` when a copy's
+    /// The most space on disk deleting all but one copy could free: the
+    /// scan's allocated sizes, less the smallest. `None` when a copy's
     /// allocation is unknown or a copy has other hard-link names. Shared
     /// storage (block cloning, deduplication) can make it less still.
     #[ts(type = "number | null")]

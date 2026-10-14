@@ -50,7 +50,7 @@ files: number,
 reclaimable: number, 
 /**
  * Of the groups with a known [`DuplicateGroup::on_disk`], the space
- * their copies beyond the first take on disk, at most.
+ * their copies beyond the first could free on disk: up to this much.
  */
 reclaimableOnDisk: number, 
 /**

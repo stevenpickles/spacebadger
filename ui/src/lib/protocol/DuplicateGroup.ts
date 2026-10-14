@@ -10,8 +10,8 @@ export type DuplicateGroup = {
  */
 size: number, 
 /**
- * The most space on disk deleting all but the largest copy could
- * free, from the scan's allocated sizes. `None` when a copy's
+ * The most space on disk deleting all but one copy could free: the
+ * scan's allocated sizes, less the smallest. `None` when a copy's
  * allocation is unknown or a copy has other hard-link names. Shared
  * storage (block cloning, deduplication) can make it less still.
  */

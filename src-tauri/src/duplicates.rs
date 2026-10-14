@@ -533,10 +533,11 @@ fn has_other_names(tree: &Tree, n: NodeId, print: &Fingerprint) -> bool {
     tree.flags(n) & flags::HARDLINKED != 0 || print.links.is_some_and(|l| l > 1)
 }
 
-/// The most space on disk deleting all but the largest copy could free:
-/// the copies' allocated sizes as scanned, less the largest. `None` when a
-/// copy's allocation is unknown, or a copy has other names (deleting it
-/// may free nothing) or an unknown number of them.
+/// The most space on disk deleting all but one copy could free: the
+/// copies' allocated sizes as scanned, less the smallest (keeping that one
+/// frees the most). `None` when a copy's allocation is unknown, or a copy
+/// has other names (deleting it may free nothing) or an unknown number of
+/// them.
 fn on_disk(tree: &Tree, g: &Group) -> Option<u64> {
     let mut sizes = Vec::with_capacity(g.files.len());
     for (&n, print) in g.files.iter().zip(&g.prints) {
@@ -545,8 +546,8 @@ fn on_disk(tree: &Tree, g: &Group) -> Option<u64> {
         }
         sizes.push(tree.file_allocated(n).get()?);
     }
-    let largest = sizes.iter().copied().max().unwrap_or(0);
-    Some(sizes.iter().sum::<u64>() - largest)
+    let smallest = sizes.iter().copied().min().unwrap_or(0);
+    Some(sizes.iter().sum::<u64>() - smallest)
 }
 
 #[cfg(test)]
@@ -619,7 +620,7 @@ mod tests {
         let known = Allocated::known;
         let g = group(&mut tree, &[known(4096), known(4096), known(1024)]);
         assert_eq!(reclaimable(&g), 8192, "content in the extra copies");
-        assert_eq!(on_disk(&tree, &g), Some(5120), "all but the largest");
+        assert_eq!(on_disk(&tree, &g), Some(8192), "all but the smallest");
 
         // Sparse or compressed: little on disk, whatever the length.
         let sparse = group(&mut tree, &[known(0), known(0)]);
