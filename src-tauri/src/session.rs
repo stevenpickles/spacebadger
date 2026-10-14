@@ -477,6 +477,7 @@ impl Session {
             total: total as u32,
             files,
             empty: cached.empty as u32,
+            revision,
         })
     }
 
@@ -532,6 +533,7 @@ impl Session {
             locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
         let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
+        let revision = self.scan.progress().revision;
         let folder = node(&tree, req.folder)?;
         let filter = match req.search {
             Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
@@ -565,6 +567,7 @@ impl Session {
                 })
                 .collect(),
             empty: empty as u32,
+            revision,
         })
     }
 
