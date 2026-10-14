@@ -774,7 +774,7 @@
     const folder = l.kind[i] === KIND_FOLDER;
     const lines: (string | null)[] = [size];
     if (folder) lines.push(d ? plural(d.files, "file") : null);
-    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned yet");
+    if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned");
     if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
     return { title: d?.name ?? l.labels.get(i) ?? "", path: d ? d.path : null, lines };
   });

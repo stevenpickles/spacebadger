@@ -2,13 +2,20 @@
 //! aggregator thread owns all writes to the [`Tree`].
 //!
 //! - Workers only call the adapter; they never touch the tree.
-//! - Results flow through a bounded channel, so slow aggregation applies
-//!   backpressure to listing instead of buffering without limit.
+//! - Listings arrive in batches of at most
+//!   [`BATCH_ENTRIES`](crate::adapter::BATCH_ENTRIES) entries through a
+//!   bounded channel, so slow aggregation applies backpressure to listing
+//!   instead of buffering without limit, and memory stays bounded however
+//!   wide a directory is. The aggregator takes the tree's write lock once
+//!   per batch, so readers wait at most one batch.
+//! - A directory becomes [`DirState::Listed`] only after its last batch; one
+//!   whose listing fails part way keeps the entries already added and is
+//!   marked as having unreadable entries.
 //! - Progress is coalesced and published at most once per interval.
-//! - Cancellation is a flag checked by workers before each job and by the
-//!   aggregator at least every [`CANCEL_POLL`]; the aggregator stops without
-//!   waiting for OS calls already in flight, so a blocked network listing
-//!   cannot delay it.
+//! - Cancellation is a flag checked by workers before each job and between
+//!   batches, and by the aggregator between batches and at least every
+//!   [`CANCEL_POLL`]; the aggregator stops without waiting for OS calls
+//!   already in flight, so a blocked network listing cannot delay it.
 
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
@@ -17,6 +24,7 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
@@ -321,10 +329,18 @@ enum Job {
 }
 
 enum Outcome {
+    /// Some of a directory's entries; more batches or its end may follow.
+    Batch {
+        dir: NodeId,
+        path: PathBuf,
+        entries: Vec<Entry>,
+    },
+    /// A directory's listing ended, with its last batch (if any).
     Listed {
         dir: NodeId,
         path: PathBuf,
-        result: Result<Vec<Entry>, ScanError>,
+        entries: Vec<Entry>,
+        result: Result<(), ScanError>,
     },
     Measured {
         file: NodeId,
@@ -332,6 +348,8 @@ enum Outcome {
     },
     /// The worker saw the cancel flag and didn't run the job.
     Skipped,
+    /// The worker saw the cancel flag part way through listing `dir`.
+    Stopped { dir: NodeId },
 }
 
 #[derive(Default)]
@@ -381,6 +399,8 @@ struct Aggregator<A> {
     pending_dirs: u64,
     owners: HashMap<u128, NodeId>,
     remeasured: HashSet<NodeId>,
+    /// Directories with batches applied whose listing hasn't ended yet.
+    partial: HashSet<NodeId>,
     omissions: Omissions,
     revision: u64,
     published_revision: u64,
@@ -411,6 +431,7 @@ impl<A: FsAdapter> Aggregator<A> {
             pending_dirs: 0,
             owners: HashMap::new(),
             remeasured: HashSet::new(),
+            partial: HashSet::new(),
             omissions: Omissions::default(),
             revision: 0,
             published_revision: 0,
@@ -472,6 +493,11 @@ impl<A: FsAdapter> Aggregator<A> {
             if self.stop.is_some() {
                 continue;
             }
+            // A cancel that arrived while the last outcome was applied may
+            // have cut work short; the top of the loop reports it.
+            if self.cancelled() {
+                continue;
+            }
             if self.outstanding == 0 {
                 self.queue.close();
                 let state = if self.omissions.total() == 0 {
@@ -506,8 +532,40 @@ impl<A: FsAdapter> Aggregator<A> {
                     } else {
                         match job {
                             Job::List { dir, path } => {
-                                let result = adapter.read_dir(&path);
-                                Outcome::Listed { dir, path, result }
+                                // Each batch goes to the aggregator once the
+                                // next is read, so the last one travels with
+                                // the listing's end (most directories fit in
+                                // one). The cancel flag ends the listing.
+                                let mut held = None;
+                                let mut stopped = false;
+                                let result = adapter.read_dir(&path, &mut |entries| {
+                                    if shared.cancel.load(Ordering::Relaxed) {
+                                        stopped = true;
+                                        return ControlFlow::Break(());
+                                    }
+                                    if let Some(entries) = held.replace(entries) {
+                                        let batch = Outcome::Batch {
+                                            dir,
+                                            path: path.clone(),
+                                            entries,
+                                        };
+                                        if tx.send(batch).is_err() {
+                                            stopped = true;
+                                            return ControlFlow::Break(());
+                                        }
+                                    }
+                                    ControlFlow::Continue(())
+                                });
+                                if stopped {
+                                    Outcome::Stopped { dir }
+                                } else {
+                                    Outcome::Listed {
+                                        dir,
+                                        path,
+                                        entries: held.unwrap_or_default(),
+                                        result,
+                                    }
+                                }
                             }
                             Job::Measure { file, path } => Outcome::Measured {
                                 file,
@@ -535,12 +593,36 @@ impl<A: FsAdapter> Aggregator<A> {
     }
 
     fn apply(&mut self, outcome: Outcome) {
-        self.outstanding -= 1;
+        // A batch is part of a job, not its end.
+        if !matches!(outcome, Outcome::Batch { .. }) {
+            self.outstanding -= 1;
+        }
         match outcome {
-            Outcome::Listed { dir, path, result } => {
+            Outcome::Batch { dir, path, entries } => {
+                self.partial.insert(dir);
+                self.apply_batch(dir, &path, entries);
+                self.revision += 1;
+            }
+            Outcome::Listed {
+                dir,
+                path,
+                entries,
+                result,
+            } => {
                 self.pending_dirs -= 1;
+                let partial = self.partial.remove(&dir) || !entries.is_empty();
+                if !entries.is_empty() {
+                    self.apply_batch(dir, &path, entries);
+                }
+                if self.stop.is_some() {
+                    return;
+                }
                 match result {
-                    Ok(entries) => self.apply_listing(dir, &path, entries),
+                    Ok(()) => self
+                        .tree
+                        .write()
+                        .unwrap()
+                        .set_dir_state(dir, DirState::Listed),
                     Err(err) => {
                         let reason = OmissionReason::from_error(err.kind);
                         self.omissions
@@ -548,19 +630,32 @@ impl<A: FsAdapter> Aggregator<A> {
                                 path: path.clone(),
                                 detail: Some(err.message.clone()),
                             });
-                        self.tree
-                            .write()
-                            .unwrap()
-                            .set_dir_state(dir, DirState::Failed);
-                        if dir == NodeId::ROOT {
-                            self.stop = Some(ScanState::Failed(format!(
-                                "The selected folder can't be listed: {}",
-                                err.message
-                            )));
+                        let mut tree = self.tree.write().unwrap();
+                        if partial {
+                            // Listed in part: the entries already added stay,
+                            // and the folder counts as not fully read.
+                            tree.set_dir_state(dir, DirState::Listed);
+                            tree.mark_unreadable_entries(dir);
+                        } else {
+                            tree.set_dir_state(dir, DirState::Failed);
+                            if dir == NodeId::ROOT {
+                                self.stop = Some(ScanState::Failed(format!(
+                                    "The selected folder can't be listed: {}",
+                                    err.message
+                                )));
+                            }
                         }
                     }
                 }
                 self.revision += 1;
+            }
+            Outcome::Stopped { dir } => {
+                // Left pending, so it ends up as not scanned. Work dropped
+                // for a cancel means the scan is cancelled, even if this was
+                // the last of it.
+                self.pending_dirs -= 1;
+                self.partial.remove(&dir);
+                self.stop.get_or_insert(ScanState::Cancelled);
             }
             Outcome::Measured { file, result } => {
                 // A failed re-measure keeps the listing's values.
@@ -573,18 +668,38 @@ impl<A: FsAdapter> Aggregator<A> {
                     self.revision += 1;
                 }
             }
-            Outcome::Skipped => {}
+            Outcome::Skipped => {
+                self.stop.get_or_insert(ScanState::Cancelled);
+            }
         }
     }
 
-    fn apply_listing(&mut self, dir: NodeId, path: &Path, entries: Vec<Entry>) {
+    /// Adds one batch of `dir`'s entries under one hold of the write lock,
+    /// then queues the subdirectories and re-measures it found.
+    fn apply_batch(&mut self, dir: NodeId, path: &Path, entries: Vec<Entry>) {
+        if self.stop.is_some() {
+            return;
+        }
         let limit = self.config.sample_limit;
         let mut subdirs = Vec::new();
         let mut remeasure = Vec::new();
+        // Hard-link owners are looked up before taking the lock and new
+        // owners recorded after releasing it: the map holds an entry per file
+        // on Windows, and growing it at millions of entries takes long enough
+        // to stall readers. Names sharing a file within this batch are
+        // matched under the lock through a map bounded by the batch.
+        let known: Vec<Option<NodeId>> = entries
+            .iter()
+            .map(|e| match e.identity {
+                Identity::MaybeShared { key } => self.owners.get(&key).copied(),
+                _ => None,
+            })
+            .collect();
+        let mut first_names: HashMap<u128, NodeId> = HashMap::new();
         let tree_lock = Arc::clone(&self.tree);
         let mut tree = tree_lock.write().unwrap();
         let mut unreadable = false;
-        for entry in entries {
+        for (entry, known) in entries.into_iter().zip(known) {
             let skipped = match entry.kind {
                 EntryKind::File | EntryKind::Directory => None,
                 EntryKind::Symlink => Some(OmissionReason::Symlink),
@@ -615,22 +730,25 @@ impl<A: FsAdapter> Aggregator<A> {
                 tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
                     .map(|id| {
                         tree.set_id(id, fingerprint(entry.id));
-                        if let Identity::MaybeShared { key } = entry.identity {
-                            match self.owners.entry(key) {
+                        let Identity::MaybeShared { key } = entry.identity else {
+                            return;
+                        };
+                        let owner = match known {
+                            Some(owner) => owner,
+                            None => match first_names.entry(key) {
                                 MapEntry::Vacant(v) => {
                                     v.insert(id);
+                                    return;
                                 }
-                                MapEntry::Occupied(o) => {
-                                    let owner = *o.get();
-                                    tree.mark_alias(id, owner);
-                                    // Listings of other names can be stale (NTFS),
-                                    // so re-measure both sides once.
-                                    remeasure.push(id);
-                                    if self.remeasured.insert(owner) {
-                                        remeasure.push(owner);
-                                    }
-                                }
-                            }
+                                MapEntry::Occupied(o) => *o.get(),
+                            },
+                        };
+                        tree.mark_alias(id, owner);
+                        // Listings of other names can be stale (NTFS), so
+                        // re-measure both sides once.
+                        remeasure.push((id, tree.path(id)));
+                        if self.remeasured.insert(owner) {
+                            remeasure.push((owner, tree.path(owner)));
                         }
                     })
             };
@@ -643,12 +761,11 @@ impl<A: FsAdapter> Aggregator<A> {
                 break;
             }
         }
-        tree.set_dir_state(dir, DirState::Listed);
         if unreadable {
             tree.mark_unreadable_entries(dir);
         }
-        let remeasure: Vec<_> = remeasure.into_iter().map(|n| (n, tree.path(n))).collect();
         drop(tree);
+        self.owners.extend(first_names);
         if self.stop.is_some() {
             return;
         }

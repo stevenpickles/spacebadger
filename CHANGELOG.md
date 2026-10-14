@@ -33,6 +33,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - The Duplicates tab lists groups as they're found, most content in extra copies first, with progress and a Stop button that keeps what was found. Choose the smallest file size to look at, from 1 KB to 100 MB (1 MB to start). The space deleting them would free on disk is estimated only where it's known (no unknown allocation or other hard-link names), since sparse, compressed, and linked files can free much less. Files written to while being read are left out.
 - Select duplicates like any other items, or use "Select all but the first" to select every copy except the one with the shortest path in each group. Deleting still goes through the guarded delete, which warns if a group would lose every copy, and deleted files leave their groups. Before moving anything, the delete checks each duplicate you selected itself and reads the copies meant to stay again in full, with progress and a way to stop, keeping a selected duplicate that changed or whose other copy can't be confirmed unchanged; on Windows the confirmed copy is held until the moves are done. Duplicates inside a selected folder go with the folder.
 
+### Scanning
+- Folders holding hundreds of thousands of files are read a few thousand at a time: the map stays responsive while they're read, Cancel takes effect at once, and they take about half the memory they did.
+
 ### Packages
 - winget and Chocolatey packages of the portable Windows download, generated for each release: `winget install StevenPickles.SpaceBadger` and `choco install spacebadger` once they're accepted. Both add a `spacebadger` command.
 

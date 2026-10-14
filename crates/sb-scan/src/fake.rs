@@ -1,7 +1,7 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -32,6 +32,10 @@ pub struct FakeFs {
     nodes: Arc<Mutex<BTreeMap<PathBuf, Node>>>,
     errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
     gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Listings that fail after this many entries.
+    late_errors: Arc<Mutex<BTreeMap<PathBuf, (usize, ScanError)>>>,
+    /// Listings that block after this many entries.
+    late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
@@ -172,6 +176,32 @@ impl FakeFs {
         Gate(tx)
     }
 
+    /// Makes listing `path` fail after its first `entries` entries (in name
+    /// order) were handed over.
+    pub fn fail_dir_after(&self, path: &str, entries: usize, kind: ErrorKind) -> &Self {
+        self.dir(path);
+        self.late_errors
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), (entries, ScanError::new(kind, "injected")));
+        self
+    }
+
+    /// Makes listing `path` block after its first `entries` entries (in name
+    /// order) were handed over, until the returned gate is released or
+    /// dropped. Entries are handed over in whole batches, so `entries` should
+    /// be a multiple of [`BATCH_ENTRIES`](crate::adapter::BATCH_ENTRIES) for
+    /// all of them to arrive first.
+    pub fn gate_dir_after(&self, path: &str, entries: usize) -> Gate {
+        self.dir(path);
+        let (tx, rx) = channel();
+        self.late_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), (entries, Arc::new(Mutex::new(rx))));
+        Gate(tx)
+    }
+
     /// Sets what [`FsAdapter::measure_file`] returns for `path`.
     pub fn set_measured(&self, path: &str, logical: u64, allocated: u64) -> &Self {
         self.measured.lock().unwrap().insert(
@@ -207,7 +237,7 @@ impl FsAdapter for FakeFs {
         }
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
             let _ = gate.lock().unwrap().recv();
@@ -215,8 +245,50 @@ impl FsAdapter for FakeFs {
         if let Some(err) = self.errors.lock().unwrap().get(dir) {
             return Err(err.clone());
         }
+        let late_error = self.late_errors.lock().unwrap().get(dir).cloned();
+        let late_gate = self.late_gates.lock().unwrap().get(dir).cloned();
+        let entries = self.entries(dir);
+        batched(sink, |out| {
+            for (i, entry) in entries.into_iter().enumerate() {
+                if let Some((at, err)) = &late_error
+                    && i == *at
+                {
+                    return Err(err.clone());
+                }
+                if let Some((at, gate)) = &late_gate
+                    && i == *at
+                {
+                    let _ = gate.lock().unwrap().recv();
+                }
+                if out.push(entry).is_break() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        if let Some(m) = self.measured.lock().unwrap().get(file) {
+            return Ok(*m);
+        }
+        match self.nodes.lock().unwrap().get(file) {
+            Some(Node::File {
+                logical, allocated, ..
+            }) => Ok(Measured {
+                logical: *logical,
+                allocated: *allocated,
+            }),
+            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
+        }
+    }
+}
+
+impl FakeFs {
+    /// The direct children of `dir` in name order.
+    fn entries(&self, dir: &Path) -> Vec<Entry> {
         let nodes = self.nodes.lock().unwrap();
-        let entries = nodes
+        nodes
             .iter()
             .filter(|(p, _)| p.parent() == Some(dir))
             .map(|(p, node)| {
@@ -264,22 +336,6 @@ impl FsAdapter for FakeFs {
                     },
                 }
             })
-            .collect();
-        Ok(entries)
-    }
-
-    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        if let Some(m) = self.measured.lock().unwrap().get(file) {
-            return Ok(*m);
-        }
-        match self.nodes.lock().unwrap().get(file) {
-            Some(Node::File {
-                logical, allocated, ..
-            }) => Ok(Measured {
-                logical: *logical,
-                allocated: *allocated,
-            }),
-            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
-        }
+            .collect()
     }
 }

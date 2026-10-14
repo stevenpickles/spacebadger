@@ -47,6 +47,7 @@ cargo test --workspace       # core tests (also regenerates ui/src/lib/protocol/
 npm run check                # type-check the interface
 npx tauri build              # release build (macOS app, Linux AppImage); add --no-bundle on Windows
 cargo run --release -p sb-bench   # scale benchmark: 1M and 5M synthetic nodes
+cargo run --release -p sb-bench -- --wide 5000000   # scanning one folder of 5M entries
 ```
 
 The app also accepts a folder to scan on start: `spacebadger <folder>` (for example `target\debug\spacebadger.exe C:\Users\me`).

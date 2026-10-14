@@ -10,7 +10,8 @@
 //!   report neither attribute fall back to `/proc/self/mountinfo`.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
+    batched,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use rustix::fs::{
@@ -148,7 +149,29 @@ impl FsAdapter for LinuxFs {
         Ok(kind)
     }
 
-    fn read_dir(&self, dir: &Path) -> Result<Vec<Entry>, ScanError> {
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        batched(sink, |out| self.list(dir, out))
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        let stx = statx(CWD, file, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(error)?;
+        if kind_of(&stx) != FileType::RegularFile {
+            return Err(ScanError::new(
+                ErrorKind::Vanished,
+                "no longer a regular file",
+            ));
+        }
+        Ok(Measured {
+            logical: stx.stx_size,
+            allocated: Some(stx.stx_blocks.saturating_mul(512)),
+        })
+    }
+}
+
+impl LinuxFs {
+    /// Reads `dir` with `getdents`, `statx`ing each entry and passing it on
+    /// at once; stops early when the batcher says so.
+    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let boundary = self.boundary();
         let fd = openat(
             CWD,
@@ -157,7 +180,6 @@ impl FsAdapter for LinuxFs {
             Mode::empty(),
         )
         .map_err(error)?;
-        let mut entries = Vec::new();
         for item in Dir::read_from(fd.as_fd()).map_err(error)? {
             let item = item.map_err(error)?;
             let name: &CStr = item.file_name();
@@ -169,7 +191,7 @@ impl FsAdapter for LinuxFs {
                 Ok(stx) => stx,
                 Err(err) => {
                     let kind = error(err).kind;
-                    entries.push(Entry {
+                    let failed = Entry {
                         name: os_name,
                         kind: EntryKind::Failed(kind),
                         logical: 0,
@@ -178,7 +200,10 @@ impl FsAdapter for LinuxFs {
                         id: 0,
                         cloud: false,
                         modified: None,
-                    });
+                    };
+                    if out.push(failed).is_break() {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -204,7 +229,7 @@ impl FsAdapter for LinuxFs {
                 }
                 _ => EntryKind::Special,
             };
-            entries.push(Entry {
+            let entry = Entry {
                 name: os_name,
                 kind,
                 logical: stx.stx_size,
@@ -220,23 +245,12 @@ impl FsAdapter for LinuxFs {
                 id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
                 modified: modified(&stx),
-            });
+            };
+            if out.push(entry).is_break() {
+                return Ok(());
+            }
         }
-        Ok(entries)
-    }
-
-    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        let stx = statx(CWD, file, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(error)?;
-        if kind_of(&stx) != FileType::RegularFile {
-            return Err(ScanError::new(
-                ErrorKind::Vanished,
-                "no longer a regular file",
-            ));
-        }
-        Ok(Measured {
-            logical: stx.stx_size,
-            allocated: Some(stx.stx_blocks.saturating_mul(512)),
-        })
+        Ok(())
     }
 }
 
