@@ -709,6 +709,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One group of 200,000 identical small files found among 20,000 groups
+    /// of two: how long a status (sent every 250 ms while reading) and a
+    /// list take, and how much the list sends. Run by hand:
+    /// `cargo test --release -p spacebadger duplicates_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn duplicates_at_scale() {
+        const HUGE: usize = 200_000;
+        const PAIRS: usize = 20_000;
+        let mut tree = Tree::new("/r");
+        let sizes = |logical| FileSizes {
+            logical,
+            allocated: Allocated::known(logical.next_multiple_of(4096)),
+        };
+        let generated = tree.add_dir(NodeId::ROOT, "generated".as_ref()).unwrap();
+        let mut folder = generated;
+        let mut huge = Vec::with_capacity(HUGE);
+        for i in 0..HUGE {
+            if i % 1000 == 0 {
+                let name = format!("batch-{:03}", i / 1000);
+                folder = tree.add_dir(generated, name.as_ref()).unwrap();
+            }
+            let name = format!("part-{i:06}.tmp");
+            huge.push(
+                tree.add_file(folder, name.as_ref(), sizes(1500), None, 0)
+                    .unwrap(),
+            );
+        }
+        let photos = tree.add_dir(NodeId::ROOT, "photos".as_ref()).unwrap();
+        let backup = tree.add_dir(NodeId::ROOT, "backup".as_ref()).unwrap();
+        let mut pairs = Vec::with_capacity(PAIRS);
+        for i in 0..PAIRS {
+            let name = format!("IMG_{i:05}.jpg");
+            let size = sizes(2_000_000 + i as u64);
+            let a = tree.add_file(photos, name.as_ref(), size, None, 0).unwrap();
+            let b = tree.add_file(backup, name.as_ref(), size, None, 0).unwrap();
+            pairs.push((size.logical, [a, b]));
+        }
+        let found = |size, files: Vec<NodeId>| {
+            Event::Found(Group {
+                size,
+                digest: [0; 32],
+                prints: (0..files.len())
+                    .map(|i| print(i as u128, Some(1)))
+                    .collect(),
+                files,
+            })
+        };
+        let scope = Scope {
+            generation: 1,
+            folder: 0,
+            path: "/r".into(),
+            query: None,
+            min_size: 1,
+        };
+        let job = Job::new(1, scope, Plan::default());
+        for (size, files) in pairs {
+            job.record(found(size, files.to_vec()));
+        }
+        job.record(found(1500, huge));
+
+        let time = |what: &str, runs: u32, f: &dyn Fn() -> usize| {
+            let start = Instant::now();
+            let mut out = 0;
+            for _ in 0..runs {
+                out = f();
+            }
+            let each = start.elapsed() / runs;
+            println!("{what}: {each:.1?} each, {out}");
+        };
+        time("status", 5, &|| job.status(&tree, 0).groups as usize);
+        time("list", 3, &|| {
+            let list = job.list(&tree, 0);
+            let files: usize = list.groups.iter().map(|g| g.files.len()).sum();
+            let json = serde_json::to_vec(&list).unwrap().len();
+            println!(
+                "  list: {} groups, {files} files, {json} bytes as JSON",
+                list.groups.len()
+            );
+            files
+        });
+    }
+
     #[test]
     fn space_on_disk_is_estimated_only_when_every_copy_is_known() {
         let mut tree = Tree::new("/r");
