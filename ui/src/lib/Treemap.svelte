@@ -6,6 +6,7 @@
   // for it, folded into one follow-up request (natural backpressure).
   import { announce } from "./announce.svelte";
   import { changeMarks, nodeDetails, requestLayout } from "./api";
+  import type { Lane } from "./protocol/Lane";
   import { Lanes, latest, queryKey } from "./request";
   import {
     changeColor,
@@ -214,10 +215,13 @@
   let marks = $state.raw<{ layout: DecodedLayout; compare: string; bytes: Uint8Array } | null>(null);
   const changeMode = $derived(colors === "change" && compare !== null);
 
-  async function fetchMarks(l: DecodedLayout, cmp: string): Promise<Uint8Array> {
+  async function fetchMarks(l: DecodedLayout, cmp: string, lane: Lane): Promise<Uint8Array> {
     const nodes = Array.from(l.node.subarray(0, l.count));
-    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }));
+    return new Uint8Array(await changeMarks({ generation: l.generation, snapshot: cmp, nodes }, lane));
   }
+
+  /** Marks for the map already drawn: newer ones supersede older ones. */
+  const marksLane = new Lanes();
 
   // Switching to change colors, or to another comparison, marks the map
   // already drawn; new layouts come with their marks (see fetchLayout).
@@ -225,7 +229,7 @@
     const l = layout;
     const cmp = changeMode ? compare : null;
     if (!l || cmp === null || (marks?.layout === l && marks.compare === cmp)) return;
-    fetchMarks(l, cmp).then(
+    fetchMarks(l, cmp, marksLane.next()).then(
       (bytes) => {
         if (layout === l && compare === cmp) marks = { layout: l, compare: cmp, bytes };
       },
@@ -259,7 +263,8 @@
         // flash in neutral colors first.
         const cmp = changeMode ? compare : null;
         let replyMarks: Uint8Array | null = null;
-        if (cmp !== null) replyMarks = await fetchMarks(reply, cmp).catch(() => null);
+        // Asked in the layout's lane, so another view supersedes them too.
+        if (cmp !== null) replyMarks = await fetchMarks(reply, cmp, lane).catch(() => null);
         return { reply, cmp, replyMarks, started };
       },
       ({ reply, cmp, replyMarks, started }) => {
