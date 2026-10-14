@@ -497,8 +497,10 @@ impl Tree {
     /// Direct children, most recently added first.
     pub fn children(&self, node: NodeId) -> Children<'_> {
         Children {
-            tree: self,
+            next_sibling: &self.next_sibling,
             next: *self.first_child.at(self.checked(node)),
+            // The root's chunk; every tree has it.
+            chunk: (0, &self.next_sibling.chunks[0]),
         }
     }
 
@@ -801,8 +803,13 @@ pub fn fingerprint(id: u128) -> u64 {
 }
 
 pub struct Children<'a> {
-    tree: &'a Tree,
+    next_sibling: &'a Column<u32>,
     next: u32,
+    /// The chunk of sibling links the last child was found in, by index.
+    /// Siblings are mostly added together, so the next one is usually in
+    /// the same chunk; reusing it keeps walking a long list to one
+    /// dependent load per child instead of two (the chunk, then the link).
+    chunk: (usize, &'a [u32; CHUNK]),
 }
 
 impl Iterator for Children<'_> {
@@ -812,9 +819,12 @@ impl Iterator for Children<'_> {
         if self.next == NONE {
             return None;
         }
-        let id = NodeId(self.next);
-        self.next = self.tree.next_sibling(id).map_or(NONE, |n| n.0);
-        Some(id)
+        let i = self.next as usize;
+        if self.chunk.0 != i >> CHUNK_BITS {
+            self.chunk = (i >> CHUNK_BITS, &self.next_sibling.chunks[i >> CHUNK_BITS]);
+        }
+        self.next = self.chunk.1[i & SLOT];
+        Some(NodeId(i as u32))
     }
 }
 
