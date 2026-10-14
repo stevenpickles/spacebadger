@@ -38,11 +38,14 @@ const STATUS_EVERY: Duration = Duration::from_millis(150);
 /// A tooltip is asked for about this often while the pointer moves.
 const HOVER_EVERY: Duration = Duration::from_millis(50);
 
-/// A pointer sweeping across small tiles asks for a tooltip this often.
+/// The stress case's tooltips, one this often without waiting. The
+/// interface asks only after the pointer rests for 120 ms; this is far
+/// faster, to make tooltips overtake each other.
 const SWEEP_HOVER_EVERY: Duration = Duration::from_millis(5);
 
-/// A map being resized asks for a layout this often: faster than a layout
-/// takes, as several resize events a frame or a slower machine make it.
+/// The stress case's layouts, one this often without waiting: faster than
+/// a layout takes. The interface coalesces a resize into one request at a
+/// time; this stands for work arriving faster than it can be done.
 const SWEEP_RESIZE_EVERY: Duration = Duration::from_millis(4);
 
 /// How long to go on after the scan finishes, for the settled numbers.
@@ -240,7 +243,9 @@ struct Scenario {
     name: &'static str,
     filter: Filter,
     contents: Contents,
-    /// Adds a pointer sweeping across tiles and a map being resized, whose
+    /// Adds a synthetic stress case: tooltips and layouts asked for faster
+    /// than they're answered, each superseding the last (see
+    /// [`SWEEP_HOVER_EVERY`] and [`SWEEP_RESIZE_EVERY`]), whose
     /// requests supersede each other.
     sweep: bool,
 }
@@ -265,9 +270,8 @@ struct How {
     /// thread rather than a runtime worker.
     blocking: bool,
     /// Asked for again before the reply, each time superseding the one
-    /// before (a pointer sweeping across tiles, the map resized or
-    /// navigated quickly); otherwise each waits for the previous reply, like
-    /// the interface's coalescing.
+    /// before (the synthetic floods); otherwise each waits for the previous
+    /// reply, like the interface's coalescing.
     overlap: bool,
 }
 
@@ -575,19 +579,20 @@ fn run(scenario: &Scenario) -> (Vec<Sample>, Duration, usize) {
         ),
     });
     if scenario.sweep {
-        // A pointer sweeping across small tiles: a tooltip for each, the
+        // Stress: tooltips asked for faster than any pointer would, the
         // newest superseding those not answered yet.
         threads.push(spawn(
-            "hover",
+            "tooltip_flood",
             SWEEP_HOVER_EVERY,
             overlaps(Class::Interactive),
             Arc::new(move |s: &Session, rng: &mut Rng| {
                 s.details(rng.below(size(s)) as u32, None).map(drop)
             }),
         ));
-        // A second map being resized: each size supersedes the last.
+        // Stress: a second map's layouts asked for faster than they take,
+        // each superseding the last.
         threads.push(spawn(
-            "resize",
+            "layout_flood",
             SWEEP_RESIZE_EVERY,
             overlaps(Class::View),
             Arc::new(layout(id(), 1200.0)),
@@ -750,7 +755,7 @@ fn interaction_latency_while_scanning() {
             sweep: false,
         },
         Scenario {
-            name: "Filter on, Contents with folders, pointer sweeping and a map resized",
+            name: "Filter on, Contents with folders, plus synthetic tooltip and layout floods",
             filter: Filter::AtStart,
             contents: Contents::Items,
             sweep: true,
