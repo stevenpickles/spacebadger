@@ -24,6 +24,7 @@ use crate::search::Search;
 use crate::tree::{NodeId, Tree};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// While scanning, a ranking of a folder that has changed is made again at
@@ -44,6 +45,9 @@ const MAX_RANKINGS: usize = 16;
 
 /// A ranking's own cost, in items.
 const ENTRY_COST: usize = 16;
+
+/// Numbers walks, so the one being finished can be told from later ones.
+static WALKS: AtomicU64 = AtomicU64::new(1);
 
 /// What a ranking lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +129,7 @@ enum Kept {
 /// Ranking a folder's items, a bounded number of nodes at a time.
 #[derive(Debug)]
 pub struct Walk {
+    id: u64,
     scope: Scope,
     metric: Metric,
     basis: Basis,
@@ -142,6 +147,7 @@ impl Walk {
     /// (`usize::MAX` for all).
     pub fn new(key: Key, basis: Basis, want: usize) -> Self {
         Self {
+            id: WALKS.fetch_add(1, Ordering::Relaxed),
             scope: key.scope,
             metric: key.metric,
             basis,
@@ -159,6 +165,11 @@ impl Walk {
 
     pub fn basis(&self) -> &Basis {
         &self.basis
+    }
+
+    /// Tells this walk (and the ranking it makes) from every other.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// How many items it keeps.
@@ -250,6 +261,7 @@ impl Walk {
             Kept::Top(heap, _) => heap.into_sorted_vec(),
         };
         Ranking {
+            walk: self.id,
             basis: self.basis,
             items: ranked.into_iter().map(|(Reverse(w), n)| (n, w)).collect(),
             weighted: self.weighted,
@@ -261,6 +273,8 @@ impl Walk {
 /// A folder's items largest first, with the weights they were ranked by.
 #[derive(Debug)]
 pub struct Ranking {
+    /// The walk that made it.
+    walk: u64,
     basis: Basis,
     /// The largest items, in order; all of them unless `weighted` is more.
     items: Vec<(NodeId, u64)>,
@@ -271,6 +285,13 @@ pub struct Ranking {
 impl Ranking {
     pub fn basis(&self) -> &Basis {
         &self.basis
+    }
+
+    /// Whether it was made from a later look at the tree than `other`: a
+    /// later revision, after the scan rather than during it, or later.
+    pub fn newer_than(&self, other: &Ranking) -> bool {
+        let order = |b: &Basis| (b.revision, b.finished, b.at);
+        order(&self.basis) > order(&other.basis)
     }
 
     /// Items with a weight, ranked or not.
@@ -313,6 +334,11 @@ pub struct Entry {
     key: Key,
     ranking: Option<Ranking>,
     walk: Option<Walk>,
+    /// The walk taken to be finished, until its ranking is kept or it's
+    /// given up; other requests wait for it rather than walk again.
+    finishing: Option<u64>,
+    /// Walks started, for tests.
+    walks: u64,
     used: u64,
 }
 
@@ -342,17 +368,44 @@ impl Entry {
         {
             self.walk = None;
         }
+        if self.walk.is_none() {
+            self.walks += 1;
+        }
         self.walk
             .get_or_insert_with(|| Walk::new(self.key, *now, want))
     }
 
-    /// Takes the walk under way, to finish it.
+    /// Takes the walk under way to finish it, noting that it's being
+    /// finished (see [`Entry::finishing`]) until [`Entry::keep`] is given
+    /// its ranking or [`Rankings::give_up`] its id.
     pub fn take_walk(&mut self) -> Option<Walk> {
-        self.walk.take()
+        let walk = self.walk.take()?;
+        self.finishing = Some(walk.id);
+        Some(walk)
     }
 
-    pub fn keep(&mut self, ranking: Ranking) {
+    /// Whether a walk taken by [`Entry::take_walk`] is still being finished.
+    pub fn finishing(&self) -> bool {
+        self.finishing.is_some()
+    }
+
+    /// Walks started for this entry.
+    pub fn walks(&self) -> u64 {
+        self.walks
+    }
+
+    /// Keeps `ranking` unless the one kept is newer (a request that took
+    /// longer finishing an older walk mustn't replace it), and ends its
+    /// walk's finishing. Returns whether it was kept.
+    pub fn keep(&mut self, ranking: Ranking) -> bool {
+        if self.finishing == Some(ranking.walk) {
+            self.finishing = None;
+        }
+        if self.ranking.as_ref().is_some_and(|r| r.newer_than(&ranking)) {
+            return false;
+        }
         self.ranking = Some(ranking);
+        true
     }
 
     /// Drops the ranking kept.
@@ -403,6 +456,8 @@ impl Rankings {
                     key,
                     ranking: None,
                     walk: None,
+                    finishing: None,
+                    walks: 0,
                     used: 0,
                 });
                 self.entries.len() - 1
@@ -416,6 +471,23 @@ impl Rankings {
             .position(|e| e.key == key)
             .expect("the entry asked for is kept");
         &mut self.entries[i]
+    }
+
+    /// Whether a walk for `key` is being finished.
+    pub fn finishing(&self, key: Key) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.key == key && e.finishing.is_some())
+    }
+
+    /// Ends the finishing of walk `id` for `key`, if it's still under way,
+    /// when its ranking won't be kept.
+    pub fn give_up(&mut self, key: Key, id: u64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.key == key)
+            && e.finishing == Some(id)
+        {
+            e.finishing = None;
+        }
     }
 
     /// Drops the least recently used entries other than `keep` until the
@@ -692,6 +764,84 @@ mod tests {
             assert!(ranking.items().iter().all(|&(n, _)| !t.is_removed(n)));
             assert!(ranking.current(&now, REFRESH));
         }
+    }
+
+    #[test]
+    fn an_older_ranking_finished_late_does_not_replace_a_newer_one() {
+        let (t, _) = random_tree(11, 500);
+        let key = Key {
+            scope: Scope::Files,
+            folder: NodeId::ROOT,
+            metric: Metric::Logical,
+            search: None,
+        };
+        let start = basis(&t, key, None, 0);
+        let made = |revision, finished, after| {
+            let b = Basis {
+                revision,
+                finished,
+                at: start.at + Duration::from_millis(after),
+                ..start
+            };
+            let mut w = Walk::new(key, b, 10);
+            while !w.step(&t, None, 100) {}
+            w
+        };
+        let mut rankings = Rankings::default();
+        let entry = rankings.entry(key);
+        // Two requests walk while scanning; the later walk finishes first.
+        let older = made(1, false, 0);
+        let newer = made(2, false, 5);
+        assert!(entry.keep(newer.finish()));
+        assert!(!entry.keep(older.finish()), "older revision refused");
+        assert_eq!(entry.ranking().unwrap().basis().revision, 2);
+        // At one revision, the later look wins, and after the scan beats
+        // during it.
+        assert!(entry.keep(made(2, false, 9).finish()));
+        assert!(!entry.keep(made(2, false, 7).finish()));
+        assert!(entry.keep(made(2, true, 0).finish()));
+        assert!(!entry.keep(made(2, false, 50).finish()));
+        assert!(entry.ranking().unwrap().basis().finished);
+        assert!(entry.keep(made(3, true, 0).finish()));
+    }
+
+    #[test]
+    fn a_walk_being_finished_is_marked_until_kept_or_given_up() {
+        let (t, _) = random_tree(12, 300);
+        let key = Key {
+            scope: Scope::Children,
+            folder: NodeId::ROOT,
+            metric: Metric::Logical,
+            search: None,
+        };
+        let now = basis(&t, key, None, 1);
+        let mut rankings = Rankings::default();
+        let entry = rankings.entry(key);
+        while !entry.walk(&now, 0).step(&t, None, 25) {}
+        // Steps by several requests go on with the one walk.
+        assert_eq!(entry.walks(), 1);
+        let walk = entry.take_walk().unwrap();
+        assert!(entry.finishing() && rankings.finishing(key));
+        // Another walk's ranking doesn't end this one's finishing.
+        let entry = rankings.entry(key);
+        let mut other = Walk::new(key, now, usize::MAX);
+        while !other.step(&t, None, 1_000) {}
+        entry.keep(other.finish());
+        assert!(entry.finishing());
+        let id = walk.id();
+        entry.keep(walk.finish());
+        assert!(!rankings.finishing(key));
+
+        // Given up (say, edited since): the mark goes, and only for its own
+        // walk.
+        let entry = rankings.entry(key);
+        while !entry.walk(&now, 0).step(&t, None, 1_000) {}
+        let walk = entry.take_walk().unwrap();
+        rankings.give_up(key, id);
+        assert!(rankings.finishing(key), "an earlier walk's id");
+        rankings.give_up(key, walk.id());
+        assert!(!rankings.finishing(key));
+        assert_eq!(rankings.entry(key).walks(), 2);
     }
 
     #[test]
