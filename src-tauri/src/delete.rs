@@ -403,10 +403,15 @@ pub mod tests {
         }
 
         fn holds(&self, path: &str) -> bool {
-            // Paths on the volume, without the drive.
-            let dir = self.0.0.to_string_lossy();
+            // Paths on the volume without the drive, as the handle names
+            // them: long names, not 8.3 ones such as `RUNNER~1`.
+            let Ok(dir) = std::fs::canonicalize(&self.0.0) else {
+                return false;
+            };
+            let dir = dir.to_string_lossy().to_lowercase();
+            let dir = dir.strip_prefix(r"\\?\").unwrap_or(&dir);
             let dir = dir.get(2..).unwrap_or_default();
-            path.to_lowercase().starts_with(&dir.to_lowercase())
+            path.to_lowercase().starts_with(dir)
         }
     }
 
