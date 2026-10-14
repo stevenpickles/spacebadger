@@ -3294,6 +3294,7 @@ name = "spacebadger"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "rustix",
  "sb-core",
  "sb-protocol",
  "sb-scan",

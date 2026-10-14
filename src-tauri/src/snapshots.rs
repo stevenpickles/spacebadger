@@ -5,9 +5,11 @@
 //! absolute path (compared as the file system compares names), holding
 //! `<finished ms>.sbsnap` files in the format of `sb_core::snapshot`. A
 //! snapshot is written to a new temporary file (see [`crate::atomic_file`])
-//! and renamed into place, so a crash leaves either the whole file or none,
-//! and saves at once never write into each other's files. Temporary files a
-//! crash left behind are removed by a later prune once an hour old.
+//! and renamed into place without replacing anything, so a crash leaves
+//! either the whole file or none, and saves at once never write into or
+//! over each other's files: one that finds its id taken as it renames takes
+//! the next (`<ms>-1`, `<ms>-2`, ...). Temporary files a crash left behind
+//! are removed by a later prune once an hour old.
 //!
 //! After each save, a root keeps its newest [`KEEP_NEWEST`] snapshots, the
 //! first of every other day (UTC), and always its first, so rescanning a
@@ -34,6 +36,10 @@ const EXTENSION: &str = "sbsnap";
 /// Temporary files of earlier versions.
 const OLD_TEMP_EXTENSION: &str = "tmp";
 
+/// Ids a save tries for snapshots of one root finished in the same
+/// millisecond before giving up.
+const MAX_SAME_TIME: usize = 10_000;
+
 /// Temporary files older than this are left over from a crash.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
 
@@ -46,7 +52,8 @@ pub struct Store {
 
 /// A snapshot file found while pruning.
 struct Found {
-    created: u64,
+    /// Finish time, then the number after it among same-time ones.
+    order: (u64, u64),
     path: PathBuf,
     size: u64,
     /// Removed last when over the total: 0 a daily one, 1 one of the
@@ -84,24 +91,43 @@ impl Store {
         // Another save's prune may remove the folder while it's empty, just
         // after it was made here; then it's made again.
         let mut retried = false;
-        let (id, temp) = loop {
+        let mut temp = loop {
             fs::create_dir_all(&dir)?;
-            let mut id = base.clone();
-            let mut n = 1;
-            while dir.join(format!("{id}.{EXTENSION}")).exists() {
-                id = format!("{base}-{n}");
-                n += 1;
-            }
-            match TempFile::new_in(&dir, &format!("{id}.{EXTENSION}")) {
-                Ok(temp) => break (id, temp),
+            match TempFile::new_in(&dir, &format!("{base}.{EXTENSION}")) {
+                Ok(temp) => break temp,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !retried => retried = true,
                 Err(e) => return Err(e),
             }
         };
-        let path = dir.join(format!("{id}.{EXTENSION}"));
         // Removed when dropped unless persisted.
         temp.file().write_all(&bytes)?;
-        temp.persist(&path)?;
+        // The id after the last of the same time, so a newer snapshot never
+        // takes the lower number of one pruned, claimed only if it's still
+        // free as the file is renamed into place: saves at once, in this app
+        // or another copy of it, each keep a snapshot of their own.
+        let created = snap.header().created_ms;
+        let mut n = snapshot_files(&dir)
+            .iter()
+            .map(|(id, _)| order_of(id))
+            // A number no save would reach is someone else's file; it's
+            // skipped, so counting on from it can't overflow.
+            .filter(|&(c, n)| c == created && n < u64::from(u32::MAX))
+            .map(|(_, n)| n + 1)
+            .max()
+            .unwrap_or(0);
+        let mut tries = 0;
+        let id = loop {
+            let id = numbered(&base, n);
+            match temp.persist_new(&format!("{id}.{EXTENSION}")) {
+                Ok(()) => break id,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < MAX_SAME_TIME => {
+                    n = n.saturating_add(1);
+                    tries += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let path = dir.join(format!("{id}.{EXTENSION}"));
         let mut keep = vec![path];
         keep.extend(protect.map(|p| dir.join(format!("{p}.{EXTENSION}"))));
         self.prune(&keep);
@@ -121,7 +147,8 @@ impl Store {
                 (root_key(Path::new(&header.root)) == key).then_some((id, header))
             })
             .collect();
-        found.sort_by_key(|f| std::cmp::Reverse(f.1.created_ms));
+        // Same-time ones by their number: `<ms>-2` before `<ms>-10`.
+        found.sort_by_key(|f| std::cmp::Reverse((f.1.created_ms, order_of(&f.0).1)));
         found
     }
 
@@ -154,18 +181,18 @@ impl Store {
             let mut files: Vec<Found> = snapshot_files(&dir)
                 .into_iter()
                 .map(|(id, path)| Found {
-                    created: created_of(&id),
+                    order: order_of(&id),
                     size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
                     path,
                     rank: 0,
                 })
                 .collect();
             // Oldest first, so each day's first comes before the rest of it.
-            files.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.path.cmp(&b.path)));
+            files.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.path.cmp(&b.path)));
             let newest_from = files.len().saturating_sub(self.keep_newest);
             let mut days = HashSet::new();
             for (i, mut f) in files.into_iter().enumerate() {
-                let first_of_day = days.insert(f.created / DAY_MS);
+                let first_of_day = days.insert(f.order.0 / DAY_MS);
                 f.rank = if i == 0 {
                     2
                 } else if i >= newest_from {
@@ -183,8 +210,8 @@ impl Store {
             let _ = fs::remove_dir(&dir);
         }
         all.sort_by(|a, b| {
-            (a.rank, a.created)
-                .cmp(&(b.rank, b.created))
+            (a.rank, a.order)
+                .cmp(&(b.rank, b.order))
                 .then_with(|| a.path.cmp(&b.path))
         });
         let mut total: u64 = all.iter().map(|f| f.size).sum();
@@ -236,18 +263,37 @@ fn remove_stale_temps(dir: &Path) {
             .ok()
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .is_some_and(|age| age > STALE_TEMP);
-        if old {
+        if !old {
+            continue;
+        }
+        // Outside Windows a temporary file is in a private folder of that
+        // name. The entry's type is its own, never a link's target, and
+        // removing a folder never follows links inside it.
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(path);
+        } else {
             let _ = fs::remove_file(path);
         }
     }
 }
 
-/// The finish time in an id (`1760000000000` or `1760000000000-1`).
-fn created_of(id: &str) -> u64 {
-    id.split('-')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// The id of the `n`th snapshot of a root finished at `base`: `base`, then
+/// `base-1`, `base-2`, and so on.
+fn numbered(base: &str, n: u64) -> String {
+    if n == 0 {
+        base.to_owned()
+    } else {
+        format!("{base}-{n}")
+    }
+}
+
+/// The finish time in an id and the number after it (`1760000000000` is
+/// `(1760000000000, 0)`, `1760000000000-2` is `(1760000000000, 2)`), so
+/// same-time snapshots sort as numbered.
+fn order_of(id: &str) -> (u64, u64) {
+    let mut parts = id.split('-').map(|s| s.parse().unwrap_or(0));
+    let created = parts.next().unwrap_or(0);
+    (created, parts.next().unwrap_or(0))
 }
 
 /// The root as compared: its path with one kind of separator (on Windows,
@@ -463,6 +509,16 @@ mod tests {
         // A fixed name the new snapshot's temporary file might once have had.
         let taken = dir.join(".5000.sbsnap.partial");
         let hour_ago = SystemTime::now() - STALE_TEMP - Duration::from_secs(60);
+        // Private folders holding a temporary file, as made outside Windows.
+        let stale_folder = dir.join(".6000.sbsnap.1-0.partial");
+        let fresh_folder = dir.join(".7000.sbsnap.1-0.partial");
+        for (folder, aged) in [(&stale_folder, true), (&fresh_folder, false)] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join("data"), "not ours").unwrap();
+            if aged {
+                open_folder(folder).set_modified(hour_ago).unwrap();
+            }
+        }
         for (path, aged) in [
             (&stale, true),
             (&old, true),
@@ -486,12 +542,79 @@ mod tests {
             [
                 ".4000.sbsnap.1-0.partial",
                 ".5000.sbsnap.partial",
+                ".7000.sbsnap.1-0.partial",
                 "1000.sbsnap",
                 "5000.sbsnap"
             ]
         );
         assert_eq!(fs::read(&taken).unwrap(), b"not ours");
         assert_eq!(fs::read(&fresh).unwrap(), b"not ours");
+        assert_eq!(fs::read(fresh_folder.join("data")).unwrap(), b"not ours");
+    }
+
+    /// A folder opened to change its times.
+    fn open_folder(path: &Path) -> File {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS opens a folder; FILE_WRITE_ATTRIBUTES
+            // sets its times.
+            options.custom_flags(0x0200_0000).access_mode(0x100);
+        }
+        options.open(path).unwrap()
+    }
+
+    #[test]
+    fn same_time_snapshots_sort_by_number() {
+        let tmp = temp("numbered");
+        let store = Store::with_limits(tmp.0.clone(), 3, u64::MAX);
+        let a = Path::new("/data/a");
+        for logical in 0..12 {
+            store
+                .save(a, &snap("/data/a", 1000, logical), None)
+                .unwrap();
+        }
+        let ids: Vec<String> = store.list(a).into_iter().map(|(id, _)| id).collect();
+        // The first, and the newest three: `1000-10` is newer than `1000-9`.
+        assert_eq!(ids, ["1000-11", "1000-10", "1000-9", "1000"]);
+        assert_eq!(order_of("1000-10"), (1000, 10));
+
+        // A huge number isn't counted on from.
+        let huge = store.root_dir(a).join(format!("1000-{}.sbsnap", u64::MAX));
+        fs::write(&huge, b"not a snapshot").unwrap();
+        let next = store.save(a, &snap("/data/a", 1000, 99), None).unwrap();
+        assert_eq!(next, "1000-12");
+        fs::remove_file(&huge).unwrap();
+        assert_eq!(order_of("1000"), (1000, 0));
+    }
+
+    #[test]
+    fn concurrent_saves_at_one_time_each_keep_their_own() {
+        let tmp = temp("concurrent");
+        let store = Store::with_limits(tmp.0.clone(), 100, u64::MAX);
+        let a = Path::new("/data/a");
+        let ids: Vec<(u64, String)> = std::thread::scope(|s| {
+            let saves: Vec<_> = (1..=32u64)
+                .map(|logical| {
+                    let store = &store;
+                    s.spawn(move || {
+                        let id = store.save(a, &snap("/data/a", 1000, logical), None);
+                        (logical, id.unwrap())
+                    })
+                })
+                .collect();
+            saves.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let distinct: HashSet<&String> = ids.iter().map(|(_, id)| id).collect();
+        assert_eq!(distinct.len(), 32, "{ids:?}");
+        for (logical, id) in &ids {
+            assert_eq!(store.load(a, id).unwrap().header().logical, *logical);
+        }
+        assert_eq!(store.list(a).len(), 32);
+        let left = fs::read_dir(store.root_dir(a)).unwrap().count();
+        assert_eq!(left, 32, "no temporary files left");
     }
 
     #[test]
