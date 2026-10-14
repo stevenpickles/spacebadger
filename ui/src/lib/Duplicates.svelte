@@ -1,12 +1,14 @@
 <script lang="ts">
   // Groups of files with the same contents, most reclaimable space first,
   // each a header row followed by its files (shortest path first) unless
-  // folded. Header rows stand for no item: picks on them are dropped, and
-  // Enter or a click on the header folds the group. The list is fetched
-  // again whenever the search finds more or items are deleted.
+  // folded. The list brings only a group's first files; a "Show more" row
+  // after them fetches the next page. Header and "Show more" rows stand for
+  // no item: picks on them are dropped, and Enter or a click folds the
+  // group or shows more. The list is fetched again whenever the search
+  // finds more or items are deleted.
   import { untrack } from "svelte";
   import { announce } from "./announce.svelte";
-  import { duplicatesList, errorText } from "./api";
+  import { duplicateFiles, duplicatesExtras, duplicatesList, errorText } from "./api";
   import { exactBytes, formatBytes, formatCount, formatElapsed, KILO, percent, plural } from "./format";
   import ItemList from "./ItemList.svelte";
   import type { DuplicateFile } from "./protocol/DuplicateFile";
@@ -63,14 +65,24 @@
     { value: 100 * KILO ** 2, label: "100 MB" },
   ];
 
+  /** Files a "Show more" row fetches; must match `sb_protocol::DUPLICATE_FILES_PAGE`. */
+  const PAGE = 1000;
+
   type Row =
-    | { kind: "group"; group: DuplicateGroup; index: number; key: number; open: boolean }
-    | { kind: "file"; group: DuplicateGroup; file: DuplicateFile; first: boolean };
+    | { kind: "group"; group: DuplicateGroup; index: number; open: boolean }
+    | { kind: "file"; group: DuplicateGroup; file: DuplicateFile; first: boolean }
+    | { kind: "more"; group: DuplicateGroup; index: number; left: number };
 
   let list = $state.raw<DuplicatesList | null>(null);
   let error = $state<string | null>(null);
-  /** Folded groups, by their first file's node. */
+  /** Folded groups, by ID. */
   let folded = $state.raw(new Set<number>());
+  /** Groups shown beyond the list's first files, by ID: their files from
+   * the first, and how many the group had when they were fetched. */
+  let more = $state.raw(new Map<number, { count: number; files: DuplicateFile[] }>());
+  /** Groups whose next files are being fetched. */
+  let loading = $state.raw(new Set<number>());
+  let selecting = $state(false);
 
   // Fetch the groups when the search finds more or items are deleted; one
   // request at a time, and once more if anything changed meanwhile.
@@ -84,6 +96,12 @@
     stale = true;
     if (!fetching) untrack(() => void fetchList());
   });
+  // Another search starts with only the first files of each group.
+  $effect(() => {
+    void [generation, job];
+    more = new Map();
+    loading = new Set();
+  });
 
   async function fetchList() {
     fetching = true;
@@ -96,6 +114,7 @@
         if (gen === generation && job === status.job) {
           list = next;
           error = null;
+          refetchShown(next);
         }
       } catch (e) {
         if (gen === generation && job === status.job) error = errorText(e);
@@ -106,16 +125,88 @@
 
   const groups = $derived(list?.job === status.job ? list.groups : []);
 
+  /** A group's files fetched so far, from the first. */
+  function shown(group: DuplicateGroup): DuplicateFile[] {
+    const extra = more.get(group.id);
+    return extra && extra.files.length > group.files.length ? extra.files : group.files;
+  }
+
+  // Rows only for the files fetched, however many a group has.
   const rows = $derived.by(() => {
     const out: Row[] = [];
     groups.forEach((group, index) => {
-      const key = group.files[0]!.node;
-      const open = !folded.has(key);
-      out.push({ kind: "group", group, index, key, open });
-      if (open) group.files.forEach((file, i) => out.push({ kind: "file", group, file, first: i === 0 }));
+      const open = !folded.has(group.id);
+      out.push({ kind: "group", group, index, open });
+      if (!open) return;
+      const files = shown(group);
+      files.forEach((file, i) => out.push({ kind: "file", group, file, first: i === 0 }));
+      if (group.count > files.length) out.push({ kind: "more", group, index, left: group.count - files.length });
     });
     return out;
   });
+
+  /** Fetches `count` of a group's files from `offset`, a page at a time;
+   * `null` if the search changed meanwhile. */
+  async function fetchFiles(group: number, offset: number, count: number): Promise<DuplicateFile[] | null> {
+    const gen = generation;
+    const job = status.job;
+    const files: DuplicateFile[] = [];
+    while (files.length < count) {
+      const page = await duplicateFiles({
+        generation: gen,
+        job,
+        group,
+        offset: offset + files.length,
+        limit: Math.min(PAGE, count - files.length),
+      });
+      if (gen !== generation || job !== status.job) return null;
+      files.push(...page.files);
+      if (page.files.length === 0) break;
+    }
+    return files;
+  }
+
+  /** Fetches the next page of a group's files. */
+  async function showMore(group: DuplicateGroup) {
+    if (loading.has(group.id)) return;
+    loading = new Set(loading).add(group.id);
+    const have = shown(group);
+    try {
+      const files = await fetchFiles(group.id, have.length, PAGE);
+      if (files) {
+        more = new Map(more).set(group.id, { count: group.count, files: [...have, ...files] });
+        error = null;
+      }
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      const next = new Set(loading);
+      next.delete(group.id);
+      loading = next;
+    }
+  }
+
+  /** Fetches the files shown of groups that lost some since, as far as
+   * they were shown. */
+  function refetchShown(next: DuplicatesList) {
+    for (const group of next.groups) {
+      const extra = more.get(group.id);
+      if (!extra || extra.count === group.count || loading.has(group.id)) continue;
+      loading = new Set(loading).add(group.id);
+      fetchFiles(group.id, 0, Math.min(extra.files.length, group.count))
+        .then(
+          (files) => {
+            if (files) more = new Map(more).set(group.id, { count: group.count, files });
+          },
+          (e: unknown) => (error = errorText(e)),
+        )
+        .finally(() => {
+          const set = new Set(loading);
+          set.delete(group.id);
+          loading = set;
+        });
+    }
+  }
 
   const running = $derived(status.phase === "running");
   const shownTotal = $derived(list?.job === status.job ? list.total : 0);
@@ -133,9 +224,12 @@
     announce(status.phase === "cancelled" ? `Stopped. ${found} so far` : found);
   });
 
-  /** Header rows have no node; they get negative numbers no item has. */
+  /** Header and "Show more" rows have no node; they get negative numbers
+   * no item has. */
   function rowNode(r: Row): number {
-    return r.kind === "group" ? -1 - r.index : r.file.node;
+    if (r.kind === "group") return -1 - 2 * r.index;
+    if (r.kind === "more") return -2 - 2 * r.index;
+    return r.file.node;
   }
 
   function toggle(key: number) {
@@ -158,19 +252,30 @@
     }
   }
 
-  /** Selects every file but the first (shortest path) of each group. */
-  function selectExtras() {
-    const nodes = groups.flatMap((g) => g.files.slice(1).map((f) => f.node));
-    if (nodes.length === 0) return;
-    onpick({ focus: { node: nodes[0]!, other: false }, nodes, mode: "replace", keepAnchor: false });
-    const size = groups.reduce((sum, g) => sum + g.size * (g.files.length - 1), 0);
-    announce(`Selected ${plural(nodes.length, "file")}, ${formatBytes(size)} of content`);
+  /** Selects every file but the first (shortest path) of each listed
+   * group, including files not fetched: the backend sends their nodes. */
+  async function selectExtras() {
+    const gen = generation;
+    const job = status.job;
+    selecting = true;
+    try {
+      const extras = await duplicatesExtras(gen, job);
+      if (gen !== generation || job !== status.job || extras.nodes.length === 0) return;
+      const nodes = extras.nodes;
+      onpick({ focus: { node: nodes[0]!, other: false }, nodes, mode: "replace", keepAnchor: false });
+      announce(`Selected ${plural(nodes.length, "file")}, ${formatBytes(extras.content)} of content`);
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      selecting = false;
+    }
   }
 
   function rowTitle(r: Row): string {
     if (r.kind === "group") {
-      return `${plural(r.group.files.length, "file")} of ${exactBytes(r.group.size)} with the same contents. Enter ${r.open ? "folds" : "unfolds"} the group.`;
+      return `${plural(r.group.count, "file")} of ${exactBytes(r.group.size)} with the same contents. Enter ${r.open ? "folds" : "unfolds"} the group.`;
     }
+    if (r.kind === "more") return `${plural(r.left, "more file")} in this group. Enter shows the next ${formatCount(Math.min(PAGE, r.left))}.`;
     const notes = [
       r.first ? "shortest path in its group" : "",
       r.file.hardlinked ? "has other hard-link names, so deleting this one alone may free nothing" : "",
@@ -221,7 +326,7 @@
     "Deleting may free less than the content: sparse and compressed files take less space, a file with other hard-link names frees nothing until every name goes, and storage shared by block cloning or deduplication stays in use. Unknown where a copy's allocation is unknown or it has other names.";
 
   function groupTitle(g: DuplicateGroup): string {
-    const content = `${exactBytes(g.size * (g.files.length - 1))} of content in the copies beyond the first`;
+    const content = `${exactBytes(g.size * (g.count - 1))} of content in the copies beyond the first`;
     const disk = g.onDisk === null ? "space on disk unknown" : `up to ${exactBytes(g.onDisk)} on disk`;
     return `${content}; ${disk}`;
   }
@@ -298,9 +403,9 @@
       <button
         type="button"
         class="extras"
-        disabled={groups.length === 0}
-        title="Select every file except the one with the shortest path in each group. Nothing is deleted."
-        onclick={selectExtras}>Select all but the first</button
+        disabled={groups.length === 0 || selecting}
+        title="Select every file except the one with the shortest path in each group, including files not shown yet. Nothing is deleted."
+        onclick={() => void selectExtras()}>Select all but the first</button
       >
     </div>
   </header>
@@ -314,7 +419,8 @@
     {selected}
     {anchor}
     onpick={pick}
-    onopen={(r) => (r.kind === "group" ? toggle(r.key) : onshow(r.file))}
+    onopen={(r) =>
+      r.kind === "group" ? toggle(r.group.id) : r.kind === "more" ? void showMore(r.group) : onshow(r.file)}
     onmenu={(r, x, y) => r.kind === "file" && onmenu(r.file, x, y)}
     {ondelete}
   >
@@ -327,15 +433,33 @@
           aria-expanded={r.open}
           onclick={(e) => {
             e.stopPropagation();
-            toggle(r.key);
+            toggle(r.group.id);
           }}
           ondblclick={(e) => e.stopPropagation()}
         >
           <span class="caret" aria-hidden="true">{r.open ? "▾" : "▸"}</span>
           <span class="row-name">
-            <strong>{formatCount(r.group.files.length)} copies</strong> of {nameOf(r.group.files[0]!.path)}
+            <strong>{formatCount(r.group.count)} copies</strong> of {nameOf(r.group.files[0]!.path)}
           </span>
           <span class="row-name each muted">{formatBytes(r.group.size)} each</span>
+        </button>
+      {:else if r.kind === "more"}
+        <button
+          type="button"
+          class="more link"
+          tabindex="-1"
+          disabled={loading.has(r.group.id)}
+          onclick={(e) => {
+            e.stopPropagation();
+            void showMore(r.group);
+          }}
+          ondblclick={(e) => e.stopPropagation()}
+        >
+          {#if loading.has(r.group.id)}
+            Loading…
+          {:else}
+            Show {formatCount(Math.min(PAGE, r.left))} more ({formatCount(r.left)} not shown)
+          {/if}
         </button>
       {:else}
         {@const [head, tail] = splitFolder(r.file.path)}
@@ -351,9 +475,9 @@
     {#snippet size(r)}
       {#if r.kind === "group"}
         <span title={groupTitle(r.group)}
-          >{formatBytes(r.group.size * (r.group.files.length - 1))}</span
+          >{formatBytes(r.group.size * (r.group.count - 1))}</span
         >
-      {:else}
+      {:else if r.kind === "file"}
         <span class="muted" title={exactBytes(r.group.size)}>{formatBytes(r.group.size)}</span>
       {/if}
     {/snippet}
@@ -479,6 +603,9 @@
   .file {
     display: block;
     padding-left: 1.5em;
+  }
+  .more {
+    margin-left: 1.5em;
   }
   .name {
     display: block;
