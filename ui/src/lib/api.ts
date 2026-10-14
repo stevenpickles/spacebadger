@@ -38,6 +38,7 @@ import type { SnapshotInfo } from "./protocol/SnapshotInfo";
 import type { SuggestRequest } from "./protocol/SuggestRequest";
 import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
+import { enableTrace, timed } from "./metrics";
 
 export const EXPECTED_PROTOCOL_VERSION = 4;
 
@@ -46,6 +47,12 @@ const SCAN_STATUS_EVENT = "scan-status";
 
 /** Must match `sb_protocol::EXPORT_PROGRESS_EVENT`. */
 const EXPORT_PROGRESS_EVENT = "export-progress";
+
+// Request timings are kept only when the backend keeps its own.
+invoke<boolean>("trace_enabled").then(
+  (on) => enableTrace(on, (reset) => invoke<string | null>("trace_report", { reset })),
+  () => {},
+);
 
 export function appInfo(): Promise<AppInfo> {
   return invoke<AppInfo>("app_info");
@@ -70,12 +77,12 @@ export function scanStatus(): Promise<ScanStatus | null> {
 
 /** Binary layout; decode with `decodeLayout`. */
 export function requestLayout(request: LayoutRequest): Promise<ArrayBuffer> {
-  return invoke<ArrayBuffer>("layout", { request });
+  return timed("layout", invoke<ArrayBuffer>("layout", { request }));
 }
 
 /** With `search`, the details also say what that filter matches there. */
 export function nodeDetails(generation: number, node: number, search?: number | null): Promise<NodeDetails> {
-  return invoke<NodeDetails>("node_details", { generation, node, search: search ?? null });
+  return timed("node_details", invoke<NodeDetails>("node_details", { generation, node, search: search ?? null }));
 }
 
 /**
@@ -83,24 +90,24 @@ export function nodeDetails(generation: number, node: number, search?: number | 
  * Rejects if a newer search replaced this one before it finished.
  */
 export function searchSet(generation: number, query: string): Promise<SearchSummary | null> {
-  return invoke<SearchSummary | null>("search_set", { generation, query });
+  return timed("search_set", invoke<SearchSummary | null>("search_set", { generation, query }));
 }
 
 export function searchSummary(generation: number, search: number): Promise<SearchSummary> {
-  return invoke<SearchSummary>("search_summary", { generation, search });
+  return timed("search_summary", invoke<SearchSummary>("search_summary", { generation, search }));
 }
 
 export function searchResults(request: SearchResultsRequest): Promise<SearchPage> {
-  return invoke<SearchPage>("search_results", { request });
+  return timed("search_results", invoke<SearchPage>("search_results", { request }));
 }
 
 export function smallItems(request: SmallItemsRequest): Promise<SmallItemsPage> {
-  return invoke<SmallItemsPage>("small_items", { request });
+  return timed("small_items", invoke<SmallItemsPage>("small_items", { request }));
 }
 
 /** The largest files anywhere under a folder. */
 export function folderFiles(request: FolderFilesRequest): Promise<FolderFilesPage> {
-  return invoke<FolderFilesPage>("folder_files", { request });
+  return timed("folder_files", invoke<FolderFilesPage>("folder_files", { request }));
 }
 
 /** Capacity of the scanned volume; `null` where unavailable. */
@@ -133,7 +140,7 @@ export function onExportProgress(handler: (progress: ExportProgress) => void): P
 
 /** What a set of selected items amounts to. */
 export function selectionSummary(request: SelectionRequest): Promise<SelectionSummary> {
-  return invoke<SelectionSummary>("selection_summary", { request });
+  return timed("selection_summary", invoke<SelectionSummary>("selection_summary", { request }));
 }
 
 /** Turns deleting on or off for this run of the app. It always starts off. */
@@ -183,7 +190,7 @@ export function errorText(e: unknown): string {
 
 /** Folder names or extensions in the scan, for the filter's completion. */
 export function filterSuggest(request: SuggestRequest): Promise<Suggestion[]> {
-  return invoke<Suggestion[]>("filter_suggest", { request });
+  return timed("filter_suggest", invoke<Suggestion[]>("filter_suggest", { request }));
 }
 
 // ---- comparing with an earlier scan ------------------------------------
@@ -199,17 +206,17 @@ export function compareSet(generation: number, snapshot: string | null): Promise
 }
 
 export function compareItem(generation: number, snapshot: string, node: number): Promise<ItemChange> {
-  return invoke<ItemChange>("compare_item", { generation, snapshot, node });
+  return timed("compare_item", invoke<ItemChange>("compare_item", { generation, snapshot, node }));
 }
 
 /** One byte per node; see `sb_protocol::change_mark` and `changeColor`. */
 export function changeMarks(request: ChangeMarksRequest): Promise<ArrayBuffer> {
-  return invoke<ArrayBuffer>("change_marks", { request });
+  return timed("change_marks", invoke<ArrayBuffer>("change_marks", { request }));
 }
 
 /** The biggest changes under a folder, including removed items. */
 export function compareChanges(request: ChangesRequest): Promise<ChangesPage> {
-  return invoke<ChangesPage>("compare_changes", { request });
+  return timed("compare_changes", invoke<ChangesPage>("compare_changes", { request }));
 }
 
 /** Must match `sb_protocol::DUPLICATES_STATUS_EVENT`. */

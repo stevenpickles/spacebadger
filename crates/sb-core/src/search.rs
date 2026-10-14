@@ -942,6 +942,14 @@ impl Search {
     pub fn examined(&self) -> usize {
         self.next
     }
+
+    /// An upper bound on what [`Search::catch_up`] has left to do on
+    /// `tree`: nodes not yet examined plus change-log entries not yet
+    /// replayed, some of which it skips (files not yet examined, repeats).
+    pub fn backlog(&self, tree: &Tree) -> usize {
+        tree.len().saturating_sub(self.next)
+            + tree.changed_files().len().saturating_sub(self.changes_seen)
+    }
 }
 
 /// Matching files largest first, sorted only as far as has been asked for.
@@ -1313,9 +1321,12 @@ mod tests {
             .add_file(NodeId::ROOT, "a".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
         let mut s = Search::new(Matcher::new("a").unwrap());
+        assert_eq!(s.backlog(&t), 2);
         s.catch_up(&t, 1); // only the root
         t.update_file(f, sizes(7, 8));
+        assert_eq!(s.backlog(&t), 2, "the file, and its change");
         s.catch_up(&t, usize::MAX);
+        assert_eq!(s.backlog(&t), 0);
         assert_eq!(
             s.totals(NodeId::ROOT),
             Totals {

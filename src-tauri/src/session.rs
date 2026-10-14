@@ -6,6 +6,7 @@ mod export;
 use crate::delete::{self, Outcome, Scanned, Target};
 use crate::duplicates::{self, Job};
 use crate::identity::{self, Found};
+use crate::metrics::{self, locked};
 use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
@@ -15,13 +16,15 @@ use sb_core::suggest::NameIndex;
 use sb_core::tree::{DirState, NodeId, Tree, flags};
 use sb_protocol as proto;
 use sb_scan::duplicates::plan;
-use sb_scan::{NativeFs, OmissionReason, Progress, Scan, ScanState, native};
+use sb_scan::{FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState, native};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 mod compare;
+#[cfg(test)]
+mod load;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -123,6 +126,20 @@ impl Session {
         carried: Option<compare::Carried>,
         on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
     ) -> Self {
+        let config = native::scan_config(&root);
+        Self::start_on(root, NativeFs::new(), config, snapshots, carried, on_status)
+    }
+
+    /// [`Session::start_with`] scanning through `adapter`, for tests and
+    /// benchmarks with a synthetic filesystem.
+    fn start_on(
+        root: PathBuf,
+        adapter: impl FsAdapter,
+        config: ScanConfig,
+        snapshots: Option<Arc<Store>>,
+        carried: Option<compare::Carried>,
+        on_status: impl Fn(proto::ScanStatus) + Send + Sync + 'static,
+    ) -> Self {
         let started_ms = compare::now_ms();
         let root_found = identity::hold(&root, false).ok().map(|(found, _)| found);
         let on_status: StatusSink = Arc::new(on_status);
@@ -137,17 +154,12 @@ impl Session {
             saved: Arc::clone(&saved_snapshot),
             protect: carried.as_ref().map(|c| c.id().to_owned()),
         });
-        let scan = Scan::start(
-            root.clone(),
-            NativeFs::new(),
-            native::scan_config(&root),
-            move |p| {
-                sink(status(&display, p));
-                if let Some(saver) = &saver {
-                    saver.progress(&p.state);
-                }
-            },
-        );
+        let scan = Scan::start(root.clone(), adapter, config, move |p| {
+            sink(status(&display, p));
+            if let Some(saver) = &saver {
+                saver.progress(&p.state);
+            }
+        });
         let _ = tree_cell.set(Arc::downgrade(&scan.tree()));
         Self {
             root,
@@ -199,9 +211,10 @@ impl Session {
             req.width.clamp(0.0, 16_384.0),
             req.height.clamp(0.0, 16_384.0),
         );
-        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut search =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         // Read with the tree's lock held, so the revision sent describes the
         // tree laid out (see `with_duplicates`).
         let progress = self.scan.progress();
@@ -211,6 +224,7 @@ impl Session {
         let result = match req.search {
             Some(id) => {
                 let active = current_search(&mut search, id, &tree)?;
+                let _compute = metrics::span("compute");
                 layout::layout(
                     &tree,
                     view,
@@ -223,14 +237,14 @@ impl Session {
             }
             None => {
                 drop(search);
-                let mut order = self
-                    .order
-                    .lock()
+                let mut order = locked("order", || self.order.lock())
                     .map_err(|_| "layout state is unavailable")?;
+                let _compute = metrics::span("compute");
                 layout::layout(&tree, view, metric, None, &params, &mut order, !finished)
             }
         };
 
+        let _encode = metrics::span("encode");
         let mut rects = Vec::with_capacity(result.rects.len());
         let mut names = Vec::new();
         for (i, r) in result.rects.iter().enumerate() {
@@ -287,7 +301,8 @@ impl Session {
         let id = self.latest_search.fetch_add(1, Ordering::SeqCst) + 1;
         let superseded = || format!("search {id} was replaced by a newer one");
         let Some(matcher) = Matcher::parse_at(query, SystemTime::now(), &local_midnight)? else {
-            let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
+            let mut current =
+                locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
             if self.latest_search.load(Ordering::SeqCst) == id {
                 *current = None;
             }
@@ -299,16 +314,19 @@ impl Session {
             if self.latest_search.load(Ordering::SeqCst) != id {
                 return Err(superseded());
             }
-            let tree = tree_lock.read().map_err(|_| "scan data is unavailable")?;
+            let tree =
+                locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
+            let _examine = metrics::span("examine");
             if search.catch_up(&tree, SEARCH_STEP) {
                 break;
             }
         }
-        let mut current = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut current =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         if self.latest_search.load(Ordering::SeqCst) != id {
             return Err(superseded());
         }
-        let tree = tree_lock.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
         search.catch_up(&tree, usize::MAX);
         let active = current.insert(ActiveSearch {
             id,
@@ -321,9 +339,10 @@ impl Session {
 
     /// Matching totals for search `id`, brought up to date with the scan.
     pub fn search_summary(&self, id: u32) -> Result<proto::SearchSummary, String> {
-        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut search =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let active = current_search(&mut search, id, &tree)?;
         Ok(self.summary(active))
     }
@@ -346,11 +365,13 @@ impl Session {
         &self,
         req: &proto::SearchResultsRequest,
     ) -> Result<proto::SearchPage, String> {
-        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut search =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let active = current_search(&mut search, req.search, &tree)?;
         let metric = metric(req.metric);
+        let rank = metrics::span("rank");
         let ranked = match &mut active.ranked {
             Some(r) if r.is_current(&active.search, metric) => r,
             slot => slot.insert(Ranked::new(&active.search, metric)),
@@ -360,7 +381,9 @@ impl Session {
         let end = start
             .saturating_add(req.limit.min(MAX_PAGE) as usize)
             .min(total);
-        let rows = ranked.top(&tree, end)[start..]
+        let top = ranked.top(&tree, end);
+        drop(rank);
+        let rows = top[start..]
             .iter()
             .map(|&f| {
                 let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
@@ -391,9 +414,10 @@ impl Session {
         &self,
         req: &proto::FolderFilesRequest,
     ) -> Result<proto::FolderFilesPage, String> {
-        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut search =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         // Read with the tree's lock held, so the ranking is cached under the
         // revision of the tree it's made from (see `with_duplicates`).
         let revision = self.scan.progress().revision;
@@ -409,10 +433,9 @@ impl Session {
             filter.map(|s| (req.search.unwrap_or(0), s.version())),
             metric,
         );
-        let mut cache = self
-            .folder_files
-            .lock()
+        let mut cache = locked("folder_files", || self.folder_files.lock())
             .map_err(|_| "folder files are unavailable")?;
+        let rank = metrics::span("rank");
         let cached = match &mut *cache {
             Some(c) if c.key == key => c,
             slot => {
@@ -430,7 +453,9 @@ impl Session {
             .saturating_add(req.limit.min(MAX_PAGE) as usize)
             .min(total);
         let base = tree.path(folder);
-        let files = cached.ranked.top(&tree, end)[start..]
+        let top = cached.ranked.top(&tree, end);
+        drop(rank);
+        let files = top[start..]
             .iter()
             .map(|&f| {
                 let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
@@ -462,19 +487,19 @@ impl Session {
         let progress = self.scan.progress();
         let scanning = matches!(progress.state, ScanState::Scanning);
         let index = {
-            let mut names = self
-                .names
-                .lock()
-                .map_err(|_| "suggestions are unavailable")?;
+            let mut names =
+                locked("names", || self.names.lock()).map_err(|_| "suggestions are unavailable")?;
             let fresh = names.as_ref().is_some_and(|n| {
                 n.revision == progress.revision || (scanning && n.built.elapsed() < NAMES_REFRESH)
             });
             if !fresh {
                 let tree = self.scan.tree();
-                let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+                let tree =
+                    locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
                 // Read again with the tree's lock held, so the index is kept
                 // under the revision of the tree it's built from.
                 let revision = self.scan.progress().revision;
+                let _index = metrics::span("index");
                 *names = Some(Names {
                     revision,
                     built: Instant::now(),
@@ -503,14 +528,16 @@ impl Session {
         &self,
         req: &proto::SmallItemsRequest,
     ) -> Result<proto::SmallItemsPage, String> {
-        let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut search =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let folder = node(&tree, req.folder)?;
         let filter = match req.search {
             Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
             None => None,
         };
+        let rank = metrics::span("rank");
         let (items, empty) = layout::small_children(
             &tree,
             folder,
@@ -518,6 +545,7 @@ impl Session {
             filter,
             req.count as usize,
         );
+        drop(rank);
         let start = (req.offset as usize).min(items.len());
         let end = start
             .saturating_add(req.limit.min(MAX_PAGE) as usize)
@@ -556,9 +584,10 @@ impl Session {
     /// under it. A search that's no longer current gives no matching totals
     /// rather than an error, since a newer one is on its way.
     pub fn details(&self, id: u32, search: Option<u32>) -> Result<proto::NodeDetails, String> {
-        let mut active = self.search.lock().map_err(|_| "search is unavailable")?;
+        let mut active =
+            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let n = node(&tree, id)?;
         let matching = search
             .and_then(|s| current_search(&mut active, s, &tree).ok())
@@ -619,7 +648,7 @@ impl Session {
     /// What a set of selected items amounts to.
     pub fn selection(&self, nodes: &[u32]) -> Result<proto::SelectionSummary, String> {
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         let r = selection::resolve(&tree, nodes);
         Ok(proto::SelectionSummary {
             generation: self.generation(),
@@ -690,7 +719,7 @@ impl Session {
             .clone();
         let (targets, retained): (Vec<(NodeId, Target)>, _) = {
             let tree = self.scan.tree();
-            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
             let targets = selection::resolve(&tree, nodes)
                 .items
                 .into_iter()
@@ -817,9 +846,10 @@ impl Session {
             return Err("Duplicates can be found once the scan finishes or is cancelled.".into());
         }
         let (scope, plan) = {
-            let mut search = self.search.lock().map_err(|_| "search is unavailable")?;
+            let mut search =
+                locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
             let tree = self.scan.tree();
-            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
             let folder = node(&tree, req.folder)?;
             let filter = match req.search {
                 Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
@@ -924,7 +954,7 @@ impl Session {
         let job = self.duplicates_job(job)?;
         let pending = {
             let tree = self.scan.tree();
-            let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+            let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
             job.check(&tree, nodes)
         };
         // The disk is looked at with no lock held.
@@ -994,7 +1024,7 @@ impl Session {
     /// The native path of a node, for file manager actions.
     pub fn path(&self, id: u32) -> Result<PathBuf, String> {
         let tree = self.scan.tree();
-        let tree = tree.read().map_err(|_| "scan data is unavailable")?;
+        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
         Ok(tree.path(node(&tree, id)?))
     }
 }
@@ -1034,6 +1064,10 @@ fn current_search<'a>(
         .as_mut()
         .filter(|a| a.id == id)
         .ok_or_else(|| format!("search {id} is no longer current"))?;
+    if metrics::enabled() {
+        metrics::count("catch-up", active.search.backlog(tree));
+    }
+    let _catch_up = metrics::span("catch-up");
     active.search.catch_up(tree, usize::MAX);
     Ok(active)
 }
