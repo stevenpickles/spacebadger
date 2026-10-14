@@ -10,6 +10,7 @@ use crate::metrics::{self, locked};
 use crate::snapshots::Store;
 use sb_core::filetype::FileType;
 use sb_core::layout::{self, LayoutParams, OrderCache, RectKind, rect_flags};
+use sb_core::ranking::{self, Basis, Key, Ranking, Rankings, Scope, Signature};
 use sb_core::search::{Matcher, Ranked, Search};
 use sb_core::selection;
 use sb_core::suggest::NameIndex;
@@ -36,10 +37,19 @@ const SEARCH_STEP: usize = 200_000;
 /// Largest page of search results returned at once.
 const MAX_PAGE: u32 = 500;
 
+/// Nodes a ranking for the Contents list looks at per hold of the tree's
+/// read lock (and the search's), about a millisecond, so the scanner and
+/// other requests get in between.
+const RANK_STEP: usize = 100_000;
+
+/// While scanning, nodes one request walks to bring a ranking up to date
+/// before it serves the one kept instead; the next request goes on.
+const RANK_BUDGET: usize = 4 * RANK_STEP;
+
 type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 
 // Lock order: `deleting` first, `search` and `compare` before the tree,
-// then `folder_files`, and `order` last. `rematching` is taken with the
+// then `rankings`, and `order` last. `rematching` is taken with the
 // tree read-locked, and `compare` briefly inside it.
 pub struct Session {
     pub root: PathBuf,
@@ -51,8 +61,9 @@ pub struct Session {
     latest_search: AtomicU32,
     /// Held while deleting, so deletes run one at a time.
     deleting: Mutex<()>,
-    /// The files under the folder last asked for, ranked by size.
-    folder_files: Mutex<Option<FolderFiles>>,
+    /// The Contents list's rankings: folders' items, or the files under
+    /// them, by size.
+    rankings: Mutex<Rankings>,
     /// Folder names and extensions for the filter's completion.
     names: Mutex<Option<Names>>,
     /// The latest search for duplicate files.
@@ -88,14 +99,6 @@ struct Names {
 
 /// While scanning, the completion index is rebuilt at most this often.
 const NAMES_REFRESH: Duration = Duration::from_secs(5);
-
-struct FolderFiles {
-    /// What the ranking was made from: folder, scan revision, search and
-    /// its version, metric.
-    key: (u32, u64, Option<(u32, u64)>, layout::Metric),
-    ranked: Ranked,
-    empty: usize,
-}
 
 struct ActiveSearch {
     id: u32,
@@ -169,7 +172,7 @@ impl Session {
             search: Mutex::new(None),
             latest_search: AtomicU32::new(0),
             deleting: Mutex::new(()),
-            folder_files: Mutex::new(None),
+            rankings: Mutex::new(Rankings::default()),
             names: Mutex::new(None),
             duplicates: Mutex::new(None),
             latest_duplicates: AtomicU32::new(0),
@@ -414,70 +417,132 @@ impl Session {
         &self,
         req: &proto::FolderFilesRequest,
     ) -> Result<proto::FolderFilesPage, String> {
-        let mut search =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
-        let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        // Read with the tree's lock held, so the ranking is cached under the
-        // revision of the tree it's made from (see `with_duplicates`).
-        let revision = self.scan.progress().revision;
-        let folder = node(&tree, req.folder)?;
-        let filter = match req.search {
-            Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
-            None => None,
+        let key = Key {
+            scope: Scope::Files,
+            folder: NodeId::from_index(req.folder),
+            metric: metric(req.metric),
+            search: req.search,
         };
-        let metric = metric(req.metric);
-        let key = (
-            req.folder,
-            revision,
-            filter.map(|s| (req.search.unwrap_or(0), s.version())),
-            metric,
-        );
-        let mut cache = locked("folder_files", || self.folder_files.lock())
-            .map_err(|_| "folder files are unavailable")?;
-        let rank = metrics::span("rank");
-        let cached = match &mut *cache {
-            Some(c) if c.key == key => c,
-            slot => {
-                let (files, empty) = layout::files_under(&tree, folder, metric, filter);
-                slot.insert(FolderFiles {
-                    key,
-                    ranked: Ranked::from_files(files, metric),
-                    empty,
+        let limit = req.limit.min(MAX_PAGE) as usize;
+        let end = (req.offset as usize).saturating_add(limit);
+        self.ranked(key, end, |tree, ranking| {
+            let total = ranking.total();
+            let start = (req.offset as usize).min(total);
+            let end = start.saturating_add(limit).min(total);
+            let base = tree.path(key.folder);
+            let files = ranking.items()[start..end]
+                .iter()
+                .map(|&(f, weight)| {
+                    let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
+                    let path = tree.path(parent);
+                    let sub = path.strip_prefix(&base).unwrap_or(&path);
+                    proto::FolderFile {
+                        node: f.index() as u32,
+                        name: tree.name(f).to_string_lossy().into_owned(),
+                        parent: parent.index() as u32,
+                        subfolder: display_path(sub),
+                        weight,
+                    }
                 })
+                .collect();
+            proto::FolderFilesPage {
+                generation: self.generation(),
+                folder: req.folder,
+                offset: start as u32,
+                total: total as u32,
+                files,
+                empty: ranking.empty() as u32,
+                revision: ranking.basis().revision,
             }
-        };
-        let total = cached.ranked.len();
-        let start = (req.offset as usize).min(total);
-        let end = start
-            .saturating_add(req.limit.min(MAX_PAGE) as usize)
-            .min(total);
-        let base = tree.path(folder);
-        let top = cached.ranked.top(&tree, end);
-        drop(rank);
-        let files = top[start..]
-            .iter()
-            .map(|&f| {
-                let parent = tree.parent(f).unwrap_or(NodeId::ROOT);
-                let path = tree.path(parent);
-                let sub = path.strip_prefix(&base).unwrap_or(&path);
-                proto::FolderFile {
-                    node: f.index() as u32,
-                    name: tree.name(f).to_string_lossy().into_owned(),
-                    parent: parent.index() as u32,
-                    subfolder: display_path(sub),
-                    weight: metric.weight_in(&tree, filter, f),
-                }
-            })
-            .collect();
-        Ok(proto::FolderFilesPage {
-            generation: self.generation(),
-            folder: req.folder,
-            offset: start as u32,
-            total: total as u32,
-            files,
-            empty: cached.empty as u32,
         })
+    }
+
+    /// Serves a page with `serve` from a ranking of `key`'s items that
+    /// covers the first `end`, with the tree read-locked.
+    ///
+    /// A ranking kept for the key is served while [`Ranking::current`]
+    /// says so. Otherwise a walk ranks the items again, a step at a time,
+    /// letting go of the locks between steps. While scanning, a request
+    /// walks at most [`RANK_BUDGET`] nodes and then serves the ranking kept,
+    /// if there is one, so a large folder is ranked again across several
+    /// requests; after the scan, a request walks until it's done, so it
+    /// never serves a ranking from before an edit such as a delete.
+    fn ranked<R>(
+        &self,
+        key: Key,
+        end: usize,
+        serve: impl Fn(&Tree, &Ranking) -> R,
+    ) -> Result<R, String> {
+        let tree_lock = self.scan.tree();
+        let mut walked = 0;
+        loop {
+            let mut search = match key.search {
+                Some(_) => Some(
+                    locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?,
+                ),
+                None => None,
+            };
+            let tree =
+                locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
+            // Read with the tree's lock held, so the revision describes the
+            // tree walked (see `with_duplicates`).
+            let progress = self.scan.progress();
+            let folder = node(&tree, key.folder.index() as u32)?;
+            let filter = match (key.search, search.as_mut()) {
+                (Some(id), Some(search)) => Some(&current_search(search, id, &tree)?.search),
+                _ => None,
+            };
+            let now = Basis {
+                revision: progress.revision,
+                finished: progress.state.is_finished(),
+                signature: Signature::of(&tree, folder, filter),
+                at: Instant::now(),
+            };
+            let mut rankings = locked("rankings", || self.rankings.lock())
+                .map_err(|_| "rankings are unavailable")?;
+            let entry = rankings.entry(key);
+            let serve_kept = entry.ranking().is_some_and(|r| {
+                r.covers(end)
+                    && (r.current(&now, ranking::REFRESH)
+                        || (!now.finished && walked >= RANK_BUDGET))
+            });
+            if serve_kept {
+                drop(search);
+                return Ok(serve(&tree, entry.ranking().expect("checked above")));
+            }
+            let done = {
+                let _rank = metrics::span("rank");
+                entry.walk(&now, end).step(&tree, filter, RANK_STEP)
+            };
+            walked += RANK_STEP;
+            if !done {
+                continue;
+            }
+            let walk = entry.take_walk().expect("a walk was just stepped");
+            drop((rankings, tree, search));
+            let ranking = {
+                let _rank = metrics::span("rank");
+                walk.finish()
+            };
+            let tree =
+                locked("tree", || tree_lock.read()).map_err(|_| "scan data is unavailable")?;
+            let progress = self.scan.progress();
+            let made = ranking.basis();
+            if progress.state.is_finished()
+                && !(made.finished && made.revision == progress.revision)
+            {
+                // Edited since the walk started, or walked while scanning:
+                // either may list what's gone since.
+                continue;
+            }
+            let page = serve(&tree, &ranking);
+            drop(tree);
+            let mut rankings = locked("rankings", || self.rankings.lock())
+                .map_err(|_| "rankings are unavailable")?;
+            rankings.entry(key).keep(ranking);
+            rankings.trim(key);
+            return Ok(page);
+        }
     }
 
     /// Folder names or extensions for the filter's completion, largest
@@ -528,43 +593,37 @@ impl Session {
         &self,
         req: &proto::SmallItemsRequest,
     ) -> Result<proto::SmallItemsPage, String> {
-        let mut search =
-            locked("search", || self.search.lock()).map_err(|_| "search is unavailable")?;
-        let tree = self.scan.tree();
-        let tree = locked("tree", || tree.read()).map_err(|_| "scan data is unavailable")?;
-        let folder = node(&tree, req.folder)?;
-        let filter = match req.search {
-            Some(id) => Some(&current_search(&mut search, id, &tree)?.search),
-            None => None,
+        let key = Key {
+            scope: Scope::Children,
+            folder: NodeId::from_index(req.folder),
+            metric: metric(req.metric),
+            search: req.search,
         };
-        let rank = metrics::span("rank");
-        let (items, empty) = layout::small_children(
-            &tree,
-            folder,
-            metric(req.metric),
-            filter,
-            req.count as usize,
-        );
-        drop(rank);
-        let start = (req.offset as usize).min(items.len());
-        let end = start
-            .saturating_add(req.limit.min(MAX_PAGE) as usize)
-            .min(items.len());
-        Ok(proto::SmallItemsPage {
-            generation: self.generation(),
-            folder: req.folder,
-            offset: start as u32,
-            total: items.len() as u32,
-            items: items[start..end]
-                .iter()
-                .map(|&(n, weight)| proto::SmallItem {
-                    node: n.index() as u32,
-                    name: tree.name(n).to_string_lossy().into_owned(),
-                    folder: tree.is_dir(n),
-                    weight,
-                })
-                .collect(),
-            empty: empty as u32,
+        self.ranked(key, 0, |tree, ranking| {
+            // The region merges the smallest children with a weight.
+            let all = ranking.items();
+            let items = &all[all.len().saturating_sub(req.count as usize)..];
+            let start = (req.offset as usize).min(items.len());
+            let end = start
+                .saturating_add(req.limit.min(MAX_PAGE) as usize)
+                .min(items.len());
+            proto::SmallItemsPage {
+                generation: self.generation(),
+                folder: req.folder,
+                offset: start as u32,
+                total: items.len() as u32,
+                items: items[start..end]
+                    .iter()
+                    .map(|&(n, weight)| proto::SmallItem {
+                        node: n.index() as u32,
+                        name: tree.name(n).to_string_lossy().into_owned(),
+                        folder: tree.is_dir(n),
+                        weight,
+                    })
+                    .collect(),
+                empty: ranking.empty() as u32,
+                revision: ranking.basis().revision,
+            }
         })
     }
 
@@ -1468,6 +1527,66 @@ mod tests {
         let names: Vec<_> = page.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["b.log", "keep.txt"]);
         assert_eq!(session.folder_files(&request).unwrap().total, 2);
+    }
+
+    #[test]
+    fn contents_pages_after_a_delete_are_ranked_again_under_the_new_revision() {
+        let tmp = fixture_named("contents-delete");
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statuses);
+        let session = Session::start(tmp.0.clone(), move |s| sink.lock().unwrap().push(s));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished(&statuses) {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (old, b) = {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            let old = child(&tree, NodeId::ROOT, "old");
+            (old, child(&tree, old, "b.log"))
+        };
+        let search = session.search_set("*.log").unwrap().unwrap().search;
+        let files = |offset| proto::FolderFilesRequest {
+            generation: session.generation(),
+            folder: 0,
+            metric: proto::Metric::Logical,
+            search: Some(search),
+            offset,
+            limit: 1,
+        };
+        let items = proto::SmallItemsRequest {
+            generation: session.generation(),
+            folder: old.index() as u32,
+            metric: proto::Metric::Logical,
+            search: None,
+            count: u32::MAX,
+            offset: 0,
+            limit: 10,
+        };
+        let first = session.folder_files(&files(0)).unwrap();
+        assert_eq!((first.files[0].name.as_str(), first.total), ("a.log", 2));
+        let before = session.small_items(&items).unwrap();
+        assert_eq!(before.total, 2);
+        assert_eq!(
+            before.revision, first.revision,
+            "both ranked after the scan"
+        );
+
+        // The second page, asked for after b.log is deleted, comes from a
+        // new ranking, which the revision tells apart.
+        let ((), progress) = session
+            .scan
+            .edit_finished(|t| assert!(t.remove(b)))
+            .unwrap();
+        let second = session.folder_files(&files(1)).unwrap();
+        assert_eq!((second.files.len(), second.total), (0, 1));
+        assert_eq!(second.revision, progress.revision);
+        assert!(second.revision > first.revision);
+        let after = session.small_items(&items).unwrap();
+        let names: Vec<_> = after.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["logs"]);
+        assert_eq!(after.revision, progress.revision);
     }
 
     #[test]

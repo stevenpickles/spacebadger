@@ -490,7 +490,7 @@ const PARTS: &[(&str, &str, Kind)] = &[
     ("search wait", "search", Kind::Wait),
     ("tree wait", "tree", Kind::Wait),
     ("order wait", "order", Kind::Wait),
-    ("files wait", "folder_files", Kind::Wait),
+    ("rankings wait", "rankings", Kind::Wait),
     ("catch-up", "catch-up", Kind::Stage),
     ("compute", "compute", Kind::Stage),
     ("rank", "rank", Kind::Stage),

@@ -9,4 +9,8 @@ total: number, files: Array<FolderFile>,
 /**
  * Other files under the folder with no size in this metric.
  */
-empty: number, };
+empty: number, 
+/**
+ * The scan revision the files were ranked at.
+ */
+revision: number, };
