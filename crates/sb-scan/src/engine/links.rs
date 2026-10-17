@@ -60,16 +60,32 @@ impl Hasher for IdHasher {
 
 /// The first name a file with several names was found under: the alias
 /// owner, with its listing's stamp to compare later names' listings with.
-/// Its listed sizes are the tree's until the file is re-measured.
+/// Its listed sizes are the tree's until the file is re-measured. With the
+/// key, an entry of the owner map takes 40 bytes (an `Option` would make it
+/// 48).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Owner {
     pub(super) node: NodeId,
-    stamp: Option<LinkStamp>,
+    /// [`NO_STAMP`] for none.
+    stamp: LinkStamp,
 }
+
+/// No listed stamp: listed times are never negative.
+const NO_STAMP: LinkStamp = LinkStamp {
+    written: i64::MIN,
+    changed: i64::MIN,
+};
 
 impl Owner {
     pub(super) fn new(node: NodeId, stamp: Option<LinkStamp>) -> Self {
-        Self { node, stamp }
+        Self {
+            node,
+            stamp: stamp.filter(|s| *s != NO_STAMP).unwrap_or(NO_STAMP),
+        }
+    }
+
+    fn stamp(&self) -> Option<LinkStamp> {
+        (self.stamp != NO_STAMP).then_some(self.stamp)
     }
 }
 
@@ -128,7 +144,7 @@ impl Links {
         owner: Owner,
         remeasure: &mut Vec<(NodeId, PathBuf)>,
     ) {
-        let (Some(listed), Some(first), false) = (entry.stamp, owner.stamp, self.exact) else {
+        let (Some(listed), Some(first), false) = (entry.stamp, owner.stamp(), self.exact) else {
             // Listings of other names can be stale (NTFS), so re-measure
             // both sides once.
             remeasure.push((alias, tree.path(alias)));
@@ -209,6 +225,18 @@ impl Links {
 mod tests {
     use super::*;
     use std::hash::BuildHasher;
+
+    #[test]
+    fn owner_map_entries_stay_small() {
+        assert_eq!(size_of::<(FileKey, Owner)>(), 40);
+        let none = Owner::new(NodeId::ROOT, None);
+        assert_eq!(none.stamp(), None);
+        let stamp = LinkStamp {
+            written: 0,
+            changed: 1,
+        };
+        assert_eq!(Owner::new(NodeId::ROOT, Some(stamp)).stamp(), Some(stamp));
+    }
 
     #[test]
     fn file_ids_hash_apart_in_the_low_bits() {
