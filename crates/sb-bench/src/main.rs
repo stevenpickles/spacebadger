@@ -339,6 +339,7 @@ fn engines(root: &Path, ruler: &Ruler) -> Vec<String> {
     let strategy = ruler.strategies[0];
     let mut failures = Vec::new();
     for &threads in &ruler.threads {
+        let failed_before = failures.len();
         let engine_args = [
             "--engine".into(),
             root.display().to_string(),
@@ -456,6 +457,11 @@ fn engines(root: &Path, ruler: &Ruler) -> Vec<String> {
                 c.pct()
             );
         }
+        line += if failures.len() == failed_before {
+            " coverage=ok"
+        } else {
+            " coverage=failed"
+        };
         println!("{line}");
     }
     failures
