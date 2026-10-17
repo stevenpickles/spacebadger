@@ -818,20 +818,18 @@ pub mod paths {
                 if !server.is_empty() {
                     // `\\server` without a share names no folder; it's kept
                     // as written rather than read as rooted on a drive.
-                    let parts = components(&bytes[2 + server.len()..], style);
                     return Parsed {
                         prefix: Prefix::Unc(os(server), OsString::new()),
-                        absolute: !parts.is_empty(),
-                        parts,
+                        absolute: true,
+                        parts: components(&bytes[2 + server.len()..], style),
                     };
                 }
             }
-            // `/C:/x`, as some tools write Windows paths.
+            // `/C:/x` (or `/C:x`), as some tools write Windows paths.
             if bytes.len() >= 3
                 && is_sep(bytes[0], style)
                 && bytes[1].is_ascii_alphabetic()
                 && bytes[2] == b':'
-                && bytes.get(3).is_none_or(|&b| is_sep(b, style))
             {
                 rest = &bytes[1..];
             }
@@ -899,7 +897,10 @@ pub mod paths {
                 out.push(first);
             }
         }
-        if parsed.absolute {
+        // A UNC prefix is written without a trailing separator, so that
+        // `\\server` and `\\server\share` read back the same.
+        let unc = matches!(parsed.prefix, Prefix::Unc(..));
+        if parsed.absolute && !(unc && parsed.parts.is_empty()) {
             out.push(sep);
         }
         for (i, part) in parsed.parts.iter().enumerate() {
@@ -1060,7 +1061,7 @@ mod tests {
         assert_eq!(normalize(&p(r"c:\a/b\..\..\..\z"), w), p(r"C:\z"));
         assert_eq!(
             normalize(&p(r"\\server\share\a\..\.."), w),
-            p(r"\\server\share\")
+            p(r"\\server\share")
         );
         assert_eq!(normalize(&p("//server/share/x"), w), p(r"\\server\share\x"));
         assert_eq!(normalize(&p(r"\\?\C:\a\..\b"), w), p(r"C:\b"));
@@ -1076,6 +1077,34 @@ mod tests {
         assert_eq!(normalize(&p(r"a\.\b/c"), w), p(r"a\b\c"));
         assert_eq!(normalize(&p("/C:/x/./y"), w), p(r"C:\x\y"));
         assert_eq!(normalize(&p("/C:"), w), p(r"C:\"));
+        assert_eq!(normalize(&p("/C:x"), w), p(r"C:\x"));
+    }
+
+    #[test]
+    fn unc_paths_normalize_to_a_fixed_point() {
+        let w = Style::WINDOWS;
+        for raw in [
+            r"\\server",
+            r"\\server\\x\y",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\server\share\a\..",
+            r"\\server\\x\..\..",
+        ] {
+            let once = normalize(&p(raw), w);
+            let twice = normalize(&once, w);
+            assert_eq!(once.as_os_str(), twice.as_os_str(), "{raw}");
+        }
+        assert_eq!(
+            normalize(&p(r"\\server\share\"), w).as_os_str(),
+            r"\\server\share"
+        );
+        assert_eq!(normalize(&p(r"\\server\\x\.."), w).as_os_str(), r"\\server");
+        assert_eq!(resolve(&p(r"\\server"), "x", w).as_os_str(), r"\\server\x");
+        assert_eq!(
+            resolve(&p(r"\\server"), "../x/y", w).as_os_str(),
+            r"\\server\x\y"
+        );
     }
 
     #[test]
