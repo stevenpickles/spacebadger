@@ -32,6 +32,11 @@ impl Prior {
         Self { snap, index }
     }
 
+    /// Approximate heap bytes held: the snapshot and its index.
+    pub fn memory_bytes(&self) -> usize {
+        self.snap.memory_bytes() + self.index.memory_bytes()
+    }
+
     /// When the snapshot's scan finished, in milliseconds since the Unix
     /// epoch.
     pub fn created_ms(&self) -> u64 {

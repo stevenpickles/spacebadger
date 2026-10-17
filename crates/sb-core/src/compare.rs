@@ -204,6 +204,14 @@ impl ChildIndex {
         from..to
     }
 
+    /// Approximate heap bytes held.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.child_start.capacity() * 4
+            + self.children.capacity() * 4
+            + self.keys.capacity()
+            + self.key_start.capacity() * std::mem::size_of::<usize>()
+    }
+
     /// Lets the folded names go once every lookup is done.
     fn drop_keys(&mut self) {
         self.keys = Vec::new();

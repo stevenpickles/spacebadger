@@ -207,6 +207,21 @@ impl Snapshot {
         id
     }
 
+    /// Approximate heap bytes held.
+    pub fn memory_bytes(&self) -> usize {
+        self.parent.capacity() * 4
+            + self.kind.capacity()
+            + self.name_start.capacity() * 4
+            + self.name_len.capacity() * 2
+            + self.names.capacity()
+            + self.logical.capacity() * 8
+            + self.files.capacity() * 4
+            + self.small_start.capacity() * 4
+            + self.small_len.capacity() * 4
+            + self.small.capacity() * 4
+            + self.header.root.capacity()
+    }
+
     pub fn header(&self) -> &SnapshotHeader {
         &self.header
     }
