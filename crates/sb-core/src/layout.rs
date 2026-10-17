@@ -60,7 +60,7 @@ impl Metric {
     /// previous scan's size of the folders at or under it not yet listed
     /// (see [`Tree::set_prior`]). Snapshots keep logical sizes only, so
     /// only the logical map uses them, and never a filtered one.
-    fn estimate(self, tree: &Tree, filter: Option<&Search>, node: NodeId) -> u64 {
+    pub(crate) fn estimate(self, tree: &Tree, filter: Option<&Search>, node: NodeId) -> u64 {
         match (self, filter) {
             (Self::Logical, None) => tree.pending_estimate(node),
             _ => 0,

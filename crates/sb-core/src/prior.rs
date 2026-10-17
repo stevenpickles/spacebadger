@@ -104,31 +104,44 @@ mod tests {
     }
 
     /// Outside the crate the estimates can't be read at all; inside it,
-    /// only the tree (which keeps them) and the layout's provisional weight
-    /// may. Totals, exports, comparisons, searches, selections, rankings
+    /// only the tree (which keeps them), the layout's provisional weight,
+    /// and the ranking that orders the small items the map merged by that
+    /// same weight may. Totals, exports, comparisons, searches, selections
     /// and Git summaries live in this crate too, so they're checked here.
     #[test]
     fn only_the_layout_reads_estimates() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        // Spelled in two parts so this test doesn't count itself.
-        let needle = ["pending", "_estimate("].concat();
-        let mut readers = Vec::new();
-        for entry in std::fs::read_dir(&src).unwrap() {
-            let path = entry.unwrap().path();
-            let text = std::fs::read_to_string(&path).unwrap();
-            let uses = text.matches(needle.as_str()).count();
-            if uses > 0 {
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                readers.push((name, uses));
+        // Spelled in parts so this test doesn't count itself.
+        let readers = |needle: String| {
+            let mut found = Vec::new();
+            for entry in std::fs::read_dir(&src).unwrap() {
+                let path = entry.unwrap().path();
+                let text = std::fs::read_to_string(&path).unwrap();
+                let uses = text.matches(needle.as_str()).count();
+                if uses > 0 {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    found.push((name, uses));
+                }
             }
-        }
-        readers.sort();
-        // tree.rs defines and maintains it; layout.rs reads it once, in
+            found.sort();
+            found
+        };
+        // The column: kept by tree.rs, read once in layout.rs, in
         // `Metric::estimate`.
-        assert_eq!(readers.len(), 2, "{readers:?}");
-        assert_eq!(readers[0].0, "layout.rs");
-        assert_eq!(readers[0].1, 1, "one read in the layout");
-        assert_eq!(readers[1].0, "tree.rs");
+        let column = readers(["pending", "_estimate("].concat());
+        assert_eq!(column.len(), 2, "{column:?}");
+        assert_eq!(
+            column[0],
+            ("layout.rs".to_owned(), 1),
+            "one read in the layout"
+        );
+        assert_eq!(column[1].0, "tree.rs");
+        // `Metric::estimate`: the layout's area weight, and the ranking's.
+        let names: Vec<String> = readers([".esti", "mate("].concat())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["layout.rs", "ranking.rs"]);
     }
 
     #[test]

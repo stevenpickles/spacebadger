@@ -116,7 +116,9 @@ pub struct Basis {
 }
 
 /// Largest first, ties by node ID; smaller is ranked higher.
-type Rank = (Reverse<u64>, NodeId);
+/// Area weight (the layout's: measured, plus an estimate while a rescan
+/// runs), node, and the measured weight reported.
+type Rank = (Reverse<u64>, NodeId, u64);
 
 #[derive(Debug)]
 enum Kept {
@@ -225,11 +227,14 @@ impl Walk {
                 self.folders.push(c);
                 continue;
             }
-            match self.metric.weight_in(tree, filter, c) {
+            // Ranked as the map sizes it, so the small-items list holds
+            // what the map merged, but reported as measured.
+            let weight = self.metric.weight_in(tree, filter, c);
+            match weight + self.metric.estimate(tree, filter, c) {
                 0 => self.empty += 1,
-                w => {
+                area => {
                     self.weighted += 1;
-                    self.keep((Reverse(w), c));
+                    self.keep((Reverse(area), c, weight));
                 }
             }
         }
@@ -263,14 +268,17 @@ impl Walk {
         Ranking {
             walk: self.id,
             basis: self.basis,
-            items: ranked.into_iter().map(|(Reverse(w), n)| (n, w)).collect(),
+            items: ranked.into_iter().map(|(_, n, w)| (n, w)).collect(),
             weighted: self.weighted,
             empty: self.empty,
         }
     }
 }
 
-/// A folder's items largest first, with the weights they were ranked by.
+/// A folder's items largest first, with their weights. While a rescan
+/// runs they're ranked as the logical map sizes them (measured weight plus
+/// the estimate for what isn't listed yet; see [`Metric`]), but the weights
+/// given are always the measured ones.
 #[derive(Debug)]
 pub struct Ranking {
     /// The walk that made it.
@@ -1001,6 +1009,49 @@ mod tests {
             entry.keep(ranking);
             rankings.trim(files);
             assert!(rankings.items() <= 1_000 || rankings.len() == 1);
+        }
+    }
+
+    #[test]
+    fn children_rank_by_the_maps_area_but_report_measured_weights() {
+        // An earlier scan where `big` held 9,000 bytes; now it's not listed.
+        let sizes = |n| FileSizes {
+            logical: n,
+            allocated: Allocated::known(n),
+        };
+        let mut old = Tree::new("/r");
+        let big = old.add_dir(NodeId::ROOT, "big".as_ref()).unwrap();
+        old.add_file(big, "x".as_ref(), sizes(9_000), None, 0)
+            .unwrap();
+        old.set_dir_state(big, crate::tree::DirState::Listed);
+        old.set_dir_state(NodeId::ROOT, crate::tree::DirState::Listed);
+        let prior = std::sync::Arc::new(crate::prior::Prior::new(
+            crate::snapshot::Snapshot::capture(&old, 0, true),
+        ));
+        let mut rng = Rng(77);
+        let (mut t, mut dirs) = random_tree(5, 0);
+        t.set_prior(prior);
+        let big = t.add_dir(NodeId::ROOT, "big".as_ref()).unwrap();
+        grow(&mut t, &mut dirs, &mut rng, 300);
+        t.set_dir_state(NodeId::ROOT, crate::tree::DirState::Listed);
+        for metric in [Metric::Logical, Metric::Allocated] {
+            let key = Key {
+                scope: Scope::Children,
+                folder: NodeId::ROOT,
+                metric,
+                search: None,
+            };
+            let r = walk(&t, key, None, usize::MAX, &mut rng);
+            let (all, empty) = reference(&t, key, None);
+            assert_eq!(r.items(), &all[..]);
+            assert_eq!(r.empty(), empty);
+            let first = r.items()[0];
+            if metric == Metric::Logical {
+                // Ranked first by its estimate, at its measured 0 bytes.
+                assert_eq!(first, (big, 0));
+            } else {
+                assert_ne!(first.0, big, "no estimate on the allocated map");
+            }
         }
     }
 }
