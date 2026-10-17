@@ -97,6 +97,10 @@ pub mod rect_flags {
     pub const INCOMPLETE: u8 = 1 << 3;
     pub const CLOUD: u8 = 1 << 4;
     pub const HARDLINKED: u8 = 1 << 5;
+    /// Bits 6–7 hold the rectangle's [`GitClass`](crate::git::GitClass):
+    /// `(flags & GIT_MASK) >> GIT_SHIFT`.
+    pub const GIT_SHIFT: u8 = 6;
+    pub const GIT_MASK: u8 = 0b11 << GIT_SHIFT;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
