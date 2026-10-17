@@ -2,8 +2,8 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
 use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::{
-    BATCH_ENTRIES, EntryKind, ErrorKind, HoldProbe, OmissionReason, Progress, RootKind, Scan,
-    ScanConfig, ScanState,
+    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, HoldProbe, OmissionReason, Progress, RootKind,
+    Scan, ScanConfig, ScanState,
 };
 use std::path::Path;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -17,6 +17,7 @@ fn config() -> ScanConfig {
         progress_interval: Duration::from_millis(10),
         sample_limit: 2,
         write_holds: None,
+        git_grace: GIT_GRACE,
     }
 }
 

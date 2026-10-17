@@ -6,7 +6,10 @@ use sb_core::layout::Metric;
 use sb_core::tree::{NodeId, Tree};
 use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::git::ANCESTOR_LIMIT;
-use sb_scan::{EntryKind, ErrorKind, OmissionReason, Progress, Scan, ScanConfig, ScanState};
+use sb_scan::{
+    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, OmissionReason, Progress, Scan, ScanConfig,
+    ScanState,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, RwLock};
@@ -20,6 +23,7 @@ fn config() -> ScanConfig {
         progress_interval: Duration::from_millis(10),
         sample_limit: 2,
         write_holds: None,
+        git_grace: GIT_GRACE,
     }
 }
 
@@ -514,7 +518,11 @@ fn scans_complete_only_once_probes_are_done() {
     let fs = FakeFs::new();
     worktree(&fs);
     let gate = fs.gate_read("wt/.git");
-    let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+    let config = ScanConfig {
+        git_grace: HANG,
+        ..config()
+    };
+    let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
     assert!(gate.entered(HANG), "the probe never reached the gate");
     let deadline = Instant::now() + HANG;
     while s.progress().pending_dirs > 0 || s.progress().git_roots < 1 {
@@ -601,4 +609,177 @@ fn the_repository_above_is_looked_for_only_so_far() {
     let (progress, tree) = run_at(&fs, fs.root().join(&far));
     assert!(tree.read().unwrap().git().above().is_none());
     assert_eq!(progress.git_roots, 0);
+}
+
+#[test]
+fn git_files_pointing_to_other_computers_or_devices_are_never_read() {
+    let fs = FakeFs::new();
+    fs.set_path_style(Style::WINDOWS);
+    let targets = [
+        ("d1", "//192.0.2.1/share/repo"),
+        ("d2", r"\\host\share\repo"),
+        ("d3", r"\\?\UNC\host\share\repo"),
+        ("d4", r"\\.\pipe\x"),
+        ("d5", r"\\?\GLOBALROOT\Device\HarddiskVolume1\repo"),
+        (
+            "d6",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\repo",
+        ),
+    ];
+    for (dir, target) in targets {
+        fs.text(&format!("{dir}/.git"), &format!("gitdir: {target}\n"));
+    }
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    for (dir, _) in targets {
+        assert_eq!(problem(&tree, dir), Some(Problem::NotRead), "{dir}");
+    }
+    assert_eq!(progress.state, ScanState::Complete);
+    // Only the `.git` files themselves and the folders above the root
+    // were looked at.
+    for read in fs.reads() {
+        let text = read.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            ["192.0.2.1", "host", "pipe", "globalroot", "volume{"]
+                .iter()
+                .all(|s| !text.contains(s)),
+            "read {}",
+            read.display()
+        );
+    }
+}
+
+#[test]
+fn git_files_pointing_to_mounted_filesystems_are_never_read() {
+    let fs = FakeFs::new();
+    fs.set_path_style(Style::UNIX);
+    fs.text("nas/.git", "gitdir: /mnt/nas/repo.git\n")
+        .text("usb/.git", "gitdir: /media/me/usb/repo.git\n")
+        .text("mac/.git", "gitdir: /Volumes/Share/repo.git\n")
+        .text("local/.git", "gitdir: /elsewhere/repo.git\n")
+        .outside_text("/elsewhere/repo.git/HEAD", "ref: refs/heads/main\n")
+        .outside_dir("/elsewhere/repo.git/objects")
+        .outside_dir("/elsewhere/repo.git/refs");
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    for dir in ["nas", "usb", "mac"] {
+        assert_eq!(problem(&tree, dir), Some(Problem::NotRead), "{dir}");
+    }
+    assert_eq!(kind(&tree, "local"), Some(RootKind::SeparateGitDir));
+    assert!(
+        fs.reads().iter().all(|p| !p.starts_with("/mnt")
+            && !p.starts_with("/media")
+            && !p.starts_with("/Volumes"))
+    );
+}
+
+#[test]
+fn a_scan_doesnt_wait_forever_for_a_stuck_probe() {
+    let fs = FakeFs::new();
+    worktree(&fs);
+    fs.file("other/a.txt", 1, 4096);
+    let gate = fs.gate_read("wt/.git");
+    let config = ScanConfig {
+        git_grace: Duration::from_millis(200),
+        ..config()
+    };
+    let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
+    assert!(gate.entered(HANG), "the probe never reached the gate");
+    let tree = s.tree();
+    let (finished, watchdog) = release_after_returning(gate);
+    let progress = s.wait();
+    let _ = finished.send(());
+    assert!(
+        watchdog.join().unwrap(),
+        "the scan waited for the stuck read"
+    );
+
+    assert_eq!(progress.state, ScanState::Complete);
+    assert_eq!(progress.files, 10, "everything listed is kept");
+    let tree = tree.read().unwrap();
+    assert_eq!(problem(&tree, "wt"), Some(Problem::TimedOut));
+    assert_eq!(kind(&tree, "main"), Some(RootKind::Repository));
+}
+
+#[test]
+fn git_files_inside_git_directories_are_ignored() {
+    let fs = FakeFs::new();
+    repo(&fs, "r");
+    fs.text("r/.git/.git", "gitdir: nowhere\n");
+    git_dir(&fs, "b.git", "\tbare = true\n");
+    fs.text("b.git/.git", "gitdir: nowhere\n");
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert_eq!(kind(&tree, "r"), Some(RootKind::Repository));
+    assert_eq!(kind(&tree, "r/.git"), Some(RootKind::DotGit));
+    assert_eq!(
+        tree.git_class(find(&tree, "r/.git/HEAD")),
+        GitClass::Metadata
+    );
+    assert_eq!(kind(&tree, "b.git"), Some(RootKind::Bare), "not a pointer");
+    assert_eq!(progress.git_roots, 2);
+}
+
+#[test]
+fn a_worktree_needs_a_real_main_git_directory() {
+    let fs = FakeFs::new();
+    fs.text("wt/.git", "gitdir: ../admin\n")
+        .text("admin/HEAD", "ref: refs/heads/main\n")
+        .text("admin/commondir", "../nothing\n")
+        .text("wt2/.git", "gitdir: ../admin2\n")
+        .text("admin2/HEAD", "ref: refs/heads/main\n")
+        .text("admin2/commondir", "../plain\n")
+        .file("plain/readme.txt", 1, 4096);
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert_eq!(
+        problem(&tree, "wt"),
+        Some(Problem::TargetMissing(native("/fake/nothing")))
+    );
+    assert!(matches!(problem(&tree, "wt2"), Some(Problem::Malformed(_))));
+    assert_eq!(progress.git_roots, 2, "both unresolved");
+}
+
+#[test]
+fn a_git_folder_listed_in_part_is_unreadable() {
+    let fs = FakeFs::new();
+    fs.file("r/.git/a", 1, 4096)
+        .file("r/.git/b", 1, 4096)
+        .fail_dir_after("r/.git", 1, ErrorKind::Disconnected);
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert!(
+        matches!(
+            problem(&tree, "r"),
+            Some(Problem::Unreadable { kind: 2, .. })
+        ),
+        "{:?}",
+        problem(&tree, "r")
+    );
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn a_git_file_is_read_by_its_listed_name() {
+    let fs = FakeFs::new();
+    repo(&fs, "main");
+    fs.text("main/.git/worktrees/wt/HEAD", "ref: refs/heads/topic\n")
+        .text("main/.git/worktrees/wt/commondir", "../..\n")
+        .text("wt/.GIT", "gitdir: ../main/.git/worktrees/wt\n");
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    assert_eq!(kind(&tree, "wt"), Some(RootKind::LinkedWorktree));
+    assert_eq!(kind(&tree, "wt/.GIT"), Some(RootKind::DotGit));
+}
+
+#[test]
+fn signals_in_different_batches_of_a_listing_add_up() {
+    let fs = FakeFs::new();
+    for i in 0..2 * BATCH_ENTRIES + 7 {
+        fs.file(&format!("big.git/f{i:05}"), 1, 1);
+    }
+    // `HEAD` and `config` sort first, `objects` and `refs` last.
+    git_dir(&fs, "big.git", "\tbare = true\n");
+    let (_, tree) = run(&fs);
+    assert_eq!(kind(&tree.read().unwrap(), "big.git"), Some(RootKind::Bare));
 }

@@ -329,6 +329,23 @@ fn reads_small_files_only_when_plain_and_never_through_links() {
         }
         Err(err) => eprintln!("skipped file symlink: {err}"),
     }
+
+    // A FIFO named HEAD is refused without waiting for a writer.
+    #[cfg(unix)]
+    {
+        let fifo = tmp.0.join("fifo/HEAD");
+        std::fs::create_dir(tmp.0.join("fifo")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let err = fs.read_small(&fifo, 4096).unwrap_err();
+        assert_eq!(err.message, refused::NOT_FILE, "{err:?}");
+        assert_eq!(fs.stat_kind(&fifo).unwrap(), EntryKind::Special);
+    }
 }
 
 #[test]
