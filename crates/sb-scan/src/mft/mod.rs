@@ -7,11 +7,14 @@
 //!
 //! - [`record`]: update-sequence fixups, the attribute walk, run lists, and
 //!   the per-record fields a scan needs.
+//! - [`table`]: extension records merged into their base, names per
+//!   record, and a walk with bottom-up subtree totals.
 //!
 //! Kinds come from [`classify`], which decides exactly as the Windows
 //! listing adapter does from the same attributes and reparse tag.
 
 pub mod record;
+pub mod table;
 
 #[cfg(test)]
 mod tests;

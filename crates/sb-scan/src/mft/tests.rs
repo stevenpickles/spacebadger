@@ -1,6 +1,7 @@
 //! Tests with hand-built MFT records.
 
 use super::record::*;
+use super::table::*;
 use super::*;
 
 const SIZE: usize = 1024;
@@ -40,8 +41,18 @@ impl Builder {
         }
     }
 
+    fn directory(mut self) -> Self {
+        self.bytes[22] |= 2;
+        self
+    }
+
     fn not_in_use(mut self) -> Self {
         self.bytes[22] &= !1;
+        self
+    }
+
+    fn base(mut self, reference: u64) -> Self {
+        self.bytes[32..40].copy_from_slice(&reference.to_le_bytes());
         self
     }
 
@@ -456,4 +467,205 @@ fn classifies_like_the_listing_adapter() {
     assert!(is_cloud(rp, 0x9000_101A));
     assert!(!is_cloud(0, 0x9000_101A), "a tag without the attribute");
     assert!(!is_cloud(0x20, 0));
+}
+
+/// A small volume: metafiles, `$Extend`, folders, a hard link, a junction,
+/// a cloud placeholder, and a file whose data and second name live in an
+/// extension record.
+fn volume() -> Vec<Parsed> {
+    let root = frn(5, 5);
+    let docs = frn(40, 2);
+    vec![
+        Builder::new(0, 1)
+            .standard(0x6, 0)
+            .name(root, "$MFT", 3)
+            .data(8)
+            .parse(0),
+        Builder::new(5, 5)
+            .directory()
+            .standard(0x6, 0)
+            .name(root, ".", 3)
+            .parse(5),
+        Builder::new(11, 11)
+            .directory()
+            .standard(0x6, 0)
+            .name(root, "$Extend", 3)
+            .parse(11),
+        Builder::new(24, 1)
+            .standard(0x6, 0)
+            .name(frn(11, 11), "$UsnJrnl", 3)
+            .data(64)
+            .parse(24),
+        Builder::new(40, 2)
+            .directory()
+            .standard(0, 0)
+            .name(root, "docs", 1)
+            .parse(40),
+        Builder::new(41, 1)
+            .standard(0x20, 7)
+            .name(docs, "a.txt", 1)
+            .data(100)
+            .parse(41),
+        // Two names in two folders: counted once.
+        Builder::new(42, 1)
+            .standard(0x20, 0)
+            .name(docs, "link-1.bin", 1)
+            .name(root, "link-2.bin", 1)
+            .big_data(0, 8192, 5000, 0)
+            .parse(42),
+        Builder::new(43, 1)
+            .directory()
+            .standard(0x400, 0)
+            .name(root, "junction", 1)
+            .reparse(tag::MOUNT_POINT)
+            .parse(43),
+        Builder::new(44, 1)
+            .standard(0x400 | attr::RECALL_ON_DATA_ACCESS, 0)
+            .name(docs, "cloud.docx", 1)
+            .reparse(0x9000_601A)
+            .big_data(0x8000, 1 << 20, 1 << 20, 0)
+            .parse(44),
+        // Base record 45 keeps its standard info and attribute list; its
+        // data and its second name are in extension record 46.
+        Builder::new(45, 1)
+            .standard(0x20, 0)
+            .name(root, "big.iso", 1)
+            .attribute_list(&[(0x10, frn(45, 1)), (0x80, frn(46, 1)), (0x30, frn(46, 1))])
+            .parse(45),
+        Builder::new(46, 1)
+            .base(frn(45, 1))
+            .name(docs, "big-alias.iso", 1)
+            .big_data(0, 1 << 30, 1 << 30, 0)
+            .parse(46),
+        // An extension whose base was reused (other sequence): ignored.
+        Builder::new(47, 1)
+            .base(frn(41, 9))
+            .name(root, "ghost", 1)
+            .data(8)
+            .parse(47),
+        // Names a parent whose sequence moved on: not reached.
+        Builder::new(48, 1)
+            .standard(0x20, 0)
+            .name(frn(40, 1), "stale", 1)
+            .data(8)
+            .parse(48),
+    ]
+}
+
+#[test]
+fn merges_extension_records_into_their_base() {
+    let table = Table::build([volume()], 64);
+    let big = table.get(45).unwrap();
+    assert_eq!((big.logical, big.allocated), (1 << 30, 1 << 30));
+    assert_eq!(big.attribute_list, ListKind::Resident);
+    assert_eq!(big.extensions, 1);
+    let names: Vec<_> = table
+        .names_of(45)
+        .map(|i| String::from_utf16_lossy(table.name(i).1))
+        .collect();
+    assert_eq!(names, ["big.iso", "big-alias.iso"]);
+    assert_eq!(
+        table.get(41).unwrap().logical,
+        100,
+        "untouched by the orphan"
+    );
+    assert_eq!(table.get(41).unwrap().usn, 7);
+    let s = &table.stats;
+    assert_eq!(
+        (
+            s.extension_records,
+            s.merged_extensions,
+            s.orphan_extensions
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!((s.attribute_list_records, s.missing_list_segments), (1, 0));
+    assert_eq!(s.hard_linked_records, 2);
+    assert_eq!(s.stale_parents, 1);
+    assert!(
+        table.get(46).is_none(),
+        "extensions aren't records of their own"
+    );
+    assert_eq!(table.path(42), "\\docs\\link-1.bin");
+    assert_eq!(table.reference_of(42), frn(42, 1));
+}
+
+#[test]
+fn reports_list_entries_that_were_not_merged_and_non_resident_lists() {
+    let mut parsed = vec![
+        Builder::new(5, 5).directory().standard(0, 0).parse(5),
+        Builder::new(50, 1)
+            .standard(0x20, 0)
+            .name(frn(5, 5), "f", 1)
+            .attribute_list(&[(0x80, frn(51, 1))])
+            .parse(50),
+    ];
+    let mut b = Builder::new(52, 1)
+        .standard(0x20, 0)
+        .name(frn(5, 5), "g", 1);
+    b.non_resident(
+        ATTR_ATTRIBUTE_LIST,
+        "",
+        0,
+        0,
+        &[0x11, 0x01, 0x30],
+        4096,
+        200,
+        0,
+    );
+    parsed.push(b.parse(52));
+    let table = Table::build([parsed], 64);
+    assert_eq!(table.stats.missing_list_segments, 1);
+    assert_eq!(table.stats.nonresident_attribute_lists, [frn(52, 1)]);
+    assert_eq!(table.stats.attribute_list_records, 2);
+    assert_eq!(table.get(52).unwrap().attribute_list, ListKind::NonResident);
+}
+
+#[test]
+fn walks_down_from_the_root_with_bottom_up_totals() {
+    // Chunks may arrive in any order.
+    let mut records = volume();
+    let tail = records.split_off(6);
+    let table = Table::build([tail, records], 64);
+    let walk = table.walk(ROOT);
+    let mut seen: Vec<_> = walk
+        .nodes
+        .iter()
+        .map(|n| String::from_utf16_lossy(table.name(n.name).1))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            "a.txt",
+            "big-alias.iso",
+            "big.iso",
+            "cloud.docx",
+            "docs",
+            "junction",
+            "link-1.bin",
+            "link-2.bin",
+        ],
+        "no metafiles, nothing under $Extend, nothing through the junction"
+    );
+    let t = walk.totals;
+    assert_eq!((t.files, t.aliases, t.directories), (4, 2, 1));
+    assert_eq!(t.mount_points, 1);
+    assert_eq!(t.logical, 100 + 5000 + (1 << 20) + (1 << 30));
+    // The placeholder holds no clusters: allocated 0, as listed.
+    assert_eq!(t.allocated, 104 + 8192 + (1 << 30));
+    assert_eq!(walk.directories[0].0, ROOT);
+    let (docs, docs_totals) = walk.directories[1];
+    assert_eq!(docs, 40);
+    // Whichever name of the shared files is reached first takes their size.
+    assert!(docs_totals.files + docs_totals.aliases == 4);
+    assert!(table.cloud(44));
+    assert_eq!(table.kind(44), EntryKind::File);
+    assert_eq!(table.kind(43), EntryKind::MountPoint);
+    assert_eq!(table.kind(40), EntryKind::Directory);
+
+    // A subtree walk sees only its own part.
+    let sub = table.walk(40);
+    assert_eq!(sub.nodes.len(), 4);
+    assert!(table.walk(41).nodes.is_empty(), "a file isn't walked");
 }
