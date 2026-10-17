@@ -3,8 +3,8 @@
 use sb_core::git::{GitClass, Problem, RootKind as GitKind};
 use sb_core::tree::{NodeId, Tree, flags};
 use sb_scan::{
-    BATCH_ENTRIES, EntryKind, ErrorKind, FsAdapter, NativeFs, OmissionReason, Progress, Scan,
-    ScanConfig, ScanState, refused,
+    BATCH_ENTRIES, DirHandle, DirRef, EntryKind, ErrorKind, FsAdapter, NativeFs, OmissionReason,
+    Progress, Scan, ScanConfig, ScanError, ScanState, refused,
 };
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -418,4 +418,126 @@ fn records_an_id_for_every_file_and_folder() {
         .map(|p| tree.id(find(&tree, p)).expect("an id"))
         .collect();
     assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+}
+
+/// Every node's path, kind, sizes, ID and flags, in path order.
+fn contents(tree: &Tree) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(NodeId::ROOT, PathBuf::new())];
+    while let Some((node, path)) = stack.pop() {
+        out.push(format!(
+            "{} {} {} {} {:?} {} {:?}",
+            path.display(),
+            tree.is_dir(node),
+            tree.logical(node),
+            tree.allocated(node),
+            tree.id(node),
+            tree.flags(node),
+            tree.dir_state(node),
+        ));
+        for child in tree.children(node) {
+            stack.push((child, path.join(tree.name(child))));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn folders_past_the_open_limit_are_opened_by_path_with_the_same_result() {
+    let tmp = TempDir::new("open-limit");
+    for d in 0..6 {
+        for s in 0..4 {
+            write(&tmp.0.join(format!("d{d}/s{s}/deeper/f.bin")), d * 10 + s);
+            write(&tmp.0.join(format!("d{d}/s{s}/g.bin")), 7);
+        }
+    }
+    let scan_with = |open_dirs| {
+        let config = ScanConfig {
+            open_dirs,
+            ..ScanConfig::default()
+        };
+        let s = Scan::start(tmp.0.clone(), NativeFs::new(), config, |_| {});
+        let tree = s.tree();
+        let progress = s.wait();
+        assert_eq!(progress.state, ScanState::Complete);
+        assert_eq!(progress.files, 48);
+        let tree = tree.read().unwrap();
+        contents(&tree)
+    };
+    let all = scan_with(sb_scan::OPEN_DIRS);
+    assert_eq!(all.len(), 1 + 6 + 24 + 24 + 48);
+    assert_eq!(scan_with(0), all);
+    assert_eq!(scan_with(1), all);
+}
+
+/// Lists `dir` with [`FsAdapter::list_dir`]: the result, and each entry's
+/// name, kind, length and ID in name order.
+#[allow(clippy::type_complexity)]
+fn list(
+    fs: &NativeFs,
+    dir: DirRef<'_>,
+) -> (
+    Result<Option<DirHandle>, ScanError>,
+    Vec<(std::ffi::OsString, EntryKind, u64, u128)>,
+) {
+    let mut entries = Vec::new();
+    let result = fs.list_dir(dir, &mut |batch| {
+        entries.extend(batch.into_iter().map(|e| (e.name, e.kind, e.logical, e.id)));
+        ControlFlow::Continue(())
+    });
+    entries.sort_by(|x, y| x.0.cmp(&y.0));
+    (result, entries)
+}
+
+#[test]
+fn a_folder_opened_relative_to_its_parent_lists_as_by_path_and_vanishes_when_renamed() {
+    let tmp = TempDir::new("relative");
+    let (a, b) = (tmp.0.join("a"), tmp.0.join("a/b"));
+    write(&b.join("one.bin"), 10);
+    write(&b.join("c/two.bin"), 20);
+    let fs = NativeFs::new();
+    let (parent, _) = list(
+        &fs,
+        DirRef {
+            path: &a,
+            parent: None,
+        },
+    );
+    let parent = parent.unwrap();
+    assert_eq!(parent.is_some(), cfg!(windows), "kept open on Windows");
+
+    let at_b = DirRef {
+        path: &b,
+        parent: parent.as_ref(),
+    };
+    let (relative, entries) = list(&fs, at_b);
+    assert!(relative.is_ok());
+    drop(relative);
+    let (by_path, expected) = list(
+        &fs,
+        DirRef {
+            path: &b,
+            parent: None,
+        },
+    );
+    drop(by_path);
+    assert_eq!(entries, expected);
+    assert_eq!(entries.len(), 2);
+
+    // Renamed after its parent was listed: gone, as a path open says.
+    std::fs::rename(&b, a.join("b2")).unwrap();
+    let (relative, _) = list(&fs, at_b);
+    let (by_path, _) = list(
+        &fs,
+        DirRef {
+            path: &b,
+            parent: None,
+        },
+    );
+    let Err(err) = relative else {
+        panic!("listed a renamed folder")
+    };
+    assert_eq!(err.kind, ErrorKind::Vanished);
+    assert_eq!(Some(err), by_path.err());
 }
