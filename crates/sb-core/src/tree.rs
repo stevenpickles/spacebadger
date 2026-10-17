@@ -11,6 +11,7 @@
 //! keep their IDs, which are never reused, but are unlinked from their
 //! parent and report zero sizes.
 
+use crate::git::{GitClass, GitIndex, GitRoot, Problem, RootKind};
 use crate::size::Allocated;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -49,6 +50,8 @@ pub mod flags {
     /// A listed folder with entries that couldn't be read (they vanished
     /// or couldn't be measured), so some of its children may be missing.
     pub const UNREADABLE_ENTRIES: u8 = 1 << 5;
+    /// Has an entry in the tree's [`GitIndex`](crate::git::GitIndex).
+    pub const GIT: u8 = 1 << 6;
 }
 
 /// Traversal state of a directory.
@@ -264,6 +267,9 @@ pub struct Tree {
     /// files), in order. Lets overlays such as search catch up without
     /// rescanning the tree.
     changes: Vec<u32>,
+    /// Git repositories, worktrees and metadata found in the scan. A side
+    /// table, not a column: only nodes with [`flags::GIT`] have entries.
+    git: GitIndex,
 }
 
 impl std::fmt::Debug for Tree {
@@ -299,6 +305,7 @@ impl Tree {
             alias_owner: HashMap::new(),
             dir_count: 0,
             changes: Vec::new(),
+            git: GitIndex::default(),
         };
         tree.push(NONE, OsStr::new(""), flags::DIRECTORY)
             .expect("empty tree has capacity for its root");
@@ -669,6 +676,7 @@ impl Tree {
         self.unlink(node);
 
         let mut orphaned = Vec::new();
+        let mut git = Vec::new();
         let mut stack = vec![node.0];
         while let Some(n) = stack.pop() {
             let j = n as usize;
@@ -678,6 +686,9 @@ impl Tree {
                 c = self.next_sibling[c as usize];
             }
             let node_flags = self.flags[j];
+            if node_flags & flags::GIT != 0 {
+                git.push(NodeId(n));
+            }
             if node_flags & flags::DIRECTORY != 0 {
                 self.dir_count -= 1;
             } else {
@@ -696,6 +707,17 @@ impl Tree {
         }
         for (owner, allocated) in orphaned {
             self.hand_over(owner, allocated);
+        }
+        for n in git {
+            // A repository whose `.git` (folder or file) went is no longer
+            // known to be one.
+            if self.git.get(n).is_some_and(|r| r.kind == RootKind::DotGit) {
+                let owner = self.parent[n.index()];
+                if owner != NONE && !self.is_removed(NodeId(owner)) {
+                    self.set_git(GitRoot::unresolved(NodeId(owner), Problem::MetadataRemoved));
+                }
+            }
+            self.git.forget(n);
         }
         true
     }
@@ -752,6 +774,74 @@ impl Tree {
         self.alias_owner.len()
     }
 
+    /// Inserts or replaces the Git entry of `root.node`. Its node is logged
+    /// in [`GitIndex::changes`] when its class or kind changed, so overlays
+    /// can reclassify its subtree. Ignored for a removed node.
+    pub fn set_git(&mut self, root: GitRoot) {
+        let i = self.checked(root.node).0;
+        if self.flags[i] & flags::REMOVED != 0 {
+            return;
+        }
+        self.flags[i] |= flags::GIT;
+        self.git.set(root);
+    }
+
+    /// Records the repository the scan root is inside of, found at `path`
+    /// above it. Logs the root in [`GitIndex::changes`] when it changed.
+    pub fn set_git_above(&mut self, path: PathBuf, root: GitRoot) {
+        debug_assert_eq!(root.node, NodeId::ROOT);
+        self.git.set_above(path, root);
+    }
+
+    pub fn git(&self) -> &GitIndex {
+        &self.git
+    }
+
+    /// The node's own Git entry, if it has one.
+    pub fn git_entry(&self, node: NodeId) -> Option<&GitRoot> {
+        if *self.flags.at(self.checked(node)) & flags::GIT == 0 {
+            return None;
+        }
+        self.git.get(node)
+    }
+
+    /// The class the node's own entry gives its subtree; `None` when it
+    /// inherits one from above.
+    pub fn git_own(&self, node: NodeId) -> Option<GitClass> {
+        self.git_entry(node).and_then(|r| r.kind.class())
+    }
+
+    /// The node's Git class: that of the nearest entry at or above it with
+    /// one, or of the repository above the scan root. O(depth).
+    pub fn git_class(&self, node: NodeId) -> GitClass {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if let Some(class) = self.git_own(n) {
+                return class;
+            }
+            cur = self.parent(n);
+        }
+        self.git
+            .above()
+            .and_then(|(_, r)| r.kind.class())
+            .unwrap_or_default()
+    }
+
+    /// The nearest node at or above `node` with a listed Git entry (a
+    /// repository, worktree, or unresolved candidate). `None` when there's
+    /// none in the scan; the repository above the scan root, if any, is
+    /// [`GitIndex::above`].
+    pub fn git_root_of(&self, node: NodeId) -> Option<NodeId> {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if self.git_entry(n).is_some_and(|r| r.kind.listed()) {
+                return Some(n);
+            }
+            cur = self.parent(n);
+        }
+        None
+    }
+
     /// Approximate heap bytes held by the tree.
     pub fn memory_bytes(&self) -> usize {
         let columns = [
@@ -773,6 +863,7 @@ impl Tree {
             + self.names.capacity()
             + self.alias_owner.capacity() * 16
             + self.changes.capacity() * 4
+            + self.git.memory_bytes()
     }
 }
 
@@ -1230,8 +1321,9 @@ mod tests {
         let mut t = Tree::new("/");
         // Past the end, but inside the root's chunk.
         let ghost = NodeId::from_index(5);
-        let writes: [&dyn Fn(&mut Tree); 7] = [
+        let writes: [&dyn Fn(&mut Tree); 8] = [
             &|t| t.set_id(ghost, 42),
+            &|t| t.set_git(GitRoot::pending(ghost)),
             &|t| t.set_dir_state(ghost, DirState::Listed),
             &|t| t.mark_unreadable_entries(ghost),
             &|t| t.update_file(ghost, sizes(1, 1)),
@@ -1258,5 +1350,167 @@ mod tests {
         assert_eq!(t.dir_state(ghost), DirState::Pending);
         assert_eq!(t.flags(ghost), flags::DIRECTORY);
         assert_eq!(t.children(ghost).count(), 0);
+        assert!(t.git().is_empty());
+    }
+
+    fn git_changes(t: &Tree) -> Vec<NodeId> {
+        t.git()
+            .changes()
+            .iter()
+            .map(|&raw| NodeId::from_index(raw))
+            .collect()
+    }
+
+    #[test]
+    fn set_git_flags_the_node_and_logs_class_changes() {
+        let mut t = Tree::new("/s");
+        let repo = t.add_dir(NodeId::ROOT, "repo".as_ref()).unwrap();
+        let dot = t.add_dir(repo, ".git".as_ref()).unwrap();
+        let f = t
+            .add_file(repo, "a".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        assert_eq!(t.git_class(f), GitClass::Other);
+        assert_eq!(t.git_own(repo), None);
+
+        t.set_git(GitRoot::pending(repo));
+        assert_ne!(t.flags(repo) & flags::GIT, 0);
+        assert_eq!(t.git_own(repo), None, "pending inherits");
+        assert_eq!(t.git_root_of(f), None);
+        t.set_git(GitRoot {
+            head: Some(crate::git::Head::Branch("main".into())),
+            ..GitRoot::new(repo, RootKind::Repository)
+        });
+        t.set_git(GitRoot::new(dot, RootKind::DotGit));
+        // Same kind, new details: nothing to reclassify.
+        t.set_git(GitRoot::new(repo, RootKind::Repository));
+        assert_eq!(git_changes(&t), [repo, repo, dot]);
+        assert_eq!(t.git().get(repo).unwrap().head, None);
+        assert_eq!(t.git().listed_count(), 1);
+        assert_eq!(t.git().roots().count(), 2);
+
+        assert_eq!(t.git_class(f), GitClass::Checkout);
+        assert_eq!(t.git_class(dot), GitClass::Metadata);
+        assert_eq!(t.git_class(NodeId::ROOT), GitClass::Other);
+        assert_eq!(t.git_root_of(f), Some(repo));
+        assert_eq!(t.git_root_of(dot), Some(repo));
+        assert_eq!(t.git_root_of(NodeId::ROOT), None);
+        assert_eq!(t.flags(f) & flags::GIT, 0);
+    }
+
+    #[test]
+    fn nearest_git_entry_wins_and_above_covers_the_rest() {
+        let mut t = Tree::new("/s/repo/src");
+        let outer = t.add_dir(NodeId::ROOT, "outer".as_ref()).unwrap();
+        let wt = t.add_dir(outer, "wt".as_ref()).unwrap();
+        let broken = t.add_dir(wt, "broken".as_ref()).unwrap();
+        let deep = t
+            .add_file(broken, "f".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        let loose = t
+            .add_file(NodeId::ROOT, "g".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        t.set_git(GitRoot::new(outer, RootKind::Repository));
+        t.set_git(GitRoot::new(wt, RootKind::LinkedWorktree));
+        t.set_git(GitRoot::unresolved(broken, Problem::Link));
+        assert_eq!(t.git_class(deep), GitClass::Worktree);
+        assert_eq!(t.git_root_of(deep), Some(broken), "unresolved is listed");
+        assert_eq!(t.git_class(loose), GitClass::Other);
+
+        let before = t.git().changes().len();
+        t.set_git_above(
+            PathBuf::from("/s/repo"),
+            GitRoot::new(NodeId::ROOT, RootKind::Repository),
+        );
+        assert_eq!(t.git_class(loose), GitClass::Checkout);
+        assert_eq!(t.git_class(NodeId::ROOT), GitClass::Checkout);
+        assert_eq!(t.git_class(deep), GitClass::Worktree);
+        assert_eq!(&t.git().changes()[before..], [0]);
+        assert_eq!(t.git().above().unwrap().0, Path::new("/s/repo"));
+        assert_eq!(t.git().listed_count(), 4);
+        // Setting the same again logs nothing.
+        t.set_git_above(
+            PathBuf::from("/s/repo"),
+            GitRoot::new(NodeId::ROOT, RootKind::Repository),
+        );
+        assert_eq!(t.git().changes().len(), before + 1);
+        assert_eq!(t.git().listed_count(), 4);
+        assert_eq!(t.git_root_of(loose), None);
+    }
+
+    #[test]
+    fn removing_a_dot_git_downgrades_its_repository() {
+        let mut t = Tree::new("/s");
+        let repo = t.add_dir(NodeId::ROOT, "repo".as_ref()).unwrap();
+        let dot = t.add_dir(repo, ".git".as_ref()).unwrap();
+        let wt = t.add_dir(NodeId::ROOT, "wt".as_ref()).unwrap();
+        let pointer = t
+            .add_file(wt, ".git".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        let other = t.add_dir(NodeId::ROOT, "other".as_ref()).unwrap();
+        let nested = t.add_dir(other, "nested".as_ref()).unwrap();
+        t.set_git(GitRoot::new(repo, RootKind::Repository));
+        t.set_git(GitRoot::new(dot, RootKind::DotGit));
+        t.set_git(GitRoot::new(wt, RootKind::LinkedWorktree));
+        t.set_git(GitRoot::new(pointer, RootKind::DotGit));
+        t.set_git(GitRoot::new(nested, RootKind::Repository));
+        assert_eq!(t.git().listed_count(), 3);
+
+        let before = t.git().changes().len();
+        assert!(t.remove(dot));
+        assert!(t.remove(pointer));
+        let downgraded = t.git().get(repo).unwrap();
+        assert_eq!(downgraded.kind, RootKind::Unresolved);
+        assert_eq!(downgraded.problem, Some(Problem::MetadataRemoved));
+        assert_eq!(t.git().get(wt).unwrap().kind, RootKind::Unresolved);
+        assert_eq!(&git_changes(&t)[before..], [repo, wt]);
+        assert_eq!(t.git_class(repo), GitClass::Other);
+        assert!(t.git().get(dot).is_none() && t.git().get(pointer).is_none());
+
+        // A repository removed whole leaves nothing behind.
+        assert!(t.remove(other));
+        assert!(t.git().get(nested).is_none());
+        assert_eq!(t.git().listed_count(), 2);
+        assert_eq!(t.git().roots().count(), 2);
+        // Removed nodes take no new entries.
+        t.set_git(GitRoot::new(nested, RootKind::Repository));
+        assert!(t.git().get(nested).is_none());
+    }
+
+    #[test]
+    fn git_entries_across_chunks() {
+        let mut t = Tree::new("/");
+        let mut parent = NodeId::ROOT;
+        let mut repos = Vec::new();
+        for i in 0..2 * CHUNK + 5 {
+            let d = t.add_dir(parent, format!("d{i}").as_ref()).unwrap();
+            if i % 1000 == 0 {
+                t.set_git(GitRoot::new(d, RootKind::Repository));
+                repos.push(d);
+            }
+            if i % 7 == 0 {
+                parent = d;
+            }
+        }
+        let leaf = t
+            .add_file(parent, "f".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        assert_eq!(t.git().listed_count(), repos.len() as u32);
+        for &r in &repos {
+            assert_eq!(t.git_own(r), Some(GitClass::Checkout));
+        }
+        assert_eq!(t.git_class(leaf), GitClass::Checkout);
+        // The nearest is the last repository the leaf's chain passes.
+        let root = t.git_root_of(leaf).unwrap();
+        assert!(repos.contains(&root));
+        let mut cur = t.parent(leaf);
+        while let Some(n) = cur {
+            if n == root {
+                break;
+            }
+            assert_eq!(t.git_entry(n), None);
+            cur = t.parent(n);
+        }
+        let with = t.memory_bytes();
+        assert!(with >= repos.len() * std::mem::size_of::<GitRoot>());
     }
 }
