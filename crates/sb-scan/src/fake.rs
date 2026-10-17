@@ -1,8 +1,8 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
-    read_capped, refused,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured, RootKind, ScanError,
+    Sink, batched, read_capped, refused,
 };
 use sb_core::git::paths::Style;
 use std::collections::BTreeMap;
@@ -21,6 +21,8 @@ enum Node {
         identity: Identity,
         cloud: bool,
         modified: Option<SystemTime>,
+        /// The listed times of a linked name; see [`FakeFs::stamped_link`].
+        stamp: Option<LinkStamp>,
         /// What [FsAdapter::read_small] returns; zeros of the logical size
         /// when not given.
         contents: Option<Arc<[u8]>>,
@@ -56,6 +58,10 @@ pub struct FakeFs {
     /// Listings that block after this many entries.
     late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
+    measure_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
+    measure_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Every path given to `measure_file`, in order.
+    measures: Arc<Mutex<Vec<PathBuf>>>,
     read_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
     read_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
     /// Every path given to `read_small` or `stat_kind`, in order.
@@ -144,6 +150,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                stamp: None,
                 contents: None,
             },
         )
@@ -158,6 +165,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                stamp: None,
                 contents: None,
             },
         )
@@ -172,6 +180,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: true,
                 modified: None,
+                stamp: None,
                 contents: None,
             },
         )
@@ -187,6 +196,33 @@ impl FakeFs {
                 identity: Identity::MaybeShared { key },
                 cloud: false,
                 modified: None,
+                stamp: None,
+                contents: None,
+            },
+        )
+    }
+
+    /// A name of a file sharing `key` with other names, listed with
+    /// `stamp` as a Windows listing gives it: names of one file listed with
+    /// the same sizes and stamp are taken as listed, and a difference makes
+    /// the scan re-measure the file once.
+    pub fn stamped_link(
+        &self,
+        path: &str,
+        logical: u64,
+        allocated: u64,
+        key: u128,
+        stamp: LinkStamp,
+    ) -> &Self {
+        self.insert(
+            path,
+            Node::File {
+                logical,
+                allocated: Some(allocated),
+                identity: Identity::MaybeShared { key },
+                cloud: false,
+                modified: None,
+                stamp: Some(stamp),
                 contents: None,
             },
         )
@@ -222,6 +258,7 @@ impl FakeFs {
             identity: Identity::Unique,
             cloud: false,
             modified: None,
+            stamp: None,
             contents: Some(Arc::from(text.as_bytes())),
         }
     }
@@ -316,6 +353,32 @@ impl FakeFs {
         self
     }
 
+    /// Makes [`FsAdapter::measure_file`] of `path` fail as vanished.
+    pub fn fail_measure(&self, path: &str) -> &Self {
+        self.measure_errors.lock().unwrap().insert(
+            Self::abs(path),
+            ScanError::new(ErrorKind::Vanished, "injected"),
+        );
+        self
+    }
+
+    /// Makes [`FsAdapter::measure_file`] of `path` block until the returned
+    /// gate is released or dropped.
+    pub fn gate_measure(&self, path: &str) -> Gate {
+        let (gate, receiver) = Gate::new();
+        self.measure_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), receiver);
+        gate
+    }
+
+    /// Every path [`FsAdapter::measure_file`] was asked about so far, in
+    /// order.
+    pub fn measures(&self) -> Vec<PathBuf> {
+        self.measures.lock().unwrap().clone()
+    }
+
     /// Sets how paths in Git metadata read (by default as on this platform).
     pub fn set_path_style(&self, style: Style) -> &Self {
         *self.style.lock().unwrap() = Some(style);
@@ -383,6 +446,14 @@ impl FsAdapter for FakeFs {
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        self.measures.lock().unwrap().push(file.to_path_buf());
+        let gate = self.measure_gates.lock().unwrap().get(file).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+        if let Some(err) = self.measure_errors.lock().unwrap().get(file) {
+            return Err(err.clone());
+        }
         if let Some(m) = self.measured.lock().unwrap().get(file) {
             return Ok(*m);
         }
@@ -466,6 +537,7 @@ impl FakeFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     },
                     Node::File {
                         logical,
@@ -473,6 +545,7 @@ impl FakeFs {
                         identity,
                         cloud,
                         modified,
+                        stamp,
                         ..
                     } => Entry {
                         name,
@@ -487,6 +560,7 @@ impl FakeFs {
                         },
                         cloud: *cloud,
                         modified: *modified,
+                        stamp: *stamp,
                     },
                     Node::Other(kind) => Entry {
                         name,
@@ -497,6 +571,7 @@ impl FakeFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     },
                 }
             })

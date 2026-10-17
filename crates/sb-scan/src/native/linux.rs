@@ -226,6 +226,7 @@ impl LinuxFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     };
                     if out.push(failed).is_break() {
                         return Ok(());
@@ -271,6 +272,7 @@ impl LinuxFs {
                 id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
                 modified: modified(&stx),
+                stamp: None,
             };
             if out.push(entry).is_break() {
                 return Ok(());

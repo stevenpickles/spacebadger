@@ -185,6 +185,7 @@ impl FsAdapter for SynthFs {
                     id: u128::from(seed ^ i),
                     cloud: false,
                     modified: Some(modified),
+                    stamp: None,
                 };
                 if out.push(entry).is_break() {
                     return Ok(());
@@ -203,6 +204,7 @@ impl FsAdapter for SynthFs {
                     id: u128::from(seed ^ (i << 20)),
                     cloud: false,
                     modified: Some(modified),
+                    stamp: None,
                 };
                 if out.push(entry).is_break() {
                     return Ok(());

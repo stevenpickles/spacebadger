@@ -8,6 +8,10 @@
 //!   held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
+//! - A file listed under several names may be stale under all but the one
+//!   it was last changed through, so each entry also carries its listed
+//!   `LastWriteTime` and `ChangeTime` (see [`LinkStamp`]): the engine
+//!   re-measures a file only when its names' listings disagree.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -21,8 +25,8 @@
 //!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io, read_capped, refused,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured, RootKind,
+    ScanError, Sink, batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
@@ -425,6 +429,8 @@ struct Listed {
     file_id: u128,
     /// `LastWriteTime`: 100 ns intervals since 1601, 0 when not set.
     last_write: i64,
+    /// `ChangeTime`, likewise.
+    change_time: i64,
 }
 
 /// Seconds from 1601-01-01, where `FILETIME` counts from, to the Unix epoch.
@@ -505,6 +511,10 @@ impl Listed {
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),
+            stamp: Some(LinkStamp {
+                written: self.last_write,
+                changed: self.change_time,
+            }),
             name: self.name,
         }
     }
@@ -539,6 +549,7 @@ impl DirInfo for FILE_ID_EXTD_DIR_INFO {
             reparse_tag: self.ReparsePointTag,
             file_id: u128::from_le_bytes(self.FileId.Identifier),
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
 }
@@ -564,6 +575,7 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
             reparse_tag: self.EaSize,
             file_id: self.FileId as u64 as u128,
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
 }

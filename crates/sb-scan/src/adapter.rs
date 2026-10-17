@@ -64,6 +64,26 @@ pub struct Entry {
     pub cloud: bool,
     /// Last write time, if the listing gave one. Recorded for files.
     pub modified: Option<SystemTime>,
+    /// The listing's raw times for a file that may have other names, where
+    /// the listing of one name can be stale (see [`LinkStamp`]); `None`
+    /// where the adapter gives none, and then every name of a shared file is
+    /// re-measured.
+    pub stamp: Option<LinkStamp>,
+}
+
+/// The times a listing gives for one name of a file, as the filesystem
+/// keeps them per name. NTFS keeps a copy of a file's sizes and times in
+/// each directory entry and updates only the entry of the name a change
+/// went through, so the other names' entries go stale. Two names of one
+/// file listed with the same sizes and stamp are taken as they are; a
+/// difference means one is stale, and the file is re-measured once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkStamp {
+    /// Last write time as the listing gives it (Windows: 100 ns ticks
+    /// since 1601).
+    pub written: i64,
+    /// Last change time (attributes, links or contents), likewise.
+    pub changed: i64,
 }
 
 /// Authoritative sizes from a per-file query.
@@ -321,6 +341,7 @@ mod tests {
             id: 0,
             cloud: false,
             modified: None,
+            stamp: None,
         }
     }
 

@@ -45,6 +45,7 @@ impl WideFs {
             id: i as u128 + 1,
             cloud: false,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            stamp: None,
         }
     }
 }

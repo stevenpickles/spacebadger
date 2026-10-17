@@ -66,6 +66,7 @@ fn listed(parent: u64, dir: &str, name: &str, kind: EntryKind, id: u64) -> Liste
             id: id.into(),
             cloud: false,
             modified: None,
+            stamp: None,
         },
     }
 }

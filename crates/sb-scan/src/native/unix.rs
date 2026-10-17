@@ -311,6 +311,7 @@ fn lstat_entry(path: &Path, name: OsString, root_dev: u64) -> Entry {
                 id: 0,
                 cloud: false,
                 modified: None,
+                stamp: None,
             };
         }
     };
@@ -344,6 +345,7 @@ fn lstat_entry(path: &Path, name: OsString, root_dev: u64) -> Entry {
         id: unix_object_id(meta.ino(), birth_secs(&meta)),
         cloud: is_cloud(&meta),
         modified: meta.modified().ok(),
+        stamp: None,
     }
 }
 
