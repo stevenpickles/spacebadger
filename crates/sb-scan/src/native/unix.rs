@@ -2,10 +2,14 @@
 //!
 //! **Unvalidated on a real Mac.** It is built and tested on CI's macOS
 //! runners only. Known gaps, tracked in `docs/PLAN.md`:
-//! - Mount boundaries use the device ID only. Scanning `/` on macOS treats
-//!   firmlinked data-volume folders (`/Users`, `/Applications`, ...) as other
-//!   filesystems and skips them as mount points. Both listings below keep
-//!   that policy: the bulk listing hands firmlinks to `lstat`.
+//! - Mount boundaries use the device ID only. On CI's macOS runner, `lstat`
+//!   reports the same device for `/`, the firmlinked data-volume folders
+//!   (`/Users`, `/Applications`, ...) and `/System/Volumes/Data`, so a scan
+//!   of `/` descends into the firmlinks *and* into `/System/Volumes/Data`,
+//!   and may count the data volume twice. Only `/dev` and some
+//!   `/System/Volumes/*` volumes are skipped as mount points. `/.nofollow`,
+//!   `/.resolve` and `/.vol` list as empty folders. Both listings below keep
+//!   this behaviour: the bulk listing hands firmlinks to `lstat`.
 //!
 //! On macOS directories are listed with `getattrlistbulk` (see `bulk`), which
 //! returns the metadata of a 64 KiB buffer of entries in one call, instead of
