@@ -25,5 +25,9 @@ windows = { version = "=0.62.2", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
 
+# The same listing calls as sb-scan's Linux adapter, for the floor.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs"] }
+
 [lints]
 workspace = true

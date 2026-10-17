@@ -2897,6 +2897,7 @@ name = "sb-bench"
 version = "0.3.0"
 dependencies = [
  "libc",
+ "rustix",
  "sb-core",
  "sb-protocol",
  "sb-scan",
