@@ -2,6 +2,7 @@
 //! it per platform; [`crate::fake::FakeFs`] implements it in memory for tests.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::SystemTime;
@@ -225,7 +226,9 @@ pub fn batched(
 }
 
 /// Filesystem access for one scan. Implementations must never follow links,
-/// read file contents, or trigger cloud hydration.
+/// read file contents (except through [`FsAdapter::read_small`], used only
+/// for Git metadata files: `HEAD`, a `.git` file, `commondir`, `gitdir`,
+/// `config`), or trigger cloud hydration.
 pub trait FsAdapter: Send + Sync + 'static {
     /// Inspects the root without following it and fixes the scan's
     /// filesystem boundary for later [`FsAdapter::read_dir`] calls.
@@ -242,6 +245,52 @@ pub trait FsAdapter: Send + Sync + 'static {
     /// Re-measures one file authoritatively without following links or
     /// hydrating. Used for hard-link owners whose listing may be stale.
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError>;
+
+    /// Reads a small metadata file whole: never through a link (in the last
+    /// component), never a cloud placeholder or offline file, and only a
+    /// regular file. Refusals use the messages in [`refused`]; a file over
+    /// `cap` bytes fails with [`refused::TOO_LARGE`].
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        let _ = (path, cap);
+        Err(ScanError::new(ErrorKind::Unavailable, "not supported"))
+    }
+
+    /// What `path` is, without following it (`lstat`). A directory is
+    /// reported as [`EntryKind::Directory`] whatever filesystem it's on.
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let _ = path;
+        Err(ScanError::new(ErrorKind::Unavailable, "not supported"))
+    }
+}
+
+/// The messages [`FsAdapter::read_small`] refuses with, so a caller can tell
+/// why without parsing OS errors.
+pub mod refused {
+    /// A link or other redirection, which is never read through.
+    /// [`ErrorKind::Unavailable`](super::ErrorKind::Unavailable).
+    pub const LINK: &str = "a link, not followed";
+    /// A cloud placeholder or offline file, which reading would download.
+    /// [`ErrorKind::Unavailable`](super::ErrorKind::Unavailable).
+    pub const CLOUD: &str = "a cloud file, not downloaded";
+    /// A folder, device, or file stored behind a filter.
+    /// [`ErrorKind::Unavailable`](super::ErrorKind::Unavailable).
+    pub const NOT_FILE: &str = "not a plain file";
+    /// Larger than the cap. [`ErrorKind::Other`](super::ErrorKind::Other).
+    pub const TOO_LARGE: &str = "too large";
+}
+
+/// Reads `reader` to its end, failing with [`refused::TOO_LARGE`] past
+/// `cap` bytes; for [`FsAdapter::read_small`].
+pub fn read_capped(reader: impl Read, cap: usize) -> Result<Vec<u8>, ScanError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ScanError::from)?;
+    if bytes.len() > cap {
+        return Err(ScanError::new(ErrorKind::Other, refused::TOO_LARGE));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

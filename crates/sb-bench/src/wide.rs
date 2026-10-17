@@ -100,6 +100,14 @@ impl<A: FsAdapter> FsAdapter for Watched<A> {
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
         self.inner.measure_file(file)
     }
+
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.inner.read_small(path, cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.inner.stat_kind(path)
+    }
 }
 
 /// Longest and 99th-percentile waits for the read lock while `done` is unset.

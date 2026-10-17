@@ -11,7 +11,7 @@
 
 use crate::adapter::{
     Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched,
+    batched, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use sb_core::tree::{birth_secs, unix_object_id};
@@ -110,6 +110,55 @@ impl FsAdapter for UnixFs {
         Ok(Measured {
             logical: meta.size(),
             allocated: Some(meta.blocks().saturating_mul(512)),
+        })
+    }
+
+    /// Checked before opening and again on the open file, which must be the
+    /// same: a regular file, not dataless (cloud-only). The open refuses a
+    /// link and never blocks.
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let check = |meta: &Metadata| {
+            if meta.file_type().is_symlink() {
+                Err(ScanError::new(ErrorKind::Unavailable, refused::LINK))
+            } else if is_cloud(meta) {
+                Err(ScanError::new(ErrorKind::Unavailable, refused::CLOUD))
+            } else if !meta.is_file() {
+                Err(ScanError::new(ErrorKind::Unavailable, refused::NOT_FILE))
+            } else {
+                Ok(())
+            }
+        };
+        let before = std::fs::symlink_metadata(path)?;
+        check(&before)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(open_flags::NOFOLLOW_NONBLOCK)
+            .open(path)
+            .map_err(|e| match e.raw_os_error() {
+                Some(code) if code == open_flags::ELOOP => {
+                    ScanError::new(ErrorKind::Unavailable, refused::LINK)
+                }
+                _ => ScanError::from(e),
+            })?;
+        let meta = file.metadata()?;
+        check(&meta)?;
+        if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) {
+            return Err(ScanError::new(ErrorKind::Vanished, "replaced while read"));
+        }
+        read_capped(file, cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let file_type = std::fs::symlink_metadata(path)?.file_type();
+        Ok(if file_type.is_symlink() {
+            EntryKind::Symlink
+        } else if file_type.is_dir() {
+            EntryKind::Directory
+        } else if file_type.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Special
         })
     }
 }

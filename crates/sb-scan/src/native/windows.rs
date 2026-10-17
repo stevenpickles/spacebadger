@@ -21,7 +21,7 @@
 
 use crate::adapter::{
     Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io,
+    batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
@@ -573,6 +573,56 @@ impl FsAdapter for WindowsFs {
             allocated: Some(standard.AllocationSize as u64),
         })
     }
+
+    /// Checked first with an attributes-only open, as finding duplicates
+    /// does, so a link, a cloud file or a file behind another filter is
+    /// refused before anything opens its data; the open that reads uses
+    /// `OPEN_NO_RECALL` (and `OPEN_REPARSE_POINT` but for a WOF-compressed
+    /// file) and must be the same file.
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        // Backup semantics so a folder or junction opens too, to be refused
+        // for what it is.
+        let probe = open(path, FILE_READ_ATTRIBUTES.0)?;
+        let compressed = small_readable(&probe)?;
+        let id = file_id(&probe);
+        drop(probe);
+        let mut flags = FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN;
+        if !compressed {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags)
+            .map_err(scan_error)?;
+        if let (Some(before), Some(now)) = (id, file_id(&handle))
+            && before != now
+        {
+            return Err(ScanError::new(ErrorKind::Vanished, "replaced while read"));
+        }
+        small_readable(&handle)?;
+        read_capped(std::fs::File::from(handle), cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let handle = open(path, FILE_READ_ATTRIBUTES.0)?;
+        let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(&handle, FileAttributeTagInfo)?;
+        Ok(classify(tag_info.FileAttributes, tag_info.ReparseTag))
+    }
+}
+
+/// Whether [`FsAdapter::read_small`] may read a handle's file, as
+/// [`readable`] decides: `Ok(true)` for a WOF-compressed file.
+fn small_readable(handle: &OwnedHandle) -> Result<bool, ScanError> {
+    let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo)?;
+    let (attributes, reparse_tag) = (tag_info.FileAttributes, tag_info.ReparseTag);
+    readable(attributes, reparse_tag).map_err(|skip| {
+        let why = match (skip, classify(attributes, reparse_tag)) {
+            (Skip::Cloud, _) => refused::CLOUD,
+            (_, EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse) => {
+                refused::LINK
+            }
+            _ => refused::NOT_FILE,
+        };
+        ScanError::new(ErrorKind::Unavailable, why)
+    })
 }
 
 /// Enables `SeBackupPrivilege` when this process already holds it (it was
