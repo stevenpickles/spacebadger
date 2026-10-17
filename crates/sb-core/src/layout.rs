@@ -139,7 +139,10 @@ pub struct LayoutRect {
     /// The measured weight. The area is in proportion to it, except while
     /// `provisional`.
     pub weight: u64,
-    /// Number of merged items for [`RectKind::OtherSmall`], else 1.
+    /// Number of merged items for [`RectKind::OtherSmall`], else 1. 0 for
+    /// the estimated filler of a folder still being listed: the part of
+    /// its earlier size nothing found so far stands for (always
+    /// `provisional`, weight 0).
     pub count: u32,
     /// Part of the area stands for folders not yet listed, sized from the
     /// previous scan (see [`Tree::set_prior`]); `weight` doesn't count it.
@@ -425,6 +428,9 @@ pub fn small_children(
     filter: Option<&Search>,
     count: usize,
 ) -> (Vec<(NodeId, u64)>, usize) {
+    // Chosen by area weight, as the layout chose them (so while a rescan
+    // runs, folders not listed yet are among them by their estimates), but
+    // reported with their measured weight.
     let mut weighted = Vec::new();
     let mut empty = 0;
     for c in tree.children(dir) {
@@ -432,14 +438,16 @@ pub fn small_children(
         if filter.is_some_and(|s| s.totals(c).files == 0) {
             continue;
         }
-        match metric.weight_in(tree, filter, c) {
+        let weight = metric.weight_in(tree, filter, c);
+        match weight + metric.estimate(tree, filter, c) {
             0 => empty += 1,
-            w => weighted.push((c, w)),
+            area => weighted.push((c, area, weight)),
         }
     }
-    weighted.sort_unstable_by_key(|&(id, w)| (Reverse(w), id.index()));
+    weighted.sort_unstable_by_key(|&(id, area, _)| (Reverse(area), id.index()));
     let start = weighted.len().saturating_sub(count);
-    (weighted.split_off(start), empty)
+    let small = weighted[start..].iter().map(|&(c, _, w)| (c, w)).collect();
+    (small, empty)
 }
 
 /// Every file anywhere under `dir` with a weight, in tree order (matching
@@ -546,23 +554,40 @@ impl Ctx<'_> {
         // which is their weight once the scan has finished.
         let mut visible = Vec::new();
         let mut small = Small::default();
+        let mut children = 0u64;
         for c in tree.children(dir) {
             match self.area_weight(c) {
                 (0, _) => {}
                 (w, estimate) if (w as f64 * scale) < min_area => {
+                    children += w;
                     small.area += w;
                     small.weight += w - estimate;
                     small.count += 1;
                     small.provisional |= estimate > 0;
                 }
-                (w, _) => visible.push((c, w)),
+                (w, _) => {
+                    children += w;
+                    visible.push((c, w));
+                }
             }
         }
         let visible = self.cache.arrange(dir, visible, self.stable);
-        let mut items: Vec<Item> = Vec::with_capacity(visible.len() + 1);
+        let mut items: Vec<Item> = Vec::with_capacity(visible.len() + 2);
         items.extend(visible.into_iter().map(|(node, w)| Item::Node(node, w)));
         if small.count > 0 {
             items.push(Item::Other(small));
+        }
+        // A folder still being listed keeps the part of its estimate its
+        // children haven't taken over yet: an estimated filler holds it, so
+        // no child is stretched over it.
+        let rest = total.saturating_sub(children);
+        if rest > 0 && self.metric.estimate(tree, self.filter, dir) > 0 {
+            items.push(Item::Other(Small {
+                area: rest,
+                weight: 0,
+                count: 0,
+                provisional: true,
+            }));
         }
 
         let areas: Vec<f64> = items.iter().map(|i| i.area() as f64 * scale).collect();
@@ -1231,6 +1256,75 @@ mod tests {
         let r = l.rects.iter().find(|r| r.node == big).unwrap();
         assert!(r.provisional && r.weight == 1_000);
         assert!(l.rects.iter().any(|r| r.node == deep && r.provisional));
+    }
+
+    /// Review of #62: a folder still being listed counted its own estimate
+    /// beside its children's, and its last child took over the difference
+    /// (a 99-byte file covered 92% of the map, unflagged).
+    #[test]
+    fn a_folder_being_listed_stretches_no_child_over_its_estimate() {
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        // The root's listing is under way: mid (estimated 900) and f (99).
+        let mid = t.add_dir(NodeId::ROOT, OsStr::new("mid")).unwrap();
+        let f = file(&mut t, NodeId::ROOT, "f", 99);
+        let params = LayoutParams::new(100.0, 100.0);
+        let l = logical(&t, &params);
+        let area = |r: &LayoutRect| r.w * r.h;
+        let rf = l.rects.iter().find(|r| r.node == f).unwrap();
+        let rm = l.rects.iter().find(|r| r.node == mid).unwrap();
+        // Of the root's 10,000 bytes then: f 99, mid 900, and 9,001 not
+        // found yet, held by an estimated filler.
+        assert!((area(rf) - 99.0).abs() < 1.0, "{rf:?}");
+        assert!(!rf.provisional);
+        assert!((area(rm) - 900.0).abs() < 1.0 && rm.provisional);
+        let filler = l
+            .rects
+            .iter()
+            .find(|r| r.kind == RectKind::OtherSmall && r.count == 0)
+            .expect("a filler for the rest");
+        assert_eq!((filler.node, filler.weight), (NodeId::ROOT, 0));
+        assert!(filler.provisional && (area(filler) - 9_001.0).abs() < 1.0);
+        let total: f32 = l.rects.iter().filter(|r| r.depth == 1).map(area).sum();
+        assert!((total - 10_000.0).abs() < 1.0);
+
+        // Once the root's listing ends it has nothing left to fill; mid,
+        // still waiting, is all filler inside.
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+        let l = logical(&t, &params);
+        let fillers: Vec<_> = l
+            .rects
+            .iter()
+            .filter(|r| r.count == 0)
+            .map(|r| r.node)
+            .collect();
+        assert_eq!(fillers, [mid]);
+    }
+
+    #[test]
+    fn small_items_are_chosen_by_area_but_reported_measured() {
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        let tiny = t.add_dir(NodeId::ROOT, OsStr::new("tiny")).unwrap();
+        file(&mut t, NodeId::ROOT, "f", 1_000_000);
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+        let l = logical(&t, &LayoutParams::new(100.0, 100.0));
+        let other = l
+            .rects
+            .iter()
+            .find(|r| r.kind == RectKind::OtherSmall)
+            .unwrap();
+        assert_eq!((other.count, other.weight, other.provisional), (1, 0, true));
+        // tiny weighs nothing yet but has an estimated area: it's the merged
+        // item, at its measured size.
+        let (items, empty) = small_children(
+            &t,
+            NodeId::ROOT,
+            Metric::Logical,
+            None,
+            other.count as usize,
+        );
+        assert_eq!((items, empty), (vec![(tiny, 0)], 0));
     }
 
     #[test]
