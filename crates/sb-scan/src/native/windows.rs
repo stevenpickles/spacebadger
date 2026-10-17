@@ -11,10 +11,9 @@
 //! - A file listed under several names may be stale under all but the one
 //!   it was last changed through, so each entry also carries its listed
 //!   `LastWriteTime` and `ChangeTime` (see [`LinkStamp`]): the engine
-//!   re-measures a file only when its names' listings disagree. Files whose
-//!   listed allocation can be wrong under every name (WOF-compressed ones
-//!   list 0; compressed, sparse and cloud files) carry none and are always
-//!   re-measured.
+//!   re-measures a file once, and only when its names' listings disagree
+//!   or its listed allocation can be wrong under every name alike
+//!   (WOF-compressed files list 0; compressed, sparse and cloud files).
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -502,18 +501,18 @@ impl WindowsFs {
 
 impl Listed {
     /// The stamp to compare this name's listing with its file's other
-    /// names'; none where the listing's allocation can be wrong under every
-    /// name alike: less allocated than the file's length (WOF-compressed
-    /// files list 0 allocated, and the WOF filter hides their reparse
-    /// point from listings), or a reparse point, compressed, sparse, or in
-    /// the cloud. Such a file's names are all re-measured, as before.
-    fn stamp(&self) -> Option<LinkStamp> {
+    /// names'. Untrusted where the listing's allocation can be wrong under
+    /// every name alike: less allocated than the file's length
+    /// (WOF-compressed files list 0 allocated, and the WOF filter hides
+    /// their reparse point from listings), or a reparse point, compressed,
+    /// sparse, or in the cloud; such a file is always re-measured once.
+    fn stamp(&self) -> LinkStamp {
         let unreliable = attr::REPARSE_POINT | attr::COMPRESSED | attr::SPARSE | attr::CLOUD;
-        let plain = self.attributes & unreliable == 0 && self.allocation_size >= self.end_of_file;
-        plain.then_some(LinkStamp {
+        LinkStamp {
             written: self.last_write,
             changed: self.change_time,
-        })
+            trusted: self.attributes & unreliable == 0 && self.allocation_size >= self.end_of_file,
+        }
     }
 
     fn entry(self) -> Entry {
@@ -531,7 +530,7 @@ impl Listed {
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),
-            stamp: self.stamp(),
+            stamp: Some(self.stamp()),
             name: self.name,
         }
     }
@@ -1065,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn stamps_only_listings_whose_sizes_can_be_compared() {
+    fn trusts_only_listings_whose_allocation_can_be_compared() {
         let listed = |attributes, reparse_tag| Listed {
             name: "f".into(),
             end_of_file: 5000,
@@ -1080,22 +1079,24 @@ mod tests {
             listed(0x20, 0).entry().stamp,
             Some(LinkStamp {
                 written: 10,
-                changed: 20
+                changed: 20,
+                trusted: true,
             })
         );
+        let trusted = |l: Listed| l.entry().stamp.unwrap().trusted;
         let resident = Listed {
             end_of_file: 439,
             allocation_size: 440,
             ..listed(0x20, 0)
         };
-        assert!(resident.entry().stamp.is_some());
+        assert!(trusted(resident));
         // How a WOF-compressed file lists: plain attributes, nothing
         // allocated.
         let wof = Listed {
             allocation_size: 0,
             ..listed(0x20, 0)
         };
-        assert_eq!(wof.entry().stamp, None);
+        assert!(!trusted(wof));
         let rp = attr::REPARSE_POINT;
         for (attributes, tag) in [
             (0x20 | rp, tag::WOF),
@@ -1104,11 +1105,7 @@ mod tests {
             (0x20 | attr::SPARSE, 0),
             (0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
         ] {
-            assert_eq!(
-                listed(attributes, tag).entry().stamp,
-                None,
-                "{attributes:#x}"
-            );
+            assert!(!trusted(listed(attributes, tag)), "{attributes:#x}");
         }
     }
 

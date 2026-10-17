@@ -77,13 +77,18 @@ pub struct Entry {
 /// went through, so the other names' entries go stale. Two names of one
 /// file listed with the same sizes and stamp are taken as they are; a
 /// difference means one is stale, and the file is re-measured once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkStamp {
     /// Last write time as the listing gives it (Windows: 100 ns ticks
     /// since 1601).
     pub written: i64,
     /// Last change time (attributes, links or contents), likewise.
     pub changed: i64,
+    /// Whether the listed sizes are right whenever the names agree. A
+    /// listing whose allocation can be wrong under every name alike (a
+    /// WOF-compressed file lists none) is not, and such a file is
+    /// re-measured once whatever its names' listings say.
+    pub trusted: bool,
 }
 
 /// Authoritative sizes from a per-file query.

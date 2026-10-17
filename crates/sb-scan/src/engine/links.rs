@@ -9,7 +9,8 @@
 //! taken as listed (both could only be stale if the file was last changed
 //! through a name the scan never lists), and a file whose names disagree is
 //! re-measured once, by its first name, after every folder is listed, with
-//! the result applied to all its names. Without a stamp, or with
+//! the result applied to all its names; so is a file whose stamp says its
+//! listings can be wrong under every name alike. Without a stamp, or with
 //! [`ScanConfig::exact_hard_links`](super::ScanConfig::exact_hard_links),
 //! every later name and (once) its first name are re-measured as they're
 //! found.
@@ -60,32 +61,39 @@ impl Hasher for IdHasher {
 
 /// The first name a file with several names was found under: the alias
 /// owner, with its listing's stamp to compare later names' listings with.
-/// Its listed sizes are the tree's until the file is re-measured. With the
-/// key, an entry of the owner map takes 40 bytes (an `Option` would make it
-/// 48).
+/// Its listed sizes are the tree's until the file is re-measured. The
+/// stamp is kept as fields, with `trusted` in what would be padding, so an
+/// entry of the owner map takes 40 bytes with its key (an `Option` of a
+/// [`LinkStamp`] would make it 48).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Owner {
     pub(super) node: NodeId,
-    /// [`NO_STAMP`] for none.
-    stamp: LinkStamp,
+    trusted: bool,
+    /// [`NONE`] in both for no stamp.
+    written: i64,
+    changed: i64,
 }
 
 /// No listed stamp: listed times are never negative.
-const NO_STAMP: LinkStamp = LinkStamp {
-    written: i64::MIN,
-    changed: i64::MIN,
-};
+const NONE: i64 = i64::MIN;
 
 impl Owner {
     pub(super) fn new(node: NodeId, stamp: Option<LinkStamp>) -> Self {
+        let stamp = stamp.filter(|s| (s.written, s.changed) != (NONE, NONE));
         Self {
             node,
-            stamp: stamp.filter(|s| *s != NO_STAMP).unwrap_or(NO_STAMP),
+            trusted: stamp.is_some_and(|s| s.trusted),
+            written: stamp.map_or(NONE, |s| s.written),
+            changed: stamp.map_or(NONE, |s| s.changed),
         }
     }
 
     fn stamp(&self) -> Option<LinkStamp> {
-        (self.stamp != NO_STAMP).then_some(self.stamp)
+        ((self.written, self.changed) != (NONE, NONE)).then_some(LinkStamp {
+            written: self.written,
+            changed: self.changed,
+            trusted: self.trusted,
+        })
     }
 }
 
@@ -156,7 +164,9 @@ impl Links {
         self.aliases.push((owner.node, alias));
         let first_allocated =
             (tree.unknown_allocation_files(owner.node) == 0).then(|| tree.allocated(owner.node));
-        let agree = listed == first
+        // An untrusted listing can be wrong under every name alike.
+        let agree = listed.trusted
+            && listed == first
             && entry.logical == tree.logical(owner.node)
             && entry.allocated == first_allocated;
         if !agree {
@@ -231,11 +241,14 @@ mod tests {
         assert_eq!(size_of::<(FileKey, Owner)>(), 40);
         let none = Owner::new(NodeId::ROOT, None);
         assert_eq!(none.stamp(), None);
-        let stamp = LinkStamp {
-            written: 0,
-            changed: 1,
-        };
-        assert_eq!(Owner::new(NodeId::ROOT, Some(stamp)).stamp(), Some(stamp));
+        for trusted in [true, false] {
+            let stamp = LinkStamp {
+                written: 0,
+                changed: 1,
+                trusted,
+            };
+            assert_eq!(Owner::new(NodeId::ROOT, Some(stamp)).stamp(), Some(stamp));
+        }
     }
 
     #[test]

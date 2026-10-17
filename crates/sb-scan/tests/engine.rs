@@ -179,6 +179,7 @@ fn hard_links_count_allocation_once_and_remeasure() {
 const STAMP: LinkStamp = LinkStamp {
     written: 1000,
     changed: 2000,
+    trusted: true,
 };
 
 /// Three names of one file in one folder and one in its subfolder, which is
@@ -258,6 +259,28 @@ fn a_hard_link_whose_names_disagree_is_remeasured_once_for_all_names() {
         assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
         assert_eq!(progress.allocated, 12_288 + 4096, "allocated once per file");
     }
+}
+
+/// Names listed alike, but with sizes the listing can't vouch for (a
+/// WOF-compressed file lists none allocated under every name): the file is
+/// re-measured once all the same.
+#[test]
+fn an_untrusted_hard_link_is_remeasured_once_though_its_names_agree() {
+    let untrusted = LinkStamp {
+        trusted: false,
+        ..STAMP
+    };
+    let fs = FakeFs::new();
+    fs.stamped_link("d/1.bin", 5000, 0, 7, untrusted)
+        .stamped_link("d/2.bin", 5000, 0, 7, untrusted)
+        .stamped_link("d/z/3.bin", 5000, 0, 7, untrusted)
+        .set_measured("d/1.bin", 5000, 4096);
+    let (progress, _) = run(&fs);
+
+    assert_eq!(fs.measures(), [Path::new("/fake/d/1.bin")]);
+    assert_eq!(progress.hardlink_aliases, 2);
+    assert_eq!(progress.logical, 3 * 5000);
+    assert_eq!(progress.allocated, 4096);
 }
 
 #[test]

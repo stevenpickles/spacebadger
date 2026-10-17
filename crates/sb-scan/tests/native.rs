@@ -306,10 +306,10 @@ fn hard_links_whose_listings_agree_are_not_remeasured() {
 }
 
 /// A WOF-compressed file lists 0 allocated under every name, so agreeing
-/// listings prove nothing: its names are re-measured as before.
+/// listings prove nothing: the file is re-measured once.
 #[cfg(windows)]
 #[test]
-fn compressed_hard_links_are_remeasured_though_their_listings_agree() {
+fn compressed_hard_links_are_remeasured_once_though_their_listings_agree() {
     let tmp = TempDir::new("wof-link");
     let root = tmp.0.join("root");
     let file = root.join("x/a.bin");
@@ -326,7 +326,7 @@ fn compressed_hard_links_are_remeasured_though_their_listings_agree() {
     let measured = NativeFs::new().measure_file(&file).unwrap();
 
     let (progress, _, measures) = scan_counted(&root, false);
-    assert_eq!(measures.len(), 2, "the alias and its owner: {measures:?}");
+    assert_eq!(measures.len(), 1, "once for the file: {measures:?}");
     assert_eq!(progress.hardlink_aliases, 1);
     assert_eq!(Some(progress.allocated), measured.allocated);
     assert_eq!(progress.logical, 2 * 260_000);
