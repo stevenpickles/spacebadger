@@ -261,8 +261,10 @@ fn a_hard_link_written_through_another_name_is_remeasured_once() {
     );
     let tree = tree.read().unwrap();
     let (a, b) = (find(&tree, "x/a.bin"), find(&tree, "y/b.bin"));
-    let owner = if tree.alias_owner(b) == Some(a) { a } else { b };
-    assert_eq!(measures[0], tree.path(owner), "measured by its first name");
+    // Measured by whichever name was listed first; the allocation then goes
+    // to x/a.bin, first in name order at the same depth.
+    assert!([tree.path(a), tree.path(b)].contains(&measures[0]));
+    assert_eq!(tree.alias_owner(b), Some(a));
     assert_eq!(progress.hardlink_aliases, 1);
     assert_eq!((tree.logical(a), tree.logical(b)), (15_000, 15_000));
     assert_eq!(progress.logical, 30_000);
