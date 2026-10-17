@@ -453,7 +453,10 @@ mod tests {
             .unwrap()
             .replace("\r\n", "\n");
         assert!(text.contains("Git repositories (1 of 1)\n"), "{text}");
-        assert!(text.contains("In Git repositories: "), "{text}");
+        assert!(
+            text.contains("In Git repositories under this folder: "),
+            "{text}"
+        );
     }
 
     #[test]
