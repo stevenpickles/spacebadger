@@ -12,8 +12,8 @@ pub mod mft;
 pub mod native;
 
 pub use adapter::{
-    BATCH_ENTRIES, Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
-    ScanError, Sink, batched, read_capped, refused,
+    BATCH_ENTRIES, Batcher, DirHandle, DirRef, Entry, EntryKind, ErrorKind, FsAdapter, Identity,
+    Measured, RootKind, ScanError, Sink, batched, read_capped, refused,
 };
 pub use engine::{
     GIT_GRACE, HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig,

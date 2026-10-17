@@ -21,8 +21,8 @@
 //!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io, read_capped, refused,
+    Batcher, DirHandle, DirRef, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured,
+    RootKind, ScanError, Sink, batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
@@ -32,12 +32,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
-    FILE_INFORMATION_CLASS, FileIdBothDirectoryInformation, FileIdExtdDirectoryInformation,
-    NtQueryDirectoryFile,
+    FILE_INFORMATION_CLASS, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_NO_RECALL,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileIdBothDirectoryInformation,
+    FileIdExtdDirectoryInformation, NtOpenFile, NtQueryDirectoryFile,
 };
 use windows::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID, RtlNtStatusToDosError,
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID, OBJ_CASE_INSENSITIVE,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
@@ -52,12 +55,12 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
     FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle,
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
-    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
 };
 use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 mod attr {
     pub const DIRECTORY: u32 = 0x10;
@@ -155,6 +158,50 @@ fn open(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
     )
     .map_err(scan_error)
+}
+
+/// Opens the directory `name` (one component, UTF-16) inside the open
+/// directory `parent` for listing, as [`open`] would open it by path:
+/// the same access `CreateFileW` asks for, sharing everything, with backup
+/// intent, never through a reparse point, never recalling. `None` when that
+/// fails, for the caller to open by path.
+fn open_relative(parent: &OwnedHandle, name: &[u16]) -> Option<OwnedHandle> {
+    let bytes = u16::try_from(size_of_val(name)).ok()?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: PWSTR(name.as_ptr().cast_mut()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: raw(parent),
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle = HANDLE::default();
+    // SAFETY: every pointer refers to a local that outlives the call, and
+    // `parent` is an open directory handle.
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            (FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
+            &attributes,
+            &mut status_block,
+            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+            (FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_NO_RECALL)
+                .0,
+        )
+    };
+    // SAFETY: on success NtOpenFile returned a valid handle that we now own.
+    status
+        .is_ok()
+        .then(|| unsafe { OwnedHandle::from_raw_handle(handle.0) })
 }
 
 fn open_with(
@@ -416,6 +463,20 @@ impl WindowsFs {
         with_list_buffer(|buffer| self.list_handle(&handle, buffer, out))
     }
 
+    /// Opens a directory to list it: relative to its open parent where
+    /// given, which skips parsing the whole path, else (and whenever the
+    /// relative open fails, so errors are exactly a path open's) by path.
+    fn open_dir(dir: DirRef<'_>) -> Result<OwnedHandle, ScanError> {
+        let parent = dir.parent.and_then(|p| p.downcast_ref::<OwnedHandle>());
+        if let (Some(parent), Some(name)) = (parent, dir.path.file_name()) {
+            let name: Vec<u16> = name.encode_wide().collect();
+            if let Some(handle) = open_relative(parent, &name) {
+                return Ok(handle);
+            }
+        }
+        open(dir.path, FILE_LIST_DIRECTORY.0)
+    }
+
     /// Lists an open directory into `buffer`, with the extended class where
     /// the volume supports it.
     fn list_handle(
@@ -638,6 +699,18 @@ impl FsAdapter for WindowsFs {
 
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         batched(sink, |out| self.list(dir, out))
+    }
+
+    fn list_dir(
+        &self,
+        dir: DirRef<'_>,
+        sink: &mut Sink<'_>,
+    ) -> Result<Option<DirHandle>, ScanError> {
+        let handle = Self::open_dir(dir)?;
+        batched(sink, |out| {
+            with_list_buffer(|buffer| self.list_handle(&handle, buffer, out))
+        })?;
+        Ok(Some(Box::new(handle)))
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
