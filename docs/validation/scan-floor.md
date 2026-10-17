@@ -12,13 +12,19 @@ target/release/sb-bench --engine <root> --threads 16 --runs 5
 target/release/sb-bench --floor <root> --threads 16 [--strategy current|ntdll|relative]... --runs 5
 ```
 
-- `--floor <root>` lists the folder with N threads and nothing else: open a folder, list it, count its entries, queue its subfolders. No tree, no aggregation, no hard-link work, one 64 KiB buffer per thread. It descends into the same folders the engine does (not links, mount points or other name-surrogate reparse points; cloud-tagged folders are descended; on Unix not other filesystems), so its entry count matches the engine's files + folders + omissions to within what changed on disk between runs (616,350 vs 616,356 on the work tree).
-- Strategies: `current` is the adapter's calls today (on Windows `CreateFileW` by `\\?\` path with `FILE_LIST_DIRECTORY`, share all, `BACKUP_SEMANTICS | OPEN_REPARSE_POINT | OPEN_NO_RECALL`, then `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)`; on Linux `read_dir` and a `statx` per entry relative to the folder; on macOS `read_dir` and `lstat` per entry). Windows also has `ntdll` (same opens, `NtQueryDirectoryFile` direct) and `relative` (`NtOpenFile` relative to the parent's handle with the name from the listing, then `NtQueryDirectoryFile`; `FILE_OPEN_NO_RECALL` is left out because NTFS rejects it with `FILE_DIRECTORY_FILE` as an invalid parameter).
-- `--engine <root>` alternates a floor run (the first `--strategy`, default `current`) and a real engine scan (`Scan` with `NativeFs`, the given worker count, a `HoldProbe` counting write holds) `--runs` times, each in its own child process, then prints a summary.
+- `--floor <root>` lists the folder with N threads and nothing else: open a folder, list it, count its entries, queue its subfolders. No tree, no aggregation, no hard-link work, one 64 KiB buffer per thread. It descends into the same folders the engine does (not links, mount points or other name-surrogate reparse points; cloud-tagged folders are descended; on Unix not other filesystems), so its entry count matches the engine's files + folders + omissions to within what changed on disk between runs (687,964 for both in the re-check below).
+- Like the engine's adapter, the floor child enables the backup privilege when the process is already elevated (through `sb_scan::native::privileged_access`, the public function that calls the adapter's `enable_backup_privilege`; nothing in sb-scan changed) and prints `access: privileged` or `access: ordinary`, so both list the same protected folders.
+- Strategies:
+  - `current` is the adapter's calls today. On Windows: `CreateFileW` by `\\?\` path with `FILE_LIST_DIRECTORY`, share all, `BACKUP_SEMANTICS | OPEN_REPARSE_POINT | OPEN_NO_RECALL`, then `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)`. Where a volume doesn't support that class, it falls back once for the rest of the run to `FileIdBothDirectoryInfo` (reparse tag in `EaSize`), only before any entry of the folder was read, exactly as the adapter does, and says so. On Linux: `openat(O_DIRECTORY | O_NOFOLLOW)`, rustix's `Dir` and a `statx` per entry relative to the folder with the adapter's flags and mask; a folder is another mount (not descended) when its device differs, `STATX_ATTR_MOUNT_ROOT` is set or its mount ID differs, or, when statx reports neither, it is listed in `/proc/self/mountinfo`. On macOS: `read_dir` and `lstat` per entry, as the portable adapter.
+  - `ntdll` (Windows): the same opens, `NtQueryDirectoryFile` direct (with the same class fallback).
+  - `relative` (Windows): `NtOpenFile` relative to the parent's handle with the name from the listing, then `NtQueryDirectoryFile`. Folders are taken newest first, so a parent's handle closes soon after its children are opened, and at most 4,096 folder handles are open at once; past that, children are opened by path (rebuilt from the names already listed), as design §2.2 item 4 proposes. It prints the most handles open at once and how many folders were opened by path. `FILE_OPEN_NO_RECALL` is left out because NTFS rejects it with `FILE_DIRECTORY_FILE` as an invalid parameter. `current` and `ntdll` take folders oldest first, as the engine does.
+- `--engine <root>` runs one floor run and one engine scan as a discarded warm-up pair (skip with `--no-warmup`), then alternates a floor run (the first `--strategy`; a warning says so if more were given) and a real engine scan (`Scan` with `NativeFs`, the given worker count, a `HoldProbe` counting write holds) `--runs` times, each in its own child process, then prints a summary. `--floor` with `--runs` also does one discarded warm-up run.
+- **Coverage check.** In every run the floor's entries are compared with the engine's files + folders + omissions, and the summary line carries `entries_floor`, `entries_engine`, `floor_errors` and `engine_state` (of the last run). The command exits with status 1 and says why if, in any run, the counts differ by more than 0.5 %, the scan ended Cancelled or Failed, or the floor couldn't list more than 1 % of the folders. A scan that ends `CompleteWithOmissions` passes: every real tree has links or unreadable folders, and the engine reports those as omissions (both trees here end that way).
 - `--threads` defaults to the engine's default worker count (8 on this machine) and may be repeated. The coordinator's gates use 16.
-- Per run it prints wall time, entries, folders, queries, per-folder open time, per-query time (and the end-of-listing query), thread time summed over threads, and process kernel/user CPU (`GetProcessTimes`, `getrusage`). The engine run adds write-hold count, total and longest, and CPU per thread role (aggregator, workers, other) from the names `sb-scan` already gives its threads, so **no change to `sb-scan` was needed**. On Windows the bench enumerates its own threads every 5 ms with `NtGetNextThread` and keeps each handle open, so a thread's final CPU time is read exactly after it exits; on Linux it samples `/proc/self/task/*/stat`; macOS reports process CPU only. Windows CPU times tick at 15.6 ms.
+- Per run it prints wall time, entries, folders, queries, per-folder open time, per-query time (and the end-of-listing query), thread time summed over threads, and process kernel/user CPU (`GetProcessTimes`, `getrusage`). The engine run adds write-hold count, total and longest, and CPU per thread role (aggregator, workers, other) from the names `sb-scan` already gives its threads, so **no change to `sb-scan` was needed**.
+- **CPU per thread.** On Windows the bench enumerates its own threads every 5 ms with `NtGetNextThread` and keeps each handle open, so a thread's final CPU time is read exactly after it exits; it asks an unnamed thread its name on at most three looks (and once at the end) and frees each name with `LocalFree`. On Linux it samples `/proc/self/task/*/stat`; macOS reports process CPU only. The watcher runs in the floor child too, and its own CPU (role `watcher`) is subtracted from the process CPU of both, so the comparison is like for like. Windows CPU times tick at 15.6 ms: when the floor's median CPU is under 1.5 s the CPU ratio is left out with a warning, and the summary says how many runs went into it (`cpu_runs`).
 - `--wide-dir` also prints process CPU and CPU per role now.
-- Every child prints a `result:` line and every summary a `summary:` line of `key=value` pairs, for scripts: `ratio_of_mins`, `ratio_median`, `ratio_spread_pct`, `cpu_ratio_median`, `cpu_ratio_spread_pct`, and the medians and minimums.
+- Every child prints a `result:` line and every summary a `summary:` line of `key=value` pairs, for scripts: `ratio_of_mins`, `ratio_median`, `ratio_spread_pct`, `cpu_runs`, `cpu_ratio_median`, `cpu_ratio_spread_pct`, the coverage fields, and the medians and minimums.
 
 ## Today's numbers
 
@@ -75,6 +81,21 @@ Engine CPU by role: workers 277–295 s, aggregator 11.3–13.7 s (kernel 2.6 s,
 
 The aggregator's 12 s of CPU per `C:\` scan is more than the design's estimate (~8 s); with the walk at ~10 s on a quiet machine it is close to being the bottleneck once the workers get faster.
 
+### Re-check after review (same day, still loaded)
+
+After the review fixes (warm-up pair, watcher CPU subtracted, coverage check, newest-first `relative` with the handle cap), work tree, 16 threads, 3 alternating runs after a warm-up pair:
+
+| | Min | Median | Max | Spread |
+|---|---:|---:|---:|---:|
+| Floor wall | 1,903 ms | 2,089 ms | 2,215 ms | 15 % |
+| Engine wall | 6,950 ms | 8,191 ms | 8,943 ms | 24 % |
+| Engine/floor wall, per run (3.65, 4.28, 3.70) | 3.65 | 3.70 | 4.28 | 17 % |
+| Floor CPU | 13.9 s | 14.2 s | 14.3 s | 2.6 % |
+| Engine CPU | 43.4 s | 45.3 s | 46.2 s | 6.2 % |
+| Engine/floor CPU, per run (3.25, 3.05, 3.23) | 3.05 | **3.23** | 3.25 | **6.2 %** |
+
+Entries 687,964 for both (the tree had grown by ~70K entries since the morning's runs as agents built in it), floor errors 0, scan `CompleteWithOmissions`; the coverage check passed. The watcher used 16–190 ms of CPU per child, now left out. `relative` on the same tree, 16 threads, 3 runs: 1,530 / 1,630 / 1,686 ms, at most 46–54 folder handles open at once with newest-first order, none opened by path. On a 62-entry folder the CPU ratio is left out with the warning, as intended. The earlier tables predate these fixes: the engine's CPU then included the watcher's (well under 1 % of it), there was no warm-up, and `relative` took folders oldest first.
+
 ## Reproducibility
 
 The target was engine/floor within 10 % run to run.
@@ -93,6 +114,9 @@ Raw outputs of the runs above are kept in the session's scratch folder (`agent-f
 
 ## Tests
 
-- The floor counts a known tree (40 folders, 160 files) identically with every strategy at 1 and 4 threads, and a missing root is one error, not a hang; on Unix a symlinked folder is counted and not followed.
-- CPU per role attributes two named busy threads to aggregator and workers.
-- Result lines parse and the spread is (max − min) / median.
+- The floor counts a known tree (40 folders, 160 files) identically with every strategy at 1 and 4 threads, and with the older directory-information class; a missing root is one error, not a hang; on Unix a symlinked folder is counted and not followed.
+- `relative` with a cap of 2 handles opens folders by path past it and still counts the same tree; newest-first order takes the last folder pushed first.
+- A thread that panics while listing still marks its folder done, so the others finish instead of waiting forever (the walk then fails).
+- CPU per role attributes two named busy threads to aggregator and workers; the watcher's CPU is subtracted; floor and watcher threads get their own roles.
+- The coverage check passes counts within 0.5 % and `CompleteWithOmissions`, and fails a larger difference, a cancelled or failed scan, and floor errors above 1 %.
+- Result lines parse into numbers and words, and the spread is (max − min) / median.
