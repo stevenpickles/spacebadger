@@ -23,6 +23,23 @@ export const GIT_METADATA = 3;
 /** The Git class a rectangle's flags carry in bits 6-7. */
 export const gitClassOf = (rflags: number): number => (rflags >> RF_GIT_SHIFT) & 3;
 
+/** A folder's Git root badge (its `ftype`), as sb_protocol::wire::git_badge:
+ * the word on its map label, the kind in full, and the Git class of its
+ * content. Index 0 is no root. */
+export const GIT_BADGES: readonly { short: string; name: string; cls: number }[] = [
+  { short: "", name: "", cls: GIT_OTHER },
+  { short: "repo", name: "Repository", cls: GIT_CHECKOUT },
+  { short: "worktree", name: "Linked worktree", cls: GIT_WORKTREE },
+  { short: "submodule", name: "Submodule", cls: GIT_CHECKOUT },
+  { short: "repo", name: "Repository with a separate Git directory", cls: GIT_CHECKOUT },
+  { short: "bare", name: "Bare repository", cls: GIT_METADATA },
+  { short: "git", name: "Git directory", cls: GIT_METADATA },
+  { short: "git?", name: "Unresolved Git metadata", cls: GIT_OTHER },
+];
+export const GIT_BADGE_UNRESOLVED = 7;
+/** The Git class each badge's content has, by badge. */
+export const GIT_BADGE_CLASS = GIT_BADGES.map((b) => b.cls);
+
 /** Mirrors sb_core::filetype::FileType, in value order. */
 export const FILE_TYPES = [
   "Other",

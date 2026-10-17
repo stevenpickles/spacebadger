@@ -39,6 +39,8 @@
   import ExportDialog, { exportFileName, localTime, type ExportChoice } from "./lib/ExportDialog.svelte";
   import ExportToast from "./lib/ExportToast.svelte";
   import FilterBox from "./lib/FilterBox.svelte";
+  import GitScope from "./lib/GitScope.svelte";
+  import { hasGitTerms } from "./lib/gitQuery";
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
   import { formatBytes, KILO, plural } from "./lib/format";
@@ -55,6 +57,7 @@
   import type { SmallItem } from "./lib/protocol/SmallItem";
   import type { SearchSummary } from "./lib/protocol/SearchSummary";
   import type { SelectionSummary } from "./lib/protocol/SelectionSummary";
+  import Repositories from "./lib/Repositories.svelte";
   import SearchResults from "./lib/SearchResults.svelte";
   import Shortcuts from "./lib/Shortcuts.svelte";
   import SmallItems from "./lib/SmallItems.svelte";
@@ -66,7 +69,7 @@
   import VolumeStrip from "./lib/VolumeStrip.svelte";
 
   const ROOT = 0;
-  type PanelTab = "contents" | "changes" | "results" | "small" | "duplicates" | "omissions";
+  type PanelTab = "contents" | "changes" | "results" | "repos" | "small" | "duplicates" | "omissions";
   const FILTER_HELP: [string, string][] = [
     ["report", "names containing “report”"],
     ["*.jpg", "names ending in .jpg (* is any text, ? one character)"],
@@ -81,6 +84,11 @@
     ["older:1y", "modified over a year ago; also h, d, w, mo"],
     ["newer:2024-06-30", "modified on or after a date"],
     ["*.iso; size:>1GB; older:1y", "disk images over 1 GB, untouched for a year"],
+    ["git:repo", "files in Git repositories and linked worktrees, .git folders included"],
+    ["git:worktree", "files in linked worktree checkouts"],
+    ["git:metadata", "Git's own data: .git folders, bare repositories"],
+    ["git:repo; !git:metadata", "repository files, leaving out Git's own data"],
+    ["is:code; git:worktree", "code in linked worktrees"],
   ];
 
   const scan = new ScanController((message) => (problem = message));
@@ -187,7 +195,8 @@
   }
 
   function savedColors(): ColorMode {
-    return saved("colors") === "type" ? "type" : "depth";
+    const c = saved("colors");
+    return c === "type" || c === "git" ? c : "depth";
   }
 
   function remember(key: string, value: string) {
@@ -220,7 +229,9 @@
     volume = null;
     dupes = null;
     compare.restart(previous);
-    // Keep the filter across Refresh and new roots.
+    // Keep the filter across Refresh and new roots, and the Git list in
+    // front if it was.
+    reposNext = query !== "" && activeTab === "repos";
     if (query) applySearch(query);
   }
 
@@ -274,6 +285,7 @@
   const searches = latest();
 
   function onQueryInput() {
+    reposNext = false;
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => applySearch(query), 250);
   }
@@ -287,6 +299,15 @@
   function applyNow() {
     clearTimeout(searchTimer);
     applySearch(query);
+  }
+
+  /** The Repos and Worktrees quick filters bring the Repositories tab up
+   * once their search is in, rather than the results. */
+  let reposNext = false;
+
+  function applyGitScope(scope: "all" | "repo" | "worktree") {
+    reposNext = scope !== "all";
+    applyNow();
   }
 
   async function applySearch(text: string) {
@@ -303,7 +324,10 @@
     } catch (e) {
       // A newer search replaced this one; its reply will arrive instead.
       // The one that failed is the query as typed, e.g. an unknown type.
-      if (searches.current(t) && gen === generation) filterError = errorText(e);
+      if (searches.current(t) && gen === generation) {
+        filterError = errorText(e);
+        reposNext = false;
+      }
     } finally {
       if (searches.current(t)) searching = false;
     }
@@ -927,6 +951,9 @@
       generation !== null ? { id: "contents" as const, label: "Contents" } : null,
       comparison && generation !== null ? { id: "changes" as const, label: "Changes" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
+      generation !== null && ((status?.gitRoots ?? 0) > 0 || hasGitTerms(query))
+        ? { id: "repos" as const, label: status?.gitRoots ? `Git ${status.gitRoots}` : "Git" }
+        : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
       dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
       showOmissions && status ? { id: "omissions" as const, label: "Not counted" } : null,
@@ -934,9 +961,14 @@
   );
   const activeTab = $derived(tabs.find((t) => t.id === tab)?.id ?? tabs[0]?.id ?? null);
 
-  // A list that opens comes to the front.
+  // A list that opens comes to the front: a new search's results (not its
+  // updated totals), or the repositories for a Git quick filter.
   $effect(() => {
-    if (search) untrack(() => (tab = "results"));
+    if (searchId === undefined) return;
+    untrack(() => {
+      tab = reposNext ? "repos" : "results";
+      reposNext = false;
+    });
   });
   $effect(() => {
     if (smallOf?.folder !== undefined) untrack(() => (tab = "small"));
@@ -1047,6 +1079,7 @@
         <select bind:value={colors}>
           <option value="depth">Depth</option>
           <option value="type">File type</option>
+          <option value="git">Git</option>
           {#if comparison}<option value="change">Change</option>{/if}
         </select>
       </label>
@@ -1076,8 +1109,9 @@
             <div class="popover" role="note">
               <p>
                 Matches file names, ignoring case. Start a pattern with <code>dir:</code> to match folder names, or
-                <code>is:</code> for a file type. <code>size:</code>, <code>older:</code>, and <code>newer:</code> narrow
-                the matches by size and modified date. Press ↓ for suggestions.
+                <code>is:</code> for a file type, or <code>git:</code> for Git repositories, worktrees, or metadata.
+                <code>size:</code>, <code>older:</code>, and <code>newer:</code> narrow the matches by size and modified
+                date. Press ↓ for suggestions.
               </p>
               <dl>
                 {#each FILTER_HELP as [pattern, meaning] (pattern)}
@@ -1088,6 +1122,7 @@
             </div>
           {/if}
         </div>
+        <GitScope bind:query onapply={applyGitScope} />
       </div>
     {/if}
     <div class="end">
@@ -1385,6 +1420,17 @@
               onclose={closeDuplicates}
               onclear={() => pick(null)}
             />
+          {:else if activeTab === "repos" && generation !== null}
+            <Repositories
+              {generation}
+              search={searchId ?? null}
+              revision={status?.revision ?? 0}
+              refresh={filterUpdates}
+              selected={pickedSet}
+              {anchor}
+              onpick={pick}
+              onopen={openFolder}
+            />
           {:else if activeTab === "results" && search && generation !== null}
             <SearchResults
               {generation}
@@ -1510,9 +1556,10 @@
      dangle at the row's start. */
   .filter {
     border-left: none;
-    flex: 1 1 150px;
-    max-width: 420px;
-    min-width: 150px;
+    /* Room for the quick filters beside a box of at least 150px. */
+    flex: 1 1 340px;
+    max-width: 600px;
+    min-width: 340px;
   }
   .filter-help {
     position: relative;
