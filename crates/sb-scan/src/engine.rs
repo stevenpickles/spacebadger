@@ -23,11 +23,16 @@
 //!   work, so a scan completes only once they're done, or once they've gone
 //!   [`ScanConfig::git_grace`] without an answer after the last listing; a
 //!   cancel leaves the unconfirmed candidates as not checked.
+//! - A file seen under a second name is counted once, as an alias of its
+//!   first name. Names whose listings may be stale are re-measured: by
+//!   default only a file whose names' listings disagree, once, after every
+//!   folder is listed (the scan is still running then); see [`links`].
 
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
 use crate::git::{self, Finding, Plan, Scope, Signals, Spot};
+use links::{FileKey, IdHash, Links, Owner};
 use sb_core::git::{GitRoot, Problem, RootKind as GitKind};
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
@@ -41,6 +46,8 @@ use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+mod links;
 
 const CANCEL_POLL: Duration = Duration::from_millis(25);
 
@@ -66,6 +73,11 @@ pub struct ScanConfig {
     /// answer (a read stuck on a share that stopped responding) before the
     /// scan finishes without them, leaving their candidates timed out.
     pub git_grace: Duration,
+    /// Re-measures every name of a file with several names as it's found,
+    /// even when the names' listings agree. Off by default: listings that
+    /// agree can only both be stale when the file was last changed through
+    /// a name outside the scan (or in a folder that couldn't be listed).
+    pub exact_hard_links: bool,
 }
 
 /// Called after the scanner releases the tree's write lock with how long it
@@ -95,6 +107,7 @@ impl Default for ScanConfig {
             sample_limit: 50,
             write_holds: None,
             git_grace: GIT_GRACE,
+            exact_hard_links: false,
         }
     }
 }
@@ -563,8 +576,7 @@ struct Aggregator<A> {
     queue: Arc<Queue>,
     outstanding: u64,
     pending_dirs: u64,
-    owners: HashMap<u128, NodeId>,
-    remeasured: HashSet<NodeId>,
+    links: Links,
     /// Directories with batches applied whose listing hasn't ended yet.
     partial: HashSet<NodeId>,
     /// Git probes queued or running.
@@ -590,6 +602,7 @@ impl<A: FsAdapter> Aggregator<A> {
         on_progress: Box<dyn Fn(&Progress) + Send>,
     ) -> Self {
         let now = Instant::now();
+        let exact_hard_links = config.exact_hard_links;
         let scope = Arc::new(Scope {
             root: root.clone(),
             style: adapter.path_style(),
@@ -606,8 +619,7 @@ impl<A: FsAdapter> Aggregator<A> {
             queue: Arc::new(Queue::default()),
             outstanding: 0,
             pending_dirs: 0,
-            owners: HashMap::new(),
-            remeasured: HashSet::new(),
+            links: Links::new(exact_hard_links),
             partial: HashSet::new(),
             git_jobs: 0,
             git_quiet_since: None,
@@ -678,6 +690,9 @@ impl<A: FsAdapter> Aggregator<A> {
             // have cut work short; the top of the loop reports it.
             if self.cancelled() {
                 continue;
+            }
+            if self.pending_dirs == 0 && !self.links.refined() {
+                self.refine();
             }
             if self.outstanding == 0 || self.git_stalled() {
                 self.queue.close();
@@ -792,6 +807,15 @@ impl<A: FsAdapter> Aggregator<A> {
         self.queue.push(Job::Measure { file, path });
     }
 
+    /// Once every folder is listed, queues the hard-link re-measures left
+    /// for then (see [`links`]).
+    fn refine(&mut self) {
+        let jobs = self.links.refine(&self.tree.read().unwrap());
+        for (file, path) in jobs {
+            self.enqueue_measure(file, path);
+        }
+    }
+
     fn enqueue_git(&mut self, path: PathBuf, plan: Plan) {
         self.outstanding += 1;
         self.git_jobs += 1;
@@ -843,14 +867,27 @@ impl<A: FsAdapter> Aggregator<A> {
                 self.stop.get_or_insert(ScanState::Cancelled);
             }
             Outcome::Measured { file, result } => {
-                // A failed re-measure keeps the listing's values.
-                if let Ok(m) = result {
-                    let sizes = FileSizes {
-                        logical: m.logical,
-                        allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
-                    };
-                    write(&self.tree, self.config.write_holds.as_ref()).update_file(file, sizes);
-                    self.revision += 1;
+                // One measure applies to every name of a file re-measured
+                // after the listings; a failed re-measure tries the file's
+                // next name, or keeps the listings' values.
+                match (self.links.measured(file, result.is_ok()), result) {
+                    (Ok(names), Ok(m)) => {
+                        let sizes = FileSizes {
+                            logical: m.logical,
+                            allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
+                        };
+                        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+                        for name in names {
+                            tree.update_file(name, sizes);
+                        }
+                        drop(tree);
+                        self.revision += 1;
+                    }
+                    (Err(Some(next)), _) if self.stop.is_none() => {
+                        let path = self.tree.read().unwrap().path(next);
+                        self.enqueue_measure(next, path);
+                    }
+                    _ => {}
                 }
             }
             Outcome::Git { finding } => {
@@ -897,14 +934,14 @@ impl<A: FsAdapter> Aggregator<A> {
         // on Windows, and growing it at millions of entries takes long enough
         // to stall readers. Names sharing a file within this batch are
         // matched under the lock through a map bounded by the batch.
-        let known: Vec<Option<NodeId>> = entries
+        let known: Vec<Option<Owner>> = entries
             .iter()
             .map(|e| match e.identity {
-                Identity::MaybeShared { key } => self.owners.get(&key).copied(),
+                Identity::MaybeShared { key } => self.links.owner(key),
                 _ => None,
             })
             .collect();
-        let mut first_names: HashMap<u128, NodeId> = HashMap::new();
+        let mut first_names: HashMap<FileKey, Owner, IdHash> = HashMap::default();
         let tree_lock = Arc::clone(&self.tree);
         let probe = self.config.write_holds.clone();
         let mut tree = write(&tree_lock, probe.as_ref());
@@ -949,21 +986,16 @@ impl<A: FsAdapter> Aggregator<A> {
                         };
                         let owner = match known {
                             Some(owner) => owner,
-                            None => match first_names.entry(key) {
+                            None => match first_names.entry(FileKey::of(key)) {
                                 MapEntry::Vacant(v) => {
-                                    v.insert(id);
+                                    v.insert(Owner::new(id, entry.stamp));
                                     return;
                                 }
                                 MapEntry::Occupied(o) => *o.get(),
                             },
                         };
-                        tree.mark_alias(id, owner);
-                        // Listings of other names can be stale (NTFS), so
-                        // re-measure both sides once.
-                        remeasure.push((id, tree.path(id)));
-                        if self.remeasured.insert(owner) {
-                            remeasure.push((owner, tree.path(owner)));
-                        }
+                        tree.mark_alias(id, owner.node);
+                        self.links.alias(&tree, id, &entry, owner, &mut remeasure);
                     })
             };
             let Ok(added) = added else {
@@ -986,7 +1018,7 @@ impl<A: FsAdapter> Aggregator<A> {
             _ => None,
         };
         drop(tree);
-        self.owners.extend(first_names);
+        self.links.add_owners(first_names);
         if self.stop.is_some() {
             return None;
         }

@@ -2,8 +2,8 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
 use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::{
-    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, HoldProbe, OmissionReason, Progress, RootKind,
-    Scan, ScanConfig, ScanState,
+    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, HoldProbe, LinkStamp, OmissionReason, Progress,
+    RootKind, Scan, ScanConfig, ScanState,
 };
 use std::path::Path;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -18,6 +18,7 @@ fn config() -> ScanConfig {
         sample_limit: 2,
         write_holds: None,
         git_grace: GIT_GRACE,
+        exact_hard_links: false,
     }
 }
 
@@ -171,6 +172,190 @@ fn hard_links_count_allocation_once_and_remeasure() {
     };
     assert_eq!(tree.alias_owner(alias), Some(owner));
     assert_eq!(tree.allocated(tree.parent(alias).unwrap()), 0);
+    // Listings without a stamp can't be compared: both names re-measured.
+    assert_eq!(fs.measures().len(), 2);
+}
+
+const STAMP: LinkStamp = LinkStamp {
+    written: 1000,
+    changed: 2000,
+};
+
+/// Three names of one file in one folder (so `d/1.bin` is found first and
+/// owns the allocation) and one in another; the names of other files
+/// agree.
+fn three_names_and_a_fourth(fs: &FakeFs, third: LinkStamp, third_logical: u64) {
+    fs.stamped_link("d/1.bin", 5000, 8192, 7, STAMP)
+        .stamped_link("d/2.bin", 5000, 8192, 7, STAMP)
+        .stamped_link("d/3.bin", third_logical, 8192, 7, third)
+        .stamped_link("e/4.bin", 5000, 8192, 7, STAMP)
+        .stamped_link("d/other.bin", 10, 4096, 8, STAMP)
+        .stamped_link("e/other.bin", 10, 4096, 8, STAMP)
+        .set_measured("d/1.bin", 9000, 12_288)
+        .set_measured("d/2.bin", 9000, 12_288)
+        .set_measured("d/3.bin", 9000, 12_288)
+        .set_measured("e/4.bin", 9000, 12_288);
+}
+
+fn run_with(fs: &FakeFs, config: ScanConfig) -> (Progress, Arc<std::sync::RwLock<Tree>>) {
+    let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
+    let tree = s.tree();
+    (s.wait(), tree)
+}
+
+#[test]
+fn hard_links_whose_listings_agree_are_taken_as_listed() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5000);
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+
+    assert_eq!(fs.measures(), Vec::<std::path::PathBuf>::new());
+    assert_eq!(progress.state, ScanState::Complete);
+    assert_eq!(progress.hardlink_aliases, 4);
+    assert_eq!(progress.logical, 4 * 5000 + 2 * 10);
+    assert_eq!(progress.allocated, 8192 + 4096, "allocated once per file");
+    let owner = find(&tree, "d/1.bin");
+    for name in ["d/2.bin", "d/3.bin", "e/4.bin"] {
+        assert_eq!(tree.alias_owner(find(&tree, name)), Some(owner), "{name}");
+    }
+}
+
+#[test]
+fn a_hard_link_whose_names_disagree_is_remeasured_once_for_all_names() {
+    for (stamp, logical) in [
+        (
+            LinkStamp {
+                written: 1001,
+                ..STAMP
+            },
+            5000,
+        ),
+        (
+            LinkStamp {
+                changed: 2001,
+                ..STAMP
+            },
+            5000,
+        ),
+        (STAMP, 5001),
+    ] {
+        let fs = FakeFs::new();
+        three_names_and_a_fourth(&fs, stamp, logical);
+        let (progress, tree) = run(&fs);
+        let tree = tree.read().unwrap();
+
+        assert_eq!(
+            fs.measures(),
+            [Path::new("/fake/d/1.bin")],
+            "once, by the first name"
+        );
+        assert_eq!(progress.state, ScanState::Complete);
+        assert_eq!(progress.hardlink_aliases, 4);
+        for name in ["d/1.bin", "d/2.bin", "d/3.bin", "e/4.bin"] {
+            assert_eq!(tree.logical(find(&tree, name)), 9000, "{name}");
+        }
+        assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
+        assert_eq!(progress.allocated, 12_288 + 4096, "allocated once per file");
+    }
+}
+
+#[test]
+fn a_failed_remeasure_tries_the_files_next_name() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5001);
+    fs.fail_measure("d/1.bin");
+    let (progress, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+
+    assert_eq!(
+        fs.measures(),
+        [Path::new("/fake/d/1.bin"), Path::new("/fake/d/2.bin")]
+    );
+    assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
+    assert_eq!(progress.allocated, 12_288 + 4096);
+    assert_eq!(tree.logical(find(&tree, "e/4.bin")), 9000);
+}
+
+#[test]
+fn exact_hard_links_remeasures_every_name_as_found() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5000);
+    let config = ScanConfig {
+        exact_hard_links: true,
+        ..config()
+    };
+    let (progress, tree) = run_with(&fs, config);
+    let tree = tree.read().unwrap();
+
+    // Every alias, and each owner once: as before the listings were
+    // compared.
+    let mut measures = fs.measures();
+    measures.sort();
+    let expected: Vec<_> = [
+        "d/1.bin",
+        "d/2.bin",
+        "d/3.bin",
+        "d/other.bin",
+        "e/4.bin",
+        "e/other.bin",
+    ]
+    .map(|p| Path::new("/fake").join(p))
+    .into_iter()
+    .collect();
+    assert_eq!(measures, expected);
+    assert_eq!(progress.hardlink_aliases, 4);
+    assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
+    assert_eq!(progress.allocated, 12_288 + 4096);
+    assert_eq!(tree.logical(find(&tree, "d/2.bin")), 9000);
+}
+
+#[test]
+fn the_scan_runs_until_remeasures_after_the_listings_finish() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5001);
+    let gate = fs.gate_measure("d/1.bin");
+    let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+    assert!(gate.entered(HANG), "the re-measure started");
+    // Every folder is listed and the map has its shape, but the scan isn't
+    // done.
+    assert_eq!(s.progress().state, ScanState::Scanning);
+    {
+        let tree = s.tree();
+        let tree = tree.read().unwrap();
+        for dir in ["d", "e"] {
+            assert_eq!(tree.dir_state(find(&tree, dir)), DirState::Listed);
+        }
+        assert_eq!(tree.file_count(NodeId::ROOT), 6);
+        assert_eq!(tree.logical(find(&tree, "d/2.bin")), 5000, "as listed");
+    }
+    gate.release();
+    let tree = s.tree();
+    let progress = s.wait();
+    assert_eq!(progress.state, ScanState::Complete);
+    let tree = tree.read().unwrap();
+    assert_eq!(tree.logical(find(&tree, "d/2.bin")), 9000);
+}
+
+#[test]
+fn a_cancel_during_remeasures_keeps_the_listings() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5001);
+    let gate = fs.gate_measure("d/1.bin");
+    let s = Scan::start(fs.root(), fs.clone(), config(), |_| {});
+    assert!(gate.entered(HANG), "the re-measure started");
+    let returned = release_after_returning(gate);
+    s.cancel();
+    let tree = s.tree();
+    let progress = s.wait();
+    assert!(
+        returned.finish(),
+        "cancelled without waiting for the measure"
+    );
+    assert_eq!(progress.state, ScanState::Cancelled);
+    let tree = tree.read().unwrap();
+    assert_eq!(progress.allocated, 8192 + 4096);
+    assert_eq!(tree.logical(find(&tree, "d/3.bin")), 5001, "as listed");
 }
 
 #[test]
