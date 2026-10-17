@@ -84,26 +84,26 @@ pub fn change_level(before: u64, after: u64) -> u8 {
     }
 }
 
-/// A scan matched against a snapshot.
+/// A snapshot's children by parent, each folder's in order of their names
+/// as compared (folded when the snapshot ignores case), so one of them can
+/// be found by name with a binary search. Shared by [`Comparison`] and
+/// [`Prior`](crate::prior::Prior).
 #[derive(Debug, Clone)]
-pub struct Comparison {
-    /// Per current node: its snapshot entry, [`SMALL`], [`NEW`], or
-    /// [`UNKNOWN`].
-    matched: Vec<u32>,
-    /// Per snapshot entry: whether it's accounted for (a current node
-    /// matched it, or it's inside a folder that couldn't be read now), so
-    /// it isn't listed as removed.
-    seen: Vec<bool>,
-    /// Snapshot children by parent, as ranges of `children`.
+pub(crate) struct ChildIndex {
+    /// Children by parent, as ranges of `children`.
     child_start: Vec<u32>,
     children: Vec<u32>,
-    threshold: u64,
+    /// Folded names of the entries, as ranges of `keys`, when case is
+    /// ignored; empty otherwise (the names are compared as they are).
+    keys: Vec<u8>,
+    key_start: Vec<usize>,
+    insensitive: bool,
 }
 
-impl Comparison {
-    /// Matches every node of `tree` with `snap`, comparing names as the
-    /// snapshot was taken (ignoring case on Windows and macOS).
-    pub fn new(tree: &Tree, snap: &Snapshot) -> Self {
+impl ChildIndex {
+    /// Children in snapshot order; [`ChildIndex::sort`] orders a folder's
+    /// for [`ChildIndex::named`].
+    pub(crate) fn new(snap: &Snapshot) -> Self {
         let insensitive = snap.header().case_insensitive;
         let n = snap.len();
         // Children by parent (counting sort, so entries stay in order).
@@ -125,7 +125,6 @@ impl Comparison {
             }
         }
 
-        // Folded names of the snapshot's entries, when case is ignored.
         let mut keys = Vec::new();
         let mut key_start = Vec::new();
         if insensitive {
@@ -138,13 +137,93 @@ impl Comparison {
             }
             key_start.push(keys.len());
         }
-        let key = |e: u32| -> &[u8] {
-            if insensitive {
-                &keys[key_start[e as usize]..key_start[e as usize + 1]]
-            } else {
-                snap.name(e)
-            }
-        };
+        Self {
+            child_start,
+            children,
+            keys,
+            key_start,
+            insensitive,
+        }
+    }
+
+    pub(crate) fn insensitive(&self) -> bool {
+        self.insensitive
+    }
+
+    /// Entry `e`'s name as compared.
+    pub(crate) fn key<'a>(&'a self, snap: &'a Snapshot, e: u32) -> &'a [u8] {
+        if self.insensitive {
+            &self.keys[self.key_start[e as usize]..self.key_start[e as usize + 1]]
+        } else {
+            snap.name(e)
+        }
+    }
+
+    fn range(&self, entry: u32) -> std::ops::Range<usize> {
+        let e = entry as usize;
+        self.child_start[e] as usize..self.child_start[e + 1] as usize
+    }
+
+    pub(crate) fn children(&self, entry: u32) -> &[u32] {
+        &self.children[self.range(entry)]
+    }
+
+    /// Orders `entry`'s children by name as compared, exact names breaking
+    /// ties.
+    pub(crate) fn sort(&mut self, snap: &Snapshot, entry: u32) {
+        let range = self.range(entry);
+        let mut kids = std::mem::take(&mut self.children);
+        kids[range].sort_unstable_by(|&a, &b| {
+            self.key(snap, a)
+                .cmp(self.key(snap, b))
+                .then(snap.name(a).cmp(snap.name(b)))
+        });
+        self.children = kids;
+    }
+
+    /// Where `entry`'s children named `folded` (as compared) are, within
+    /// [`ChildIndex::children`]; the folder's children must be sorted.
+    pub(crate) fn named(
+        &self,
+        snap: &Snapshot,
+        entry: u32,
+        folded: &[u8],
+    ) -> std::ops::Range<usize> {
+        let kids = self.children(entry);
+        let from = kids.partition_point(|&k| self.key(snap, k) < folded);
+        let to = from + kids[from..].partition_point(|&k| self.key(snap, k) == folded);
+        from..to
+    }
+
+    /// Lets the folded names go once every lookup is done.
+    fn drop_keys(&mut self) {
+        self.keys = Vec::new();
+        self.key_start = Vec::new();
+    }
+}
+
+/// A scan matched against a snapshot.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    /// Per current node: its snapshot entry, [`SMALL`], [`NEW`], or
+    /// [`UNKNOWN`].
+    matched: Vec<u32>,
+    /// Per snapshot entry: whether it's accounted for (a current node
+    /// matched it, or it's inside a folder that couldn't be read now), so
+    /// it isn't listed as removed.
+    seen: Vec<bool>,
+    /// Snapshot children by parent (their folded names dropped).
+    index: ChildIndex,
+    threshold: u64,
+}
+
+impl Comparison {
+    /// Matches every node of `tree` with `snap`, comparing names as the
+    /// snapshot was taken (ignoring case on Windows and macOS).
+    pub fn new(tree: &Tree, snap: &Snapshot) -> Self {
+        let n = snap.len();
+        let mut index = ChildIndex::new(snap);
+        let insensitive = index.insensitive();
 
         let mut matched = vec![UNKNOWN; tree.len()];
         let mut seen = vec![false; n];
@@ -161,10 +240,8 @@ impl Comparison {
         let mut pending = Vec::new();
         let mut accounted = Vec::new();
         while let Some((dir, entry)) = pairs.pop() {
-            let range =
-                child_start[entry as usize] as usize..child_start[entry as usize + 1] as usize;
-            let kids = &mut children[range];
-            kids.sort_unstable_by(|&a, &b| key(a).cmp(key(b)).then(snap.name(a).cmp(snap.name(b))));
+            index.sort(snap, entry);
+            let kids = index.children(entry);
             let read_then = snap.was_read(entry);
             kids_now.clear();
             kids_now.extend(tree.children(dir));
@@ -176,8 +253,10 @@ impl Comparison {
             for &c in &kids_now {
                 let raw = tree.name(c).as_encoded_bytes();
                 let folded = fold(raw, insensitive, &mut buf);
-                let from = kids.partition_point(|&k| key(k) < folded);
-                let to = from + kids[from..].partition_point(|&k| key(k) == folded);
+                let std::ops::Range {
+                    start: from,
+                    end: to,
+                } = index.named(snap, entry, folded);
                 match kids[from..to]
                     .iter()
                     .find(|&&k| !seen[k as usize] && snap.name(k) == raw)
@@ -239,9 +318,7 @@ impl Comparison {
                     while let Some(e) = accounted.pop() {
                         let e = e as usize;
                         seen[e] = true;
-                        accounted.extend_from_slice(
-                            &children[child_start[e] as usize..child_start[e + 1] as usize],
-                        );
+                        accounted.extend_from_slice(index.children(e as u32));
                     }
                 } else if is_dir {
                     // Read only in part, then or now: its own total isn't
@@ -255,15 +332,11 @@ impl Comparison {
             // Some entries here couldn't be read now: an earlier child not
             // found may be one of them, so it isn't called removed.
             if !tree.fully_listed(dir) {
-                let range =
-                    child_start[entry as usize] as usize..child_start[entry as usize + 1] as usize;
-                accounted.extend(children[range].iter().filter(|&&k| !seen[k as usize]));
+                accounted.extend(kids.iter().filter(|&&k| !seen[k as usize]));
                 while let Some(e) = accounted.pop() {
                     let e = e as usize;
                     seen[e] = true;
-                    accounted.extend_from_slice(
-                        &children[child_start[e] as usize..child_start[e + 1] as usize],
-                    );
+                    accounted.extend_from_slice(index.children(e as u32));
                 }
             }
         }
@@ -276,11 +349,11 @@ impl Comparison {
                 }
             }
         }
+        index.drop_keys();
         Self {
             matched,
             seen,
-            child_start,
-            children,
+            index,
             threshold: snap.header().threshold,
         }
     }
@@ -314,8 +387,7 @@ impl Comparison {
     }
 
     fn snapshot_children(&self, entry: u32) -> &[u32] {
-        let e = entry as usize;
-        &self.children[self.child_start[e] as usize..self.child_start[e + 1] as usize]
+        self.index.children(entry)
     }
 
     /// The items under `folder`, at any depth, whose size changed: grown,
