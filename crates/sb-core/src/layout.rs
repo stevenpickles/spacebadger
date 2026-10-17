@@ -13,6 +13,12 @@
 //!   folders without matches are left out.
 //! - Every rectangle carries its [`GitClass`] in its flags, passed down from
 //!   folder to contents, so drawing needs no lookups.
+//! - While a rescan runs, folders not yet listed take the area they had in
+//!   the previous scan (see [`Tree::set_prior`]) on the unfiltered logical
+//!   map, and their rectangles are marked [`LayoutRect::provisional`]. The
+//!   rectangles' weights and the view's total stay what was measured. Once
+//!   every folder is listed nothing is estimated, so the final layout is
+//!   the exact one.
 //!
 //! Coordinates are in the caller's units (CSS pixels for the interface).
 //! Rectangles are emitted parent before child, so drawing in order paints
@@ -47,6 +53,17 @@ impl Metric {
         match filter {
             Some(search) => search.weight(self, node),
             None => self.weight(tree, node),
+        }
+    }
+
+    /// The area `node` is given beyond its weight while a rescan runs: the
+    /// previous scan's size of the folders at or under it not yet listed
+    /// (see [`Tree::set_prior`]). Snapshots keep logical sizes only, so
+    /// only the logical map uses them, and never a filtered one.
+    fn estimate(self, tree: &Tree, filter: Option<&Search>, node: NodeId) -> u64 {
+        match (self, filter) {
+            (Self::Logical, None) => tree.pending_estimate(node),
+            _ => 0,
         }
     }
 }
@@ -119,9 +136,14 @@ pub struct LayoutRect {
     pub depth: u8,
     pub kind: RectKind,
     pub flags: u8,
+    /// The measured weight. The area is in proportion to it, except while
+    /// `provisional`.
     pub weight: u64,
     /// Number of merged items for [`RectKind::OtherSmall`], else 1.
     pub count: u32,
+    /// Part of the area stands for folders not yet listed, sized from the
+    /// previous scan (see [`Tree::set_prior`]); `weight` doesn't count it.
+    pub provisional: bool,
 }
 
 impl LayoutRect {
@@ -500,9 +522,17 @@ impl Ctx<'_> {
 
     /// Squarifies `dir`'s children into `area`; `class` is `dir`'s Git
     /// class, which its contents have unless they have entries of their own.
+    /// The area `node` is given: its weight, plus while a rescan runs the
+    /// estimate for what it holds that isn't listed yet.
+    fn area_weight(&self, node: NodeId) -> (u64, u64) {
+        let weight = self.metric.weight_in(self.tree, self.filter, node);
+        let estimate = self.metric.estimate(self.tree, self.filter, node);
+        (weight + estimate, estimate)
+    }
+
     fn fill(&mut self, dir: NodeId, area: Area, depth: u8, class: GitClass) {
         let tree = self.tree;
-        let total = self.metric.weight_in(tree, self.filter, dir);
+        let (total, _) = self.area_weight(dir);
         if total == 0 {
             return;
         }
@@ -512,36 +542,42 @@ impl Ctx<'_> {
         // Whether a child is drawn depends only on its own weight, so the
         // ones too small to see are counted up front and only the rest are
         // ordered: with a positive `min_area`, never more than the area over
-        // `min_area`.
+        // `min_area`. Children are ordered and placed by their area weight,
+        // which is their weight once the scan has finished.
         let mut visible = Vec::new();
-        let mut small = (0u64, 0u32);
+        let mut small = Small::default();
         for c in tree.children(dir) {
-            match self.metric.weight_in(tree, self.filter, c) {
-                0 => {}
-                w if (w as f64 * scale) < min_area => {
-                    small.0 += w;
-                    small.1 += 1;
+            match self.area_weight(c) {
+                (0, _) => {}
+                (w, estimate) if (w as f64 * scale) < min_area => {
+                    small.area += w;
+                    small.weight += w - estimate;
+                    small.count += 1;
+                    small.provisional |= estimate > 0;
                 }
-                w => visible.push((c, w)),
+                (w, _) => visible.push((c, w)),
             }
         }
         let visible = self.cache.arrange(dir, visible, self.stable);
         let mut items: Vec<Item> = Vec::with_capacity(visible.len() + 1);
         items.extend(visible.into_iter().map(|(node, w)| Item::Node(node, w)));
-        if small.1 > 0 {
-            items.push(Item::Other(small.0, small.1));
+        if small.count > 0 {
+            items.push(Item::Other(small));
         }
 
-        let areas: Vec<f64> = items.iter().map(|i| i.weight() as f64 * scale).collect();
+        let areas: Vec<f64> = items.iter().map(|i| i.area() as f64 * scale).collect();
         let mut placed = Vec::with_capacity(items.len());
         squarify(&areas, area, &mut placed);
         for (item, a) in items.into_iter().zip(placed) {
             let rect = match item {
-                Item::Node(node, weight) => {
+                Item::Node(node, area) => {
                     let class = tree.git_own(node).unwrap_or(class);
-                    node_rect(tree, node, weight, a, depth, class)
+                    let weight = self.metric.weight_in(tree, self.filter, node);
+                    let mut rect = node_rect(tree, node, weight, a, depth, class);
+                    rect.provisional = area != weight;
+                    rect
                 }
-                Item::Other(weight, count) => LayoutRect {
+                Item::Other(small) => LayoutRect {
                     node: dir,
                     x: a.x,
                     y: a.y,
@@ -550,8 +586,9 @@ impl Ctx<'_> {
                     depth,
                     kind: RectKind::OtherSmall,
                     flags: git_flags(class),
-                    weight,
-                    count,
+                    weight: small.weight,
+                    count: small.count,
+                    provisional: small.provisional,
                 },
             };
             let index = self.rects.len();
@@ -616,18 +653,33 @@ fn node_rect(
         flags: f,
         weight,
         count: 1,
+        provisional: false,
     }
 }
 
+/// Children merged into one "other small items" rectangle.
+#[derive(Default)]
+struct Small {
+    /// Their area weight (see [`Ctx::area_weight`]).
+    area: u64,
+    /// Their measured weight.
+    weight: u64,
+    count: u32,
+    /// Some of the area is estimated.
+    provisional: bool,
+}
+
 enum Item {
+    /// A child and its area weight.
     Node(NodeId, u64),
-    Other(u64, u32),
+    Other(Small),
 }
 
 impl Item {
-    fn weight(&self) -> u64 {
-        match *self {
-            Self::Node(_, w) | Self::Other(w, _) => w,
+    fn area(&self) -> u64 {
+        match self {
+            Self::Node(_, w) => *w,
+            Self::Other(small) => small.area,
         }
     }
 }
@@ -1087,6 +1139,130 @@ mod tests {
         assert_eq!(class(&l, loose, RectKind::File), GitClass::Checkout);
     }
 
+    /// A snapshot of /r: big/(9,000: deep/(8,000)), mid/(900), tiny/(1),
+    /// and 99 bytes of files.
+    fn prior() -> std::sync::Arc<crate::prior::Prior> {
+        let mut t = Tree::new("/r");
+        let big = dir(&mut t, NodeId::ROOT, "big");
+        let deep = dir(&mut t, big, "deep");
+        let mid = dir(&mut t, NodeId::ROOT, "mid");
+        let tiny = dir(&mut t, NodeId::ROOT, "tiny");
+        file(&mut t, deep, "d", 8_000);
+        file(&mut t, big, "b", 1_000);
+        file(&mut t, mid, "m", 900);
+        file(&mut t, tiny, "t", 1);
+        file(&mut t, NodeId::ROOT, "f", 99);
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+        std::sync::Arc::new(crate::prior::Prior::new(
+            crate::snapshot::Snapshot::capture(&t, 0, true),
+        ))
+    }
+
+    fn logical(t: &Tree, params: &LayoutParams) -> Layout {
+        layout(
+            t,
+            NodeId::ROOT,
+            Metric::Logical,
+            None,
+            params,
+            &mut OrderCache::default(),
+            false,
+        )
+    }
+
+    #[test]
+    fn unlisted_folders_take_their_prior_area_flagged_but_weigh_nothing() {
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        // The root is listed; its folders are still waiting.
+        let big = t.add_dir(NodeId::ROOT, OsStr::new("big")).unwrap();
+        let mid = t.add_dir(NodeId::ROOT, OsStr::new("mid")).unwrap();
+        let tiny = t.add_dir(NodeId::ROOT, OsStr::new("tiny")).unwrap();
+        let f = file(&mut t, NodeId::ROOT, "f", 100);
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+
+        let params = LayoutParams::new(100.0, 100.0);
+        let l = logical(&t, &params);
+        assert_eq!(l.total, 100, "the view's weight is what was measured");
+        let rect = |n: NodeId| *l.rects.iter().find(|r| r.node == n).unwrap();
+        let area = |r: LayoutRect| r.w * r.h;
+        // 10,000 px² for 9,000 + 900 + 1 estimated and 100 measured bytes.
+        assert!((area(rect(big)) - 9_000.0).abs() < 1.0, "{:?}", rect(big));
+        assert!((area(rect(mid)) - 900.0).abs() < 1.0);
+        assert!((area(rect(f)) - 100.0).abs() < 1.0);
+        for n in [big, mid] {
+            let r = rect(n);
+            assert!(r.provisional && r.weight == 0 && r.flags & rect_flags::PENDING != 0);
+        }
+        assert!(!rect(f).provisional);
+        // tiny is too small to draw: merged, the merge flagged, its weight
+        // still measured only.
+        let other = l
+            .rects
+            .iter()
+            .find(|r| r.kind == RectKind::OtherSmall)
+            .unwrap();
+        assert_eq!((other.count, other.weight, other.provisional), (1, 0, true));
+        let _ = tiny;
+
+        // Not on the allocated map, which the snapshot can't speak for, nor
+        // a filtered one.
+        let allocated = run(&t, NodeId::ROOT, &params);
+        assert!(allocated.rects.iter().all(|r| !r.provisional));
+        assert_eq!(allocated.rects.len(), 1);
+        let mut s = crate::search::Search::new(crate::search::Matcher::new("*").unwrap());
+        s.catch_up(&t, usize::MAX);
+        let filtered = layout(
+            &t,
+            NodeId::ROOT,
+            Metric::Logical,
+            Some(&s),
+            &params,
+            &mut OrderCache::default(),
+            false,
+        );
+        assert!(filtered.rects.iter().all(|r| !r.provisional));
+
+        // big listed: its contents take over, deep still estimated inside.
+        let deep = t.add_dir(big, OsStr::new("deep")).unwrap();
+        file(&mut t, big, "b", 1_000);
+        t.set_dir_state(big, DirState::Listed);
+        let l = logical(&t, &params);
+        let r = l.rects.iter().find(|r| r.node == big).unwrap();
+        assert!(r.provisional && r.weight == 1_000);
+        assert!(l.rects.iter().any(|r| r.node == deep && r.provisional));
+    }
+
+    #[test]
+    fn once_every_folder_is_listed_the_layout_is_exactly_the_unestimated_one() {
+        let build = |with_prior: bool| {
+            let mut t = Tree::new("/r");
+            if with_prior {
+                t.set_prior(prior());
+            }
+            let big = t.add_dir(NodeId::ROOT, OsStr::new("big")).unwrap();
+            let mid = t.add_dir(NodeId::ROOT, OsStr::new("mid")).unwrap();
+            let new = t.add_dir(NodeId::ROOT, OsStr::new("new")).unwrap();
+            file(&mut t, NodeId::ROOT, "f", 100);
+            t.set_dir_state(NodeId::ROOT, DirState::Listed);
+            let deep = t.add_dir(big, OsStr::new("deep")).unwrap();
+            // Things changed since the snapshot.
+            file(&mut t, big, "b", 3_000);
+            file(&mut t, deep, "d", 50);
+            file(&mut t, mid, "m", 7_000);
+            file(&mut t, new, "n", 500);
+            for d in [big, deep, mid, new] {
+                t.set_dir_state(d, DirState::Listed);
+            }
+            t
+        };
+        let params = LayoutParams::new(640.0, 480.0);
+        let with = logical(&build(true), &params);
+        let without = logical(&build(false), &params);
+        assert!(same(&with, &without));
+        assert!(with.rects.iter().all(|r| !r.provisional));
+    }
+
     /// The layout as it was before small children were set aside up front:
     /// every child with a weight is ordered (and its rank remembered) before
     /// the small ones are merged. Kept to show the new one draws the same.
@@ -1254,10 +1430,15 @@ mod tests {
                     }
                 }
                 if small.1 > 0 {
-                    items.push(Item::Other(small.0, small.1));
+                    items.push(Item::Other(Small {
+                        area: small.0,
+                        weight: small.0,
+                        count: small.1,
+                        provisional: false,
+                    }));
                 }
 
-                let areas: Vec<f64> = items.iter().map(|i| i.weight() as f64 * scale).collect();
+                let areas: Vec<f64> = items.iter().map(|i| i.area() as f64 * scale).collect();
                 let mut placed = Vec::with_capacity(items.len());
                 squarify(&areas, area, &mut placed);
                 for (item, a) in items.into_iter().zip(placed) {
@@ -1266,7 +1447,7 @@ mod tests {
                         Item::Node(node, weight) => {
                             node_rect(tree, node, weight, a, depth, tree.git_class(node))
                         }
-                        Item::Other(weight, count) => LayoutRect {
+                        Item::Other(Small { weight, count, .. }) => LayoutRect {
                             node: dir,
                             x: a.x,
                             y: a.y,
@@ -1277,6 +1458,7 @@ mod tests {
                             flags: git_flags(tree.git_class(dir)),
                             weight,
                             count,
+                            provisional: false,
                         },
                     };
                     let index = self.rects.len();
