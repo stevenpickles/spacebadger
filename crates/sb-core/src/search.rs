@@ -49,6 +49,7 @@ use crate::filetype::FileType;
 use crate::git::GitClass;
 use crate::layout::Metric;
 use crate::tree::{NodeId, Tree};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -913,7 +914,10 @@ impl Search {
     pub fn catch_up(&mut self, tree: &Tree, budget: usize) -> bool {
         let changes = tree.changed_files();
         let recheck = self.matcher.depends_on_size();
-        let mut dropped = false;
+        // Files that stopped matching during this call: still listed in
+        // `matches` until it ends, so one matching again is restored there
+        // rather than listed twice.
+        let mut left = HashSet::new();
         for &raw in &changes[self.changes_seen..] {
             let file = NodeId::from_index(raw);
             // Changes to files not yet examined are picked up when they are.
@@ -936,9 +940,11 @@ impl Search {
                     Totals::default()
                 };
                 self.replace(tree, file, new);
-                dropped |= !matches;
+                if !matches {
+                    left.insert(file);
+                }
             } else if matches {
-                self.add(tree, file);
+                self.join(tree, file, &mut left);
             }
         }
         self.changes_seen = changes.len();
@@ -954,9 +960,9 @@ impl Search {
                 }
             }
             self.git_seen = log.len();
-            spent = self.rewalk(tree, budget, &mut dropped);
+            spent = self.rewalk(tree, budget, &mut left);
         }
-        if dropped {
+        if !left.is_empty() {
             let (slot, totals) = (&self.slot, &self.totals);
             self.matches.retain(|f| match slot[f.index()] {
                 NONE => false,
@@ -1004,8 +1010,10 @@ impl Search {
     /// leaves them be, since nothing below it changed but entries of their
     /// own, which the change log brings separately. A file joins or leaves
     /// the matches, adjusting the totals above it, so every step leaves
-    /// them whole.
-    fn rewalk(&mut self, tree: &Tree, budget: usize, dropped: &mut bool) -> usize {
+    /// them whole. A node can be looked at before a folder above it whose
+    /// class changed too, and then again once that folder's change reaches
+    /// it; files that leave go in `left`, as in [`Search::catch_up`].
+    fn rewalk(&mut self, tree: &Tree, budget: usize, left: &mut HashSet<NodeId>) -> usize {
         let mut spent = 0;
         while spent < budget {
             let Some(item) = self.rewalk.pop() else {
@@ -1039,13 +1047,23 @@ impl Search {
                 let matches = self.file_matches(tree, node);
                 if matched && !matches {
                     self.replace(tree, node, Totals::default());
-                    *dropped = true;
+                    left.insert(node);
                 } else if matches && !matched {
-                    self.add(tree, node);
+                    self.join(tree, node, left);
                 }
             }
         }
         spent
+    }
+
+    /// Makes a file that doesn't match now match: restored in place if it
+    /// left during this call (it's still in `matches`), else added.
+    fn join(&mut self, tree: &Tree, file: NodeId, left: &mut HashSet<NodeId>) {
+        if left.remove(&file) {
+            self.replace(tree, file, Totals::of_file(tree, file));
+        } else {
+            self.add(tree, file);
+        }
     }
 
     /// The Git class an examined node has: its own entry's, or else that of
@@ -2068,6 +2086,14 @@ mod tests {
     fn assert_fresh(s: &Search, t: &Tree, query: &str) {
         let fresh = search(query, t);
         assert_eq!(names(s, t), names(&fresh, t), "{query}");
+        let mut matches = s.matches().to_vec();
+        matches.sort_unstable();
+        let listed = matches.len();
+        matches.dedup();
+        assert_eq!(matches.len(), listed, "{query}: a file listed twice");
+        let mut expected = fresh.matches().to_vec();
+        expected.sort_unstable();
+        assert_eq!(matches, expected, "{query}");
         for i in 0..t.len() {
             let n = NodeId::from_index(i as u32);
             assert_eq!(s.totals(n), fresh.totals(n), "{query}: totals of {n:?}");
@@ -2491,6 +2517,52 @@ mod tests {
     }
 
     #[test]
+    fn a_file_dropped_and_restored_in_one_catch_up_is_listed_once() {
+        // The file's own entry goes class-less, so it's looked at with its
+        // folder's stale class and drops out, before its folder's new class
+        // brings it back.
+        let mut t = Tree::new("/r");
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        let f = t
+            .add_file(a, "f.txt".as_ref(), sizes(10, 10), None, 0)
+            .unwrap();
+        t.set_git(GitRoot::new(f, RootKind::DotGit));
+        let mut s = search("git:repo", &t);
+        assert_eq!(s.matches(), [f]);
+        t.set_git(GitRoot::new(a, RootKind::Repository));
+        t.set_git(GitRoot::unresolved(f, Problem::NotGit));
+        assert!(s.catch_up(&t, usize::MAX));
+        assert_eq!(s.matches(), [f]);
+        assert_fresh(&s, &t, "git:repo");
+    }
+
+    #[test]
+    fn a_nested_repository_left_unchecked_inside_a_new_one_is_listed_once() {
+        let mut r = Repos::new();
+        r.t.set_git(GitRoot::new(r.lib, RootKind::Repository));
+        let mut s = search("git:repo", &r.t);
+        assert_eq!(s.matches().len(), 2, "lib.rs and lib's .git");
+        r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+        r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_fresh(&s, &r.t, "git:repo");
+        // And with a size term, re-measured files judged against classes
+        // not yet walked again.
+        let mut r = Repos::new();
+        r.t.set_git(GitRoot::new(r.lib, RootKind::Repository));
+        let mut s = search("git:repo; size:<1000", &r.t);
+        r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+        r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+        let lib_rs =
+            r.t.children(r.lib)
+                .find(|&c| r.t.name(c) == "lib.rs")
+                .unwrap();
+        r.t.update_file(lib_rs, sizes(60, 60));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_fresh(&s, &r.t, "git:repo; size:<1000");
+    }
+
+    #[test]
     fn interleaved_growth_and_discovery_converge_to_a_fresh_search() {
         // xorshift, so failures repeat.
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -2508,13 +2580,22 @@ mod tests {
             RootKind::Pending,
             RootKind::Unresolved,
         ];
-        for round in 0..30 {
-            let query = ["git:repo", "git:worktree; !git:metadata", "!git:repo; *1*"][round % 3];
+        let queries = [
+            "git:repo",
+            "git:worktree; !git:metadata",
+            "!git:repo; *1*",
+            "size:>500; git:repo",
+            "!git:metadata; size:<300",
+        ];
+        for round in 0..200 {
+            let query = queries[round % queries.len()];
             let mut t = Tree::new("/r");
             let mut dirs = vec![NodeId::ROOT];
+            let mut files = Vec::new();
+            let mut entries: Vec<NodeId> = Vec::new();
             let mut s = Search::new(Matcher::new(query).unwrap());
             for _ in 0..300 {
-                match next(10) {
+                match next(14) {
                     0..=2 => {
                         let p = dirs[next(dirs.len() as u64) as usize];
                         let name = format!("d{}", t.len());
@@ -2524,13 +2605,33 @@ mod tests {
                         let p = dirs[next(dirs.len() as u64) as usize];
                         let name = format!("f{}", t.len());
                         let len = next(1000);
-                        t.add_file(p, name.as_ref(), sizes(len, len), None, 0)
-                            .unwrap();
+                        files.push(
+                            t.add_file(p, name.as_ref(), sizes(len, len), None, 0)
+                                .unwrap(),
+                        );
                     }
-                    7 => {
+                    7 | 8 => {
                         let n = NodeId::from_index(next(t.len() as u64) as u32);
                         let kind = kinds[next(kinds.len() as u64) as usize];
                         t.set_git(GitRoot::new(n, kind));
+                        entries.push(n);
+                    }
+                    // An entry changing kind, often from a class to none
+                    // (confirmed, then unresolved or unchecked).
+                    9 if !entries.is_empty() => {
+                        let n = entries[next(entries.len() as u64) as usize];
+                        let kind = kinds[next(kinds.len() as u64) as usize];
+                        t.set_git(GitRoot::new(n, kind));
+                    }
+                    // A file re-measured, so size terms judge it again.
+                    10 if !files.is_empty() => {
+                        let f = files[next(files.len() as u64) as usize];
+                        let len = next(1000);
+                        t.update_file(f, sizes(len, len));
+                    }
+                    11 => {
+                        assert!(s.catch_up(&t, usize::MAX));
+                        assert_fresh(&s, &t, query);
                     }
                     _ => {
                         s.catch_up(&t, 1 + next(5) as usize);
