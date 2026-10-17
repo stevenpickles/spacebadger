@@ -49,6 +49,7 @@ impl Session {
             row.matching = s.matching;
             row.files = u64::from(s.files);
             row.parent = s.parent.map(|p| p.index() as u32);
+            row.parent_outside = s.parent_outside;
             row.nested = nested[start + i];
             rows.push(row);
         }
@@ -132,6 +133,7 @@ pub(super) fn root_row(tree: &Tree, node: NodeId, outside: bool) -> proto::GitRo
         kind: root.map_or(proto::GitRootKind::Unresolved, |r| root_kind(r.kind)),
         head: root.and_then(|r| r.head.as_ref()).map(head),
         parent: None,
+        parent_outside: false,
         repository: root.and_then(|r| repository(tree, r)),
         size: 0,
         own: 0,
@@ -262,10 +264,10 @@ pub(super) fn details(tree: &Tree, n: NodeId) -> Option<proto::GitDetails> {
     let root = found.map(|(r, outside)| {
         let mut row = root_row(tree, r, outside);
         row.files = u64::from(tree.file_count(r));
-        row.parent = (!outside)
-            .then(|| enclosing(tree, r))
-            .flatten()
-            .map(|p| p.index() as u32);
+        if let Some((parent, parent_outside)) = (!outside).then(|| enclosing(tree, r)).flatten() {
+            row.parent = Some(parent.index() as u32);
+            row.parent_outside = parent_outside;
+        }
         row
     });
     if content.is_none() && root.is_none() {
@@ -281,23 +283,24 @@ pub(super) fn details(tree: &Tree, n: NodeId) -> Option<proto::GitDetails> {
     })
 }
 
-/// The nearest listed root with a class around `node`, as
-/// `RootSummary::parent` gives it.
-fn enclosing(tree: &Tree, node: NodeId) -> Option<NodeId> {
+/// The nearest listed root with a class around `node`, and whether it's
+/// the repository above the scan root, as `RootSummary::parent` and
+/// `parent_outside` give them.
+fn enclosing(tree: &Tree, node: NodeId) -> Option<(NodeId, bool)> {
     let mut cur = tree.parent(node);
     while let Some(a) = cur {
         if tree
             .git_entry(a)
             .is_some_and(|r| r.kind.listed() && r.kind.class().is_some())
         {
-            return Some(a);
+            return Some((a, false));
         }
         cur = tree.parent(a);
     }
     tree.git()
         .above()
         .filter(|(_, r)| r.kind.listed() && r.kind.class().is_some())
-        .map(|_| NodeId::ROOT)
+        .map(|_| (NodeId::ROOT, true))
 }
 
 /// For a repository whose Git directory is in the scan: the linked
@@ -417,7 +420,7 @@ mod tests {
                     },
                     GitRoot::new(dot, RootKind::DotGit),
                     GitRoot {
-                        worktree: Some(native(t, at(t, "wt1/.git"))),
+                        worktree: Some(native(t, wt)),
                         ..GitRoot::new(at(t, "main/.git/worktrees/wt1"), RootKind::WorktreeAdmin)
                     },
                     GitRoot {
@@ -628,6 +631,13 @@ mod tests {
         assert_eq!(outside.path, display_path(Path::new("/")));
         assert!(outside.partial, "most of it isn't scanned");
         assert_eq!(outside.nested, 5, "every other row");
+        let main = row(&page, node_of(&session, "main"));
+        assert_eq!((main.parent, main.parent_outside), (Some(0), true));
+        let sub = row(&page, node_of(&session, "main/vendor/sub"));
+        assert_eq!((sub.parent, sub.parent_outside), (Some(main.node), false));
+        let details = session.details(main.node, None).unwrap().git.unwrap();
+        let root = details.root.unwrap();
+        assert_eq!((root.parent, root.parent_outside), (Some(0), true));
     }
 
     #[test]
