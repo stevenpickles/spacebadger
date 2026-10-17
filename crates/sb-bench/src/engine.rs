@@ -3,9 +3,9 @@
 //! (through [`HoldProbe`]), and CPU for the whole process and per role
 //! (aggregator, workers, other), from the names `sb-scan` gives its threads.
 
-use crate::cpu::{Cpu, Threads, print_roles};
+use crate::cpu::{Cpu, Threads, print_roles, without_watcher};
 use crate::ms;
-use sb_scan::{HoldProbe, NativeFs, Scan, ScanConfig};
+use sb_scan::{HoldProbe, NativeFs, Scan, ScanConfig, ScanState};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,8 +47,9 @@ pub fn run(root: &Path, workers: usize) {
     let tree = scan.tree();
     let p = scan.wait();
     let wall = started.elapsed();
-    let cpu = Cpu::process().zip(before).map(|(a, b)| a.since(b));
+    let process = Cpu::process().zip(before).map(|(a, b)| a.since(b));
     let roles = threads.finish();
+    let cpu = process.map(|p| without_watcher(p, roles.as_ref()));
     let nodes = tree.read().unwrap().len();
     println!(
         "scan:    {:?}: {} files, {} folders, {} nodes, {} hard-link aliases, {} Git roots, {} omissions in {}",
@@ -75,7 +76,7 @@ pub fn run(root: &Path, workers: usize) {
     );
     if let Some(cpu) = cpu {
         println!(
-            "cpu:     process kernel {}, user {} ({:.1} cores busy)",
+            "cpu:     process kernel {}, user {} ({:.1} cores busy; without the thread watcher)",
             ms(cpu.kernel),
             ms(cpu.user),
             cpu.total().as_secs_f64() / wall.as_secs_f64()
@@ -95,12 +96,24 @@ pub fn run(root: &Path, workers: usize) {
     });
     println!(
         "result:  engine wall_ms={:.1} entries={} dirs={} holds={} kernel_ms={k:.0} user_ms={u:.0} \
-         aggregator_ms={:.0} workers_ms={:.0}",
+         aggregator_ms={:.0} workers_ms={:.0} state={}",
         wall.as_secs_f64() * 1e3,
         p.files + p.dirs + p.omissions.total(),
         p.dirs,
         h.count,
         role("aggregator"),
-        role("workers")
+        role("workers"),
+        state_name(&p.state)
     );
+}
+
+/// A scan state as one word, for the `result:` line.
+pub fn state_name(state: &ScanState) -> &'static str {
+    match state {
+        ScanState::Scanning => "Scanning",
+        ScanState::Complete => "Complete",
+        ScanState::CompleteWithOmissions => "CompleteWithOmissions",
+        ScanState::Cancelled => "Cancelled",
+        ScanState::Failed(_) => "Failed",
+    }
 }
