@@ -808,8 +808,6 @@ impl<A: FsAdapter> Aggregator<A> {
         self.queue.push(Job::Measure { file, path });
     }
 
-    /// Once every folder is listed, queues the hard-link re-measures left
-    /// for then (see [`links`]).
     /// Once the scan is complete, gives each hard-linked file's allocation
     /// to the name a fixed order of paths prefers, whatever was listed
     /// first (see [`links`]): chosen under the read lock, then moved in
@@ -825,6 +823,8 @@ impl<A: FsAdapter> Aggregator<A> {
         }
     }
 
+    /// Once every folder is listed, queues the hard-link re-measures left
+    /// for then (see [`links`]).
     fn refine(&mut self) {
         let jobs = self.links.refine(&self.tree.read().unwrap());
         for (file, path) in jobs {
@@ -886,24 +886,29 @@ impl<A: FsAdapter> Aggregator<A> {
                 // One measure applies to every name of a file re-measured
                 // after the listings; a failed re-measure tries the file's
                 // next name, or keeps the listings' values.
-                match (self.links.measured(file, result.is_ok()), result) {
-                    (Ok(names), Ok(m)) => {
-                        let sizes = FileSizes {
-                            logical: m.logical,
-                            allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
-                        };
-                        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
-                        for name in names {
-                            tree.update_file(name, sizes);
-                        }
-                        drop(tree);
-                        self.revision += 1;
+                let todo = self
+                    .links
+                    .measured(file, result.as_ref().ok().map(|m| m.id));
+                if let (Ok(m), false) = (&result, todo.apply.is_empty()) {
+                    let sizes = FileSizes {
+                        logical: m.logical,
+                        allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
+                    };
+                    let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+                    for name in todo.apply {
+                        tree.update_file(name, sizes);
                     }
-                    (Err(Some(next)), _) if self.stop.is_none() => {
-                        let path = self.tree.read().unwrap().path(next);
-                        self.enqueue_measure(next, path);
+                    drop(tree);
+                    self.revision += 1;
+                }
+                if self.stop.is_none() && !todo.remeasure.is_empty() {
+                    let paths: Vec<PathBuf> = {
+                        let tree = self.tree.read().unwrap();
+                        todo.remeasure.iter().map(|&n| tree.path(n)).collect()
+                    };
+                    for (name, path) in todo.remeasure.into_iter().zip(paths) {
+                        self.enqueue_measure(name, path);
                     }
-                    _ => {}
                 }
             }
             Outcome::Git { finding } => {
@@ -1011,7 +1016,8 @@ impl<A: FsAdapter> Aggregator<A> {
                             },
                         };
                         tree.mark_alias(id, owner.node);
-                        self.links.alias(&tree, id, &entry, owner, &mut remeasure);
+                        self.links
+                            .alias(&tree, id, &entry, key, owner, &mut remeasure);
                     })
             };
             let Ok(added) = added else {

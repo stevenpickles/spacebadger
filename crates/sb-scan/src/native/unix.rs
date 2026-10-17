@@ -226,6 +226,7 @@ impl FsAdapter for UnixFs {
         Ok(Measured {
             logical: meta.size(),
             allocated: Some(meta.blocks().saturating_mul(512)),
+            id: Some((u128::from(meta.dev()) << 64) | u128::from(meta.ino())),
         })
     }
 

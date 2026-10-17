@@ -97,6 +97,25 @@ impl Owner {
     }
 }
 
+/// One file being re-measured after the listings.
+struct Refining {
+    /// All the file's names, owner first.
+    names: Vec<NodeId>,
+    /// How many of them have been tried.
+    tried: usize,
+    /// The file's ID, which the re-measure must find.
+    key: u128,
+}
+
+/// What a re-measure's outcome means for the tree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Measuring {
+    /// Names its sizes apply to.
+    pub(super) apply: Vec<NodeId>,
+    /// Names to re-measure (again).
+    pub(super) remeasure: Vec<NodeId>,
+}
+
 /// What the scan keeps to count hard-linked files once and to correct
 /// stale listings of their names.
 #[derive(Default)]
@@ -111,11 +130,10 @@ pub(super) struct Links {
     /// Every (owner, alias) pair whose listings were compared, so a file
     /// found stale can have all its names corrected.
     aliases: Vec<(NodeId, NodeId)>,
-    /// Owners of files whose names' listings disagreed.
-    stale: HashSet<NodeId>,
-    /// Re-measures after the listings, by the name being measured: all of
-    /// the file's names (owner first) and how many have been tried.
-    refining: HashMap<NodeId, (Vec<NodeId>, usize)>,
+    /// Owners of files whose names' listings disagreed, with the file's ID.
+    stale: HashMap<NodeId, u128>,
+    /// Re-measures after the listings, by the name being measured.
+    refining: HashMap<NodeId, Refining>,
     /// Whether every folder is listed and the re-measures were queued.
     refined: bool,
 }
@@ -139,8 +157,9 @@ impl Links {
     }
 
     /// Notes that `alias`, just added from `entry`, is another name of
-    /// `owner`'s file, under the batch's hold of the write lock (the alias
-    /// is already marked in the tree). Pushes the names to re-measure now:
+    /// `owner`'s file, whose ID is `key`, under the batch's hold of the
+    /// write lock (the alias is already marked in the tree). Pushes the
+    /// names to re-measure now:
     /// the alias and (once) its owner where listings can't be compared or
     /// every name is to be re-measured; otherwise none, and a file whose
     /// names' listings disagree is left for [`Links::refine`].
@@ -149,6 +168,7 @@ impl Links {
         tree: &Tree,
         alias: NodeId,
         entry: &Entry,
+        key: u128,
         owner: Owner,
         remeasure: &mut Vec<(NodeId, PathBuf)>,
     ) {
@@ -170,7 +190,7 @@ impl Links {
             && entry.logical == tree.logical(owner.node)
             && entry.allocated == first_allocated;
         if !agree {
-            self.stale.insert(owner.node);
+            self.stale.insert(owner.node, key);
         }
     }
 
@@ -181,18 +201,29 @@ impl Links {
 
     /// Once every folder is listed: forgets the first names and returns one
     /// re-measure per file whose names' listings disagreed, by its first
-    /// name's path, whose result [`Links::measured`] applies to every name.
+    /// name's path, whose result [`Links::measured`] applies to every name
+    /// if it's still that file.
     pub(super) fn refine(&mut self, tree: &Tree) -> Vec<(NodeId, PathBuf)> {
         self.refined = true;
         self.owners = HashMap::default();
-        let mut groups: HashMap<NodeId, Vec<NodeId>> = self
+        let mut groups: HashMap<NodeId, Refining> = self
             .stale
             .drain()
-            .map(|owner| (owner, vec![owner]))
+            .map(|(owner, key)| {
+                let names = vec![owner];
+                (
+                    owner,
+                    Refining {
+                        names,
+                        tried: 1,
+                        key,
+                    },
+                )
+            })
             .collect();
         for (owner, alias) in &self.aliases {
-            if let Some(names) = groups.get_mut(owner) {
-                names.push(*alias);
+            if let Some(group) = groups.get_mut(owner) {
+                group.names.push(*alias);
             }
         }
         let mut jobs: Vec<(NodeId, PathBuf)> = groups
@@ -200,10 +231,7 @@ impl Links {
             .map(|&owner| (owner, tree.path(owner)))
             .collect();
         jobs.sort_unstable_by_key(|job| job.0);
-        self.refining = groups
-            .into_iter()
-            .map(|(owner, names)| (owner, (names, 1)))
-            .collect();
+        self.refining = groups;
         jobs
     }
 
@@ -235,27 +263,42 @@ impl Links {
         moves
     }
 
-    /// What a re-measure of `file` that succeeded (`ok`) or failed means:
-    /// the names its result applies to, or (`Err`) the next name of the
-    /// file to measure instead, when a re-measure after the listings failed
-    /// and another name is left to try. A failure otherwise keeps the
+    /// What a re-measure of `file` that found `id` (`Some`), or failed
+    /// (`None`), means. A re-measure after the listings applies to every
+    /// name of the file only when it found the file's ID; if it found
+    /// another file (the name was replaced since it was listed, or IDs on
+    /// that filesystem aren't unique) or none, it applies to the measured
+    /// name alone and the other names are re-measured one by one. If it
+    /// failed, the file's next name is tried. A failure otherwise keeps the
     /// listings' values.
-    pub(super) fn measured(
-        &mut self,
-        file: NodeId,
-        ok: bool,
-    ) -> Result<Vec<NodeId>, Option<NodeId>> {
-        let Some((names, tried)) = self.refining.remove(&file) else {
-            return if ok { Ok(vec![file]) } else { Err(None) };
+    pub(super) fn measured(&mut self, file: NodeId, id: Option<Option<u128>>) -> Measuring {
+        let Some(mut group) = self.refining.remove(&file) else {
+            return Measuring {
+                apply: id.map(|_| file).into_iter().collect(),
+                remeasure: Vec::new(),
+            };
         };
-        if ok {
-            return Ok(names);
+        match id {
+            Some(id) if id == Some(group.key) => Measuring {
+                apply: group.names,
+                remeasure: Vec::new(),
+            },
+            Some(_) => Measuring {
+                apply: vec![file],
+                remeasure: group.names.into_iter().filter(|&n| n != file).collect(),
+            },
+            None => {
+                let Some(&next) = group.names.get(group.tried) else {
+                    return Measuring::default();
+                };
+                group.tried += 1;
+                self.refining.insert(next, group);
+                Measuring {
+                    apply: Vec::new(),
+                    remeasure: vec![next],
+                }
+            }
         }
-        let Some(&next) = names.get(tried) else {
-            return Err(None);
-        };
-        self.refining.insert(next, (names, tried + 1));
-        Err(Some(next))
     }
 }
 

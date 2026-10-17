@@ -253,6 +253,7 @@ fn stale_hard_link_listings_are_settled_by_the_re_measure() {
         Measured {
             logical: 1 << 20,
             allocated: Some(1 << 20),
+            id: None,
         },
     );
     let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
@@ -326,6 +327,7 @@ fn a_stale_single_name_entry_settles_only_when_the_re_measure_matches() {
         Measured {
             logical: 100,
             allocated: Some(104),
+            id: None,
         },
     );
     let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
@@ -339,6 +341,7 @@ fn a_stale_single_name_entry_settles_only_when_the_re_measure_matches() {
         Measured {
             logical: 200,
             allocated: Some(208),
+            id: None,
         },
     );
     let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);

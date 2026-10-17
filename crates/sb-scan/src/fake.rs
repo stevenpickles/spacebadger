@@ -59,6 +59,8 @@ pub struct FakeFs {
     late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
     measure_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
+    /// IDs `measure_file` gives instead of the listed file's.
+    measured_ids: Arc<Mutex<BTreeMap<PathBuf, Option<u128>>>>,
     measure_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
     /// Every path given to `measure_file`, in order.
     measures: Arc<Mutex<Vec<PathBuf>>>,
@@ -341,15 +343,35 @@ impl FakeFs {
         gate
     }
 
-    /// Sets what [`FsAdapter::measure_file`] returns for `path`.
+    /// Sets the sizes [`FsAdapter::measure_file`] returns for `path`, with
+    /// the ID of the file listed there.
     pub fn set_measured(&self, path: &str, logical: u64, allocated: u64) -> &Self {
         self.measured.lock().unwrap().insert(
             Self::abs(path),
             Measured {
                 logical,
                 allocated: Some(allocated),
+                id: None,
             },
         );
+        self
+    }
+
+    /// Sets what [`FsAdapter::measure_file`] returns for `path` as another
+    /// file's: sizes and ID `id`, as when the name was replaced after it was
+    /// listed (`None`: a filesystem that gives no ID).
+    pub fn set_measured_other(
+        &self,
+        path: &str,
+        logical: u64,
+        allocated: u64,
+        id: Option<u128>,
+    ) -> &Self {
+        self.set_measured(path, logical, allocated);
+        self.measured_ids
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), id);
         self
     }
 
@@ -454,18 +476,34 @@ impl FsAdapter for FakeFs {
         if let Some(err) = self.measure_errors.lock().unwrap().get(file) {
             return Err(err.clone());
         }
-        if let Some(m) = self.measured.lock().unwrap().get(file) {
-            return Ok(*m);
-        }
-        match self.nodes.lock().unwrap().get(file) {
+        let (listed, listed_id) = match self.nodes.lock().unwrap().get(file) {
             Some(Node::File {
-                logical, allocated, ..
-            }) => Ok(Measured {
-                logical: *logical,
-                allocated: *allocated,
-            }),
-            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
-        }
+                logical,
+                allocated,
+                identity,
+                ..
+            }) => (
+                Measured {
+                    logical: *logical,
+                    allocated: *allocated,
+                    id: None,
+                },
+                match identity {
+                    Identity::MaybeShared { key } => Some(*key),
+                    _ => None,
+                },
+            ),
+            _ => return Err(ScanError::new(ErrorKind::Vanished, "not a file")),
+        };
+        let measured = self.measured.lock().unwrap().get(file).copied();
+        let id = match self.measured_ids.lock().unwrap().get(file) {
+            Some(id) => *id,
+            None => listed_id,
+        };
+        Ok(Measured {
+            id,
+            ..measured.unwrap_or(listed)
+        })
     }
 
     fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {

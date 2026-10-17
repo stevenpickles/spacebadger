@@ -164,6 +164,7 @@ impl FsAdapter for LinuxFs {
         Ok(Measured {
             logical: stx.stx_size,
             allocated: Some(stx.stx_blocks.saturating_mul(512)),
+            id: Some((u128::from(dev(&stx)) << 64) | u128::from(stx.stx_ino)),
         })
     }
 

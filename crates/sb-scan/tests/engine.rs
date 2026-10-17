@@ -283,6 +283,49 @@ fn an_untrusted_hard_link_is_remeasured_once_though_its_names_agree() {
     assert_eq!(progress.allocated, 4096);
 }
 
+/// The first name was replaced by another file after it was listed (an
+/// atomic save), or the filesystem gives no ID to check (`None`): the
+/// re-measure counts for that name alone, and the others are re-measured
+/// one by one.
+#[test]
+fn a_remeasure_that_finds_another_file_applies_to_its_name_alone() {
+    for id in [Some(999), None] {
+        let fs = FakeFs::new();
+        three_names_and_a_fourth(&fs, STAMP, 5001);
+        fs.set_measured_other("d/1.bin", 7777, 8192, id);
+        let (progress, tree) = run(&fs);
+        let tree = tree.read().unwrap();
+
+        let mut measures = fs.measures();
+        assert_eq!(measures[0], Path::new("/fake/d/1.bin"), "{id:?}");
+        measures.sort();
+        let expected: Vec<_> = ["d/1.bin", "d/2.bin", "d/3.bin", "d/z/4.bin"]
+            .map(|p| Path::new("/fake").join(p))
+            .into_iter()
+            .collect();
+        assert_eq!(measures, expected, "{id:?}");
+        assert_eq!(tree.logical(find(&tree, "d/1.bin")), 7777);
+        for name in ["d/2.bin", "d/3.bin", "d/z/4.bin"] {
+            assert_eq!(tree.logical(find(&tree, name)), 9000, "{name}, {id:?}");
+        }
+        assert_eq!(progress.logical, 7777 + 3 * 9000 + 2 * 10);
+        assert_eq!(progress.state, ScanState::Complete);
+    }
+}
+
+/// The same check when the re-measure finds the file it was meant for: one
+/// measure for every name (as in the tests above, where the fake gives
+/// each name its file's ID).
+#[test]
+fn a_remeasure_that_finds_its_file_applies_to_every_name() {
+    let fs = FakeFs::new();
+    three_names_and_a_fourth(&fs, STAMP, 5001);
+    fs.set_measured_other("d/1.bin", 9000, 12_288, Some(7));
+    let (progress, _) = run(&fs);
+    assert_eq!(fs.measures(), [Path::new("/fake/d/1.bin")]);
+    assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
+}
+
 #[test]
 fn a_failed_remeasure_tries_the_files_next_name() {
     let fs = FakeFs::new();

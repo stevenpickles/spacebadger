@@ -76,6 +76,7 @@ impl FsAdapter for WideFs {
         Ok(Measured {
             logical: 0,
             allocated: Some(0),
+            id: None,
         })
     }
 }

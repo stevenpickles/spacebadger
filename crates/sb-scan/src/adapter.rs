@@ -96,6 +96,12 @@ pub struct LinkStamp {
 pub struct Measured {
     pub logical: u64,
     pub allocated: Option<u64>,
+    /// The file's identity as [`Identity::MaybeShared`] gives it, read from
+    /// the same handle or call as the sizes, so a re-measure meant for every
+    /// name of one file can tell the name led somewhere else (replaced
+    /// since it was listed, or a filesystem whose IDs aren't unique);
+    /// `None` when unknown.
+    pub id: Option<u128>,
 }
 
 /// Classification used for omission reporting.

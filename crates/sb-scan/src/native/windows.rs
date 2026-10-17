@@ -723,6 +723,9 @@ impl FsAdapter for WindowsFs {
         Ok(Measured {
             logical: standard.EndOfFile as u64,
             allocated: Some(standard.AllocationSize as u64),
+            // The listing's file ID, which NTFS gives in either width with
+            // the same value.
+            id: file_id(&handle).map(|(_, id)| u128::from_le_bytes(id)),
         })
     }
 
