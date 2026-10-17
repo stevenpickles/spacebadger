@@ -152,6 +152,7 @@ impl Links {
         owner: Owner,
         remeasure: &mut Vec<(NodeId, PathBuf)>,
     ) {
+        self.aliases.push((owner.node, alias));
         let (Some(listed), Some(first), false) = (entry.stamp, owner.stamp(), self.exact) else {
             // Listings of other names can be stale (NTFS), so re-measure
             // both sides once.
@@ -161,7 +162,6 @@ impl Links {
             }
             return;
         };
-        self.aliases.push((owner.node, alias));
         let first_allocated =
             (tree.unknown_allocation_files(owner.node) == 0).then(|| tree.allocated(owner.node));
         // An untrusted listing can be wrong under every name alike.
@@ -190,9 +190,9 @@ impl Links {
             .drain()
             .map(|owner| (owner, vec![owner]))
             .collect();
-        for (owner, alias) in std::mem::take(&mut self.aliases) {
-            if let Some(names) = groups.get_mut(&owner) {
-                names.push(alias);
+        for (owner, alias) in &self.aliases {
+            if let Some(names) = groups.get_mut(owner) {
+                names.push(*alias);
             }
         }
         let mut jobs: Vec<(NodeId, PathBuf)> = groups
@@ -205,6 +205,34 @@ impl Links {
             .map(|(owner, names)| (owner, (names, 1)))
             .collect();
         jobs
+    }
+
+    /// When the scan ends, after every re-measure was applied: for each
+    /// hard-linked file whose owner isn't its first name in [`name_order`],
+    /// that name and the owner's other aliases, to hand to
+    /// [`Tree::promote_alias`], so which name owns the allocation doesn't
+    /// depend on which folder was listed first. Only reads the tree, so it
+    /// can run under a read lock.
+    pub(super) fn settle(&mut self, tree: &Tree) -> Vec<(NodeId, Vec<NodeId>)> {
+        let mut groups: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (owner, alias) in std::mem::take(&mut self.aliases) {
+            groups.entry(owner).or_default().push(alias);
+        }
+        let mut moves = Vec::new();
+        for (owner, aliases) in groups {
+            let best = aliases.iter().copied().fold(owner, |best, name| {
+                if name_order(tree, name, best).is_lt() {
+                    name
+                } else {
+                    best
+                }
+            });
+            if best != owner {
+                let others = aliases.into_iter().filter(|&a| a != best).collect();
+                moves.push((best, others));
+            }
+        }
+        moves
     }
 
     /// What a re-measure of `file` that succeeded (`ok`) or failed means:
@@ -229,6 +257,57 @@ impl Links {
         self.refining.insert(next, (names, tried + 1));
         Err(Some(next))
     }
+}
+
+/// The order in which names of one file are preferred as its owner: fewer
+/// path components first (`System32\x.dll` before
+/// `WinSxS\<component>\x.dll`), then path order by component, ignoring
+/// ASCII case, then exact bytes. It depends only on the paths, never on
+/// listing order, and costs a walk up each name's folders.
+fn name_order(tree: &Tree, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+    let depth = |mut node: NodeId| {
+        let mut depth = 0usize;
+        while let Some(parent) = tree.parent(node) {
+            depth += 1;
+            node = parent;
+        }
+        depth
+    };
+    let by_depth = depth(a).cmp(&depth(b));
+    if by_depth.is_ne() {
+        return by_depth;
+    }
+    let chain = |node: NodeId| {
+        let mut chain = vec![node];
+        let mut at = node;
+        while let Some(parent) = tree.parent(at) {
+            chain.push(parent);
+            at = parent;
+        }
+        chain.reverse();
+        chain
+    };
+    let (ca, cb) = (chain(a), chain(b));
+    let bytes = |n: NodeId| tree.name(n).as_encoded_bytes();
+    let pairs = || ca.iter().zip(&cb).filter(|(x, y)| x != y);
+    ca.len()
+        .cmp(&cb.len())
+        .then_with(|| {
+            pairs()
+                .map(|(&x, &y)| {
+                    let fold = |n| bytes(n).iter().map(u8::to_ascii_lowercase);
+                    fold(x).cmp(fold(y))
+                })
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            pairs()
+                .map(|(&x, &y)| bytes(x).cmp(bytes(y)))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then(a.cmp(&b))
 }
 
 #[cfg(test)]

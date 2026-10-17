@@ -391,6 +391,72 @@ fn records_each_entrys_object_id() {
     assert_eq!(tree.id(find(&tree, "b.bin")), None, "the listing gave none");
 }
 
+/// Which name owns a hard-linked file's allocation follows its path, not
+/// the order folders happen to be listed in: fewest components, then path
+/// order ignoring case.
+#[test]
+fn the_owner_of_a_hard_link_does_not_depend_on_listing_order() {
+    let names = ["z/deep/x.bin", "c/x.bin", "b/x.bin", "A/x.bin", "A/y.bin"];
+    let stale = LinkStamp {
+        changed: 2001,
+        ..STAMP
+    };
+    let fs = FakeFs::new();
+    for name in names {
+        fs.stamped_link(name, 5000, 8192, 7, STAMP);
+    }
+    // A second file whose names disagree, so it's re-measured too.
+    fs.stamped_link("z/deep/s.bin", 10, 4096, 8, STAMP)
+        .stamped_link("c/s.bin", 10, 4096, 8, stale)
+        .set_measured("z/deep/s.bin", 20, 8192)
+        .set_measured("c/s.bin", 20, 8192);
+    let folders = ["z/deep", "z", "c", "b", "A"];
+    let mut results = Vec::new();
+    for round in 0..12 {
+        // Hold back one folder so it's listed last; more workers than
+        // folders otherwise.
+        let late = folders[round % folders.len()];
+        let gate = fs.gate_dir(late);
+        let config = ScanConfig {
+            workers: 8,
+            exact_hard_links: round % 4 == 3,
+            ..config()
+        };
+        let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
+        std::thread::sleep(Duration::from_millis(20));
+        gate.release();
+        let tree = s.tree();
+        let progress = s.wait();
+        let tree = tree.read().unwrap();
+        assert_eq!(progress.state, ScanState::Complete);
+        let owner = find(&tree, "A/x.bin");
+        for name in names.into_iter().filter(|&n| n != "A/x.bin") {
+            assert_eq!(
+                tree.alias_owner(find(&tree, name)),
+                Some(owner),
+                "{name}, {late} late"
+            );
+        }
+        assert_eq!(
+            tree.alias_owner(find(&tree, "z/deep/s.bin")),
+            Some(find(&tree, "c/s.bin"))
+        );
+        let sizes: Vec<_> = folders
+            .iter()
+            .map(|f| {
+                let n = find(&tree, f);
+                (tree.logical(n), tree.allocated(n))
+            })
+            .collect();
+        assert_eq!(progress.allocated, 8192 + 8192);
+        assert_eq!(progress.hardlink_aliases, 5);
+        results.push(sizes);
+    }
+    assert!(results.windows(2).all(|w| w[0] == w[1]), "{results:?}");
+    assert_eq!(results[0][4], (2 * 5000, 8192), "A owns the first file");
+    assert_eq!(results[0][2], (5000 + 20, 8192), "c owns the second");
+}
+
 #[test]
 fn hard_links_within_one_listing_count_allocation_once() {
     let fs = FakeFs::new();

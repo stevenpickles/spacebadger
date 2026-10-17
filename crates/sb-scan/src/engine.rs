@@ -29,7 +29,7 @@
 //!   folder is listed (the scan is still running then); see [`links`].
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    BATCH_ENTRIES, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
 use crate::git::{self, Finding, Plan, Scope, Signals, Spot};
 use links::{FileKey, IdHash, Links, Owner};
@@ -705,6 +705,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 } else {
                     ScanState::CompleteWithOmissions
                 };
+                self.settle_owners();
                 self.finish(state);
                 return;
             }
@@ -809,6 +810,21 @@ impl<A: FsAdapter> Aggregator<A> {
 
     /// Once every folder is listed, queues the hard-link re-measures left
     /// for then (see [`links`]).
+    /// Once the scan is complete, gives each hard-linked file's allocation
+    /// to the name a fixed order of paths prefers, whatever was listed
+    /// first (see [`links`]): chosen under the read lock, then moved in
+    /// holds of the write lock bounded like a batch's. Skipped for a
+    /// stopped scan, so a cancel is acknowledged at once.
+    fn settle_owners(&mut self) {
+        let moves = self.links.settle(&self.tree.read().unwrap());
+        for chunk in moves.chunks(BATCH_ENTRIES) {
+            let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+            for (heir, others) in chunk {
+                tree.promote_alias(*heir, others);
+            }
+        }
+    }
+
     fn refine(&mut self) {
         let jobs = self.links.refine(&self.tree.read().unwrap());
         for (file, path) in jobs {
