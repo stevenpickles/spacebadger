@@ -162,9 +162,19 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
   return out;
 }
 
-/** Index of the deepest rectangle containing the point, or -1. */
+/** Whether rectangle `i` is the estimated filler of a folder still being
+ * listed: the part of its earlier size nothing found so far stands for
+ * (merged small items with none in it). It isn't an item of its own:
+ * pointing at it points at its folder. */
+export function isFiller(l: DecodedLayout, i: number): boolean {
+  return l.kind[i] === KIND_OTHER && l.items[i] === 0;
+}
+
+/** Index of the deepest rectangle containing the point, or -1. Fillers
+ * are passed over for the folder they're in. */
 export function hitTest(l: DecodedLayout, px: number, py: number): number {
   for (let i = l.count - 1; i >= 0; i--) {
+    if (isFiller(l, i)) continue;
     const x = l.x[i]!;
     const y = l.y[i]!;
     if (px >= x && py >= y && px < x + l.w[i]! && py < y + l.h[i]!) return i;

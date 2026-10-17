@@ -30,12 +30,12 @@
     GIT_OTHER,
     gitClassOf,
     hitTest,
+    isFiller,
     KIND_FILE,
     KIND_FOLDER,
     KIND_OTHER,
     RF_EXPANDED,
     RF_HEADER,
-    RF_PENDING,
     RF_INCOMPLETE,
     type DecodedLayout,
   } from "./layoutWire";
@@ -410,10 +410,9 @@
 
   /** Whether rectangle `i` is drawn as estimated: part of its area stands
    * for folders not listed yet, and its contents don't show where (it isn't
-   * expanded, or it's still being listed itself). */
+   * expanded; an expanded folder's estimated children and filler do). */
   function estimated(l: DecodedLayout, i: number): boolean {
-    const f = l.rflags[i]!;
-    return l.provisional[i] === 1 && (!(f & RF_EXPANDED) || (f & RF_PENDING) !== 0);
+    return l.provisional[i] === 1 && !(l.rflags[i]! & RF_EXPANDED);
   }
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
@@ -437,7 +436,7 @@
   function selectedIndex(l: DecodedLayout | null, sel: Selection | null): number {
     if (!l || !sel) return -1;
     for (let i = 0; i < l.count; i++) {
-      if (l.node[i] === sel.node && (l.kind[i] === KIND_OTHER) === sel.other) return i;
+      if (l.node[i] === sel.node && (l.kind[i] === KIND_OTHER) === sel.other && !isFiller(l, i)) return i;
     }
     return -1;
   }
@@ -625,7 +624,9 @@
     if (estimated(l, i)) ctx.fillStyle = dark ? p.textLight : p.textDark;
     else ctx.fillStyle = isDarkFill(fillFor(l, i)) ? p.textLight : p.textDark;
     const room = w - 8;
-    if (kind === KIND_OTHER) {
+    if (isFiller(l, i)) {
+      // Nothing found there yet: no label.
+    } else if (kind === KIND_OTHER) {
       // Shorter wordings as the region narrows.
       const n = formatCount(l.items[i]!);
       const text = [plural(l.items[i]!, "small item"), `${n} small`, n].find(
@@ -636,8 +637,11 @@
       // Its size isn't known yet, and the estimate is no number to show.
       label(ctx, name!, x + 4, y + line1, room);
     } else {
-      // The size in full, or none where it doesn't fit.
-      const size = formatBytes(l.weight[i]!);
+      // The size in full, or none where it doesn't fit. A folder with
+      // estimated folders inside says it's the size found so far, and
+      // drops it rather than show it alone as if final.
+      const provisional = l.provisional[i] === 1;
+      const size = provisional ? `${formatBytes(l.weight[i]!)} so far` : formatBytes(l.weight[i]!);
       const sizeWidth = measure(ctx, size);
       if (kind === KIND_FILE && h >= line2 + 3) {
         // Tall enough for two lines: name, then size.
@@ -650,6 +654,8 @@
         const pill = badge !== 0 ? drawBadge(ctx, badge, x + 4, y, room - sizeWidth - 36) : 0;
         label(ctx, name!, x + 4 + pill, y + line1, room - sizeWidth - 6 - pill);
         ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
+      } else if (provisional) {
+        label(ctx, name!, x + 4, y + line1, room);
       } else if (sizeWidth <= room) {
         // The size matters most, so it wins when both don't fit.
         ctx.fillText(size, x + 4, y + line1);
@@ -848,9 +854,12 @@
   function announceAt(i: number) {
     const l = layout;
     if (!l) return;
-    const size = formatBytes(l.weight[i]!);
-    const share = shareOfParent(l, i);
-    const guess = l.provisional[i] ? "still being scanned, area estimated from the last scan" : null;
+    // As the tooltip: an estimated tile's size is what was found so far,
+    // and its share of the parent isn't meaningful yet.
+    const provisional = l.provisional[i] === 1;
+    const size = provisional ? `${formatBytes(l.weight[i]!)} found so far` : formatBytes(l.weight[i]!);
+    const share = provisional ? null : shareOfParent(l, i);
+    const guess = provisional ? "still being scanned, area estimated from the last scan" : null;
     const say = (name: string, kind: string) =>
       announce([name, size, share, kind, guess].filter(Boolean).join(", "));
     const kind = l.kind[i];
@@ -900,7 +909,7 @@
     let best = -1;
     let bestScore = Infinity;
     for (let i = 0; i < l.count; i++) {
-      if (i === cur || l.depth[i] !== depth) continue;
+      if (i === cur || l.depth[i] !== depth || isFiller(l, i)) continue;
       const ox = l.x[i]! + l.w[i]! / 2 - cx;
       const oy = l.y[i]! + l.h[i]! / 2 - cy;
       const along = ox * dx + oy * dy;
