@@ -149,7 +149,10 @@ pub(super) fn root_row(tree: &Tree, node: NodeId, outside: bool) -> proto::GitRo
             .filter(|r| r.kind != RootKind::LinkedWorktree)
             .and_then(|r| shown(&r.worktree)),
         outside,
-        // Above the scan root, most of the repository isn't scanned.
+        // Above the scan root, most of the repository isn't scanned. Inside
+        // the scan, only the root folder's own listing is known here, as
+        // for the map's incomplete folders: the tree keeps no record of
+        // problems deeper down short of walking the subtree.
         partial: outside || !tree.fully_listed(node),
     }
 }
@@ -181,8 +184,12 @@ fn head(h: &Head) -> proto::GitHead {
 
 /// The repository a root belongs to: a linked worktree's main repository
 /// (the folder holding its common `.git`, or a bare common directory
-/// itself), a submodule's superproject (the folder holding the `.git`
-/// whose `modules` hold its Git directory), a separate Git directory.
+/// itself), a submodule's superproject, a separate Git directory.
+///
+/// A submodule's superproject is the checkout it's in: the nearest listed
+/// checkout around it, which for a submodule of a submodule is the outer
+/// submodule. Only when there's none is it read from the Git directory's
+/// path, as the folder holding the `.git` whose `modules` hold it.
 fn repository(tree: &Tree, root: &GitRoot) -> Option<proto::GitLink> {
     let style = paths::Style::native();
     let target = match root.kind {
@@ -194,17 +201,12 @@ fn repository(tree: &Tree, root: &GitRoot) -> Option<proto::GitLink> {
                 common.to_path_buf()
             }
         }
-        RootKind::Submodule => root
-            .git_dir
-            .as_deref()?
-            .ancestors()
-            .find(|a| {
-                is_named(a, "modules", style)
-                    && a.parent().is_some_and(|g| is_named(g, ".git", style))
-            })?
-            .parent()?
-            .parent()?
-            .to_path_buf(),
+        RootKind::Submodule => {
+            if let Some(link) = superproject(tree, root.node) {
+                return Some(link);
+            }
+            modules_owner(root, style)?
+        }
         RootKind::SeparateGitDir => root.git_dir.clone()?,
         _ => return None,
     };
@@ -214,14 +216,63 @@ fn repository(tree: &Tree, root: &GitRoot) -> Option<proto::GitLink> {
     })
 }
 
+/// The checkout a submodule at `node` is in: the nearest listed root
+/// around it with checkout or worktree content, in the scan or above it.
+fn superproject(tree: &Tree, node: NodeId) -> Option<proto::GitLink> {
+    let checkout = |r: &GitRoot| {
+        r.kind.listed()
+            && matches!(
+                r.kind.class(),
+                Some(GitClass::Checkout | GitClass::Worktree)
+            )
+    };
+    let mut cur = tree.parent(node);
+    while let Some(a) = cur {
+        if tree.git_entry(a).is_some_and(checkout) {
+            return Some(proto::GitLink {
+                path: display_path(&tree.path(a)),
+                node: Some(a.index() as u32),
+            });
+        }
+        cur = tree.parent(a);
+    }
+    tree.git()
+        .above()
+        .filter(|(_, r)| checkout(r))
+        .map(|(path, _)| proto::GitLink {
+            path: display_path(path),
+            node: None,
+        })
+}
+
+/// The folder holding the `.git` whose `modules` hold a submodule's Git
+/// directory.
+fn modules_owner(root: &GitRoot, style: paths::Style) -> Option<PathBuf> {
+    Some(
+        root.git_dir
+            .as_deref()?
+            .ancestors()
+            .find(|a| {
+                is_named(a, "modules", style)
+                    && a.parent().is_some_and(|g| is_named(g, ".git", style))
+            })?
+            .parent()?
+            .parent()?
+            .to_path_buf(),
+    )
+}
+
 fn is_named(path: &Path, name: &str, style: paths::Style) -> bool {
     path.file_name()
         .is_some_and(|n| same_name(n, OsStr::new(name), style))
 }
 
+/// Names compared as the file system would, ignoring ASCII case where it
+/// folds case (other letters are compared exactly), without allocating.
 fn same_name(a: &OsStr, b: &OsStr, style: paths::Style) -> bool {
     if style.fold_case {
-        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        a.as_encoded_bytes()
+            .eq_ignore_ascii_case(b.as_encoded_bytes())
     } else {
         a == b
     }
@@ -240,8 +291,8 @@ fn node_at(tree: &Tree, path: &Path, style: paths::Style) -> Option<NodeId> {
     Some(cur)
 }
 
-/// What the details panel says about `n`'s place in Git. O(depth), plus
-/// one pass over the entries for a repository's linked worktrees. The
+/// What the details panel says about `n`'s place in Git. O(depth), plus a
+/// look in a repository's `.git/worktrees` for its linked worktrees. The
 /// root's `size` and `matching` are logical sizes, as the details' own
 /// are, `matching` from `filter` when given; `own` and `metadata` aren't
 /// summed up here (they're 0; the list has them).
@@ -314,28 +365,32 @@ fn enclosing(tree: &Tree, node: NodeId) -> Option<(NodeId, bool)> {
 /// For a repository whose Git directory is in the scan: the linked
 /// worktrees registered there (its `worktrees/<id>` folders), and how many
 /// of their checkouts are in the scan too. `None` when none are known.
+/// Looks only in the repository's folder and its `.git/worktrees`.
 fn registered_worktrees(tree: &Tree, repo: NodeId) -> Option<(u32, u32)> {
     let style = paths::Style::native();
+    let child = |dir: NodeId, name: &str| {
+        tree.children(dir)
+            .find(|&c| !tree.is_removed(c) && same_name(tree.name(c), OsStr::new(name), style))
+    };
+    // `<repo>/.git/worktrees/<id>`, or `<bare>/worktrees/<id>`.
+    let git_dir = match tree.git_entry(repo)?.kind {
+        RootKind::Repository => child(repo, ".git").filter(|&d| {
+            tree.git_entry(d)
+                .is_some_and(|r| r.kind == RootKind::DotGit)
+        })?,
+        RootKind::Bare | RootKind::GitDir => repo,
+        _ => return None,
+    };
+    let list = child(git_dir, "worktrees")?;
     let (mut registered, mut here) = (0u32, 0u32);
-    for admin in tree.git().roots() {
-        if admin.kind != RootKind::WorktreeAdmin || tree.is_removed(admin.node) {
-            continue;
-        }
-        let Some(list) = tree.parent(admin.node) else {
-            continue;
-        };
-        let Some(dir) = tree.parent(list) else {
+    for id in tree.children(list) {
+        let Some(admin) = tree
+            .git_entry(id)
+            .filter(|r| r.kind == RootKind::WorktreeAdmin)
+        else {
             continue;
         };
-        if !same_name(tree.name(list), OsStr::new("worktrees"), style) {
-            continue;
-        }
-        // `<repo>/.git/worktrees/<id>`, or `<bare>/worktrees/<id>`.
-        let owner = match tree.git_entry(dir).map(|r| r.kind) {
-            Some(RootKind::DotGit) => tree.parent(dir),
-            _ => Some(dir),
-        };
-        if owner != Some(repo) {
+        if tree.is_removed(id) {
             continue;
         }
         registered += 1;
@@ -403,6 +458,7 @@ mod tests {
             .file("main/.git/worktrees/wt1/HEAD", 5, 5)
             .file("main/vendor/sub/.git", 3, 3)
             .file("main/vendor/sub/x.rs", 200, 200)
+            .file("main/vendor/sub/deep/.git", 0, 0)
             .file("wt1/.git", 4, 4)
             .file("wt1/b.rs", 300, 300)
             .file("broken/inner/.git/HEAD", 6, 6)
@@ -528,7 +584,7 @@ mod tests {
             "its .git, worktree admin folder included"
         );
         assert_eq!((main.nested, main.parent), (1, None));
-        assert_eq!(main.files, 6);
+        assert_eq!(main.files, 7);
         assert!(!main.partial && !main.outside);
         assert_eq!(main.matching, None);
 
@@ -659,6 +715,46 @@ mod tests {
         let details = session.details(main.node, None).unwrap().git.unwrap();
         let root = details.root.unwrap();
         assert_eq!((root.parent, root.parent_outside), (Some(0), true));
+    }
+
+    #[test]
+    fn a_submodule_of_a_submodule_links_to_the_outer_one() {
+        let session = scanned();
+        session
+            .scan
+            .edit_finished(|t| {
+                let dot = paths::normalize(&t.path(at(t, "main/.git")), paths::Style::native());
+                let deep = at(t, "main/vendor/sub/deep");
+                t.set_git(GitRoot {
+                    git_dir: Some(dot.join("modules/sub/modules/deep")),
+                    ..GitRoot::new(deep, RootKind::Submodule)
+                });
+            })
+            .unwrap();
+        let page = session.git_roots(&request(&session, 0, 100)).unwrap();
+        let sub = node_of(&session, "main/vendor/sub");
+        let deep = row(&page, node_of(&session, "main/vendor/sub/deep"));
+        let link = deep.repository.as_ref().unwrap();
+        assert_eq!(link.node, Some(sub), "the checkout it's in");
+        assert_eq!(link.path, row(&page, sub).path);
+        assert_eq!(deep.parent, Some(sub));
+
+        // Found only by its Git directory's path when nothing listed is
+        // around it.
+        session
+            .scan
+            .edit_finished(|t| {
+                t.set_git(GitRoot::unresolved(at(t, "main"), Problem::NotGit));
+                t.set_git(GitRoot::unresolved(
+                    at(t, "main/vendor/sub"),
+                    Problem::NotGit,
+                ));
+            })
+            .unwrap();
+        let page = session.git_roots(&request(&session, 0, 100)).unwrap();
+        let deep = row(&page, node_of(&session, "main/vendor/sub/deep"));
+        let link = deep.repository.as_ref().unwrap();
+        assert_eq!(link.node, Some(node_of(&session, "main")));
     }
 
     #[test]
