@@ -208,11 +208,12 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     };
     drop(tree);
     println!(
-        "scan:    {:?}, {} files, {} folders, {} nodes in {}",
+        "scan:    {:?}, {} files, {} folders, {} nodes, {} Git roots in {}",
         p.state,
         p.files,
         p.dirs,
         nodes,
+        p.git_roots,
         ms(elapsed)
     );
     let pct = |q: f64| waits[((waits.len() - 1) as f64 * q) as usize];
