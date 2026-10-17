@@ -2391,6 +2391,39 @@ mod tests {
     }
 
     #[test]
+    fn detection_sequences_converge_step_by_step() {
+        // As the scanner records them: candidates first, each finding later,
+        // some never confirmed; a scan of a `.git` folder itself is
+        // metadata, inside the repository found above it.
+        for query in ["git:repo", "!git:repo", "git:metadata"] {
+            let mut r = Repos::new();
+            let mut s = Search::new(Matcher::new(query).unwrap());
+            let steps = |s: &mut Search, t: &Tree| {
+                while !s.catch_up(t, 3) {
+                    assert_whole(s, t);
+                }
+                assert_fresh(s, t, query);
+            };
+            steps(&mut s, &r.t);
+            for n in [r.app, r.lib, r.wt] {
+                r.t.set_git(GitRoot::pending(n));
+                steps(&mut s, &r.t);
+            }
+            r.t.set_git_above("/".into(), GitRoot::new(NodeId::ROOT, RootKind::Repository));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(NodeId::ROOT, RootKind::DotGit));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+            r.t.set_git(GitRoot::new(r.app_git, RootKind::DotGit));
+            r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+            r.t.set_git(GitRoot::unresolved(r.wt, Problem::NotChecked));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(NodeId::ROOT, RootKind::WorktreeAdmin));
+            steps(&mut s, &r.t);
+        }
+    }
+
+    #[test]
     fn a_git_file_classified_late_becomes_metadata() {
         let mut r = Repos::new();
         let mut s = search("git:metadata", &r.t);
