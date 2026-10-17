@@ -834,11 +834,7 @@ pub mod paths {
         let mut out = OsString::new();
         match &parsed.prefix {
             Prefix::None => {}
-            Prefix::Drive(letter) => {
-                out.push(OsStr::new(
-                    std::str::from_utf8(&[*letter, b':']).unwrap_or("C:"),
-                ));
-            }
+            Prefix::Drive(letter) => out.push(format!("{}:", char::from(*letter))),
             Prefix::Unc(server, share) => {
                 out.push(r"\\");
                 out.push(server);
