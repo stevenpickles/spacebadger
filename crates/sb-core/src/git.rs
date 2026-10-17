@@ -152,6 +152,12 @@ pub enum Problem {
     NotGit,
     /// The repository's `.git` was deleted from the app.
     MetadataRemoved,
+    /// The Git directory is on another computer, a network share, a
+    /// removable drive, or a device, which the scan doesn't reach into.
+    NotRead,
+    /// Reading the metadata didn't finish in time; the scan ended without
+    /// it.
+    TimedOut,
 }
 
 impl std::fmt::Display for Problem {
@@ -170,6 +176,10 @@ impl std::fmt::Display for Problem {
             Self::Link => f.write_str(".git is a link; not followed"),
             Self::NotGit => f.write_str("folder named .git without Git data"),
             Self::MetadataRemoved => f.write_str("Git metadata was deleted"),
+            Self::NotRead => {
+                f.write_str("Git directory is on another computer or removable drive; not read")
+            }
+            Self::TimedOut => f.write_str("not checked: Git metadata didn't answer in time"),
         }
     }
 }
