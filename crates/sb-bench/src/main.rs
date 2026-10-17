@@ -58,6 +58,13 @@ static ALLOC: lod::Counting = lod::Counting;
 
 const DEFAULT_SIZES: [usize; 2] = [1_000_000, 5_000_000];
 
+/// A root from the command line, made absolute once as the app does, so
+/// the scan builds child paths verbatim (names ending in a dot or space).
+fn real_root(text: String) -> PathBuf {
+    let root = PathBuf::from(text);
+    std::path::absolute(&root).unwrap_or(root)
+}
+
 /// One measurement, run in its own process.
 enum Case {
     Nodes(usize),
@@ -128,10 +135,10 @@ fn main() {
             "--nodes" => cases.push(Case::Nodes(value() as usize)),
             "--wide" => cases.push(Case::Wide(value() as usize)),
             "--wide-slow" => cases.push(Case::WideSlow(value() as usize)),
-            "--wide-dir" => cases.push(Case::WideDir(PathBuf::from(text()))),
+            "--wide-dir" => cases.push(Case::WideDir(real_root(text()))),
             "--lod" => cases.push(Case::Lod(value() as usize)),
-            "--floor" => cases.push(Case::Floor(PathBuf::from(text()))),
-            "--engine" => cases.push(Case::Engine(PathBuf::from(text()))),
+            "--floor" => cases.push(Case::Floor(real_root(text()))),
+            "--engine" => cases.push(Case::Engine(real_root(text()))),
             "--threads" => ruler.threads.push((value() as usize).max(1)),
             "--runs" => ruler.runs = (value() as usize).max(1),
             "--no-warmup" => ruler.warmup = false,
