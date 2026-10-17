@@ -150,6 +150,8 @@ fn a_size_difference_fails_unless_the_record_changed() {
     let c = compare(&table, ROOT, &listing, &[41].into(), &probe, 5, 0);
     assert!(c.pass);
     assert_eq!(c.changed_during_run.get("logical"), Some(&1));
+    // One excused node of three is far over the 1 % limit.
+    assert!(!c.changed_within_limit);
 }
 
 #[test]

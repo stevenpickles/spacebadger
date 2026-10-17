@@ -123,6 +123,12 @@ pub struct Comparison {
     /// The first matched nodes with the record's values, when asked for
     /// (`--show`), so small trees such as the fixtures can be read off.
     pub nodes: Vec<NodeView>,
+    /// Differences excused as changed during the run, against matched nodes.
+    pub changed_ratio: f64,
+    /// `changed_ratio` is under 1 %, so few nodes went unverified. Not part
+    /// of `pass` (tiny trees such as the fixtures can't meet it); the gate
+    /// on a whole volume needs both.
+    pub changed_within_limit: bool,
     pub pass: bool,
 }
 
@@ -175,6 +181,8 @@ pub fn compare(
         totals_listing: Counted::default(),
         samples: Samples::new(samples),
         nodes: Vec::new(),
+        changed_ratio: 0.0,
+        changed_within_limit: true,
         pass: false,
     };
     let mut counted_ids = HashSet::new();
@@ -333,6 +341,9 @@ pub fn compare(
             );
         }
     }
+    let changed: u64 = out.changed_during_run.values().sum();
+    out.changed_ratio = changed as f64 / out.matched.max(1) as f64;
+    out.changed_within_limit = out.changed_ratio < 0.01;
     out.pass = out.disagreements.is_empty() && out.unverified == 0 && out.listing_failures == 0;
     out
 }

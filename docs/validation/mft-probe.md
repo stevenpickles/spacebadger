@@ -68,7 +68,7 @@ Leave the machine otherwise idle during steps 4 and 5 so few records change; cha
 | (a) read and parse ≤ 4 s cold | `mft-cold.json`: `timing.read_parse_wall_s`, `read_parse_within_4s` | ≤ 4.0 s, `true` |
 | (a, reported alongside) read, parse and build against the same 4 s | `mft-cold.json`: `timing.read_parse_build_s`, `read_parse_build_within_4s` | report both; the engine path will be judged on this total |
 | (b) 100 % agreement on unchanged records | `mft-compare-c.json`: exit code, `comparison.pass`, `comparison.disagreements`, `comparison.unverified`, `comparison.listing_failures`, `changes.lost` | exit 0; `pass: true`; `disagreements: {}`; `unverified: 0`; `listing_failures: 0`; `lost: false` |
-| (b) few nodes excused as changed | `mft-compare-c.json`: the sum of `comparison.changed_during_run` against `comparison.matched` | under 1 % of matched nodes; more leaves too much unverified, so re-run on a quieter machine |
+| (b) few nodes excused as changed | `mft-compare-c.json`: `comparison.changed_within_limit` (`comparison.changed_ratio` is the sum of `changed_during_run` over `matched`) | `true`, i.e. under 1 % of matched nodes; more leaves too much unverified, so re-run on a quieter machine. This is not part of `pass` or the exit code, so exit 0 alone is not enough |
 | (c) fixtures identical | `mft-fixtures.json`: as (b), plus the `comparison.nodes` values in the table below | as (b), and every value below |
 | (c) OneDrive identical | `mft-onedrive.json`: as (b); `explained.cloud_tag_disguised` ≥ the placeholders freed in step 2 | as (b) |
 
