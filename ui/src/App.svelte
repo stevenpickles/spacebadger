@@ -229,7 +229,9 @@
     volume = null;
     dupes = null;
     compare.restart(previous);
-    // Keep the filter across Refresh and new roots.
+    // Keep the filter across Refresh and new roots, and the Git list in
+    // front if it was.
+    reposNext = query !== "" && activeTab === "repos";
     if (query) applySearch(query);
   }
 
@@ -950,7 +952,7 @@
       comparison && generation !== null ? { id: "changes" as const, label: "Changes" } : null,
       search && generation !== null ? { id: "results" as const, label: "Results" } : null,
       generation !== null && ((status?.gitRoots ?? 0) > 0 || hasGitTerms(query))
-        ? { id: "repos" as const, label: status?.gitRoots ? `Repositories ${status.gitRoots}` : "Repositories" }
+        ? { id: "repos" as const, label: status?.gitRoots ? `Git ${status.gitRoots}` : "Git" }
         : null,
       smallOf && generation !== null ? { id: "small" as const, label: "Small items" } : null,
       dupes && generation !== null ? { id: "duplicates" as const, label: "Duplicates" } : null,
@@ -1427,7 +1429,6 @@
               selected={pickedSet}
               {anchor}
               onpick={pick}
-              ondelete={askDelete}
               onopen={openFolder}
             />
           {:else if activeTab === "results" && search && generation !== null}

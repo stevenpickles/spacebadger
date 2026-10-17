@@ -21,6 +21,10 @@
     return `detached at ${head.commit}`;
   }
 
+  /** The count last announced, per scan, so a list shown again (another
+   * tab, a new filter) doesn't say it again. */
+  let announced = "";
+
   /** What a root's link to another repository is, by kind. */
   export function repositoryLabel(row: GitRootRow): string {
     if (row.kind === "linkedWorktree") return "Main repository";
@@ -33,9 +37,9 @@
   // The Git repositories, linked worktrees, and unresolved candidates in the
   // scan, largest first. Selecting one selects its folder in the map and the
   // details; Enter or double-click opens it (the repository above the scan
-  // root stands for the scan root, node 0). Roots are few, so they come in
-  // one request (the backend caps it at 500), asked again as the scan and
-  // filter change.
+  // root stands for the scan root, node 0). Nothing is deleted from here.
+  // Roots are few, so they come in one request (the backend caps it at
+  // 500), asked again as the scan and filter change.
   import { announce } from "./announce.svelte";
   import { errorText, gitRoots } from "./api";
   import { gitAccent } from "./colors";
@@ -62,8 +66,6 @@
     /** Where Shift ranges start. */
     anchor: number | null;
     onpick: (pick: Pick) => void;
-    /** The Delete key. */
-    ondelete: () => void;
     /** Open a root's folder in the map. */
     onopen: (node: number) => void;
   }
@@ -77,7 +79,6 @@
     selected,
     anchor,
     onpick,
-    ondelete,
     onopen,
   }: Props = $props();
 
@@ -122,19 +123,41 @@
   const largest = $derived(rows.reduce((m, r) => Math.max(m, r.size), 0));
   const filtered = $derived(search !== null);
 
-  // Said once the scan has found them all.
-  let said = "";
+  // Said once the scan has found them all, and again only if that changes.
   $effect(() => {
     const p = page;
     if (!p || p.discovering) return;
     const key = `${generation}/${p.total}`;
-    if (key === said) return;
-    said = key;
+    if (key === announced) return;
+    announced = key;
     announce(plural(p.total, "Git repository or worktree", "Git repositories and worktrees"));
   });
 
+  // The repository above the scan root stands for the scan root, node 0,
+  // which may have a row of its own too. In the list it has a node of its
+  // own, so only the row picked shows as selected; picks pass node 0 on.
+  const OUTSIDE = -1;
+  /** The outside row was picked last, rather than the scan root's own. */
+  let outsidePicked = $state(false);
+  const rowNode = (r: GitRootRow) => (r.outside ? OUTSIDE : r.node);
+  const toNode = (n: number) => (n === OUTSIDE ? 0 : n);
+
+  const shownSelected = $derived.by(() => {
+    if (!outsidePicked || !selected.has(0)) return selected;
+    const s = new Set(selected);
+    s.delete(0);
+    s.add(OUTSIDE);
+    return s;
+  });
+
+  function pickRow(p: Pick) {
+    outsidePicked = p.focus.node === OUTSIDE || p.nodes.includes(OUTSIDE);
+    onpick({ ...p, focus: { ...p.focus, node: toNode(p.focus.node) }, nodes: p.nodes.map(toNode) });
+  }
+
   function indexOf(node: number): number {
-    return rows.findIndex((r) => r.node === node);
+    const n = node === 0 && outsidePicked ? OUTSIDE : node;
+    return rows.findIndex((r) => rowNode(r) === n);
   }
 
   /** The second line: how the root relates to others, or what's wrong. */
@@ -207,15 +230,15 @@
       {indexOf}
       total={rows.length}
       item={(i) => rows[i]}
-      node={(r) => r.node}
+      node={rowNode}
       label="Git repositories and worktrees, largest first"
       rowHeight={ROW}
       title={rowLabel}
-      {selected}
-      {anchor}
-      {onpick}
+      selected={shownSelected}
+      anchor={anchor === 0 && outsidePicked ? OUTSIDE : anchor}
+      onpick={pickRow}
       onopen={(r) => onopen(r.node)}
-      {ondelete}
+      ondelete={() => {}}
     >
       {#snippet main(r)}
         {@const more = facts(r)}
