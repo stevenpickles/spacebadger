@@ -281,22 +281,46 @@ pub struct Tree {
 ///
 /// A folder matched with a snapshot entry when it's created is estimated at
 /// that entry's logical size until its listing ends (whatever the outcome:
-/// listed, failed, or not scanned). `pending[D]` is the sum of the
-/// estimates of the folders at or under `D` still waiting, kept up to date
-/// with two walks up the tree per folder (one when it's created, one when
-/// its listing ends), as file sizes are. So once every folder is listed,
-/// every `pending` is 0 again.
+/// listed, failed, or not scanned). While it's being listed, what's found
+/// in it takes over that much of its own estimate: a matched subfolder its
+/// estimate, a file its length, never more than is left. So nothing is
+/// counted twice, and what's left stands for what hasn't been found yet.
+/// `pending[D]` is the sum of the own estimates still left at or under `D`,
+/// kept up to date with walks up the tree as file sizes are. Once every
+/// folder is listed, every `pending` is 0 again.
 struct Provisional {
     prior: Arc<Prior>,
-    /// Pending folders matched with a snapshot entry → that entry: its
-    /// size is the folder's estimate, and its children are where the
-    /// folder's subfolders are looked up as they're added.
-    entries: HashMap<u32, u32>,
+    /// Pending folders matched with a snapshot entry: the entry, whose
+    /// children are where the folder's subfolders are looked up as they're
+    /// added, and what's left of its own estimate.
+    entries: HashMap<u32, Waiting>,
     /// Per node: estimates of the unlisted folders at or under it.
     pending: Column<u64>,
     /// Folded names, reused.
     buf: Vec<u8>,
 }
+
+/// A pending folder's snapshot entry and the part of its estimate not yet
+/// taken over by what was found in it.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    entry: u32,
+    own: u64,
+}
+
+/// What [`Tree::match_prior`] found, for [`Tree::apply_prior`].
+#[derive(Debug)]
+pub struct PriorMatch {
+    prior: Arc<Prior>,
+    /// The tree's length when matched.
+    len: usize,
+    /// (pending folder, snapshot entry).
+    matched: Vec<(u32, u32)>,
+}
+
+/// Estimates taken out of a tree by [`Tree::clear_prior`], to be dropped
+/// once its lock is released.
+pub struct PriorEstimates(#[allow(dead_code)] Box<Provisional>);
 
 impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -440,12 +464,17 @@ impl Tree {
 
     /// Gives new folder `dir` the size its namesake had in the prior scan,
     /// if its parent was matched and is still waiting for its listing to
-    /// end (only then can it gain children).
+    /// end (only then can it gain children). That much of the parent's own
+    /// estimate is now accounted for by `dir`, so it moves there.
     fn estimate(&mut self, parent: NodeId, dir: NodeId) {
         let Some(p) = self.prior.as_deref_mut() else {
             return;
         };
-        let Some(&parent_entry) = p.entries.get(&parent.0) else {
+        let Some(&Waiting {
+            entry: parent_entry,
+            ..
+        }) = p.entries.get(&parent.0)
+        else {
             return;
         };
         let i = dir.index();
@@ -453,9 +482,31 @@ impl Tree {
         let Some(entry) = p.prior.child_dir(parent_entry, name, &mut p.buf) else {
             return;
         };
-        p.entries.insert(dir.0, entry);
         let estimate = p.prior.logical(entry);
+        p.entries.insert(
+            dir.0,
+            Waiting {
+                entry,
+                own: estimate,
+            },
+        );
+        self.take_own(parent, estimate);
         self.shift_pending(dir, estimate, true);
+    }
+
+    /// Takes up to `amount` off the own estimate of pending `dir` (and off
+    /// the pending estimate of it and its ancestors): a subfolder or file
+    /// found in it now stands for that part of it.
+    fn take_own(&mut self, dir: NodeId, amount: u64) {
+        let Some(p) = self.prior.as_deref_mut() else {
+            return;
+        };
+        let Some(waiting) = p.entries.get_mut(&dir.0) else {
+            return;
+        };
+        let taken = amount.min(waiting.own);
+        waiting.own -= taken;
+        self.shift_pending(dir, taken, false);
     }
 
     /// Adds `amount` to (or takes it from) the pending estimate of `node`
@@ -482,54 +533,132 @@ impl Tree {
     /// Estimates the folders not yet listed from `prior`, the snapshot of
     /// an earlier scan of the same root, until each one's listing ends.
     /// Replaces any earlier prior. Folders already in the tree are matched
-    /// from the root down, so it can come once the scan has begun.
+    /// from the root down, so it can come once the scan has begun. The same
+    /// as [`Tree::match_prior`] then [`Tree::apply_prior`], which let the
+    /// matching be done with only a read lock held.
     ///
     /// The estimates are kept apart from the measured sizes: nothing but
     /// the treemap layout's provisional weight reads them, and they never
     /// change any total, count, or comparison.
     pub fn set_prior(&mut self, prior: Arc<Prior>) {
-        let mut pending = Column::new();
-        for _ in 0..self.parent.chunks.len() {
-            pending.grow(0);
-        }
-        self.prior = Some(Box::new(Provisional {
-            prior,
-            entries: HashMap::new(),
-            pending,
-            buf: Vec::new(),
-        }));
-        // Folders still waiting take their estimates; listed ones are
-        // passed through to reach the waiting ones under them.
+        let matched = self.match_prior(prior);
+        self.apply_prior(matched);
+    }
+
+    /// Matches the folders now waiting for their listings with `prior`'s
+    /// entries, from the root down through the listed ones, without
+    /// changing the tree. Give the result to [`Tree::apply_prior`].
+    pub fn match_prior(&self, prior: Arc<Prior>) -> PriorMatch {
+        let mut matched = Vec::new();
+        let mut buf = Vec::new();
         let mut stack = vec![(NodeId::ROOT, 0u32)];
         while let Some((dir, entry)) = stack.pop() {
             match self.dir_state(dir) {
-                DirState::Pending => {
-                    let p = self.prior.as_deref_mut().expect("just set");
-                    p.entries.insert(dir.0, entry);
-                    let estimate = p.prior.logical(entry);
-                    self.shift_pending(dir, estimate, true);
-                }
+                DirState::Pending => matched.push((dir.0, entry)),
                 DirState::Listed => {}
                 DirState::Failed | DirState::NotScanned => continue,
             }
-            let p = self.prior.as_deref_mut().expect("just set");
             let mut c = self.first_child[dir.index()];
             while c != NONE {
                 let i = c as usize;
                 if self.flags[i] & (flags::DIRECTORY | flags::REMOVED) == flags::DIRECTORY {
                     let name = self.names.get(self.name_start[i], self.name_len[i]);
-                    if let Some(e) = p.prior.child_dir(entry, name, &mut p.buf) {
+                    if let Some(e) = prior.child_dir(entry, name, &mut buf) {
                         stack.push((NodeId(c), e));
                     }
                 }
                 c = self.next_sibling[i];
             }
         }
+        PriorMatch {
+            prior,
+            len: self.len,
+            matched,
+        }
     }
 
-    /// Forgets the prior and its estimates (and the memory they take).
-    pub fn clear_prior(&mut self) {
-        self.prior = None;
+    /// Takes the estimates [`Tree::match_prior`] found, for the folders
+    /// still waiting. Nodes added since the match are matched now, in the
+    /// order they were added (a parent before its children).
+    pub fn apply_prior(&mut self, m: PriorMatch) {
+        let mut pending = Column::new();
+        for _ in 0..self.parent.chunks.len() {
+            pending.grow(0);
+        }
+        self.prior = Some(Box::new(Provisional {
+            prior: m.prior,
+            entries: HashMap::new(),
+            pending,
+            buf: Vec::new(),
+        }));
+        for (n, entry) in m.matched {
+            let node = NodeId(n);
+            if self.dir_state(node) != DirState::Pending || self.is_removed(node) {
+                continue;
+            }
+            let p = self.prior.as_deref_mut().expect("just set");
+            let estimate = p.prior.logical(entry);
+            p.entries.insert(
+                n,
+                Waiting {
+                    entry,
+                    own: estimate,
+                },
+            );
+            self.shift_pending(node, estimate, true);
+        }
+        // What a waiting folder holds already accounts for part of it.
+        let mut known = Vec::new();
+        if let Some(p) = self.prior.as_deref() {
+            for &n in p.entries.keys() {
+                let mut c = self.first_child[n as usize];
+                while c != NONE {
+                    known.push((n, c));
+                    c = self.next_sibling[c as usize];
+                }
+            }
+        }
+        for (dir, c) in known {
+            if c as usize >= m.len {
+                continue;
+            }
+            let i = c as usize;
+            let share = if self.flags[i] & flags::DIRECTORY != 0 {
+                let waiting = self.prior.as_deref().and_then(|p| p.entries.get(&c));
+                match waiting {
+                    Some(w) => self
+                        .prior
+                        .as_deref()
+                        .map_or(0, |p| p.prior.logical(w.entry)),
+                    None => self.logical[i],
+                }
+            } else {
+                self.logical[i]
+            };
+            self.take_own(NodeId(dir), share);
+        }
+        for i in m.len..self.len {
+            let node = NodeId(i as u32);
+            let parent = NodeId(self.parent[i]);
+            if self.flags[i] & flags::REMOVED != 0 {
+                continue;
+            }
+            if self.flags[i] & flags::DIRECTORY != 0 {
+                if self.dir_state(node) == DirState::Pending {
+                    self.estimate(parent, node);
+                } else {
+                    self.take_own(parent, self.logical[i]);
+                }
+            } else {
+                self.take_own(parent, self.logical[i]);
+            }
+        }
+    }
+
+    /// Forgets the prior and its estimates. Returns them so the caller can
+    /// let their memory go after releasing the tree's lock.
+    pub fn clear_prior(&mut self) -> Option<PriorEstimates> {
+        self.prior.take().map(PriorEstimates)
     }
 
     /// When the scan the estimates come from finished (milliseconds since
@@ -582,6 +711,9 @@ impl Tree {
             t.unknown[a] += unknown;
             t.files[a] += 1;
         });
+        if self.prior.is_some() {
+            self.take_own(parent, logical);
+        }
         Ok(id)
     }
 
@@ -650,10 +782,9 @@ impl Tree {
         if was == DirState::Pending as u8
             && state != DirState::Pending
             && let Some(p) = self.prior.as_deref_mut()
-            && let Some(entry) = p.entries.remove(&dir.0)
+            && let Some(waiting) = p.entries.remove(&dir.0)
         {
-            let estimate = p.prior.logical(entry);
-            self.shift_pending(dir, estimate, false);
+            self.shift_pending(dir, waiting.own, false);
         }
     }
 
@@ -1035,10 +1166,11 @@ impl Tree {
             + self.alias_owner.capacity() * 16
             + self.changes.capacity() * 4
             + self.git.memory_bytes()
-            + self
-                .prior
-                .as_ref()
-                .map_or(0, |p| p.pending.bytes() + p.entries.capacity() * 8)
+            + self.prior.as_ref().map_or(0, |p| {
+                p.pending.bytes()
+                    + p.entries.capacity() * std::mem::size_of::<(u32, Waiting)>()
+                    + p.prior.memory_bytes()
+            })
     }
 }
 
@@ -1697,7 +1829,11 @@ mod tests {
         let e = t.add_dir(root, "e".as_ref()).unwrap();
         t.add_file(root, "v".as_ref(), sizes(1, 1), None, 0)
             .unwrap();
-        assert_eq!(pending(&t, &[root, a, d, e]), [561 + 510 + 50, 510, 50, 0]);
+        assert_eq!(
+            pending(&t, &[root, a, d, e]),
+            [560, 510, 50, 0],
+            "found things take over the root's own"
+        );
         t.set_dir_state(root, DirState::Listed);
         assert_eq!(pending(&t, &[root, a, d]), [560, 510, 50]);
         assert!(t.is_provisional(root) && t.is_provisional(a) && !t.is_provisional(e));
@@ -1751,6 +1887,55 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_being_listed_hands_its_estimate_to_what_it_finds_once() {
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        let root = NodeId::ROOT;
+        let a = t.add_dir(root, "a".as_ref()).unwrap();
+        t.set_dir_state(root, DirState::Listed);
+        // a (510) is being listed: c is found (100 of it), then a file far
+        // bigger than what's left, then b (400), whose estimate finds
+        // nothing left of a's own to take over.
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        assert_eq!(pending(&t, &[root, a, c]), [510, 510, 100]);
+        t.add_file(a, "huge".as_ref(), sizes(1_000, 1_000), None, 0)
+            .unwrap();
+        assert_eq!(pending(&t, &[root, a, c]), [100, 100, 100]);
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        assert_eq!(pending(&t, &[root, a, b, c]), [500, 500, 400, 100]);
+        // The listing ends with nothing of a's own left to drop.
+        t.set_dir_state(a, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a]), [500, 500]);
+        t.set_dir_state(b, DirState::Listed);
+        t.set_dir_state(c, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a]), [0, 0]);
+    }
+
+    #[test]
+    fn a_prior_matched_under_a_read_lock_catches_up_with_what_came_since() {
+        let mut t = Tree::new("/r");
+        let root = NodeId::ROOT;
+        let a = t.add_dir(root, "a".as_ref()).unwrap();
+        let d = t.add_dir(root, "d".as_ref()).unwrap();
+        t.set_dir_state(root, DirState::Listed);
+        // a is part way through its listing when the match is made.
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        let matched = t.match_prior(prior());
+        // Then the scan goes on: b in a, a file in a, d listed.
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        t.add_file(a, "z".as_ref(), sizes(10, 10), None, 0).unwrap();
+        t.add_file(d, "w".as_ref(), sizes(50, 50), None, 0).unwrap();
+        t.set_dir_state(d, DirState::Listed);
+        t.apply_prior(matched);
+        // a: 510, less c's 100, b's 400 and z's 10: nothing of its own left.
+        assert_eq!(pending(&t, &[root, a, b, c, d]), [500, 500, 400, 100, 0]);
+        t.set_dir_state(a, DirState::Listed);
+        assert_eq!(t.pending_estimate(root), 500);
+        assert!(t.clear_prior().is_some());
+        assert!(t.clear_prior().is_none());
+    }
+
+    #[test]
     fn estimates_grow_into_new_chunks_and_leave_with_removed_folders() {
         let mut t = Tree::new("/r");
         t.set_prior(prior());
@@ -1762,13 +1947,10 @@ mod tests {
         }
         let b = t.add_dir(a, "b".as_ref()).unwrap();
         assert!(b.index() > CHUNK);
-        assert_eq!(
-            pending(&t, &[NodeId::ROOT, a, b]),
-            [561 + 510 + 400, 910, 400]
-        );
+        assert_eq!(pending(&t, &[NodeId::ROOT, a, b]), [510, 510, 400]);
         assert!(t.memory_bytes() > 0);
         assert!(t.remove(a));
-        assert_eq!(pending(&t, &[NodeId::ROOT, a, b]), [561, 0, 0]);
+        assert_eq!(pending(&t, &[NodeId::ROOT, a, b]), [0, 0, 0]);
         t.set_dir_state(NodeId::ROOT, DirState::Listed);
         assert_eq!(t.pending_estimate(NodeId::ROOT), 0);
     }
