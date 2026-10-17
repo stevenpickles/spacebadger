@@ -439,30 +439,57 @@ mod tests {
     use sb_scan::fake::FakeFs;
     use std::time::{Duration, Instant};
 
-    /// A finished scan of:
+    /// A Git directory at `at`: `HEAD` holding `head`, `config`, a pack of
+    /// `pack` bytes, and `refs`.
+    fn git_dir(fs: &FakeFs, at: &str, head: &str, pack: u64) {
+        fs.text(&format!("{at}/HEAD"), head)
+            .text(&format!("{at}/config"), "[core]\n")
+            .file(&format!("{at}/objects/pack/p.pack"), pack, pack)
+            .dir(&format!("{at}/refs/heads"));
+    }
+
+    /// A finished scan of Git layouts as they'd be on disk, which detection
+    /// finds:
     ///
     /// ```text
-    /// main/        repository on main: src/a.rs 1000, .git/ (HEAD, objects/p 500,
-    ///              worktrees/wt1/HEAD), vendor/sub/ submodule (.git file, x.rs 200)
-    /// wt1/         linked worktree of main: .git file, b.rs 300
-    /// broken/      unresolved, holding inner/, a repository (.git/HEAD, i.rs 20)
+    /// main/        repository on main: src/a.rs 1000, .git/ (pack 500,
+    ///              worktrees/wt1, modules/sub, modules/sub/modules/deep)
+    ///   vendor/sub/       submodule: .git file, x.rs 200
+    ///     deep/           its submodule: .git file, d.txt 5
+    /// wt1/         linked worktree of main, detached: .git file, b.rs 300
+    /// broken/      a .git folder without Git data, holding
+    ///   inner/            a repository: i.rs 20
     /// other/c.txt  50
     /// ```
-    ///
-    /// with the entries detection would record, added as a new revision.
     fn scanned() -> Session {
         let fs = FakeFs::new();
-        fs.file("main/src/a.rs", 1000, 1000)
-            .file("main/.git/HEAD", 10, 10)
-            .file("main/.git/objects/p", 500, 500)
-            .file("main/.git/worktrees/wt1/HEAD", 5, 5)
-            .file("main/vendor/sub/.git", 3, 3)
-            .file("main/vendor/sub/x.rs", 200, 200)
-            .file("main/vendor/sub/deep/.git", 0, 0)
-            .file("wt1/.git", 4, 4)
-            .file("wt1/b.rs", 300, 300)
-            .file("broken/inner/.git/HEAD", 6, 6)
-            .file("broken/inner/i.rs", 20, 20)
+        git_dir(&fs, "main/.git", "ref: refs/heads/main\n", 500);
+        fs.file("main/src/a.rs", 1000, 1000);
+        fs.text(
+            "main/.git/worktrees/wt1/HEAD",
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .text("main/.git/worktrees/wt1/commondir", "../..\n")
+        .text("main/.git/worktrees/wt1/gitdir", "/fake/wt1/.git\n")
+        .text("wt1/.git", "gitdir: ../main/.git/worktrees/wt1\n")
+        .file("wt1/b.rs", 300, 300);
+        git_dir(&fs, "main/.git/modules/sub", "ref: refs/heads/main\n", 7);
+        fs.text("main/vendor/sub/.git", "gitdir: ../../.git/modules/sub\n")
+            .file("main/vendor/sub/x.rs", 200, 200);
+        git_dir(
+            &fs,
+            "main/.git/modules/sub/modules/deep",
+            "ref: refs/heads/main\n",
+            3,
+        );
+        fs.text(
+            "main/vendor/sub/deep/.git",
+            "gitdir: ../../../.git/modules/sub/modules/deep\n",
+        )
+        .file("main/vendor/sub/deep/d.txt", 5, 5);
+        fs.file("broken/.git/notes.txt", 9, 9);
+        git_dir(&fs, "broken/inner/.git", "ref: refs/heads/main\n", 6);
+        fs.file("broken/inner/i.rs", 20, 20)
             .file("other/c.txt", 50, 50);
         let session = Session::start_on(fs.root(), fs, ScanConfig::default(), None, None, |_| {});
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -471,44 +498,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         session
-            .scan
-            .edit_finished(|t| {
-                let native = |t: &Tree, n| paths::normalize(&t.path(n), paths::Style::native());
-                let main = at(t, "main");
-                let dot = at(t, "main/.git");
-                let wt = at(t, "wt1");
-                let entries = [
-                    GitRoot {
-                        head: Some(Head::Branch("main".into())),
-                        ..GitRoot::new(main, RootKind::Repository)
-                    },
-                    GitRoot::new(dot, RootKind::DotGit),
-                    GitRoot {
-                        worktree: Some(native(t, wt)),
-                        ..GitRoot::new(at(t, "main/.git/worktrees/wt1"), RootKind::WorktreeAdmin)
-                    },
-                    GitRoot {
-                        git_dir: Some(native(t, dot).join("modules").join("sub")),
-                        ..GitRoot::new(at(t, "main/vendor/sub"), RootKind::Submodule)
-                    },
-                    GitRoot::new(at(t, "main/vendor/sub/.git"), RootKind::DotGit),
-                    GitRoot {
-                        head: Some(Head::Detached("0123456789ab".into())),
-                        common_dir: Some(native(t, dot)),
-                        recorded_at: Some(PathBuf::from("/elsewhere/wt1")),
-                        ..GitRoot::new(wt, RootKind::LinkedWorktree)
-                    },
-                    GitRoot::new(at(t, "wt1/.git"), RootKind::DotGit),
-                    GitRoot::unresolved(at(t, "broken"), Problem::NotGit),
-                    GitRoot::new(at(t, "broken/inner"), RootKind::Repository),
-                    GitRoot::new(at(t, "broken/inner/.git"), RootKind::DotGit),
-                ];
-                for e in entries {
-                    t.set_git(e);
-                }
-            })
-            .unwrap();
-        session
+    }
+
+    /// The logical size of `path` in the scan.
+    fn size(session: &Session, path: &str) -> u64 {
+        let tree = session.scan.tree();
+        let tree = tree.read().unwrap();
+        tree.logical(at(&tree, path))
     }
 
     /// The node at `path` under the scan root.
@@ -550,7 +546,7 @@ mod tests {
     fn lists_roots_largest_first_a_page_at_a_time() {
         let session = scanned();
         let all = session.git_roots(&request(&session, 0, 100)).unwrap();
-        assert_eq!(all.total, 5, "main, sub, wt1, broken, inner");
+        assert_eq!(all.total, 6, "main, sub, deep, wt1, broken, inner");
         assert_eq!(
             all.total,
             session.status().git_roots,
@@ -559,15 +555,17 @@ mod tests {
         assert!(!all.discovering);
         assert_eq!(all.revision, session.scan.progress().revision);
         let names: Vec<&str> = all.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["main", "wt1", "sub", "broken", "inner"]);
+        assert_eq!(names, ["main", "wt1", "sub", "broken", "inner", "deep"]);
+        let sizes: Vec<u64> = all.rows.iter().map(|r| r.size).collect();
+        assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
 
-        let first = session.git_roots(&request(&session, 0, 2)).unwrap();
-        let rest = session.git_roots(&request(&session, 2, 2)).unwrap();
-        let last = session.git_roots(&request(&session, 4, 2)).unwrap();
-        assert_eq!((first.offset, rest.offset, last.offset), (0, 2, 4));
-        assert_eq!([first.rows, rest.rows, last.rows].concat(), all.rows);
+        let first = session.git_roots(&request(&session, 0, 4)).unwrap();
+        let rest = session.git_roots(&request(&session, 4, 4)).unwrap();
+        assert_eq!((first.offset, rest.offset), (0, 4));
+        assert_eq!((first.rows.len(), rest.rows.len()), (4, 2));
+        assert_eq!([first.rows, rest.rows].concat(), all.rows);
         let past = session.git_roots(&request(&session, 9, 2)).unwrap();
-        assert_eq!((past.offset, past.rows.len(), past.total), (5, 0, 5));
+        assert_eq!((past.offset, past.rows.len(), past.total), (6, 0, 6));
 
         let main = row(&all, node_of(&session, "main"));
         assert_eq!(main.kind, proto::GitRootKind::Repository);
@@ -577,22 +575,29 @@ mod tests {
                 name: "main".into()
             })
         );
-        assert_eq!(main.size, 1000 + 10 + 500 + 5 + 3 + 200);
-        assert_eq!(main.own, 1000, "less its .git and the submodule");
+        assert_eq!(main.size, size(&session, "main"));
         assert_eq!(
-            main.metadata, 515,
-            "its .git, worktree admin folder included"
+            main.own,
+            size(&session, "main")
+                - size(&session, "main/.git")
+                - size(&session, "main/vendor/sub"),
+            "less its .git and the submodule"
         );
-        assert_eq!((main.nested, main.parent), (1, None));
-        assert_eq!(main.files, 7);
+        assert_eq!(
+            main.metadata,
+            size(&session, "main/.git"),
+            "all of its .git: the worktree's admin folder and the submodules' Git directories too"
+        );
+        assert_eq!((main.nested, main.parent), (2, None));
         assert!(!main.partial && !main.outside);
         assert_eq!(main.matching, None);
 
         let sub = row(&all, node_of(&session, "main/vendor/sub"));
         assert_eq!(sub.kind, proto::GitRootKind::Submodule);
-        assert_eq!(sub.parent, Some(main.node));
+        assert_eq!((sub.parent, sub.nested), (Some(main.node), 1));
         let superproject = sub.repository.as_ref().unwrap();
         assert_eq!(superproject.node, Some(main.node), "{superproject:?}");
+        assert_eq!(sub.metadata, size(&session, "main/vendor/sub/.git"));
 
         let wt = row(&all, node_of(&session, "wt1"));
         assert_eq!(wt.kind, proto::GitRootKind::LinkedWorktree);
@@ -612,13 +617,10 @@ mod tests {
             )),
             "the folder holding the common .git"
         );
-        assert_eq!(
-            wt.recorded_at,
-            Some(display_path(Path::new("/elsewhere/wt1")))
-        );
+        assert_eq!(wt.recorded_at, None, "where Git says it is");
         assert_eq!(
             (wt.own, wt.metadata),
-            (300, 4),
+            (300, size(&session, "wt1/.git")),
             "shared data counts in main"
         );
 
@@ -638,12 +640,12 @@ mod tests {
                 all.totals.worktrees,
                 all.totals.unresolved
             ),
-            (3, 1, 1)
+            (4, 1, 1)
         );
         assert_eq!(
             all.totals.union,
-            1718 + 304 + 26,
-            "main, wt1 and inner, each byte once; broken's own content isn't in Git"
+            size(&session, "main") + size(&session, "wt1") + size(&session, "broken/inner"),
+            "each byte once; broken's own content isn't in Git"
         );
         assert_eq!(all.totals.matching, None);
     }
@@ -666,7 +668,7 @@ mod tests {
         let root = own.git.unwrap().root.unwrap();
         assert_eq!(root.matching, Some(own.matching.unwrap().logical));
         assert_eq!(root.matching, Some(300));
-        assert_eq!(root.size, 304);
+        assert_eq!(root.size, size(&session, "wt1"));
         let file = node_of(&session, "wt1/b.rs");
         let git = session.details(file, Some(id)).unwrap().git.unwrap();
         assert_eq!(git.root.unwrap().matching, Some(300));
@@ -693,7 +695,7 @@ mod tests {
             })
             .unwrap();
         let page = session.git_roots(&request(&session, 0, 100)).unwrap();
-        assert_eq!(page.total, 6);
+        assert_eq!(page.total, 7);
         assert_eq!(page.total, session.status().git_roots);
         let outside = &page.rows[0];
         assert!(outside.outside, "it holds the whole scan, so it's first");
@@ -707,7 +709,7 @@ mod tests {
         );
         assert_eq!(outside.path, display_path(Path::new("/")));
         assert!(outside.partial, "most of it isn't scanned");
-        assert_eq!(outside.nested, 5, "every other row");
+        assert_eq!(outside.nested, 6, "every other row");
         let main = row(&page, node_of(&session, "main"));
         assert_eq!((main.parent, main.parent_outside), (Some(0), true));
         let sub = row(&page, node_of(&session, "main/vendor/sub"));
@@ -720,17 +722,6 @@ mod tests {
     #[test]
     fn a_submodule_of_a_submodule_links_to_the_outer_one() {
         let session = scanned();
-        session
-            .scan
-            .edit_finished(|t| {
-                let dot = paths::normalize(&t.path(at(t, "main/.git")), paths::Style::native());
-                let deep = at(t, "main/vendor/sub/deep");
-                t.set_git(GitRoot {
-                    git_dir: Some(dot.join("modules/sub/modules/deep")),
-                    ..GitRoot::new(deep, RootKind::Submodule)
-                });
-            })
-            .unwrap();
         let page = session.git_roots(&request(&session, 0, 100)).unwrap();
         let sub = node_of(&session, "main/vendor/sub");
         let deep = row(&page, node_of(&session, "main/vendor/sub/deep"));
@@ -738,9 +729,11 @@ mod tests {
         assert_eq!(link.node, Some(sub), "the checkout it's in");
         assert_eq!(link.path, row(&page, sub).path);
         assert_eq!(deep.parent, Some(sub));
+        assert_eq!(deep.kind, proto::GitRootKind::Submodule);
 
         // Found only by its Git directory's path when nothing listed is
-        // around it.
+        // around it: a case detection doesn't make here, so set by hand
+        // once the scan has finished.
         session
             .scan
             .edit_finished(|t| {
@@ -781,7 +774,7 @@ mod tests {
         assert_eq!(root.files, 2);
         assert_eq!(wt.worktrees_registered, None);
 
-        let meta = details("main/.git/objects/p").unwrap();
+        let meta = details("main/.git/objects/pack/p.pack").unwrap();
         assert_eq!(meta.content, Some(proto::GitContent::Metadata));
         assert_eq!(meta.root.as_ref().unwrap().node, main);
         assert_eq!(
