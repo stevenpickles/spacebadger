@@ -1,8 +1,14 @@
 <script lang="ts">
   import PathText from "./PathText.svelte";
+  import { gitAccent } from "./colors";
   import { describeChange } from "./compare";
   import { describeItems, exactBytes, formatBytes, formatDate, percent, plural, shortcut } from "./format";
+  import { GIT_BADGES } from "./layoutWire";
   import type { FolderState } from "./protocol/FolderState";
+  import type { GitContent } from "./protocol/GitContent";
+  import type { GitDetails } from "./protocol/GitDetails";
+  import { KIND_BADGE, repositoryLabel } from "./Repositories.svelte";
+  import { theme } from "./theme.svelte";
   import type { ItemChange } from "./protocol/ItemChange";
   import type { NodeDetails } from "./protocol/NodeDetails";
   import type { SelectionSummary } from "./protocol/SelectionSummary";
@@ -87,6 +93,12 @@
     notScanned: "Not scanned (scan cancelled)",
   };
 
+  const GIT_CONTENT: Record<GitContent, string> = {
+    checkout: "Repository content",
+    worktree: "Linked worktree content",
+    metadata: "Git metadata",
+  };
+
   const ctrl = shortcut("Ctrl");
 
   /** Exact size, plus size on disk when it's known. */
@@ -120,6 +132,105 @@
       {said.text}{#if said.was}<span class="muted">{` (${said.was})`}</span>{/if}
     </dd>
   {/if}
+{/snippet}
+
+{#snippet gitGroup(d: NodeDetails, g: GitDetails)}
+  {@const root = g.root}
+  {@const isRoot = root !== null && !root.outside && root.node === d.node}
+  <section class="git" aria-label="Git">
+    <h3 class="eyebrow">Git</h3>
+    {#if root}
+      {@const badge = KIND_BADGE[root.kind]}
+      {#if !isRoot}
+        <p class="root">
+          <span class="badge" style:--kind={gitAccent(badge, theme.dark)}>{GIT_BADGES[badge]!.short}</span>
+          <span class="selectable">{root.name}</span>
+          {#if !root.outside && root.node !== view}
+            <button type="button" class="link" onclick={() => onopen(root.node)}>Open</button>
+          {/if}
+        </p>
+        <p class="path selectable">
+          {#if root.outside}Above the scan root: {/if}<PathText path={root.path} />
+        </p>
+      {/if}
+      <div class="facts">
+        <div>
+          <span class="label">Type</span>
+          <span>{GIT_BADGES[badge]!.name}</span>
+        </div>
+        {#if root.head}
+          <div title="As named by HEAD">
+            <span class="label">{root.head.kind === "detached" ? "HEAD" : "Branch"}</span>
+            <span class="selectable"
+              >{root.head.kind === "detached" ? `Detached at ${root.head.commit}` : root.head.name}</span
+            >
+          </div>
+        {/if}
+        <div title={isRoot ? undefined : "The whole repository or worktree as scanned, nested ones included"}>
+          <span class="label">{isRoot ? "Scanned" : "Root scanned"}</span>
+          <span>{formatBytes(root.size)}</span>
+        </div>
+        {#if root.matching !== null}
+          <div title="Of the scanned size, what the filter matches">
+            <span class="label">{isRoot ? "Matching filter" : "Root matching"}</span>
+            <span>{formatBytes(root.matching)}</span>
+          </div>
+        {/if}
+        {#if root.metadata > 0}
+          <div title="Git's own data this root accounts for, where it was found">
+            <span class="label">Git data</span>
+            <span>{formatBytes(root.metadata)}</span>
+          </div>
+        {/if}
+        {#if !isRoot || g.content}
+          <div>
+            <span class="label">Content here</span>
+            <span>{g.content ? GIT_CONTENT[g.content] : "Not classified"}</span>
+          </div>
+        {/if}
+      </div>
+      {#if root.repository}
+        <p class="note">
+          {repositoryLabel(root)}:
+          <span class="selectable"><PathText path={root.repository.path} /></span>
+          {#if root.repository.node !== null && root.repository.node !== view}
+            {@const target = root.repository.node}
+            <button type="button" class="link" onclick={() => onopen(target)}>Open</button>
+          {:else if root.repository.node === null}
+            <span class="muted">(outside the scan)</span>
+          {/if}
+        </p>
+      {/if}
+      {#if root.kind === "linkedWorktree"}
+        <p class="note muted">Its shared Git data is counted where it is, in the main repository, not here.</p>
+      {/if}
+      {#if g.worktreesRegistered}
+        {@const [registered, found] = g.worktreesRegistered}
+        <p class="note">Linked worktrees: {registered.toLocaleString()} registered, {found.toLocaleString()} in this scan</p>
+      {/if}
+      {#if root.nested > 0}
+        <p class="note muted">
+          Includes {plural(root.nested, "nested repository", "nested repositories")}; totals count their content once.
+        </p>
+      {/if}
+      {#if root.recordedAt}
+        <p class="note muted">Its Git data records it at <PathText path={root.recordedAt} />.</p>
+      {/if}
+      {#if root.problem}
+        <p class="note problem">{root.problem}</p>
+      {/if}
+      {#if root.partial}
+        <p class="note muted">Some of it couldn't be read or wasn't scanned, so sizes are lower bounds.</p>
+      {/if}
+    {:else if g.content}
+      <div class="facts">
+        <div>
+          <span class="label">Content here</span>
+          <span>{GIT_CONTENT[g.content]}</span>
+        </div>
+      </div>
+    {/if}
+  </section>
 {/snippet}
 
 {#snippet item(d: NodeDetails, parent: number | null, c: ItemChange | null)}
@@ -167,6 +278,9 @@
       <dd>{folderStates[d.folder]}</dd>
     {/if}
   </dl>
+  {#if d.git && (d.git.content || d.git.root)}
+    {@render gitGroup(d, d.git)}
+  {/if}
   {#if d.cloud}
     <p class="note">Cloud file: only the part stored on this device takes up space.</p>
   {/if}
@@ -339,6 +453,57 @@
   }
   .hint {
     margin: var(--space-3) 0 0;
+  }
+  /* Git: a labelled group of facts, two to a row. */
+  .git {
+    margin: 0 0 10px;
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--line);
+  }
+  .git .eyebrow {
+    margin-bottom: var(--space-1);
+  }
+  .root {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 2px;
+    font-weight: 600;
+  }
+  .root .link {
+    font-weight: normal;
+  }
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-2) var(--space-3);
+    margin: 0 0 var(--space-2);
+  }
+  .facts > div {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .label {
+    font-size: var(--fs-xs);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  /* The word carries the kind; the color echoes the map's accent. */
+  .badge {
+    flex: none;
+    padding: 0 5px;
+    border: 1px solid var(--kind);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+    font-size: var(--fs-xs);
+    font-weight: normal;
+    line-height: 16px;
+  }
+  .problem {
+    padding-left: 6px;
+    border-left: 3px solid var(--incomplete);
   }
   .tips {
     margin: 0;
