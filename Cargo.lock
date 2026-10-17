@@ -2911,6 +2911,7 @@ name = "sb-probe"
 version = "0.3.0"
 dependencies = [
  "rustix",
+ "sb-scan",
  "serde",
  "serde_json",
  "windows",

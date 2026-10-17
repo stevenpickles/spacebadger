@@ -7,6 +7,8 @@ pub mod duplicates;
 pub mod engine;
 pub mod fake;
 pub mod git;
+#[cfg(feature = "mft")]
+pub mod mft;
 pub mod native;
 
 pub use adapter::{
