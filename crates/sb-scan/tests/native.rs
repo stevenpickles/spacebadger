@@ -497,6 +497,7 @@ fn a_folder_opened_relative_to_its_parent_lists_as_by_path_and_vanishes_when_ren
     write(&b.join("one.bin"), 10);
     write(&b.join("c/two.bin"), 20);
     let fs = NativeFs::new();
+    assert_eq!(fs.open_root(&tmp.0).unwrap(), sb_scan::RootKind::Directory);
     let (parent, _) = list(
         &fs,
         DirRef {
