@@ -356,6 +356,10 @@ impl GitIndex {
 }
 
 /// One listed entry's sizes, as [`summarize`] gives them.
+///
+/// Two rows can have the scan root as `node`: the repository above it
+/// (`outside`) and the root's own entry. A row is identified by
+/// `(node, outside)`, and its parent by `(parent, parent_outside)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootSummary {
     pub node: NodeId,
@@ -374,10 +378,12 @@ pub struct RootSummary {
     pub files: u32,
     /// The nearest listed entry with a class enclosing this one. Unresolved
     /// rows have no class, so they're skipped: a root inside one gets the
-    /// repository around both. `Some(ROOT)` can be the repository above the
-    /// scan root (the `outside` row), which encloses every other row,
-    /// including one for the scan root's own entry.
+    /// repository around both. The repository above the scan root (the
+    /// `outside` row) encloses every other row, including one for the scan
+    /// root's own entry; see `parent_outside`.
     pub parent: Option<NodeId>,
+    /// `parent` is the `outside` row rather than the scan root's own entry.
+    pub parent_outside: bool,
     /// The repository found above the scan root (`node` is the root). It's
     /// a row of its own, separate from any entry of the root itself.
     pub outside: bool,
@@ -448,7 +454,8 @@ pub fn summarize(
 
     let mut own: Vec<u64> = nodes.iter().map(|e| weight(e.0)).collect();
     let mut own_matching: Vec<u64> = nodes.iter().map(|e| matching(e.0)).collect();
-    let mut parent: Vec<Option<NodeId>> = vec![None; nodes.len()];
+    // Index of each item's parent item.
+    let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
     for (i, &(node, kind, _)) in nodes.iter().enumerate() {
         // An override's whole subtree comes off the nearest override
         // around it, and off any unresolved rows in between.
@@ -463,7 +470,7 @@ pub fn summarize(
                 }
             }
             if parent[i].is_none() && k.listed() && k.class().is_some() {
-                parent[i] = Some(nodes[j].0);
+                parent[i] = Some(j);
             }
             if taken && parent[i].is_some() {
                 break;
@@ -518,7 +525,8 @@ pub fn summarize(
             metadata: metadata[i],
             matching: filter.map(|s| s.weight(metric, node)),
             files: tree.file_count(node),
-            parent: parent[i],
+            parent: parent[i].map(|j| nodes[j].0),
+            parent_outside: parent[i].is_some_and(|j| nodes[j].2),
             outside,
         })
         .collect();
@@ -1569,6 +1577,33 @@ mod tests {
         let (rows, totals) = summarize_checked(&t);
         assert!(rows.is_empty());
         assert_eq!(totals.metadata, 15);
+    }
+
+    #[test]
+    fn parents_tell_the_row_above_from_the_roots_own() {
+        let mut t = Tree::new("/s/outer/inner");
+        let sub = dir(&mut t, NodeId::ROOT, "sub");
+        file(&mut t, sub, "a", 10);
+        file(&mut t, NodeId::ROOT, "b", 5);
+        t.set_git(GitRoot::new(NodeId::ROOT, RootKind::Repository));
+        t.set_git(GitRoot::new(sub, RootKind::Repository));
+        t.set_git_above(
+            p("/s/outer"),
+            GitRoot::new(NodeId::ROOT, RootKind::Repository),
+        );
+        let (rows, _) = summarize_checked(&t);
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|r| (r.node, r.outside, r.parent, r.parent_outside))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (NodeId::ROOT, true, None, false),
+                (NodeId::ROOT, false, Some(NodeId::ROOT), true),
+                (sub, false, Some(NodeId::ROOT), false),
+            ]
+        );
     }
 
     #[test]
