@@ -1072,6 +1072,42 @@ impl Tree {
         }
     }
 
+    /// Makes `alias` the owner of its file's allocation in place of its
+    /// owner, which becomes an alias of it, as do `others` (the owner's
+    /// other aliases, which the caller knows; any that aren't are left
+    /// alone). Totals don't change. Returns `false`, changing nothing, when
+    /// `alias` isn't an alias, either name was removed, or one name's
+    /// allocation is unknown and the other's isn't (moving it would leave a
+    /// name marked unknown holding the allocation, which removing it would
+    /// then lose).
+    pub fn promote_alias(&mut self, alias: NodeId, others: &[NodeId]) -> bool {
+        let Some(owner) = self.alias_owner(alias) else {
+            return false;
+        };
+        let (a, o) = (alias.index(), owner.index());
+        if self.is_removed(alias) || self.is_removed(owner) || self.unknown[a] != self.unknown[o] {
+            return false;
+        }
+        let allocated = std::mem::take(&mut self.allocated[o]);
+        self.for_each_ancestor(owner, |t, x| t.allocated[x] -= allocated);
+        self.allocated[a] = allocated;
+        self.for_each_ancestor(alias, |t, x| t.allocated[x] += allocated);
+        self.flags[a] &= !flags::HARDLINK_ALIAS;
+        self.flags[o] |= flags::HARDLINK_ALIAS | flags::HARDLINKED;
+        self.alias_owner.remove(&alias.0);
+        self.alias_owner.insert(owner.0, alias.0);
+        for other in others {
+            if let Some(o2) = self.alias_owner.get_mut(&other.0)
+                && *o2 == owner.0
+            {
+                *o2 = alias.0;
+            }
+        }
+        self.changes.push(alias.0);
+        self.changes.push(owner.0);
+        true
+    }
+
     pub fn alias_count(&self) -> usize {
         self.alias_owner.len()
     }
@@ -1344,6 +1380,111 @@ mod tests {
                 owner.index() as u32
             ]
         );
+    }
+
+    #[test]
+    fn promoting_an_alias_moves_the_allocation_and_the_other_aliases() {
+        let mut t = Tree::new("/root");
+        let (d, e) = (
+            t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap(),
+            t.add_dir(NodeId::ROOT, "e".as_ref()).unwrap(),
+        );
+        let owner = t
+            .add_file(d, "a".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let heir = t
+            .add_file(e, "b".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let other = t
+            .add_file(d, "c".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        t.mark_alias(heir, owner);
+        t.mark_alias(other, owner);
+        assert!(!t.promote_alias(owner, &[]), "not an alias");
+
+        assert!(t.promote_alias(heir, &[other]));
+        assert_eq!(t.alias_owner(owner), Some(heir));
+        assert_eq!(t.alias_owner(other), Some(heir));
+        assert_eq!(t.alias_owner(heir), None);
+        assert_eq!(t.alias_count(), 2);
+        assert_eq!((t.allocated(d), t.allocated(e)), (0, 4096));
+        assert_eq!(t.allocated(NodeId::ROOT), 4096);
+        assert_eq!(t.logical(NodeId::ROOT), 300);
+        assert_eq!(t.flags(heir) & flags::HARDLINK_ALIAS, 0);
+        assert_ne!(t.flags(owner) & flags::HARDLINK_ALIAS, 0);
+        // Removing the new owner hands the allocation on as before.
+        assert!(t.remove(heir));
+        assert_eq!(t.allocated(NodeId::ROOT), 4096);
+        assert_eq!(t.alias_count(), 1);
+    }
+
+    #[test]
+    fn promoting_needs_both_names_to_agree_on_whether_allocation_is_known() {
+        let unknown = FileSizes {
+            logical: 100,
+            allocated: Allocated::UNKNOWN,
+        };
+        for (owner_sizes, alias_sizes, promotes) in [
+            (unknown, unknown, true),
+            (sizes(100, 4096), sizes(100, 4096), true),
+            (unknown, sizes(100, 4096), false),
+            (sizes(100, 4096), unknown, false),
+        ] {
+            let mut t = Tree::new("/root");
+            let (d, e) = (
+                t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap(),
+                t.add_dir(NodeId::ROOT, "e".as_ref()).unwrap(),
+            );
+            let owner = t.add_file(d, "a".as_ref(), owner_sizes, None, 0).unwrap();
+            let alias = t.add_file(e, "b".as_ref(), alias_sizes, None, 0).unwrap();
+            t.mark_alias(alias, owner);
+            let totals = |t: &Tree| {
+                (
+                    t.allocated(NodeId::ROOT),
+                    t.unknown_allocation_files(NodeId::ROOT),
+                    t.logical(NodeId::ROOT),
+                    t.allocated(d),
+                    t.allocated(e),
+                )
+            };
+            let before = totals(&t);
+            assert_eq!(t.promote_alias(alias, &[]), promotes);
+            let after = totals(&t);
+            assert_eq!(
+                (after.0, after.1, after.2),
+                (before.0, before.1, before.2),
+                "totals"
+            );
+            if promotes {
+                assert_eq!(t.alias_owner(owner), Some(alias));
+                assert_eq!((after.3, after.4), (0, before.3), "moved");
+            } else {
+                assert_eq!(t.alias_owner(alias), Some(owner));
+                assert_eq!(after, before, "unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn removing_a_promoted_owner_hands_its_allocation_back() {
+        let mut t = Tree::new("/root");
+        let (d, e) = (
+            t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap(),
+            t.add_dir(NodeId::ROOT, "e".as_ref()).unwrap(),
+        );
+        let owner = t
+            .add_file(d, "a".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let heir = t
+            .add_file(e, "b".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        t.mark_alias(heir, owner);
+        assert!(t.promote_alias(heir, &[]));
+        assert!(t.remove(heir));
+        assert_eq!(t.allocated(NodeId::ROOT), 4096, "the data is still there");
+        assert_eq!(t.allocated(d), 4096);
+        assert_eq!(t.alias_owner(owner), None);
+        assert_eq!(t.alias_count(), 0);
     }
 
     #[test]

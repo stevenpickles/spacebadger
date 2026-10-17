@@ -2,7 +2,11 @@
 //!
 //! ```text
 //! cargo run --release -p sb-scan --example scan -- <root> [--workers N] [--cancel-after-ms N]
+//!     [--exact-hard-links]
 //! ```
+//!
+//! `--exact-hard-links` re-measures every name of a hard-linked file (see
+//! [`sb_scan::ScanConfig::exact_hard_links`]); the summary counts re-measures.
 //!
 //! After a full scan it also times treemap layouts of the root at 1920×1080
 //! (a first, sorting layout and a repeat that reuses the sibling order), and
@@ -15,25 +19,68 @@ use sb_core::layout::{self, LayoutParams, Metric, OrderCache};
 use sb_core::search::{Matcher, Search};
 use sb_core::snapshot::{self, Snapshot};
 use sb_core::tree::NodeId;
-use sb_scan::{NativeFs, Scan};
-use std::path::PathBuf;
+use sb_scan::{EntryKind, FsAdapter, Measured, NativeFs, RootKind, Scan, ScanError, Sink};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
+/// The native adapter, counting the files it re-measures.
+struct Counted {
+    inner: NativeFs,
+    measures: Arc<AtomicU64>,
+}
+
+impl FsAdapter for Counted {
+    fn open_root(&self, root: &Path) -> Result<RootKind, ScanError> {
+        self.inner.open_root(root)
+    }
+
+    fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        self.inner.read_dir(dir, sink)
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
+        self.measures.fetch_add(1, Ordering::Relaxed);
+        self.inner.measure_file(file)
+    }
+
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.inner.read_small(path, cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.inner.stat_kind(path)
+    }
+
+    fn path_style(&self) -> sb_core::git::paths::Style {
+        self.inner.path_style()
+    }
+
+    fn local_drive(&self, letter: u8) -> bool {
+        self.inner.local_drive(letter)
+    }
+}
+
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let root = PathBuf::from(
         args.next()
-            .expect("usage: scan <root> [--workers N] [--cancel-after-ms N]"),
+            .expect("usage: scan <root> [--workers N] [--cancel-after-ms N] [--exact-hard-links]"),
     );
     // As the app does: absolute once, so listed names join on unchanged.
     let root = std::path::absolute(&root).unwrap_or(root);
     let mut config = sb_scan::native::scan_config(&root);
     let mut cancel_after = None;
     while let Some(flag) = args.next() {
+        if flag == "--exact-hard-links" {
+            config.exact_hard_links = true;
+            continue;
+        }
         let value: u64 = args
             .next()
             .and_then(|v| v.into_string().ok())
@@ -52,7 +99,12 @@ fn main() {
     let first_batch = std::sync::Arc::new(first_batch);
     let first_sink = std::sync::Arc::clone(&first_batch);
     let workers = config.workers;
-    let scan = Scan::start(root.clone(), NativeFs::new(), config, move |p| {
+    let measures = Arc::new(AtomicU64::new(0));
+    let adapter = Counted {
+        inner: NativeFs::new(),
+        measures: Arc::clone(&measures),
+    };
+    let scan = Scan::start(root.clone(), adapter, config, move |p| {
         if p.files > 0 {
             first_sink.lock().unwrap().get_or_insert(started.elapsed());
         }
@@ -77,13 +129,19 @@ fn main() {
         let p = scan.wait();
         println!("cancel acknowledged in {:?}", requested.elapsed());
         drop(tree);
-        print_summary(&root, workers, &p, None);
+        print_summary(&root, workers, &p, None, measures.load(Ordering::Relaxed));
         return;
     }
     let tree = scan.tree();
     let p = scan.wait();
     let tree = tree.read().unwrap();
-    print_summary(&root, workers, &p, *first_batch.lock().unwrap());
+    print_summary(
+        &root,
+        workers,
+        &p,
+        *first_batch.lock().unwrap(),
+        measures.load(Ordering::Relaxed),
+    );
 
     println!(
         "tree nodes:   {} (~{} MiB)",
@@ -176,6 +234,7 @@ fn print_summary(
     workers: usize,
     p: &sb_scan::Progress,
     first: Option<Duration>,
+    measures: u64,
 ) {
     let secs = p.elapsed.as_secs_f64().max(1e-9);
     println!("root:         {}", root.display());
@@ -207,6 +266,7 @@ fn print_summary(
     println!("allocated:    {}", gib(p.allocated));
     println!("unknown alloc files: {}", p.unknown_allocation_files);
     println!("hard-link aliases:   {}", p.hardlink_aliases);
+    println!("re-measures:         {measures}");
     println!("omissions:");
     for (reason, count) in p.omissions.iter() {
         let sample = p.omissions.samples(reason).first();

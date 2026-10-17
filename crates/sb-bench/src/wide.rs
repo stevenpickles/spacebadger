@@ -45,6 +45,7 @@ impl WideFs {
             id: i as u128 + 1,
             cloud: false,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            stamp: None,
         }
     }
 }
@@ -75,6 +76,7 @@ impl FsAdapter for WideFs {
         Ok(Measured {
             logical: 0,
             allocated: Some(0),
+            id: None,
         })
     }
 }
@@ -179,7 +181,12 @@ fn report_holds(mut holds: Vec<(Duration, usize)>) {
     println!("         longest: {}", longest.join(", "));
 }
 
-fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) {
+fn run_case<A: FsAdapter, F: Fn() -> A>(
+    label: &str,
+    root: PathBuf,
+    adapter: F,
+    exact_hard_links: bool,
+) {
     println!("\n== {label} ==");
     let holds = Arc::new(Mutex::new(Vec::new()));
     let config = ScanConfig {
@@ -187,6 +194,7 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
             let holds = Arc::clone(&holds);
             HoldProbe::new(move |held, nodes| holds.lock().unwrap().push((held, nodes)))
         }),
+        exact_hard_links,
         ..ScanConfig::default()
     };
     let before = memory::current();
@@ -297,6 +305,7 @@ pub fn synthetic(entries: usize) {
             entries,
             batch_delay: Duration::ZERO,
         },
+        false,
     );
 }
 
@@ -310,14 +319,25 @@ pub fn synthetic_slow(entries: usize) {
             entries,
             batch_delay: Duration::from_millis(2),
         },
+        false,
     );
 }
 
-/// A real folder, scanned with the native adapter.
-pub fn real(root: &Path) {
+/// A real folder, scanned with the native adapter, re-measuring every name
+/// of a hard-linked file if `exact_hard_links`.
+pub fn real(root: &Path, exact_hard_links: bool) {
     run_case(
-        &format!("real folder {}", root.display()),
+        &format!(
+            "real folder {}{}",
+            root.display(),
+            if exact_hard_links {
+                ", exact hard links"
+            } else {
+                ""
+            }
+        ),
         root.to_path_buf(),
         NativeFs::new,
+        exact_hard_links,
     );
 }

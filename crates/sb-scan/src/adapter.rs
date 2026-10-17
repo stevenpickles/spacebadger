@@ -64,6 +64,31 @@ pub struct Entry {
     pub cloud: bool,
     /// Last write time, if the listing gave one. Recorded for files.
     pub modified: Option<SystemTime>,
+    /// The listing's raw times for a file that may have other names, where
+    /// the listing of one name can be stale (see [`LinkStamp`]); `None`
+    /// where the adapter gives none, and then every name of a shared file is
+    /// re-measured.
+    pub stamp: Option<LinkStamp>,
+}
+
+/// The times a listing gives for one name of a file, as the filesystem
+/// keeps them per name. NTFS keeps a copy of a file's sizes and times in
+/// each directory entry and updates only the entry of the name a change
+/// went through, so the other names' entries go stale. Two names of one
+/// file listed with the same sizes and stamp are taken as they are; a
+/// difference means one is stale, and the file is re-measured once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkStamp {
+    /// Last write time as the listing gives it (Windows: 100 ns ticks
+    /// since 1601).
+    pub written: i64,
+    /// Last change time (attributes, links or contents), likewise.
+    pub changed: i64,
+    /// Whether the listed sizes are right whenever the names agree. A
+    /// listing whose allocation can be wrong under every name alike (a
+    /// WOF-compressed file lists none) is not, and such a file is
+    /// re-measured once whatever its names' listings say.
+    pub trusted: bool,
 }
 
 /// Authoritative sizes from a per-file query.
@@ -71,6 +96,13 @@ pub struct Entry {
 pub struct Measured {
     pub logical: u64,
     pub allocated: Option<u64>,
+    /// The file's identity as [`Identity::MaybeShared`] gives it, read from
+    /// the same handle or call as the sizes, so a re-measure meant for every
+    /// name of one file can tell the name now leads to another file (it was
+    /// replaced since it was listed); `None` when unknown. It can't tell
+    /// distinct files that share an ID apart (some shares and NAS boxes),
+    /// which are counted as one file's names anyway.
+    pub id: Option<u128>,
 }
 
 /// Classification used for omission reporting.
@@ -321,6 +353,7 @@ mod tests {
             id: 0,
             cloud: false,
             modified: None,
+            stamp: None,
         }
     }
 

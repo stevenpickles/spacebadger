@@ -164,6 +164,7 @@ impl FsAdapter for LinuxFs {
         Ok(Measured {
             logical: stx.stx_size,
             allocated: Some(stx.stx_blocks.saturating_mul(512)),
+            id: Some((u128::from(dev(&stx)) << 64) | u128::from(stx.stx_ino)),
         })
     }
 
@@ -226,6 +227,7 @@ impl LinuxFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     };
                     if out.push(failed).is_break() {
                         return Ok(());
@@ -271,6 +273,7 @@ impl LinuxFs {
                 id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
                 modified: modified(&stx),
+                stamp: None,
             };
             if out.push(entry).is_break() {
                 return Ok(());

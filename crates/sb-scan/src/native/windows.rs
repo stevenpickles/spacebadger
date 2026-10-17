@@ -8,6 +8,12 @@
 //!   held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
+//! - A file listed under several names may be stale under all but the one
+//!   it was last changed through, so each entry also carries its listed
+//!   `LastWriteTime` and `ChangeTime` (see [`LinkStamp`]): the engine
+//!   re-measures a file once, and only when its names' listings disagree
+//!   or its listed allocation can be wrong under every name alike
+//!   (WOF-compressed files list 0; compressed, sparse and cloud files).
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -21,8 +27,8 @@
 //!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io, read_capped, refused,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured, RootKind,
+    ScanError, Sink, batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
@@ -66,7 +72,9 @@ use windows::core::PCWSTR;
 mod attr {
     pub const DIRECTORY: u32 = 0x10;
     pub const DEVICE: u32 = 0x40;
+    pub const SPARSE: u32 = 0x200;
     pub const REPARSE_POINT: u32 = 0x400;
+    pub const COMPRESSED: u32 = 0x800;
     pub const OFFLINE: u32 = 0x1000;
     pub const RECALL_ON_OPEN: u32 = 0x40000;
     pub const PINNED: u32 = 0x80000;
@@ -425,6 +433,8 @@ struct Listed {
     file_id: u128,
     /// `LastWriteTime`: 100 ns intervals since 1601, 0 when not set.
     last_write: i64,
+    /// `ChangeTime`, likewise.
+    change_time: i64,
 }
 
 /// Seconds from 1601-01-01, where `FILETIME` counts from, to the Unix epoch.
@@ -490,6 +500,21 @@ impl WindowsFs {
 }
 
 impl Listed {
+    /// The stamp to compare this name's listing with its file's other
+    /// names'. Untrusted where the listing's allocation can be wrong under
+    /// every name alike: less allocated than the file's length
+    /// (WOF-compressed files list 0 allocated, and the WOF filter hides
+    /// their reparse point from listings), or a reparse point, compressed,
+    /// sparse, or in the cloud; such a file is always re-measured once.
+    fn stamp(&self) -> LinkStamp {
+        let unreliable = attr::REPARSE_POINT | attr::COMPRESSED | attr::SPARSE | attr::CLOUD;
+        LinkStamp {
+            written: self.last_write,
+            changed: self.change_time,
+            trusted: self.attributes & unreliable == 0 && self.allocation_size >= self.end_of_file,
+        }
+    }
+
     fn entry(self) -> Entry {
         Entry {
             kind: classify(self.attributes, self.reparse_tag),
@@ -505,6 +530,7 @@ impl Listed {
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),
+            stamp: Some(self.stamp()),
             name: self.name,
         }
     }
@@ -539,6 +565,7 @@ impl DirInfo for FILE_ID_EXTD_DIR_INFO {
             reparse_tag: self.ReparsePointTag,
             file_id: u128::from_le_bytes(self.FileId.Identifier),
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
 }
@@ -564,6 +591,7 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
             reparse_tag: self.EaSize,
             file_id: self.FileId as u64 as u128,
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
 }
@@ -695,6 +723,9 @@ impl FsAdapter for WindowsFs {
         Ok(Measured {
             logical: standard.EndOfFile as u64,
             allocated: Some(standard.AllocationSize as u64),
+            // The listing's file ID, which NTFS gives in either width with
+            // the same value.
+            id: file_id(&handle).map(|(_, id)| u128::from_le_bytes(id)),
         })
     }
 
@@ -1033,6 +1064,52 @@ mod tests {
             filetime(epoch - 10_000_000),
             UNIX_EPOCH.checked_sub(Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn trusts_only_listings_whose_allocation_can_be_compared() {
+        let listed = |attributes, reparse_tag| Listed {
+            name: "f".into(),
+            end_of_file: 5000,
+            allocation_size: 8192,
+            attributes,
+            reparse_tag,
+            file_id: 7,
+            last_write: 10,
+            change_time: 20,
+        };
+        assert_eq!(
+            listed(0x20, 0).entry().stamp,
+            Some(LinkStamp {
+                written: 10,
+                changed: 20,
+                trusted: true,
+            })
+        );
+        let trusted = |l: Listed| l.entry().stamp.unwrap().trusted;
+        let resident = Listed {
+            end_of_file: 439,
+            allocation_size: 440,
+            ..listed(0x20, 0)
+        };
+        assert!(trusted(resident));
+        // How a WOF-compressed file lists: plain attributes, nothing
+        // allocated.
+        let wof = Listed {
+            allocation_size: 0,
+            ..listed(0x20, 0)
+        };
+        assert!(!trusted(wof));
+        let rp = attr::REPARSE_POINT;
+        for (attributes, tag) in [
+            (0x20 | rp, tag::WOF),
+            (0x20 | rp, 0x8000_0013),
+            (0x20 | attr::COMPRESSED, 0),
+            (0x20 | attr::SPARSE, 0),
+            (0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
+        ] {
+            assert!(!trusted(listed(attributes, tag)), "{attributes:#x}");
+        }
     }
 
     #[test]

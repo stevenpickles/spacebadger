@@ -335,6 +335,7 @@ fn unreadable() -> Entry {
         id: 0,
         cloud: false,
         modified: None,
+        stamp: None,
     }
 }
 
@@ -456,6 +457,7 @@ fn fields(
         id: unix_object_id(ino, Some(birth_secs_of(born))),
         cloud: flags & SF_DATALESS != 0,
         modified: Some(modified),
+        stamp: None,
     })
 }
 

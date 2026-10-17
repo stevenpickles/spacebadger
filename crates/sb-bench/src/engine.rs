@@ -38,6 +38,7 @@ pub fn run(root: &Path, workers: usize) {
     let config = ScanConfig {
         workers,
         write_holds: Some(Holds::probe(&holds)),
+        exact_hard_links: crate::exact_hard_links(),
         // As the app scans the root, but for the worker count.
         ..sb_scan::native::scan_config(root)
     };

@@ -226,6 +226,7 @@ impl FsAdapter for UnixFs {
         Ok(Measured {
             logical: meta.size(),
             allocated: Some(meta.blocks().saturating_mul(512)),
+            id: Some((u128::from(meta.dev()) << 64) | u128::from(meta.ino())),
         })
     }
 
@@ -311,6 +312,7 @@ fn lstat_entry(path: &Path, name: OsString, root_dev: u64) -> Entry {
                 id: 0,
                 cloud: false,
                 modified: None,
+                stamp: None,
             };
         }
     };
@@ -344,6 +346,7 @@ fn lstat_entry(path: &Path, name: OsString, root_dev: u64) -> Entry {
         id: unix_object_id(meta.ino(), birth_secs(&meta)),
         cloud: is_cloud(&meta),
         modified: meta.modified().ok(),
+        stamp: None,
     }
 }
 

@@ -179,6 +179,161 @@ fn scans_a_real_tree_without_following_links() {
     );
 }
 
+/// The native adapter, noting every file it re-measures.
+#[cfg(windows)]
+struct Counted {
+    inner: NativeFs,
+    measures: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+
+#[cfg(windows)]
+impl FsAdapter for Counted {
+    fn open_root(&self, root: &Path) -> Result<sb_scan::RootKind, sb_scan::ScanError> {
+        self.inner.open_root(root)
+    }
+
+    fn read_dir(&self, dir: &Path, sink: &mut sb_scan::Sink<'_>) -> Result<(), sb_scan::ScanError> {
+        self.inner.read_dir(dir, sink)
+    }
+
+    fn measure_file(&self, file: &Path) -> Result<sb_scan::Measured, sb_scan::ScanError> {
+        self.measures.lock().unwrap().push(file.to_path_buf());
+        self.inner.measure_file(file)
+    }
+}
+
+/// Scans `root` natively, with every hard-linked name re-measured or not;
+/// returns what it found and the files it re-measured.
+#[cfg(windows)]
+fn scan_counted(
+    root: &Path,
+    exact_hard_links: bool,
+) -> (Progress, Arc<RwLock<Tree>>, Vec<PathBuf>) {
+    let measures = Arc::default();
+    let adapter = Counted {
+        inner: NativeFs::new(),
+        measures: Arc::clone(&measures),
+    };
+    let config = ScanConfig {
+        exact_hard_links,
+        ..ScanConfig::default()
+    };
+    let s = Scan::start(root.to_path_buf(), adapter, config, |_| {});
+    let tree = s.tree();
+    let progress = s.wait();
+    let measures = std::mem::take(&mut *measures.lock().unwrap());
+    (progress, tree, measures)
+}
+
+/// NTFS updates the directory entry of only the name a file was written
+/// through, so the other name's listing is stale: the scan sees the two
+/// names disagree, re-measures the file once, and gets both right.
+#[cfg(windows)]
+#[test]
+fn a_hard_link_written_through_another_name_is_remeasured_once() {
+    use std::io::Write;
+    let tmp = TempDir::new("stale-link");
+    let root = tmp.0.join("root");
+    write(&root.join("x/a.bin"), 5000);
+    std::fs::create_dir_all(root.join("y")).unwrap();
+    std::fs::hard_link(root.join("x/a.bin"), root.join("y/b.bin")).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("x/a.bin"))
+        .unwrap();
+    file.write_all(&[1; 10_000]).unwrap();
+    drop(file);
+    let fs = NativeFs::new();
+    let mut stale = None;
+    fs.read_dir(&root.join("y"), &mut |batch| {
+        stale = batch.first().map(|e| e.logical);
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(stale, Some(5000), "y/b.bin's listing is stale");
+
+    let (progress, tree, measures) = scan_counted(&root, false);
+    assert_eq!(progress.state, ScanState::Complete);
+    assert_eq!(
+        measures.len(),
+        1,
+        "one re-measure for the file: {measures:?}"
+    );
+    let tree = tree.read().unwrap();
+    let (a, b) = (find(&tree, "x/a.bin"), find(&tree, "y/b.bin"));
+    // Measured by whichever name was listed first; the allocation then goes
+    // to x/a.bin, first in name order at the same depth.
+    assert!([tree.path(a), tree.path(b)].contains(&measures[0]));
+    assert_eq!(tree.alias_owner(b), Some(a));
+    assert_eq!(progress.hardlink_aliases, 1);
+    assert_eq!((tree.logical(a), tree.logical(b)), (15_000, 15_000));
+    assert_eq!(progress.logical, 30_000);
+    assert_eq!(progress.allocated, 16_384, "allocated once");
+}
+
+/// Names whose listings agree are taken as listed; asked to, the scan
+/// re-measures every name as it did before.
+#[cfg(windows)]
+#[test]
+fn hard_links_whose_listings_agree_are_not_remeasured() {
+    let tmp = TempDir::new("fresh-link");
+    let root = tmp.0.join("root");
+    write(&root.join("x/a.bin"), 5000);
+    std::fs::create_dir_all(root.join("y")).unwrap();
+    // Making a link updates the entries of the name linked from and the new
+    // name alike.
+    std::fs::hard_link(root.join("x/a.bin"), root.join("y/b.bin")).unwrap();
+
+    let (progress, tree, measures) = scan_counted(&root, false);
+    assert_eq!(measures, Vec::<PathBuf>::new());
+    let (exact, exact_tree, exact_measures) = scan_counted(&root, true);
+    assert_eq!(exact_measures.len(), 2, "the alias and its owner");
+    for (progress, tree) in [(progress, tree), (exact, exact_tree)] {
+        assert_eq!(progress.state, ScanState::Complete);
+        assert_eq!(progress.hardlink_aliases, 1);
+        assert_eq!(progress.logical, 10_000);
+        assert_eq!(progress.allocated, 8192, "allocated once");
+        let tree = tree.read().unwrap();
+        assert_eq!(tree.logical(find(&tree, "y/b.bin")), 5000);
+    }
+
+    // A second link changes the file's change time, which b.bin's entry
+    // misses: one re-measure at most, and the same sizes.
+    std::fs::hard_link(root.join("x/a.bin"), root.join("y/c.bin")).unwrap();
+    let (progress, _, measures) = scan_counted(&root, false);
+    assert!(measures.len() <= 1, "{measures:?}");
+    assert_eq!(progress.hardlink_aliases, 2);
+    assert_eq!(progress.logical, 15_000);
+    assert_eq!(progress.allocated, 8192);
+}
+
+/// A WOF-compressed file lists 0 allocated under every name, so agreeing
+/// listings prove nothing: the file is re-measured once.
+#[cfg(windows)]
+#[test]
+fn compressed_hard_links_are_remeasured_once_though_their_listings_agree() {
+    let tmp = TempDir::new("wof-link");
+    let root = tmp.0.join("root");
+    let file = root.join("x/a.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"compressible ".repeat(20_000)).unwrap();
+    let compact = std::process::Command::new("compact")
+        .args(["/c", "/exe:xpress4k"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(compact.status.success(), "compact failed: {compact:?}");
+    std::fs::create_dir_all(root.join("y")).unwrap();
+    std::fs::hard_link(&file, root.join("y/b.bin")).unwrap();
+    let measured = NativeFs::new().measure_file(&file).unwrap();
+
+    let (progress, _, measures) = scan_counted(&root, false);
+    assert_eq!(measures.len(), 1, "once for the file: {measures:?}");
+    assert_eq!(progress.hardlink_aliases, 1);
+    assert_eq!(Some(progress.allocated), measured.allocated);
+    assert_eq!(progress.logical, 2 * 260_000);
+}
+
 #[test]
 fn rejects_a_link_as_the_root() {
     let tmp = TempDir::new("linkroot");
