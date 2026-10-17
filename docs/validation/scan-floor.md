@@ -96,6 +96,31 @@ After the review fixes (warm-up pair, watcher CPU subtracted, coverage check, ne
 
 Entries 687,964 for both (the tree had grown by ~70K entries since the morning's runs as agents built in it), floor errors 0, scan `CompleteWithOmissions`; the coverage check passed. The watcher used 16–190 ms of CPU per child, now left out. `relative` on the same tree, 16 threads, 3 runs: 1,530 / 1,630 / 1,686 ms, at most 46–54 folder handles open at once with newest-first order, none opened by path. On a 62-entry folder the CPU ratio is left out with the warning, as intended. The earlier tables predate these fixes: the engine's CPU then included the watcher's (well under 1 % of it), there was no warm-up, and `relative` took folders oldest first.
 
+## After the v0.4.0 scan changes (quiet machine, 2026-10-17)
+
+Measured once #58–#64 were merged and no agents were running: dev before the work (`bde3cef`) against dev after (`033794c`), the `scan` example, alternating builds, warm.
+
+| Root | Before (8 workers) | After (16 workers) | Totals |
+|---|---|---|---|
+| `C:\Users\Steven\work` (648K files, 83K folders), 7 rounds | 4.93–5.43 s, median 5.09 s | 1.10–1.20 s, median 1.13 s | identical files and allocation in every pair |
+| `C:\` (3.82M files), 3 rounds | 49.4 s (first, partly cold), 32.7 s, 31.4 s | 17.6 s, 16.6 s, 15.1 s | equal apart from files changed between runs |
+
+`sb-bench --engine C:\Users\Steven\work --threads 16 --runs 5` on dev after:
+- **Engine/floor wall ratio:** median **1.16**, spread 11 %. Before the work, the same tree measured 2.7–3.7.
+- **CPU ratio:** median **1.11**. Before: 2.9–3.2.
+- **Medians:** floor 1,058 ms, engine 1,229 ms.
+- **Coverage:** 732,745 entries on both sides; ok.
+
+Against the design's targets:
+
+| Target | Result |
+|---|---|
+| Work tree ≤ 1.5 s | met (1.13 s) |
+| Engine/floor ≤ 1.4 | met (1.16) |
+| `C:\` warm ≤ 13 s | not met (15–17 s, against a floor of about 9.5 s measured in the design) |
+
+The rest of the `C:\` gap is not yet attributed. The likely parts are the roughly 68K compressed (WOF) files that are still re-measured once each, and kernel contention at 16 workers.
+
 ## Reproducibility
 
 The target was engine/floor within 10 % run to run.
