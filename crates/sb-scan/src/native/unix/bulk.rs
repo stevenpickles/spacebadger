@@ -323,10 +323,11 @@ fn malformed() -> ScanError {
     )
 }
 
-/// An entry whose name the listing didn't give.
+/// An entry whose name the listing didn't give. It gets a placeholder name
+/// so its omission sample doesn't point at the folder itself.
 fn unreadable() -> Entry {
     Entry {
-        name: OsString::new(),
+        name: OsString::from("<unnamed entry>"),
         kind: EntryKind::Failed(ErrorKind::Unavailable),
         logical: 0,
         allocated: None,
