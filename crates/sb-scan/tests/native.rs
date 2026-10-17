@@ -1,6 +1,6 @@
 //! Scans real temporary directories with the platform's native adapter.
 
-use sb_core::git::{GitClass, RootKind as GitKind};
+use sb_core::git::{GitClass, Problem, RootKind as GitKind};
 use sb_core::tree::{NodeId, Tree, flags};
 use sb_scan::{
     BATCH_ENTRIES, EntryKind, ErrorKind, FsAdapter, NativeFs, OmissionReason, Progress, Scan,
@@ -384,6 +384,23 @@ fn finds_repositories_written_by_hand() {
     assert_eq!(tree.git_class(find(&tree, "wt/b.rs")), GitClass::Worktree);
 }
 
+#[test]
+fn never_reads_metadata_through_a_link_in_its_path() {
+    let tmp = TempDir::new("gitlink");
+    let real = tmp.0.join("elsewhere/real.git");
+    std::fs::create_dir_all(real.join("objects")).unwrap();
+    std::fs::create_dir_all(real.join("refs")).unwrap();
+    std::fs::write(real.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let root = tmp.0.join("root");
+    write(&root.join("wt/a.txt"), 1);
+    std::fs::write(root.join("wt/.git"), b"gitdir: ../lnk/real.git\n").unwrap();
+    make_dir_link(&root.join("lnk"), &tmp.0.join("elsewhere"));
+
+    let (_, tree) = scan(&root);
+    let tree = tree.read().unwrap();
+    let wt = tree.git_entry(find(&tree, "wt")).expect("an entry");
+    assert_eq!(wt.problem, Some(Problem::NotRead), "{wt:?}");
+}
 #[test]
 fn records_an_id_for_every_file_and_folder() {
     let tmp = TempDir::new("ids");

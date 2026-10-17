@@ -783,3 +783,27 @@ fn signals_in_different_batches_of_a_listing_add_up() {
     let (_, tree) = run(&fs);
     assert_eq!(kind(&tree.read().unwrap(), "big.git"), Some(RootKind::Bare));
 }
+
+#[test]
+fn metadata_reached_through_a_link_is_never_read() {
+    let fs = FakeFs::new();
+    fs.other("lnk", EntryKind::Symlink)
+        .text("wt/.git", "gitdir: ../lnk/repo.git\n")
+        .outside_other("/elsewhere/lnk", EntryKind::Symlink)
+        .text("wt2/.git", "gitdir: /elsewhere/lnk/repo.git\n")
+        .text("wt3/.git", "gitdir: ../adm\n")
+        .text("adm/HEAD", "ref: refs/heads/main\n")
+        .text("adm/commondir", "../lnk/main.git\n");
+    let (_, tree) = run(&fs);
+    let tree = tree.read().unwrap();
+    for dir in ["wt", "wt2", "wt3"] {
+        assert_eq!(problem(&tree, dir), Some(Problem::NotRead), "{dir}");
+    }
+    for read in fs.reads() {
+        let text = read.to_string_lossy().replace('\\', "/");
+        assert!(
+            !text.contains("lnk/repo.git/") && !text.contains("lnk/main.git/"),
+            "read through the link: {text}"
+        );
+    }
+}
