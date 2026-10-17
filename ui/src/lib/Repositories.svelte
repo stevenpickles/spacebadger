@@ -145,8 +145,8 @@
     if (r.outside) parts.push("above the scan root");
     // Two rows can stand for node 0: the repository above the scan root and
     // the scan root's own; `parentOutside` says which one is meant.
-    const outside = (r as GitRootRow & { parentOutside?: boolean }).parentOutside ?? false;
-    const parent = r.parent === null ? undefined : rows.find((p) => p.node === r.parent && p.outside === outside);
+    const parent =
+      r.parent === null ? undefined : rows.find((p) => p.node === r.parent && p.outside === r.parentOutside);
     if (parent) parts.push(`inside ${parent.name}`);
     if (r.kind === "linkedWorktree" && r.repository) parts.push(`main repo: ${r.repository.path}`);
     if (r.nested > 0) parts.push(`includes ${plural(r.nested, "nested root")}`);
