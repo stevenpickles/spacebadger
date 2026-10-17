@@ -912,17 +912,18 @@ impl<A: FsAdapter> Aggregator<A> {
             } => {
                 self.pending_dirs -= 1;
                 let partial = self.partial.remove(&dir) || !entries.is_empty();
-                if !entries.is_empty() {
-                    self.apply_batch(dir, &path, entries, open.as_ref(), None);
-                }
-                if self.stop.is_some() {
-                    return;
-                }
                 let end = ListingEnd { result, partial };
-                let tree_lock = Arc::clone(&self.tree);
-                let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
-                let probe = self.end_listing(&mut tree, dir, &path, end);
-                drop(tree);
+                // The last batch and the listing's end share one hold.
+                let probe = if entries.is_empty() {
+                    if self.stop.is_some() {
+                        return;
+                    }
+                    let tree_lock = Arc::clone(&self.tree);
+                    let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
+                    self.end_listing(&mut tree, dir, &path, end)
+                } else {
+                    self.apply_batch(dir, &path, entries, open.as_ref(), Some(end))
+                };
                 self.revision += 1;
                 if let Some((path, plan)) = probe {
                     self.enqueue_git(path, plan);
