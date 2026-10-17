@@ -8,6 +8,7 @@
 //! cargo run --release -p sb-bench -- [--lod N]...
 //! cargo run --release -p sb-bench -- --floor PATH [--threads N]... [--strategy S]... [--runs R] [--no-warmup]
 //! cargo run --release -p sb-bench -- --engine PATH [--threads N]... [--strategy S] [--runs R] [--no-warmup]
+//! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N]
 //! ```
 //!
 //! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
@@ -31,12 +32,17 @@
 //! spread. Each case and each run is measured in a fresh child process, so
 //! peak memory belongs to that case alone. Method and numbers:
 //! `docs/validation/scan-floor.md`.
+//!
+//! `--provisional` rescans a real folder and measures how soon its map,
+//! estimated from a snapshot, matches the final one (see [`provisional`]);
+//! it runs in this process, on its own.
 
 mod cpu;
 mod engine;
 mod floor;
 mod lod;
 mod memory;
+mod provisional;
 mod synth;
 mod wide;
 
@@ -96,7 +102,7 @@ struct Ruler {
 
 const USAGE: &str = "usage: sb-bench [--nodes N]... [--seed S] [--wide N]... [--wide-slow N]... \
                      [--wide-dir PATH]... [--lod N]... [--floor PATH]... [--engine PATH]... \
-                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup]";
+                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]]";
 
 /// Below this much floor CPU time, Windows' 15.6 ms CPU clock makes the CPU
 /// ratio too coarse to compare.
@@ -112,6 +118,9 @@ fn main() {
         runs: 1,
         warmup: true,
     };
+    let mut provisional = None;
+    let mut snapshot = None;
+    let mut rounds = 3;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut text = || {
@@ -145,10 +154,17 @@ fn main() {
                 );
                 ruler.strategies.push(strategy);
             }
+            "--provisional" => provisional = Some(PathBuf::from(text())),
+            "--snapshot" => snapshot = Some(PathBuf::from(text())),
+            "--rounds" => rounds = value() as usize,
             "--seed" => seed = value(),
             "--child" => child = true,
             _ => panic!("unknown argument {arg}\n{USAGE}"),
         }
+    }
+    if let Some(root) = provisional {
+        provisional::run(&root, snapshot.as_deref(), rounds);
+        return;
     }
     if cases.is_empty() {
         cases.extend(DEFAULT_SIZES.map(Case::Nodes));
