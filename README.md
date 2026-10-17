@@ -142,8 +142,11 @@ Limitations:
 - A scan that starts inside a checkout (say, `repo/src`) looks up to 64 folders above the scan root for the repository, not stopping at drive or mount boundaries, and lists it as "above the scan root"; that repository's `.git` data isn't scanned or counted.
 - Paths in Git's files are read as written, without following links; a link in the middle of such a path can make a Git directory look inside or outside the scan when it isn't. A `.git` that is a link or junction, or a cloud placeholder, is never followed or downloaded and shows as unresolved.
 - Not interpreted: `include` in `config`, a `core.worktree` setting (shown, but content stays where it is), and the `GIT_DIR` environment variables. The branch comes from `HEAD` alone; packed refs and commit times aren't read.
-- A `.git` file pointing outside the scan to a network share or a device path (or, on Linux and macOS, to a network or removable mount) isn't followed, so nothing slow or offline is touched; its folder shows as unresolved, "not read".
-- Git data still being read 5 seconds after every folder has been listed is given up, so a slow drive can't hold the scan open; those folders show as unresolved, "timed out". Scan again to retry.
+- A `.git` file pointing outside the scan to a network share or a device path (or, on Linux and macOS, to a network or removable mount) isn't followed, so nothing slow or offline is touched; its folder shows as unresolved: "Git directory is on another computer or removable drive; not read". The same goes for Git data outside the scan that is reached through a link, such as macOS's `/tmp` and `/var`.
+- Some network locations can't be recognized as such: `/afs`, autofs maps, and macOS firmlinks. Drives that look local but are backed by a network or a file (iSCSI, mounted virtual disks, cloud drives that report as fixed drives, such as Google Drive) are read like local ones.
+- Git data still being read 5 seconds after every folder has been listed is given up, so a slow or stuck drive can't hold the scan open; those folders show as unresolved: "not checked: Git metadata didn't answer in time". Scan again to retry.
+- A checkout kept inside a `.git` folder isn't detected; its content counts as Git metadata.
+- A folder that has both a `.git` folder and its own `HEAD`, `objects`, and `refs` is classified by whichever check finishes last.
 - A Git directory with `HEAD`, `objects`, and `refs` but an unreadable `config` counts as a Git directory, not a bare repository. Submodules whose Git directory isn't under `.git/modules` show as repositories with a separate Git directory.
 - Comparisons with earlier scans don't record Git data.
 
