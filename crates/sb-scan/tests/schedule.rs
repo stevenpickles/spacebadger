@@ -132,6 +132,46 @@ fn with_a_prior_changed_folders_go_first_then_big_ones_then_the_rest_in_order() 
 }
 
 #[test]
+fn a_prior_given_late_reorders_the_folders_already_queued() {
+    let (fs, prior) = six_folders();
+    // Listed first (its name sorts first) and held twice: as it starts,
+    // until the six folders are queued and the prior is given; and once
+    // its first batch is in, until that batch has been applied, which is
+    // when the scan notices the prior.
+    for i in 0..2 * BATCH_ENTRIES + 1 {
+        fs.file(&format!("0held/f{i:05}"), 1, 1);
+    }
+    let start = fs.gate_dir("0held");
+    let first_batch = fs.gate_dir_after("0held", 2 * BATCH_ENTRIES);
+    let before = fs.listings().len();
+    let s = Scan::start(fs.root(), fs.clone(), config(1), |_| {});
+    assert!(start.entered(HANG), "0held was never listed");
+    let deadline = Instant::now() + HANG;
+    while s.progress().pending_dirs < 7 {
+        assert!(Instant::now() < deadline, "the folders were never queued");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    s.tree().write().unwrap().set_prior(Arc::clone(&prior));
+    start.release();
+    assert!(first_batch.entered(HANG), "the first batch never arrived");
+    while (s.progress().files as usize) < BATCH_ENTRIES {
+        assert!(
+            Instant::now() < deadline,
+            "the first batch was never applied"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    first_batch.release();
+    assert_eq!(s.wait().state, ScanState::Complete);
+    let order: Vec<String> = fs.listings()[before + 2..]
+        .iter()
+        .map(|p| p.strip_prefix(fs.root()).unwrap().display().to_string())
+        .collect();
+    // Their modified times are gone by then, so e is just big.
+    assert_eq!(order, ["c", "d", "b", "e", "a", "f"]);
+}
+
+#[test]
 fn without_a_prior_folders_are_listed_in_the_order_found() {
     let (fs, _) = six_folders();
     assert_eq!(

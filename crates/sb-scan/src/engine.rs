@@ -662,6 +662,31 @@ impl Queue {
         jobs.big.clear();
         jobs.fifo.clear();
     }
+
+    /// Moves the listings waiting in order found to which `priority` puts
+    /// ahead (see [`Queue::push`]), keeping their order among equals.
+    fn reorder(&self, mut priority: impl FnMut(NodeId) -> u32) {
+        let mut jobs = self.state.lock().unwrap();
+        let jobs = &mut *jobs;
+        let waiting = std::mem::take(&mut jobs.fifo);
+        for job in waiting {
+            let p = match &job {
+                Job::List { dir, .. } => priority(*dir),
+                _ => 0,
+            };
+            if p >= BIG_SHARE {
+                let seq = jobs.queued;
+                jobs.queued += 1;
+                jobs.big.push(Big {
+                    priority: p,
+                    seq,
+                    job,
+                });
+            } else {
+                jobs.fifo.push_back(job);
+            }
+        }
+    }
 }
 
 struct Aggregator<A> {
@@ -691,6 +716,8 @@ struct Aggregator<A> {
     published_revision: u64,
     last_publish: Instant,
     stop: Option<ScanState>,
+    /// Whether the listings queued so far were ordered by a prior.
+    ordered: bool,
 }
 
 impl<A: FsAdapter> Aggregator<A> {
@@ -730,6 +757,7 @@ impl<A: FsAdapter> Aggregator<A> {
             published_revision: 0,
             last_publish: now,
             stop: None,
+            ordered: false,
         }
     }
 
@@ -1083,6 +1111,14 @@ impl<A: FsAdapter> Aggregator<A> {
         } else {
             None
         };
+        // A prior handed over once the scan has begun orders the listings
+        // already queued too, as far as it can without their folders'
+        // modified times: new folders first, then the big ones.
+        if let (Some(since), false) = (since, self.ordered) {
+            self.ordered = true;
+            self.queue
+                .reorder(|dir| listing_priority(&tree, dir, None, since));
+        }
         let mut unreadable = false;
         for (entry, known) in entries.into_iter().zip(known) {
             let spot = git::spot(entry.name.as_encoded_bytes(), entry.kind);
