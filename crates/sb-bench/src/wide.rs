@@ -6,7 +6,7 @@
 //! as the tree grows, and how soon a cancel is acknowledged once the
 //! listing's entries are being added to the tree.
 
-use crate::cpu::{Cpu, Threads, print_roles};
+use crate::cpu::{Cpu, Threads, print_roles, without_watcher};
 use crate::{memory, mib, ms};
 use sb_scan::{
     BATCH_ENTRIES, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured, NativeFs, RootKind,
@@ -211,8 +211,9 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     let tree = scan.tree();
     let p = scan.wait();
     let elapsed = started.elapsed();
-    let cpu = Cpu::process().zip(cpu_before).map(|(a, b)| a.since(b));
+    let process = Cpu::process().zip(cpu_before).map(|(a, b)| a.since(b));
     let roles = threads.finish();
+    let cpu = process.map(|p| without_watcher(p, roles.as_ref()));
     done.store(true, Ordering::Relaxed);
     let waits = reader.join().unwrap();
     let (nodes, tree_bytes) = {
@@ -240,7 +241,7 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     report_holds(std::mem::take(&mut *holds.lock().unwrap()));
     if let Some(cpu) = cpu {
         println!(
-            "cpu:     process kernel {}, user {} ({:.1} cores busy)",
+            "cpu:     process kernel {}, user {} ({:.1} cores busy; without the thread watcher)",
             ms(cpu.kernel),
             ms(cpu.user),
             cpu.total().as_secs_f64() / elapsed.as_secs_f64()

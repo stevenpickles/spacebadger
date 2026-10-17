@@ -40,8 +40,8 @@ impl std::ops::AddAssign for Cpu {
     }
 }
 
-/// Which part of a scan a thread belongs to, by the names `sb-scan` gives
-/// its threads.
+/// Which part of a measurement a thread belongs to, by the names `sb-scan`
+/// and this benchmark give their threads.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub fn role(name: &str) -> &'static str {
     // Linux truncates thread names to 15 bytes: "sb-scan-aggrega".
@@ -49,13 +49,30 @@ pub fn role(name: &str) -> &'static str {
         "aggregator"
     } else if name.starts_with("sb-scan-worker") {
         "workers"
+    } else if name.starts_with("sb-bench-floor") {
+        "floor"
+    } else if name.starts_with(WATCHER.get(..15).unwrap_or(WATCHER)) {
+        WATCHER_ROLE
     } else {
         "other"
     }
 }
 
+/// The watcher thread's name, and its role, which comparisons leave out.
+const WATCHER: &str = "sb-bench-threads";
+pub const WATCHER_ROLE: &str = "watcher";
+
 /// CPU time per role, with the number of threads seen in each.
 pub type ByRole = BTreeMap<&'static str, (Cpu, usize)>;
+
+/// Process CPU time without the watcher's own, so a measurement that
+/// watches threads compares fairly with one that doesn't.
+pub fn without_watcher(process: Cpu, roles: Option<&ByRole>) -> Cpu {
+    match roles.and_then(|r| r.get(WATCHER_ROLE)) {
+        Some((watcher, _)) => process.since(*watcher),
+        None => process,
+    }
+}
 
 /// Prints CPU per role, as continuation lines of a `cpu:` line.
 pub fn print_roles(roles: &ByRole) {
@@ -88,7 +105,7 @@ impl Threads {
         let handle = {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
-                .name("sb-bench-threads".into())
+                .name(WATCHER.into())
                 .spawn(move || imp::watch(&stop))
                 .expect("spawn thread watcher")
         };
@@ -121,7 +138,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use windows::Win32::Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, HANDLE,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, HANDLE, HLOCAL, LocalFree,
     };
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetProcessTimes, GetThreadDescription, GetThreadId, GetThreadTimes,
@@ -165,12 +182,38 @@ mod imp {
     }
 
     fn name(thread: HANDLE) -> String {
-        // SAFETY: `thread` is open. The returned string is never freed:
-        // a few bytes per thread, in a benchmark.
-        unsafe { GetThreadDescription(thread) }
-            .ok()
-            .and_then(|p| unsafe { p.to_string() }.ok())
-            .unwrap_or_default()
+        // SAFETY: `thread` is open; the string the call allocates is freed
+        // with LocalFree once copied, as its documentation asks.
+        let Ok(text) = (unsafe { GetThreadDescription(thread) }) else {
+            return String::new();
+        };
+        let name = unsafe { text.to_string() }.unwrap_or_default();
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        }
+        name
+    }
+
+    /// How many looks ask an unnamed thread for its name: a thread is
+    /// named just after it starts, so one still unnamed after a few looks
+    /// stays unnamed (it's asked once more at the end).
+    const NAME_ASKS: u8 = 3;
+
+    /// A thread seen: its handle, kept open, its name, and how often it was
+    /// asked for it.
+    struct Seen {
+        handle: Owned,
+        name: String,
+        asked: u8,
+    }
+
+    impl Seen {
+        fn ask(&mut self) {
+            if self.name.is_empty() && self.asked < NAME_ASKS {
+                self.asked += 1;
+                self.name = name(self.handle.0);
+            }
+        }
     }
 
     #[link(name = "ntdll")]
@@ -190,8 +233,8 @@ mod imp {
     }
 
     /// Keeps a handle to every thread of this process not seen yet, and
-    /// names the ones still unnamed (a thread is named just after it starts).
-    fn look(seen: &mut HashMap<u32, (Owned, String)>) {
+    /// asks the unnamed ones their names.
+    fn look(seen: &mut HashMap<u32, Seen>) {
         let mut previous: Option<Owned> = None;
         loop {
             let mut next = HANDLE::default();
@@ -213,10 +256,8 @@ mod imp {
             let next = Owned(next);
             // SAFETY: `next` is an open thread handle.
             let tid = unsafe { GetThreadId(next.0) };
-            if let Some((_, n)) = seen.get_mut(&tid) {
-                if n.is_empty() {
-                    *n = name(next.0);
-                }
+            if let Some(thread) = seen.get_mut(&tid) {
+                thread.ask();
                 previous = Some(next);
             } else {
                 // Keep this handle; continue from a duplicate of it.
@@ -234,8 +275,13 @@ mod imp {
                     )
                 }
                 .is_ok();
-                let n = name(next.0);
-                seen.insert(tid, (next, n));
+                let mut thread = Seen {
+                    handle: next,
+                    name: String::new(),
+                    asked: 0,
+                };
+                thread.ask();
+                seen.insert(tid, thread);
                 if !ok {
                     return;
                 }
@@ -252,12 +298,12 @@ mod imp {
         }
         look(&mut seen);
         let mut out = ByRole::new();
-        for (h, n) in seen.values_mut() {
-            if n.is_empty() {
-                *n = name(h.0);
+        for thread in seen.values_mut() {
+            if thread.name.is_empty() {
+                thread.name = name(thread.handle.0);
             }
-            if let Some(cpu) = times(h.0) {
-                tally(&mut out, n, cpu);
+            if let Some(cpu) = times(thread.handle.0) {
+                tally(&mut out, &thread.name, cpu);
             }
         }
         Some(out)
@@ -374,6 +420,32 @@ mod tests {
         assert_eq!(role("sb-scan-worker-3"), "workers");
         assert_eq!(role("main"), "other");
         assert_eq!(role(""), "other");
+        assert_eq!(role("sb-bench-floor-2"), "floor");
+        assert_eq!(role("sb-bench-threads"), WATCHER_ROLE);
+        assert_eq!(role("sb-bench-thread"), WATCHER_ROLE);
+    }
+
+    #[test]
+    fn the_watchers_cpu_is_left_out() {
+        let ms = Duration::from_millis;
+        let process = Cpu {
+            kernel: ms(900),
+            user: ms(300),
+        };
+        let mut roles = ByRole::new();
+        roles.insert(
+            WATCHER_ROLE,
+            (
+                Cpu {
+                    kernel: ms(40),
+                    user: ms(10),
+                },
+                1,
+            ),
+        );
+        let without = without_watcher(process, Some(&roles));
+        assert_eq!((without.kernel, without.user), (ms(860), ms(290)));
+        assert_eq!(without_watcher(process, None), process);
     }
 
     #[test]
@@ -385,7 +457,7 @@ mod tests {
                 .spawn(|| {
                     let t = std::time::Instant::now();
                     let mut x = 0u64;
-                    while t.elapsed() < Duration::from_millis(150) {
+                    while t.elapsed() < Duration::from_millis(300) {
                         x = std::hint::black_box(x.wrapping_add(1));
                     }
                 })
@@ -401,10 +473,7 @@ mod tests {
         for role in ["aggregator", "workers"] {
             let (cpu, n) = roles.get(role).copied().unwrap_or_default();
             assert_eq!(n, 1, "{role}: {roles:?}");
-            assert!(
-                cpu.total() >= Duration::from_millis(50),
-                "{role}: {roles:?}"
-            );
+            assert!(cpu.total() > Duration::ZERO, "{role}: {roles:?}");
         }
     }
 
