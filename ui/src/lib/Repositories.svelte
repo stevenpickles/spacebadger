@@ -32,7 +32,8 @@
 <script lang="ts">
   // The Git repositories, linked worktrees, and unresolved candidates in the
   // scan, largest first. Selecting one selects its folder in the map and the
-  // details; Enter or double-click opens it. Roots are few, so they come in
+  // details; Enter or double-click opens it (the repository above the scan
+  // root stands for the scan root, node 0). Roots are few, so they come in
   // one request (the backend caps it at 500), asked again as the scan and
   // filter change.
   import { announce } from "./announce.svelte";
@@ -142,7 +143,10 @@
     const parts: string[] = [];
     if (r.head) parts.push(describeHead(r.head));
     if (r.outside) parts.push("above the scan root");
-    const parent = r.parent === null ? undefined : rows.find((p) => p.node === r.parent);
+    // Two rows can stand for node 0: the repository above the scan root and
+    // the scan root's own; `parentOutside` says which one is meant.
+    const outside = (r as GitRootRow & { parentOutside?: boolean }).parentOutside ?? false;
+    const parent = r.parent === null ? undefined : rows.find((p) => p.node === r.parent && p.outside === outside);
     if (parent) parts.push(`inside ${parent.name}`);
     if (r.kind === "linkedWorktree" && r.repository) parts.push(`main repo: ${r.repository.path}`);
     if (r.nested > 0) parts.push(`includes ${plural(r.nested, "nested root")}`);

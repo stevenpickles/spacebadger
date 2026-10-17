@@ -213,6 +213,11 @@
           Includes {plural(root.nested, "nested repository", "nested repositories")}; totals count their content once.
         </p>
       {/if}
+      {#if root.worktree}
+        <p class="note muted">
+          Its config sets the working tree to <PathText path={root.worktree} />; sizes stay where the files are.
+        </p>
+      {/if}
       {#if root.recordedAt}
         <p class="note muted">Its Git data records it at <PathText path={root.recordedAt} />.</p>
       {/if}
