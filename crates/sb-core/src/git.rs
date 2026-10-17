@@ -11,6 +11,19 @@
 //! `[core]` section of `config` ([`parse_head`], [`parse_pointer`],
 //! [`parse_path_file`], [`parse_config_core`]), lexical path handling
 //! ([`paths`]), and size accounting over the entries ([`summarize`]).
+//!
+//! Limitations:
+//! - Paths are compared by name alone, never resolved on disk: a symlink
+//!   along a metadata path can put a target inside or outside the scan
+//!   wrongly.
+//! - Windows 8.3 short names (`PROGRA~1`) don't match their long names.
+//! - macOS names aren't Unicode-normalized, so NFC and NFD spellings of the
+//!   same name don't match.
+//! - Metadata paths that aren't UTF-8 aren't read (the `.git` file is
+//!   reported malformed).
+//! - [`Tree::remove`] downgrades a repository only when its own `.git` is
+//!   deleted; linked worktrees and submodules whose Git data lived in that
+//!   `.git` keep their kind until the next scan.
 
 use crate::layout::Metric;
 use crate::search::Search;
