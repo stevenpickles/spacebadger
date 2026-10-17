@@ -36,6 +36,9 @@
 //! `--provisional` rescans a real folder and measures how soon its map,
 //! estimated from a snapshot, matches the final one (see [`provisional`]);
 //! it runs in this process, on its own.
+//!
+//! `--exact-hard-links` makes `--engine` and `--wide-dir` scans re-measure
+//! every name of a hard-linked file (`ScanConfig::exact_hard_links`).
 
 mod cpu;
 mod engine;
@@ -57,6 +60,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[global_allocator]
@@ -109,7 +113,15 @@ struct Ruler {
 
 const USAGE: &str = "usage: sb-bench [--nodes N]... [--seed S] [--wide N]... [--wide-slow N]... \
                      [--wide-dir PATH]... [--lod N]... [--floor PATH]... [--engine PATH]... \
-                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]]";
+                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]] [--exact-hard-links]";
+
+/// Set by `--exact-hard-links`: real-folder scans re-measure every name of
+/// a hard-linked file, and children are told so.
+static EXACT_HARD_LINKS: AtomicBool = AtomicBool::new(false);
+
+fn exact_hard_links() -> bool {
+    EXACT_HARD_LINKS.load(Ordering::Relaxed)
+}
 
 /// Below this much floor CPU time, Windows' 15.6 ms CPU clock makes the CPU
 /// ratio too coarse to compare.
@@ -166,6 +178,7 @@ fn main() {
             "--rounds" => rounds = value() as usize,
             "--seed" => seed = value(),
             "--child" => child = true,
+            "--exact-hard-links" => EXACT_HARD_LINKS.store(true, Ordering::Relaxed),
             _ => panic!("unknown argument {arg}\n{USAGE}"),
         }
     }
@@ -189,7 +202,7 @@ fn main() {
                 Case::Nodes(n) => run(*n, seed),
                 Case::Wide(n) => wide::synthetic(*n),
                 Case::WideSlow(n) => wide::synthetic_slow(*n),
-                Case::WideDir(p) => wide::real(p),
+                Case::WideDir(p) => wide::real(p, exact_hard_links()),
                 Case::Lod(n) => lod::run(*n, seed),
                 Case::Floor(p) => floor::run(p, ruler.threads[0], ruler.strategies[0]),
                 Case::Engine(p) => engine::run(p, ruler.threads[0]),
@@ -234,6 +247,7 @@ fn spawn(args: &[String]) -> Reported {
     let exe = std::env::current_exe().expect("own executable path");
     let mut child = Command::new(&exe)
         .arg("--child")
+        .args(exact_hard_links().then_some("--exact-hard-links"))
         .args(args)
         .stdout(Stdio::piped())
         .spawn()
