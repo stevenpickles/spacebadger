@@ -8,7 +8,8 @@
 //! cargo run --release -p sb-bench -- [--lod N]...
 //! cargo run --release -p sb-bench -- --floor PATH [--threads N]... [--strategy S]... [--runs R] [--no-warmup]
 //! cargo run --release -p sb-bench -- --engine PATH [--threads N]... [--strategy S] [--runs R] [--no-warmup]
-//! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N]
+//!                                    [--snapshot FILE [--found-order]]
+//! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N] [--prior-after MS]
 //! ```
 //!
 //! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
@@ -35,10 +36,17 @@
 //!
 //! `--provisional` rescans a real folder and measures how soon its map,
 //! estimated from a snapshot, matches the final one (see [`provisional`]);
-//! it runs in this process, on its own.
+//! it runs in this process, on its own. `--prior-after` gives the scan its
+//! prior that many milliseconds after it starts, as the app does once it
+//! has read the snapshot.
 //!
 //! `--exact-hard-links` makes `--engine` and `--wide-dir` scans re-measure
 //! every name of a hard-linked file (`ScanConfig::exact_hard_links`).
+//!
+//! With `--engine`, `--snapshot` gives each scan that snapshot as its prior,
+//! as a rescan in the app has, so folders are listed in the order it
+//! suggests; `--found-order` lists them in the order found all the same
+//! (`ScanConfig::list_by_prior`).
 
 mod cpu;
 mod engine;
@@ -113,7 +121,7 @@ struct Ruler {
 
 const USAGE: &str = "usage: sb-bench [--nodes N]... [--seed S] [--wide N]... [--wide-slow N]... \
                      [--wide-dir PATH]... [--lod N]... [--floor PATH]... [--engine PATH]... \
-                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]] [--exact-hard-links]";
+                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N] [--prior-after MS]] [--exact-hard-links] \n                     [--snapshot FILE [--found-order]]";
 
 /// Set by `--exact-hard-links`: real-folder scans re-measure every name of
 /// a hard-linked file, and children are told so.
@@ -122,6 +130,14 @@ static EXACT_HARD_LINKS: AtomicBool = AtomicBool::new(false);
 fn exact_hard_links() -> bool {
     EXACT_HARD_LINKS.load(Ordering::Relaxed)
 }
+
+/// Set by `--snapshot` outside `--provisional`: the prior engine scans get,
+/// and children are told so.
+static ENGINE_SNAPSHOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set by `--found-order`: engine scans with a prior list folders in the
+/// order found.
+static FOUND_ORDER: AtomicBool = AtomicBool::new(false);
 
 /// Below this much floor CPU time, Windows' 15.6 ms CPU clock makes the CPU
 /// ratio too coarse to compare.
@@ -140,6 +156,7 @@ fn main() {
     let mut provisional = None;
     let mut snapshot = None;
     let mut rounds = 3;
+    let mut prior_after = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut text = || {
@@ -176,15 +193,25 @@ fn main() {
             "--provisional" => provisional = Some(PathBuf::from(text())),
             "--snapshot" => snapshot = Some(PathBuf::from(text())),
             "--rounds" => rounds = value() as usize,
+            "--prior-after" => prior_after = value(),
             "--seed" => seed = value(),
             "--child" => child = true,
             "--exact-hard-links" => EXACT_HARD_LINKS.store(true, Ordering::Relaxed),
+            "--found-order" => FOUND_ORDER.store(true, Ordering::Relaxed),
             _ => panic!("unknown argument {arg}\n{USAGE}"),
         }
     }
     if let Some(root) = provisional {
-        provisional::run(&root, snapshot.as_deref(), rounds);
+        provisional::run(
+            &root,
+            snapshot.as_deref(),
+            rounds,
+            Duration::from_millis(prior_after),
+        );
         return;
+    }
+    if let Some(file) = snapshot {
+        ENGINE_SNAPSHOT.set(file).expect("set once");
     }
     if cases.is_empty() {
         cases.extend(DEFAULT_SIZES.map(Case::Nodes));
@@ -205,7 +232,12 @@ fn main() {
                 Case::WideDir(p) => wide::real(p, exact_hard_links()),
                 Case::Lod(n) => lod::run(*n, seed),
                 Case::Floor(p) => floor::run(p, ruler.threads[0], ruler.strategies[0]),
-                Case::Engine(p) => engine::run(p, ruler.threads[0]),
+                Case::Engine(p) => engine::run(
+                    p,
+                    ruler.threads[0],
+                    ENGINE_SNAPSHOT.get().map(PathBuf::as_path),
+                    !FOUND_ORDER.load(Ordering::Relaxed),
+                ),
             }
         }
         return;
@@ -248,6 +280,17 @@ fn spawn(args: &[String]) -> Reported {
     let mut child = Command::new(&exe)
         .arg("--child")
         .args(exact_hard_links().then_some("--exact-hard-links"))
+        .args(
+            FOUND_ORDER
+                .load(Ordering::Relaxed)
+                .then_some("--found-order"),
+        )
+        .args(
+            ENGINE_SNAPSHOT
+                .get()
+                .into_iter()
+                .flat_map(|f| [std::ffi::OsStr::new("--snapshot"), f.as_os_str()]),
+        )
         .args(args)
         .stdout(Stdio::piped())
         .spawn()

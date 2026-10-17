@@ -31,6 +31,10 @@
 //!   capacity) keeps the listed sizes of such names, as it keeps
 //!   everything else it found. Once complete, each file's allocation goes
 //!   to a name chosen by path, not by listing order.
+//! - Folders are listed in the order found, except while the tree has a
+//!   prior scan to estimate from: then the folders whose estimates are
+//!   least to be trusted, and then the biggest, go first, so the map's
+//!   estimated areas become exact soonest (see [`listing_priority`]).
 
 use crate::adapter::{
     BATCH_ENTRIES, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
@@ -41,7 +45,7 @@ use sb_core::git::{GitRoot, Problem, RootKind as GitKind};
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -49,11 +53,53 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod links;
 
 const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// The share of the root, in millionths, an unchanged folder must have held
+/// in the prior scan for its listing to go ahead of the folders found
+/// before it (see [`listing_priority`]): 0.01 %, an area of about 130 px²
+/// on a full-screen map. Smaller folders hardly move the map, and keeping
+/// them in order of discovery keeps the queue's ordered part small.
+pub const BIG_SHARE: u32 = 100;
+
+/// Added to the priority of a folder the prior scan can't vouch for: more
+/// than any share (at most a million).
+const CHANGED: u32 = 2_000_000;
+
+/// The priority of a `.git` folder's listing: in the lane served first (see
+/// [`Queue`]), since a Git probe waits for it.
+const GIT_DIR: u32 = u32::MAX;
+
+/// Where folder `dir`, just found with modified time `modified`, is listed
+/// while the tree has a prior scan that finished at `since` (milliseconds
+/// since the Unix epoch). Measured on rescans, the map's error comes from
+/// what the prior doesn't know: folders new since (no estimate) and folders
+/// whose entries changed since (a later modified time: entries added,
+/// removed or renamed in them). So those go first, biggest first, then the
+/// unchanged folders that held at least [`BIG_SHARE`] of the root, biggest
+/// first, then the rest in order found (0). Changes inside a file don't
+/// touch its folder's time, so a file that grew in place is found in turn.
+///
+/// Modified times only order listings, never change what's found, so
+/// inexact ones only cost time: the snapshot's time is when its scan
+/// finished, so a folder changed during that scan after it was listed looks
+/// unchanged; network shares keep the server's clock; and FAT and exFAT
+/// keep local time, so after a change of time zone or daylight saving
+/// time, folders on them can look changed or unchanged by up to the shift.
+fn listing_priority(tree: &Tree, dir: NodeId, modified: Option<SystemTime>, since: u64) -> u32 {
+    let newer = modified
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|d| d.as_millis() > u128::from(since));
+    match tree.listing_priority(dir) {
+        Some(share) if !newer => share,
+        // New since, or changed since.
+        share => CHANGED.saturating_add(share.unwrap_or(0)),
+    }
+}
 
 /// How long Git probes may go without an answer once every folder is
 /// listed before the scan finishes without them (see
@@ -82,6 +128,11 @@ pub struct ScanConfig {
     /// agree can only both be stale when the file was last changed through
     /// a name outside the scan (or in a folder that couldn't be listed).
     pub exact_hard_links: bool,
+    /// While the tree has a prior scan, lists first the folders it can't
+    /// vouch for, then the ones that were big in it (see
+    /// [`listing_priority`]). On by default; off lists every folder in the
+    /// order found, as without a prior. Only the order changes.
+    pub list_by_prior: bool,
 }
 
 /// Called after the scanner releases the tree's write lock with how long it
@@ -112,6 +163,7 @@ impl Default for ScanConfig {
             write_holds: None,
             git_grace: GIT_GRACE,
             exact_hard_links: false,
+            list_by_prior: true,
         }
     }
 }
@@ -502,9 +554,21 @@ struct ListingEnd {
 
 /// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
 enum Job {
-    List { dir: NodeId, path: PathBuf },
-    Measure { file: NodeId, path: PathBuf },
-    Git { path: PathBuf, plan: Plan },
+    /// Lists folder `dir`, last modified at `modified` as its parent's
+    /// listing said (kept to order the listing by, see [`Queue::reorder`]).
+    List {
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+    },
+    Measure {
+        file: NodeId,
+        path: PathBuf,
+    },
+    Git {
+        path: PathBuf,
+        plan: Plan,
+    },
 }
 
 enum Outcome {
@@ -533,37 +597,153 @@ enum Outcome {
     Stopped { dir: NodeId },
 }
 
+/// Workers' jobs in three lanes:
+///
+/// - Git probes and listings of `.git` folders (which a probe of the folder
+///   above waits for): few, small, and wanted soon;
+/// - listings of folders a prior puts ahead (see [`listing_priority`]),
+///   highest priority first;
+/// - other listings and re-measures, in the order queued.
+///
+/// While the ordered lane has listings, the first lane is served before
+/// it; otherwise the first and last lanes are served together in the order
+/// queued. Without a prior the ordered lane stays empty, so the queue is a
+/// plain FIFO of every job.
 #[derive(Default)]
 struct Queue {
-    state: Mutex<(VecDeque<Job>, bool)>,
+    state: Mutex<Jobs>,
     ready: Condvar,
 }
 
+#[derive(Default)]
+struct Jobs {
+    /// Git probes and `.git` listings, with when each was queued.
+    soon: VecDeque<(u64, Job)>,
+    big: BinaryHeap<Big>,
+    /// Other listings, with when each was queued.
+    fifo: VecDeque<(u64, Job)>,
+    /// Jobs queued so far: the order they were queued in.
+    queued: u64,
+    closed: bool,
+}
+
+impl Jobs {
+    fn seq(&mut self) -> u64 {
+        self.queued += 1;
+        self.queued
+    }
+
+    /// Queues `job`; see [`Queue`].
+    fn put(&mut self, job: Job, priority: u32) {
+        let seq = self.seq();
+        match job {
+            Job::Git { .. } => self.soon.push_back((seq, job)),
+            // Nothing reads a re-measure before the scan ends, so it waits in turn.
+            Job::Measure { .. } => self.fifo.push_back((seq, job)),
+            Job::List { .. } if priority == GIT_DIR => self.soon.push_back((seq, job)),
+            Job::List { .. } if priority >= BIG_SHARE => self.big.push(Big { priority, seq, job }),
+            Job::List { .. } => self.fifo.push_back((seq, job)),
+        }
+    }
+
+    fn take(&mut self) -> Option<Job> {
+        let soon_first = match (self.soon.front(), self.fifo.front()) {
+            (None, _) => false,
+            _ if !self.big.is_empty() => true,
+            (Some(_), None) => true,
+            (Some((s, _)), Some((f, _))) => s < f,
+        };
+        if soon_first {
+            return self.soon.pop_front().map(|(_, job)| job);
+        }
+        if let Some(big) = self.big.pop() {
+            return Some(big.job);
+        }
+        self.fifo.pop_front().map(|(_, job)| job)
+    }
+}
+
+/// A listing ahead of the FIFO: ordered by priority, then by when queued.
+struct Big {
+    priority: u32,
+    seq: u64,
+    job: Job,
+}
+
+impl PartialEq for Big {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Big {}
+
+impl PartialOrd for Big {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Big {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then(other.seq.cmp(&self.seq))
+    }
+}
+
 impl Queue {
-    fn push(&self, job: Job) {
-        self.state.lock().unwrap().0.push_back(job);
+    /// Queues `job`: a listing with a priority of [`BIG_SHARE`] or more
+    /// goes ahead of the others (see [`Queue`]).
+    fn push(&self, job: Job, priority: u32) {
+        self.state.lock().unwrap().put(job, priority);
         self.ready.notify_one();
     }
 
     /// Next job, or `None` once closed.
     fn pop(&self) -> Option<Job> {
-        let mut state = self.state.lock().unwrap();
+        let mut jobs = self.state.lock().unwrap();
         loop {
-            if state.1 {
+            if jobs.closed {
                 return None;
             }
-            if let Some(job) = state.0.pop_front() {
+            if let Some(job) = jobs.take() {
                 return Some(job);
             }
-            state = self.ready.wait(state).unwrap();
+            jobs = self.ready.wait(jobs).unwrap();
         }
     }
 
-    fn close(&self) -> Vec<Job> {
-        let mut state = self.state.lock().unwrap();
-        state.1 = true;
+    fn close(&self) {
+        let mut jobs = self.state.lock().unwrap();
+        jobs.closed = true;
         self.ready.notify_all();
-        state.0.drain(..).collect()
+        jobs.soon.clear();
+        jobs.big.clear();
+        jobs.fifo.clear();
+    }
+
+    /// Moves the listings waiting in order found to which `priority` (of
+    /// the folder and its modified time) puts ahead (see [`Queue::push`]),
+    /// keeping their order among equals.
+    fn reorder(&self, mut priority: impl FnMut(NodeId, Option<SystemTime>) -> u32) {
+        let mut jobs = self.state.lock().unwrap();
+        let waiting = std::mem::take(&mut jobs.fifo);
+        for (seq, job) in waiting {
+            let p = match &job {
+                Job::List { dir, modified, .. } => priority(*dir, *modified),
+                _ => 0,
+            };
+            if p >= BIG_SHARE {
+                jobs.big.push(Big {
+                    priority: p,
+                    seq,
+                    job,
+                });
+            } else {
+                jobs.fifo.push_back((seq, job));
+            }
+        }
     }
 }
 
@@ -594,6 +774,8 @@ struct Aggregator<A> {
     published_revision: u64,
     last_publish: Instant,
     stop: Option<ScanState>,
+    /// Whether the listings queued so far were ordered by a prior.
+    ordered: bool,
 }
 
 impl<A: FsAdapter> Aggregator<A> {
@@ -633,6 +815,7 @@ impl<A: FsAdapter> Aggregator<A> {
             published_revision: 0,
             last_publish: now,
             stop: None,
+            ordered: false,
         }
     }
 
@@ -666,7 +849,7 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         drop(tx);
 
-        self.enqueue_list(NodeId::ROOT, self.root.clone());
+        self.enqueue_list(NodeId::ROOT, self.root.clone(), None, 0);
         self.enqueue_git(self.root.clone(), Plan::Ancestors);
         loop {
             if self.cancelled() {
@@ -748,7 +931,7 @@ impl<A: FsAdapter> Aggregator<A> {
                         Outcome::Skipped
                     } else {
                         match job {
-                            Job::List { dir, path } => {
+                            Job::List { dir, path, .. } => {
                                 // Each batch goes to the aggregator once the
                                 // next is read, so the last one travels with
                                 // the listing's end (most directories fit in
@@ -801,15 +984,28 @@ impl<A: FsAdapter> Aggregator<A> {
             .expect("spawn scan worker");
     }
 
-    fn enqueue_list(&mut self, dir: NodeId, path: PathBuf) {
+    /// Queues `dir`'s listing, ahead of others by `priority` (see
+    /// [`listing_priority`]).
+    fn enqueue_list(
+        &mut self,
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        priority: u32,
+    ) {
         self.outstanding += 1;
         self.pending_dirs += 1;
-        self.queue.push(Job::List { dir, path });
+        let job = Job::List {
+            dir,
+            path,
+            modified,
+        };
+        self.queue.push(job, priority);
     }
 
     fn enqueue_measure(&mut self, file: NodeId, path: PathBuf) {
         self.outstanding += 1;
-        self.queue.push(Job::Measure { file, path });
+        self.queue.push(Job::Measure { file, path }, 0);
     }
 
     /// Once the scan is complete, gives each hard-linked file's allocation
@@ -846,7 +1042,7 @@ impl<A: FsAdapter> Aggregator<A> {
     fn enqueue_git(&mut self, path: PathBuf, plan: Plan) {
         self.outstanding += 1;
         self.git_jobs += 1;
-        self.queue.push(Job::Git { path, plan });
+        self.queue.push(Job::Git { path, plan }, 0);
     }
 
     fn apply(&mut self, outcome: Outcome) {
@@ -977,6 +1173,20 @@ impl<A: FsAdapter> Aggregator<A> {
         let tree_lock = Arc::clone(&self.tree);
         let probe = self.config.write_holds.clone();
         let mut tree = write(&tree_lock, probe.as_ref());
+        // Listings are ordered by the prior scan only if asked to and while
+        // there is one.
+        let since = if self.config.list_by_prior {
+            tree.prior_created_ms()
+        } else {
+            None
+        };
+        // A prior handed over once the scan has begun orders the listings
+        // already queued too.
+        if let (Some(since), false) = (since, self.ordered) {
+            self.ordered = true;
+            self.queue
+                .reorder(|dir, modified| listing_priority(&tree, dir, modified, since));
+        }
         let mut unreadable = false;
         for (entry, known) in entries.into_iter().zip(known) {
             let spot = git::spot(entry.name.as_encoded_bytes(), entry.kind);
@@ -1002,7 +1212,14 @@ impl<A: FsAdapter> Aggregator<A> {
             let added = if entry.kind == EntryKind::Directory {
                 tree.add_dir(dir, &entry.name).inspect(|&id| {
                     tree.set_id(id, fingerprint(entry.id));
-                    subdirs.push((id, path.join(&entry.name)));
+                    let priority = if spot == Some(Spot::DotGit) {
+                        GIT_DIR
+                    } else {
+                        since.map_or(0, |since| {
+                            listing_priority(&tree, id, entry.modified, since)
+                        })
+                    };
+                    subdirs.push((id, path.join(&entry.name), entry.modified, priority));
                 })
             } else {
                 let sizes = FileSizes {
@@ -1055,8 +1272,8 @@ impl<A: FsAdapter> Aggregator<A> {
         if self.stop.is_some() {
             return None;
         }
-        for (id, path) in subdirs {
-            self.enqueue_list(id, path);
+        for (id, path, modified, priority) in subdirs {
+            self.enqueue_list(id, path, modified, priority);
         }
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);
@@ -1218,5 +1435,178 @@ impl<A: FsAdapter> Aggregator<A> {
         self.published_revision = self.revision;
         self.last_publish = Instant::now();
         (self.on_progress)(&progress);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(n: u32) -> Job {
+        Job::List {
+            dir: NodeId::from_index(n),
+            path: PathBuf::from(n.to_string()),
+            modified: None,
+        }
+    }
+
+    fn name(job: Job) -> String {
+        match job {
+            Job::List { path, .. } | Job::Measure { path, .. } | Job::Git { path, .. } => {
+                path.display().to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn big_listings_go_first_biggest_first_then_the_rest_in_order() {
+        let q = Queue::default();
+        q.push(list(1), 0);
+        q.push(list(2), BIG_SHARE);
+        q.push(list(3), BIG_SHARE - 1);
+        q.push(
+            Job::Git {
+                path: "probe".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        q.push(list(4), 500_000);
+        q.push(list(5), BIG_SHARE);
+        q.push(
+            Job::Measure {
+                file: NodeId::from_index(6),
+                path: "6".into(),
+            },
+            0,
+        );
+        q.push(list(7), 500_000);
+        let order: Vec<String> = (0..8).map(|_| name(q.pop().unwrap())).collect();
+        // The Git probe goes ahead of the ordered listings; those go
+        // highest first, ties to the one queued first; then the rest,
+        // re-measure included, in the order queued.
+        assert_eq!(order, ["probe", "4", "7", "2", "5", "1", "3", "6"]);
+    }
+
+    #[test]
+    fn folders_the_prior_cant_vouch_for_come_first_then_big_ones() {
+        use sb_core::prior::Prior;
+        use sb_core::size::Allocated;
+        use sb_core::snapshot::Snapshot;
+        let sizes = |n| FileSizes {
+            logical: n,
+            allocated: Allocated::known(n),
+        };
+        let mut before = Tree::new("/r");
+        for (dir, size) in [("big", 999_000), ("small", 10), ("touched", 990)] {
+            let d = before.add_dir(NodeId::ROOT, dir.as_ref()).unwrap();
+            before
+                .add_file(d, "f".as_ref(), sizes(size), None, 0)
+                .unwrap();
+            before.set_dir_state(d, DirState::Listed);
+        }
+        let empty = before.add_dir(NodeId::ROOT, "empty".as_ref()).unwrap();
+        before.set_dir_state(empty, DirState::Listed);
+        before.set_dir_state(NodeId::ROOT, DirState::Listed);
+        let since = 5_000;
+        let prior = Prior::new(Snapshot::capture(&before, since, true));
+
+        let mut t = Tree::new("/r");
+        t.set_prior(Arc::new(prior));
+        let at = |ms| Some(UNIX_EPOCH + Duration::from_millis(ms));
+        let mut order = |name: &str, modified| {
+            let d = t.add_dir(NodeId::ROOT, name.as_ref()).unwrap();
+            listing_priority(&t, d, modified, since)
+        };
+        // Shares of the million bytes the root held.
+        assert_eq!(order("big", at(since)), 999_000, "unchanged since");
+        assert_eq!(order("small", None), 10, "too small to go ahead");
+        assert_eq!(order("touched", at(since + 1)), CHANGED + 990);
+        assert_eq!(order("new", at(1)), CHANGED, "nothing to go by");
+        assert_eq!(order("empty", at(since)), 0, "unchanged and empty");
+    }
+
+    #[test]
+    fn without_priorities_the_queue_is_first_in_first_out() {
+        let q = Queue::default();
+        for n in 0..50 {
+            if n % 7 == 3 {
+                q.push(
+                    Job::Git {
+                        path: n.to_string().into(),
+                        plan: Plan::Ancestors,
+                    },
+                    0,
+                );
+            } else if n % 7 == 5 {
+                q.push(
+                    Job::Measure {
+                        file: NodeId::from_index(n),
+                        path: n.to_string().into(),
+                    },
+                    0,
+                );
+            } else {
+                q.push(list(n), 0);
+            }
+        }
+        for n in 0..50 {
+            assert_eq!(name(q.pop().unwrap()), n.to_string());
+        }
+    }
+
+    #[test]
+    fn a_git_probe_goes_ahead_of_many_ordered_listings() {
+        let q = Queue::default();
+        q.push(list(0), 0);
+        for n in 1..1_000 {
+            q.push(list(n), 500_000 + n);
+        }
+        q.push(
+            Job::Git {
+                path: "probe".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        q.push(list(1_000), GIT_DIR);
+        assert_eq!(name(q.pop().unwrap()), "probe");
+        assert_eq!(name(q.pop().unwrap()), "1000", "a .git folder's listing");
+        assert_eq!(name(q.pop().unwrap()), "999");
+        // Once the ordered listings are done, the rest go in the order
+        // queued again.
+        for _ in 1..999 {
+            q.pop().unwrap();
+        }
+        q.push(
+            Job::Git {
+                path: "later".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        assert_eq!(name(q.pop().unwrap()), "0");
+        assert_eq!(name(q.pop().unwrap()), "later");
+    }
+
+    #[test]
+    fn a_closed_queue_hands_out_nothing_more() {
+        let q = Queue::default();
+        q.push(list(1), 0);
+        q.push(list(2), 1_000);
+        q.close();
+        assert!(q.pop().is_none());
+        // Pushing after closing is harmless.
+        q.push(list(3), 1_000);
+        assert!(q.pop().is_none());
+        // A worker waiting for work wakes up and stops.
+        let idle = Arc::new(Queue::default());
+        let waiter = {
+            let idle = Arc::clone(&idle);
+            std::thread::spawn(move || idle.pop().is_none())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        idle.close();
+        assert!(waiter.join().unwrap());
     }
 }

@@ -24,6 +24,7 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Map
 - Rescanning a folder draws the map at once: folders not scanned yet take the size they had in the last saved scan, faded and hatched, until their own contents arrive. Their tooltips and details say which scan the estimate comes from; every number shown, exported, compared, or totalled is still only what this scan has found.
+- While rescanning, folders that are new or have changed since the last saved scan are listed first, then the ones that were biggest, so the estimated parts of the map are replaced by real sizes much sooner (on a folder of projects scanned 3 days earlier, the map is within 1 % of final at 0.3 s instead of near the end of the scan). The scan takes as long as before and finds the same.
 
 ## [0.3.0] - 2026-10-14
 

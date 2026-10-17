@@ -12,7 +12,10 @@
 //! exports, comparisons, searches, selections, Git summaries and deletes
 //! read the tree's measured sizes, which estimates never touch; the tree
 //! keeps the estimates in a column only the layout reads (see
-//! [`Tree::set_prior`](crate::tree::Tree::set_prior)).
+//! [`Tree::set_prior`](crate::tree::Tree::set_prior)). The scanner may also
+//! ask which waiting folders were biggest, as a share of the root, to list
+//! them first (see
+//! [`Tree::listing_priority`](crate::tree::Tree::listing_priority)).
 
 use crate::compare::ChildIndex;
 use crate::snapshot::{Snapshot, fold};
@@ -142,6 +145,30 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["layout.rs", "ranking.rs"]);
+        // The scanner's listing order: defined in tree.rs, used by no
+        // reader of sizes here, nor anywhere in the app.
+        let needle = ["listing_", "priority("].concat();
+        let order: Vec<String> = readers(needle.clone())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(order, ["tree.rs"]);
+        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
+        let mut dirs = vec![app];
+        let mut files = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(!text.contains(&needle), "{}", path.display());
+                }
+            }
+        }
+        assert!(files > 0, "the app's sources were found");
     }
 
     #[test]

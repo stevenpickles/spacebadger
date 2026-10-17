@@ -68,6 +68,10 @@ pub struct FakeFs {
     read_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
     /// Every path given to `read_small` or `stat_kind`, in order.
     reads: Arc<Mutex<Vec<PathBuf>>>,
+    /// Every folder given to `read_dir`, in order.
+    listings: Arc<Mutex<Vec<PathBuf>>>,
+    /// Folders' modified times, as their parents' listings give them.
+    dir_modified: Arc<Mutex<BTreeMap<PathBuf, SystemTime>>>,
     style: Arc<Mutex<Option<Style>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
@@ -285,12 +289,16 @@ impl FakeFs {
         gate
     }
 
-    /// Sets the modified time of the file at `path`, added earlier.
+    /// Sets the modified time of the file or folder at `path`, added
+    /// earlier.
     pub fn set_modified(&self, path: &str, time: SystemTime) -> &Self {
-        if let Some(Node::File { modified, .. }) =
-            self.nodes.lock().unwrap().get_mut(&Self::abs(path))
-        {
-            *modified = Some(time);
+        let abs = Self::abs(path);
+        match self.nodes.lock().unwrap().get_mut(&abs) {
+            Some(Node::File { modified, .. }) => *modified = Some(time),
+            Some(Node::Dir) => {
+                self.dir_modified.lock().unwrap().insert(abs, time);
+            }
+            _ => {}
         }
         self
     }
@@ -413,6 +421,11 @@ impl FakeFs {
         self.reads.lock().unwrap().clone()
     }
 
+    /// Every folder whose listing was started so far, in order.
+    pub fn listings(&self) -> Vec<PathBuf> {
+        self.listings.lock().unwrap().clone()
+    }
+
     pub fn set_root_kind(&self, kind: RootKind) -> &Self {
         *self.root_kind.lock().unwrap() = Some(kind);
         self
@@ -437,6 +450,7 @@ impl FsAdapter for FakeFs {
     }
 
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        self.listings.lock().unwrap().push(dir.to_path_buf());
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
             gate.wait();
@@ -560,6 +574,7 @@ impl FakeFs {
     /// The direct children of `dir` in name order.
     fn entries(&self, dir: &Path) -> Vec<Entry> {
         let nodes = self.nodes.lock().unwrap();
+        let dir_modified = self.dir_modified.lock().unwrap();
         nodes
             .iter()
             .filter(|(p, _)| p.parent() == Some(dir))
@@ -574,7 +589,7 @@ impl FakeFs {
                         identity: Identity::Unique,
                         id: 0,
                         cloud: false,
-                        modified: None,
+                        modified: dir_modified.get(p).copied(),
                         stamp: None,
                     },
                     Node::File {
