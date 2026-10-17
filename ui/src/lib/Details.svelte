@@ -274,7 +274,13 @@
         <dd>{d.files.toLocaleString()}</dd>
       {/if}
       <dt>Status</dt>
-      <dd>{folderStates[d.folder]}</dd>
+      <dd>
+        {#if d.folder === "listed" && d.estimatedFrom !== null}
+          Listed; folders inside still being scanned
+        {:else}
+          {folderStates[d.folder]}
+        {/if}
+      </dd>
     {/if}
   </dl>
   {#if d.estimatedFrom !== null}
