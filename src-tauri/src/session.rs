@@ -3,6 +3,7 @@
 
 mod export;
 mod filter;
+mod git;
 
 use crate::delete::{self, Outcome, Scanned, Target};
 use crate::duplicates::{self, Job};
@@ -66,7 +67,8 @@ type StatusSink = Arc<dyn Fn(proto::ScanStatus) + Send + Sync>;
 // while scanning read-locks the tree first and only tries the search's
 // write lock, so it never waits holding either; when requests keep it off,
 // it waits for the search's write lock, then the tree, in request order
-// (see `filter`).
+// (see `filter`). `git_roots` read-locks the search and then the tree, and
+// takes nothing else.
 pub struct Session {
     pub root: PathBuf,
     pub scan: Scan,
@@ -340,10 +342,10 @@ impl Session {
                 depth: r.depth,
                 kind: r.kind as u8,
                 flags: r.flags,
-                file_type: if r.kind == RectKind::File {
-                    FileType::of(tree.name(r.node), tree.logical(r.node)) as u8
-                } else {
-                    0
+                file_type: match r.kind {
+                    RectKind::File => FileType::of(tree.name(r.node), tree.logical(r.node)) as u8,
+                    RectKind::Folder => git::badge(&tree, r.node),
+                    RectKind::OtherSmall => 0,
                 },
                 parent: r.parent(&tree).index() as u32,
             });
@@ -883,7 +885,7 @@ impl Session {
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
-            git: None,
+            git: git::details(&tree, n),
         })
     }
 
