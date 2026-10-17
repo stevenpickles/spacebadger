@@ -21,15 +21,15 @@
 
 use crate::adapter::{
     Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io,
+    batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
@@ -47,7 +47,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
     FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
     GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -394,6 +395,8 @@ fn filetime(ticks: i64) -> Option<SystemTime> {
 pub struct WindowsFs {
     /// Set once the extended class is found unsupported on this volume.
     use_both_dir_info: AtomicBool,
+    /// Per drive letter: 0 not asked yet, 1 local, 2 not.
+    local_drives: Mutex<[u8; 26]>,
 }
 
 impl WindowsFs {
@@ -573,6 +576,101 @@ impl FsAdapter for WindowsFs {
             allocated: Some(standard.AllocationSize as u64),
         })
     }
+
+    /// Checked first with an attributes-only open, as finding duplicates
+    /// does, so a link, a cloud file or a file behind another filter is
+    /// refused before anything opens its data; the open that reads uses
+    /// `OPEN_NO_RECALL` (and `OPEN_REPARSE_POINT` but for a WOF-compressed
+    /// file) and must be the same file.
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        // Backup semantics so a folder or junction opens too, to be refused
+        // for what it is.
+        let probe = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
+        let compressed = small_readable(&probe)?;
+        let id = file_id(&probe);
+        drop(probe);
+        let mut flags = FILE_FLAG_OPEN_NO_RECALL
+            | FILE_FLAG_SEQUENTIAL_SCAN
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION;
+        if !compressed {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags)
+            .map_err(scan_error)?;
+        if let (Some(before), Some(now)) = (id, file_id(&handle))
+            && before != now
+        {
+            return Err(ScanError::new(ErrorKind::Vanished, "replaced while read"));
+        }
+        small_readable(&handle)?;
+        read_capped(std::fs::File::from(handle), cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let handle = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
+        let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(&handle, FileAttributeTagInfo)?;
+        Ok(classify(tag_info.FileAttributes, tag_info.ReparseTag))
+    }
+
+    /// A fixed or RAM disk, by `GetDriveTypeW`, asked once per drive.
+    fn local_drive(&self, letter: u8) -> bool {
+        if !letter.is_ascii_uppercase() {
+            return false;
+        }
+        let slot = usize::from(letter - b'A');
+        let mut known = self.local_drives.lock().unwrap();
+        if known[slot] == 0 {
+            let root: Vec<u16> = format!("{}:\\", char::from(letter))
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            const DRIVE_FIXED: u32 = 3;
+            const DRIVE_RAMDISK: u32 = 6;
+            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            known[slot] = if matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK) {
+                1
+            } else {
+                2
+            };
+        }
+        known[slot] == 1
+    }
+}
+
+/// Opens Git metadata for its attributes as [`open`] does, allowing a
+/// server only to identify us, not to impersonate us. That doesn't stop
+/// SMB from authenticating (and so sending a credential hash) if a path
+/// reaches a server; what keeps metadata reads off other computers is the
+/// target policy in `crate::git::reachable`.
+fn open_metadata(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
+    open_with(
+        path,
+        access,
+        FILE_FLAG_BACKUP_SEMANTICS
+            | FILE_FLAG_OPEN_REPARSE_POINT
+            | FILE_FLAG_OPEN_NO_RECALL
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION,
+    )
+    .map_err(scan_error)
+}
+
+/// Whether [`FsAdapter::read_small`] may read a handle's file, as
+/// [`readable`] decides: `Ok(true)` for a WOF-compressed file.
+fn small_readable(handle: &OwnedHandle) -> Result<bool, ScanError> {
+    let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo)?;
+    let (attributes, reparse_tag) = (tag_info.FileAttributes, tag_info.ReparseTag);
+    readable(attributes, reparse_tag).map_err(|skip| {
+        let why = match (skip, classify(attributes, reparse_tag)) {
+            (Skip::Cloud, _) => refused::CLOUD,
+            (_, EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse) => {
+                refused::LINK
+            }
+            _ => refused::NOT_FILE,
+        };
+        ScanError::new(ErrorKind::Unavailable, why)
+    })
 }
 
 /// Enables `SeBackupPrivilege` when this process already holds it (it was

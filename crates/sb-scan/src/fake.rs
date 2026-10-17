@@ -2,7 +2,9 @@
 
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
+    read_capped, refused,
 };
+use sb_core::git::paths::Style;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,9 @@ enum Node {
         identity: Identity,
         cloud: bool,
         modified: Option<SystemTime>,
+        /// What [FsAdapter::read_small] returns; zeros of the logical size
+        /// when not given.
+        contents: Option<Arc<[u8]>>,
     },
     Other(EntryKind),
 }
@@ -51,6 +56,11 @@ pub struct FakeFs {
     /// Listings that block after this many entries.
     late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
+    read_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
+    read_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Every path given to `read_small` or `stat_kind`, in order.
+    reads: Arc<Mutex<Vec<PathBuf>>>,
+    style: Arc<Mutex<Option<Style>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
 
@@ -103,7 +113,11 @@ impl FakeFs {
     }
 
     fn insert(&self, path: &str, node: Node) -> &Self {
-        let abs = Self::abs(path);
+        self.insert_abs(Self::abs(path), node)
+    }
+
+    /// Adds `node` at `abs` with any missing folders above it.
+    fn insert_abs(&self, abs: PathBuf, node: Node) -> &Self {
         let mut nodes = self.nodes.lock().unwrap();
         let mut ancestor = abs.parent();
         while let Some(a) = ancestor {
@@ -130,6 +144,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                contents: None,
             },
         )
     }
@@ -143,6 +158,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                contents: None,
             },
         )
     }
@@ -156,6 +172,7 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: true,
                 modified: None,
+                contents: None,
             },
         )
     }
@@ -170,8 +187,63 @@ impl FakeFs {
                 identity: Identity::MaybeShared { key },
                 cloud: false,
                 modified: None,
+                contents: None,
             },
         )
+    }
+
+    /// A small file holding `text`, which [`FsAdapter::read_small`] returns;
+    /// its size is the text's.
+    pub fn text(&self, path: &str, text: &str) -> &Self {
+        self.insert_abs(Self::abs(path), Self::text_node(text))
+    }
+
+    /// A file holding `text` at the absolute `path` outside [`FakeFs::ROOT`]:
+    /// something a scan may read (a Git directory elsewhere) but never lists.
+    pub fn outside_text(&self, path: &str, text: &str) -> &Self {
+        self.insert_abs(PathBuf::from(path), Self::text_node(text))
+    }
+
+    /// An entry of `kind` (a link, say) at the absolute `path` outside
+    /// [`FakeFs::ROOT`].
+    pub fn outside_other(&self, path: &str, kind: EntryKind) -> &Self {
+        self.insert_abs(PathBuf::from(path), Node::Other(kind))
+    }
+
+    /// A folder at the absolute `path` outside [`FakeFs::ROOT`].
+    pub fn outside_dir(&self, path: &str) -> &Self {
+        self.insert_abs(PathBuf::from(path), Node::Dir)
+    }
+
+    fn text_node(text: &str) -> Node {
+        Node::File {
+            logical: text.len() as u64,
+            allocated: Some(text.len() as u64),
+            identity: Identity::Unique,
+            cloud: false,
+            modified: None,
+            contents: Some(Arc::from(text.as_bytes())),
+        }
+    }
+
+    /// Makes [`FsAdapter::read_small`] of `path` fail as access denied.
+    pub fn deny_read(&self, path: &str) -> &Self {
+        self.read_errors.lock().unwrap().insert(
+            Self::abs(path),
+            ScanError::new(ErrorKind::PermissionDenied, "access denied"),
+        );
+        self
+    }
+
+    /// Makes [`FsAdapter::read_small`] of `path` block until the returned
+    /// gate is released or dropped.
+    pub fn gate_read(&self, path: &str) -> Gate {
+        let (gate, receiver) = Gate::new();
+        self.read_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), receiver);
+        gate
     }
 
     /// Sets the modified time of the file at `path`, added earlier.
@@ -244,6 +316,18 @@ impl FakeFs {
         self
     }
 
+    /// Sets how paths in Git metadata read (by default as on this platform).
+    pub fn set_path_style(&self, style: Style) -> &Self {
+        *self.style.lock().unwrap() = Some(style);
+        self
+    }
+
+    /// Every path [`FsAdapter::read_small`] or [`FsAdapter::stat_kind`]
+    /// was asked about so far, in order.
+    pub fn reads(&self) -> Vec<PathBuf> {
+        self.reads.lock().unwrap().clone()
+    }
+
     pub fn set_root_kind(&self, kind: RootKind) -> &Self {
         *self.root_kind.lock().unwrap() = Some(kind);
         self
@@ -312,6 +396,55 @@ impl FsAdapter for FakeFs {
             _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
         }
     }
+
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
+        let gate = self.read_gates.lock().unwrap().get(path).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+        if let Some(err) = self.read_errors.lock().unwrap().get(path) {
+            return Err(err.clone());
+        }
+        let unavailable = |why| Err(ScanError::new(ErrorKind::Unavailable, why));
+        match self.nodes.lock().unwrap().get(path) {
+            Some(Node::File { cloud: true, .. }) => unavailable(refused::CLOUD),
+            Some(Node::File {
+                logical, contents, ..
+            }) => {
+                let bytes = match contents {
+                    Some(bytes) => bytes.to_vec(),
+                    None => vec![0; (*logical).min(cap as u64 + 1) as usize],
+                };
+                read_capped(bytes.as_slice(), cap)
+            }
+            Some(Node::Other(
+                EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse,
+            )) => unavailable(refused::LINK),
+            Some(Node::Other(EntryKind::Failed(kind))) => Err(ScanError::new(*kind, "injected")),
+            Some(_) => unavailable(refused::NOT_FILE),
+            None => Err(ScanError::new(ErrorKind::Vanished, "no such file")),
+        }
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
+        match self.nodes.lock().unwrap().get(path) {
+            Some(Node::Dir) => Ok(EntryKind::Directory),
+            Some(Node::File { .. }) => Ok(EntryKind::File),
+            Some(Node::Other(kind)) => Ok(*kind),
+            None => Err(ScanError::new(ErrorKind::Vanished, "no such file")),
+        }
+    }
+
+    fn path_style(&self) -> Style {
+        self.style.lock().unwrap().unwrap_or_else(Style::native)
+    }
+
+    /// Every drive is a local disk.
+    fn local_drive(&self, _letter: u8) -> bool {
+        true
+    }
 }
 
 impl FakeFs {
@@ -340,6 +473,7 @@ impl FakeFs {
                         identity,
                         cloud,
                         modified,
+                        ..
                     } => Entry {
                         name,
                         kind: EntryKind::File,

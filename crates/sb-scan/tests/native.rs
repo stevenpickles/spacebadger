@@ -1,8 +1,10 @@
 //! Scans real temporary directories with the platform's native adapter.
 
+use sb_core::git::{GitClass, Problem, RootKind as GitKind};
 use sb_core::tree::{NodeId, Tree, flags};
 use sb_scan::{
-    BATCH_ENTRIES, FsAdapter, NativeFs, OmissionReason, Progress, Scan, ScanConfig, ScanState,
+    BATCH_ENTRIES, EntryKind, ErrorKind, FsAdapter, NativeFs, OmissionReason, Progress, Scan,
+    ScanConfig, ScanState, refused,
 };
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -270,6 +272,135 @@ fn wide_folders_are_listed_in_bounded_batches() {
     assert_eq!(batches, 1, "a listing stops when asked");
 }
 
+#[test]
+fn reads_small_files_only_when_plain_and_never_through_links() {
+    let tmp = TempDir::new("readsmall");
+    let head = tmp.0.join("HEAD");
+    std::fs::write(&head, b"ref: refs/heads/main\n").unwrap();
+    write(&tmp.0.join("big"), 5000);
+    std::fs::create_dir(tmp.0.join("folder")).unwrap();
+    let fs = NativeFs::new();
+    fs.open_root(&tmp.0).unwrap();
+
+    assert_eq!(
+        fs.read_small(&head, 4096).unwrap(),
+        b"ref: refs/heads/main\n"
+    );
+    let too_large = fs.read_small(&tmp.0.join("big"), 4096).unwrap_err();
+    assert_eq!(too_large.message, refused::TOO_LARGE);
+    assert_eq!(fs.read_small(&tmp.0.join("big"), 5000).unwrap().len(), 5000);
+    assert_eq!(
+        fs.read_small(&tmp.0.join("gone"), 4096).unwrap_err().kind,
+        ErrorKind::Vanished
+    );
+    assert_eq!(
+        fs.read_small(&tmp.0.join("folder"), 4096)
+            .unwrap_err()
+            .message,
+        refused::NOT_FILE
+    );
+    assert_eq!(fs.stat_kind(&head).unwrap(), EntryKind::File);
+    assert_eq!(
+        fs.stat_kind(&tmp.0.join("folder")).unwrap(),
+        EntryKind::Directory
+    );
+
+    make_dir_link(&tmp.0.join("dir-link"), &tmp.0.join("folder"));
+    let err = fs.read_small(&tmp.0.join("dir-link"), 4096).unwrap_err();
+    assert_eq!(err.message, refused::LINK, "{err:?}");
+    assert!(matches!(
+        fs.stat_kind(&tmp.0.join("dir-link")).unwrap(),
+        EntryKind::Symlink | EntryKind::MountPoint
+    ));
+
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&head, tmp.0.join("file-link"));
+    // Making a symbolic link needs a privilege or developer mode.
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&head, tmp.0.join("file-link"));
+    match linked {
+        Ok(()) => {
+            let err = fs.read_small(&tmp.0.join("file-link"), 4096).unwrap_err();
+            assert_eq!(err.message, refused::LINK, "{err:?}");
+            assert_eq!(
+                fs.stat_kind(&tmp.0.join("file-link")).unwrap(),
+                EntryKind::Symlink
+            );
+        }
+        Err(err) => eprintln!("skipped file symlink: {err}"),
+    }
+
+    // A FIFO named HEAD is refused without waiting for a writer.
+    #[cfg(unix)]
+    {
+        let fifo = tmp.0.join("fifo/HEAD");
+        std::fs::create_dir(tmp.0.join("fifo")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let err = fs.read_small(&fifo, 4096).unwrap_err();
+        assert_eq!(err.message, refused::NOT_FILE, "{err:?}");
+        assert_eq!(fs.stat_kind(&fifo).unwrap(), EntryKind::Special);
+    }
+}
+
+#[test]
+fn finds_repositories_written_by_hand() {
+    let tmp = TempDir::new("git");
+    let root = tmp.0.join("root");
+    let git = root.join("main/.git");
+    write(&root.join("main/src/a.rs"), 10);
+    std::fs::create_dir_all(git.join("objects/pack")).unwrap();
+    std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+    std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::write(git.join("config"), b"[core]\n\tbare = false\n").unwrap();
+    let admin = git.join("worktrees/wt");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::write(admin.join("HEAD"), b"ref: refs/heads/topic\n").unwrap();
+    std::fs::write(admin.join("commondir"), b"../..\n").unwrap();
+    let wt = root.join("wt");
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", wt.join(".git").display()),
+    )
+    .unwrap();
+    write(&wt.join("b.rs"), 10);
+    std::fs::write(wt.join(".git"), b"gitdir: ../main/.git/worktrees/wt\r\n").unwrap();
+
+    let (progress, tree) = scan(&root);
+    let tree = tree.read().unwrap();
+    assert_eq!(progress.state, ScanState::Complete, "{progress:?}");
+    assert_eq!(progress.git_roots, 2);
+    let kind = |p: &str| tree.git_entry(find(&tree, p)).map(|r| r.kind);
+    assert_eq!(kind("main"), Some(GitKind::Repository));
+    assert_eq!(kind("wt"), Some(GitKind::LinkedWorktree));
+    assert_eq!(kind("main/.git/worktrees/wt"), Some(GitKind::WorktreeAdmin));
+    let wt_entry = tree.git_entry(find(&tree, "wt")).unwrap();
+    assert_eq!(wt_entry.recorded_at, None, "{wt_entry:?}");
+    assert_eq!(tree.git_class(find(&tree, "wt/b.rs")), GitClass::Worktree);
+}
+
+#[test]
+fn never_reads_metadata_through_a_link_in_its_path() {
+    let tmp = TempDir::new("gitlink");
+    let real = tmp.0.join("elsewhere/real.git");
+    std::fs::create_dir_all(real.join("objects")).unwrap();
+    std::fs::create_dir_all(real.join("refs")).unwrap();
+    std::fs::write(real.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let root = tmp.0.join("root");
+    write(&root.join("wt/a.txt"), 1);
+    std::fs::write(root.join("wt/.git"), b"gitdir: ../lnk/real.git\n").unwrap();
+    make_dir_link(&root.join("lnk"), &tmp.0.join("elsewhere"));
+
+    let (_, tree) = scan(&root);
+    let tree = tree.read().unwrap();
+    let wt = tree.git_entry(find(&tree, "wt")).expect("an entry");
+    assert_eq!(wt.problem, Some(Problem::NotRead), "{wt:?}");
+}
 #[test]
 fn records_an_id_for_every_file_and_folder() {
     let tmp = TempDir::new("ids");

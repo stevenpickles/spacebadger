@@ -6,13 +6,15 @@ pub mod adapter;
 pub mod duplicates;
 pub mod engine;
 pub mod fake;
+pub mod git;
 pub mod native;
 
 pub use adapter::{
     BATCH_ENTRIES, Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
-    ScanError, Sink, batched,
+    ScanError, Sink, batched, read_capped, refused,
 };
 pub use engine::{
-    HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
+    GIT_GRACE, HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig,
+    ScanState,
 };
 pub use native::NativeFs;
