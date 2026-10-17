@@ -88,7 +88,6 @@ pub enum Listing {
     Readdir,
     /// `getattrlistbulk` even on filesystems it doesn't match `readdir` on;
     /// for tests that record how. Never use it to scan.
-    #[doc(hidden)]
     BulkOnAnyVolume,
 }
 
