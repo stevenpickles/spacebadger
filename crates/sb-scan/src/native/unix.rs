@@ -1,10 +1,20 @@
 //! Portable Unix adapter (macOS and other non-Linux Unix).
 //!
-//! **Unvalidated on macOS.** It compiles in CI, but no probes have run on a
-//! real Mac. Known gaps, tracked in `docs/PLAN.md`:
-//! - Uses `readdir` + `lstat` rather than `getattrlistbulk`.
-//! - Mount boundaries use the device ID only. Scanning `/` on macOS will treat
-//!   firmlinked data-volume folders as other filesystems.
+//! **Unvalidated on a real Mac.** It is built and tested on CI's macOS
+//! runners only. Known gaps, tracked in `docs/PLAN.md`:
+//! - Mount boundaries use the device ID only. Scanning `/` on macOS treats
+//!   firmlinked data-volume folders (`/Users`, `/Applications`, ...) as other
+//!   filesystems and skips them as mount points. Both listings below keep
+//!   that policy: the bulk listing hands firmlinks to `lstat`.
+//!
+//! On macOS directories are listed with `getattrlistbulk` (see `bulk`), which
+//! returns the metadata of a 64 KiB buffer of entries in one call, instead of
+//! `readdir` plus an `lstat` per entry. The results are the same (a test
+//! compares them). Entries the bulk call can't describe exactly as `lstat`
+//! does (firmlinks, mount points, autofs triggers, missing attributes) are
+//! `lstat`ed, and a filesystem that refuses the call (`ENOTSUP`, `EINVAL`) is
+//! listed with `readdir`. Setting `SB_MACOS_LISTING=readdir` forces the
+//! `readdir` listing, for comparison. Neither listing opens a file.
 //!
 //! On macOS the process I/O policy is set so dataless (cloud-only) files are
 //! never materialized by this process, and `SF_DATALESS` marks cloud files.
@@ -15,10 +25,14 @@ use crate::adapter::{
 };
 use crate::duplicates::{Fingerprint, Skip};
 use sb_core::tree::{birth_secs, unix_object_id};
+use std::ffi::OsString;
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::OnceLock;
+
+#[cfg(target_os = "macos")]
+mod bulk;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -56,15 +70,62 @@ mod macos {
     }
 }
 
+/// How the adapter lists a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// `getattrlistbulk` on macOS, falling back to `readdir` where the
+    /// filesystem refuses it; `readdir` elsewhere.
+    Bulk,
+    /// `readdir` and an `lstat` per entry.
+    Readdir,
+}
+
+impl Listing {
+    /// `Readdir` when `SB_MACOS_LISTING` is `readdir`, otherwise `Bulk`.
+    pub fn from_env() -> Self {
+        match std::env::var_os("SB_MACOS_LISTING") {
+            Some(v) if v == "readdir" => Self::Readdir,
+            _ => Self::Bulk,
+        }
+    }
+}
+
+/// Folders listed with `readdir` because the filesystem refused
+/// `getattrlistbulk`, in this process.
+#[cfg(target_os = "macos")]
+static READDIR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many folders this process listed with `readdir` because the
+/// filesystem refused `getattrlistbulk`; for tests.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn readdir_fallbacks() -> u64 {
+    READDIR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Portable Unix adapter. Create one per scan.
-#[derive(Default)]
 pub struct UnixFs {
     root_dev: OnceLock<u64>,
+    listing: Listing,
+}
+
+impl Default for UnixFs {
+    fn default() -> Self {
+        Self::with_listing(Listing::from_env())
+    }
 }
 
 impl UnixFs {
+    /// An adapter listing as `SB_MACOS_LISTING` says ([`Listing::from_env`]).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_listing(listing: Listing) -> Self {
+        Self {
+            root_dev: OnceLock::new(),
+            listing,
+        }
     }
 }
 
@@ -96,7 +157,24 @@ impl FsAdapter for UnixFs {
     }
 
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
-        batched(sink, |out| self.list(dir, out))
+        let root_dev = *self
+            .root_dev
+            .get()
+            .expect("open_root must run before read_dir");
+        batched(sink, |out| {
+            #[cfg(target_os = "macos")]
+            if self.listing == Listing::Bulk {
+                match bulk::list(dir, root_dev, out)? {
+                    bulk::Listed::Done => return Ok(()),
+                    bulk::Listed::Unsupported => {
+                        READDIR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = self.listing;
+            self.list(dir, root_dev, out)
+        })
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
@@ -166,69 +244,68 @@ impl FsAdapter for UnixFs {
 impl UnixFs {
     /// Reads `dir`, `lstat`ing each entry and passing it on at once; stops
     /// early when the batcher says so.
-    fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
-        let root_dev = *self
-            .root_dev
-            .get()
-            .expect("open_root must run before read_dir");
+    fn list(&self, dir: &Path, root_dev: u64, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         for item in std::fs::read_dir(dir)? {
             let item = item?;
-            let name = item.file_name();
-            let meta = match std::fs::symlink_metadata(item.path()) {
-                Ok(meta) => meta,
-                Err(err) => {
-                    let failed = Entry {
-                        name,
-                        kind: EntryKind::Failed(ScanError::from(err).kind),
-                        logical: 0,
-                        allocated: None,
-                        identity: Identity::Unavailable,
-                        id: 0,
-                        cloud: false,
-                        modified: None,
-                    };
-                    if out.push(failed).is_break() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-            let file_type = meta.file_type();
-            let kind = if file_type.is_symlink() {
-                EntryKind::Symlink
-            } else if file_type.is_dir() {
-                if meta.dev() == root_dev {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::MountPoint
-                }
-            } else if file_type.is_file() {
-                EntryKind::File
-            } else {
-                EntryKind::Special
-            };
-            let entry = Entry {
-                name,
-                kind,
-                logical: meta.size(),
-                allocated: Some(meta.blocks().saturating_mul(512)),
-                identity: if meta.nlink() > 1 {
-                    Identity::MaybeShared {
-                        key: (u128::from(meta.dev()) << 64) | u128::from(meta.ino()),
-                    }
-                } else {
-                    Identity::Unique
-                },
-                // The device is the scan's, checked at delete time.
-                id: unix_object_id(meta.ino(), birth_secs(&meta)),
-                cloud: is_cloud(&meta),
-                modified: meta.modified().ok(),
-            };
-            if out.push(entry).is_break() {
+            if out
+                .push(lstat_entry(&item.path(), item.file_name(), root_dev))
+                .is_break()
+            {
                 return Ok(());
             }
         }
         Ok(())
+    }
+}
+
+/// The entry for `path` (named `name` in its folder) from `lstat`: a
+/// directory on another device than `root_dev` is a mount point.
+fn lstat_entry(path: &Path, name: OsString, root_dev: u64) -> Entry {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return Entry {
+                name,
+                kind: EntryKind::Failed(ScanError::from(err).kind),
+                logical: 0,
+                allocated: None,
+                identity: Identity::Unavailable,
+                id: 0,
+                cloud: false,
+                modified: None,
+            };
+        }
+    };
+    let file_type = meta.file_type();
+    let kind = if file_type.is_symlink() {
+        EntryKind::Symlink
+    } else if file_type.is_dir() {
+        if meta.dev() == root_dev {
+            EntryKind::Directory
+        } else {
+            EntryKind::MountPoint
+        }
+    } else if file_type.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Special
+    };
+    Entry {
+        name,
+        kind,
+        logical: meta.size(),
+        allocated: Some(meta.blocks().saturating_mul(512)),
+        identity: if meta.nlink() > 1 {
+            Identity::MaybeShared {
+                key: (u128::from(meta.dev()) << 64) | u128::from(meta.ino()),
+            }
+        } else {
+            Identity::Unique
+        },
+        // The device is the scan's, checked at delete time.
+        id: unix_object_id(meta.ino(), birth_secs(&meta)),
+        cloud: is_cloud(&meta),
+        modified: meta.modified().ok(),
     }
 }
 
