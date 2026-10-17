@@ -110,13 +110,17 @@ fn scan(
     };
     let scan = Scan::start(root.to_path_buf(), NativeFs::new(), config, |_| {});
     let tree = scan.tree();
-    if let Some(prior) = prior {
-        std::thread::sleep(prior_after);
-        tree.write().unwrap().set_prior(prior);
-    }
+    // Handed over once due, between the layouts, as the app's reader
+    // thread does.
+    let mut prior = prior;
     let mut next = started;
     while !scan.progress().state.is_finished() {
         let now = Instant::now();
+        if now - started >= prior_after
+            && let Some(prior) = prior.take()
+        {
+            tree.write().unwrap().set_prior(prior);
+        }
         if now >= next {
             tick(&tree.read().unwrap(), now - started);
             next += TICK;
