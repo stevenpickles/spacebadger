@@ -9,7 +9,9 @@
 //! Every class needs a valid `HEAD` plus structure (`objects` and `refs`
 //! folders, or a `commondir`); a folder merely named `.git`, `worktrees` or
 //! `.codex` is never taken for a repository. Git directories outside the
-//! scan are only read, never listed or counted.
+//! scan are only read, never listed or counted, and only on a local disk
+//! (see [`reachable`]): a crafted `.git` file can't make the scan open a
+//! share on another computer or a device.
 
 use crate::adapter::{EntryKind, ErrorKind, FsAdapter, ScanError, refused};
 use sb_core::git::paths::{self, Style};
@@ -159,10 +161,18 @@ impl Finding {
     }
 }
 
+/// Where a probe runs: the scan's root and how metadata paths read.
+#[derive(Debug, Clone)]
+pub struct Scope {
+    pub root: PathBuf,
+    pub style: Style,
+}
+
 /// Confirms the candidate at `path` (the folder for [`Plan::AdminDir`] and
 /// [`Plan::Ancestors`], the `.git` file for [`Plan::Pointer`]). All its I/O
-/// goes through `fs`; `style` says how to read paths found in metadata.
-pub fn probe<A: FsAdapter + ?Sized>(fs: &A, path: &Path, plan: &Plan, style: Style) -> Finding {
+/// goes through `fs`.
+pub fn probe<A: FsAdapter + ?Sized>(fs: &A, path: &Path, plan: &Plan, scope: &Scope) -> Finding {
+    let style = scope.style;
     match *plan {
         Plan::AdminDir {
             dir,
@@ -171,10 +181,7 @@ pub fn probe<A: FsAdapter + ?Sized>(fs: &A, path: &Path, plan: &Plan, style: Sty
             signals,
         } => admin_dir(fs, path, dir, dotgit, owner, signals, style),
         Plan::Pointer { file, dir } => {
-            let Some(folder) = path.parent() else {
-                return Finding::default();
-            };
-            let root = pointer(fs, folder, dir, style);
+            let root = pointer(fs, path, dir, scope);
             let mut roots = Vec::with_capacity(2);
             // The `.git` file is metadata once its repository is known.
             if root.kind != RootKind::Unresolved {
@@ -188,7 +195,7 @@ pub fn probe<A: FsAdapter + ?Sized>(fs: &A, path: &Path, plan: &Plan, style: Sty
         }
         Plan::Ancestors => Finding {
             roots: Vec::new(),
-            above: ancestors(fs, path, style),
+            above: ancestors(fs, path, scope),
         },
     }
 }
@@ -370,22 +377,28 @@ fn in_parent_modules<A: FsAdapter + ?Sized>(fs: &A, dir: &Path) -> bool {
     })
 }
 
-/// Follows the `.git` file in `folder`, which is node `node` (the scan root
-/// for a folder above the scan): a linked worktree, submodule or separate
-/// Git directory, or unresolved with the reason.
-fn pointer<A: FsAdapter + ?Sized>(fs: &A, folder: &Path, node: NodeId, style: Style) -> GitRoot {
-    pointer_target(fs, folder, node, style).unwrap_or_else(|p| GitRoot::unresolved(node, p))
+/// Follows the `.git` file `dotgit`, whose folder is node `node` (the scan
+/// root for a folder above the scan): a linked worktree, submodule or
+/// separate Git directory, or unresolved with the reason.
+fn pointer<A: FsAdapter + ?Sized>(fs: &A, dotgit: &Path, node: NodeId, scope: &Scope) -> GitRoot {
+    pointer_target(fs, dotgit, node, scope).unwrap_or_else(|p| GitRoot::unresolved(node, p))
 }
 
 fn pointer_target<A: FsAdapter + ?Sized>(
     fs: &A,
-    folder: &Path,
+    dotgit: &Path,
     node: NodeId,
-    style: Style,
+    scope: &Scope,
 ) -> Result<GitRoot, Problem> {
-    let dotgit = folder.join(".git");
-    let bytes = fs.read_small(&dotgit, SMALL_CAP).map_err(problem)?;
+    let style = scope.style;
+    let folder = dotgit.parent().unwrap_or(dotgit);
+    let bytes = fs.read_small(dotgit, SMALL_CAP).map_err(problem)?;
     let target = paths::resolve(folder, parse_pointer(&bytes)?, style);
+    // Nothing is opened where a crafted path could send it: another
+    // computer, a device, a drive that may not answer.
+    if !reachable(fs, &scope.root, &target, style) {
+        return Err(Problem::NotRead);
+    }
     let head = match read_head(fs, &target.join("HEAD")) {
         Ok(Some(head)) => head,
         Ok(None) => return Err(Problem::Malformed("the Git directory's HEAD isn't valid")),
@@ -393,6 +406,18 @@ fn pointer_target<A: FsAdapter + ?Sized>(
         Err(err) => return Err(problem(err)),
     };
     if let Some(common) = read_path(fs, &target, "commondir", style)? {
+        if !reachable(fs, &scope.root, &common, style) {
+            return Err(Problem::NotRead);
+        }
+        // The main repository's Git directory must be one.
+        if !(is_dir(fs, &common.join("objects")) || is_dir(fs, &common.join("refs"))) {
+            return Err(match fs.stat_kind(&common) {
+                Err(err) if err.kind == ErrorKind::Vanished => Problem::TargetMissing(common),
+                _ => {
+                    Problem::Malformed("the main repository's Git directory has no objects or refs")
+                }
+            });
+        }
         // Where the worktree's Git directory says the worktree is; noted
         // only when that's elsewhere (moved, or a copy).
         let recorded_at = read_path(fs, &target, "gitdir", style)
@@ -425,6 +450,125 @@ fn pointer_target<A: FsAdapter + ?Sized>(
     })
 }
 
+/// Where a path is, by its prefix.
+#[derive(Debug, PartialEq, Eq)]
+enum Place<'a> {
+    /// `C:\…`; the letter upper case.
+    Drive(u8),
+    /// `\\server\share\…`.
+    Unc(&'a [u8], &'a [u8]),
+    /// `\\.\…`, `\\?\GLOBALROOT\…`, `\\?\Volume{…}\…` and the like.
+    Device,
+    /// From the root of no named drive (`\x`, or `/x` elsewhere than
+    /// Windows).
+    Rooted,
+    Relative,
+}
+
+/// Where the normalized path `bytes` is.
+fn place(bytes: &[u8], style: Style) -> Place<'_> {
+    if !style.windows {
+        return if bytes.starts_with(b"/") {
+            Place::Rooted
+        } else {
+            Place::Relative
+        };
+    }
+    if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\\.\") {
+        return Place::Device;
+    }
+    if let Some(rest) = bytes.strip_prefix(br"\\") {
+        let mut parts = rest.split(|&b| b == b'\\');
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        return if matches!(server, b"." | b"?") || server.is_empty() || share.is_empty() {
+            Place::Device
+        } else {
+            Place::Unc(server, share)
+        };
+    }
+    match bytes {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
+            Place::Drive(letter.to_ascii_uppercase())
+        }
+        [b'\\', ..] => Place::Rooted,
+        _ => Place::Relative,
+    }
+}
+
+/// How many names after `/` make up the folder of one mount under a folder
+/// where Linux and macOS mount other filesystems: `/mnt/x`,
+/// `/media/user/x`, `/run/user/1000/gvfs/x`.
+fn mount_of(names: &[&[u8]]) -> Option<usize> {
+    match names {
+        [b"net" | b"Network" | b"Volumes" | b"mnt", ..] => Some(2),
+        [b"media", ..] => Some(3),
+        [b"run", b"user", _, b"gvfs", ..] => Some(5),
+        _ => None,
+    }
+}
+
+/// Whether a path found in Git metadata may be read: inside the scan, or
+/// outside it but on a local disk.
+///
+/// On Windows: a drive the adapter says is a local fixed disk, the scan
+/// root's own drive, or the scan root's own share; never another share or
+/// a device path. Elsewhere: an absolute path without `..` that isn't under
+/// a mount folder (`/mnt`, `/media`, `/Volumes`, `/net`, `/Network`, gvfs),
+/// unless the scan root is under the same mount.
+pub fn reachable<A: FsAdapter + ?Sized>(fs: &A, root: &Path, target: &Path, style: Style) -> bool {
+    reachable_with(root, target, style, |d| fs.local_drive(d))
+}
+
+/// [`reachable`], asking `local_drive` about drive letters.
+pub fn reachable_with(
+    root: &Path,
+    target: &Path,
+    style: Style,
+    local_drive: impl Fn(u8) -> bool,
+) -> bool {
+    let target = paths::normalize(target, style);
+    let root = paths::normalize(root, style);
+    if paths::relative_to(&root, &target, style).is_some() {
+        return true;
+    }
+    let t = target.as_os_str().as_encoded_bytes();
+    let r = root.as_os_str().as_encoded_bytes();
+    if style.windows {
+        return match (place(t, style), place(r, style)) {
+            (Place::Unc(s, h), Place::Unc(rs, rh)) => {
+                s.eq_ignore_ascii_case(rs) && h.eq_ignore_ascii_case(rh)
+            }
+            (Place::Drive(d), Place::Drive(rd)) if d == rd => true,
+            (Place::Drive(d), _) => local_drive(d),
+            // Both on the current drive.
+            (Place::Rooted, Place::Rooted) => true,
+            _ => false,
+        };
+    }
+    if place(t, style) != Place::Rooted {
+        return false;
+    }
+    let names = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/')
+            .filter(|n| !n.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let (t, r) = (names(t), names(r));
+    if t.iter().any(|n| n == b"..") {
+        return false;
+    }
+    let refs: Vec<&[u8]> = t.iter().map(Vec::as_slice).collect();
+    match mount_of(&refs) {
+        None => true,
+        Some(len) => {
+            let mount = &t[..len.min(t.len())];
+            r.len() >= mount.len() && r[..mount.len()] == *mount
+        }
+    }
+}
+
 /// Whether a Git directory lies in a superproject's `.git/modules`.
 fn in_modules(git_dir: &Path) -> bool {
     let names: Vec<&[u8]> = git_dir
@@ -450,16 +594,16 @@ fn in_modules(git_dir: &Path) -> bool {
 fn ancestors<A: FsAdapter + ?Sized>(
     fs: &A,
     root: &Path,
-    style: Style,
+    scope: &Scope,
 ) -> Option<(PathBuf, GitRoot)> {
     root.ancestors()
         .skip(1)
         .take(ANCESTOR_LIMIT)
-        .find_map(|level| ancestor_at(fs, level, style).map(|r| (level.to_path_buf(), r)))
+        .find_map(|level| ancestor_at(fs, level, scope).map(|r| (level.to_path_buf(), r)))
 }
 
-fn ancestor_at<A: FsAdapter + ?Sized>(fs: &A, level: &Path, style: Style) -> Option<GitRoot> {
-    let node = NodeId::ROOT;
+fn ancestor_at<A: FsAdapter + ?Sized>(fs: &A, level: &Path, scope: &Scope) -> Option<GitRoot> {
+    let (node, style) = (NodeId::ROOT, scope.style);
     let named_dotgit = level
         .file_name()
         .is_some_and(|n| name_eq(n.as_encoded_bytes(), b".git"));
@@ -483,7 +627,7 @@ fn ancestor_at<A: FsAdapter + ?Sized>(fs: &A, level: &Path, style: Style) -> Opt
                 None => GitRoot::unresolved(node, Problem::NotGit),
             });
         }
-        Ok(EntryKind::File) => return Some(pointer(fs, level, node, style)),
+        Ok(EntryKind::File) => return Some(pointer(fs, &dotgit, node, scope)),
         Ok(EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse) => {
             return Some(GitRoot::unresolved(node, Problem::Link));
         }
@@ -553,6 +697,73 @@ mod tests {
         assert!(!inside_dotgit(Path::new("/r/.git")));
         assert!(!inside_dotgit(Path::new("/r/sub")));
         assert!(!inside_dotgit(Path::new("/r/.github/x")));
+    }
+
+    #[test]
+    fn metadata_on_other_computers_or_devices_is_never_reached_on_windows() {
+        let w = Style::WINDOWS;
+        // Only C: and D: are local disks.
+        let ok = |root: &str, target: &str| {
+            reachable_with(Path::new(root), Path::new(target), w, |d| {
+                matches!(d, b'C' | b'D')
+            })
+        };
+        assert!(ok(r"C:\scan", r"C:\scan\repo\.git"), "inside");
+        assert!(ok(r"C:\scan", r"C:\other\.git"), "same drive");
+        assert!(ok(r"C:\scan", r"d:\gitdirs\x"), "another local disk");
+        assert!(ok(r"C:\scan", r"\\?\D:\gitdirs\x"), "verbatim drive path");
+        assert!(!ok(r"C:\scan", r"Z:\gitdirs\x"), "a network drive");
+        assert!(ok(r"Z:\scan", r"Z:\other\x"), "the scan's own drive");
+        for remote in [
+            r"\\192.0.2.1\share\repo",
+            "//192.0.2.1/share/repo",
+            r"\\host\share",
+            r"\\?\UNC\host\share\repo",
+            r"\\.\pipe\x",
+            r"\\.\C:\x",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\x",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\x",
+            r"\\wsl.localhost\Ubuntu\home\x",
+            r"relative\x",
+        ] {
+            assert!(!ok(r"C:\scan", remote), "{remote}");
+        }
+        assert!(
+            ok(r"\\nas\share\scan", r"\\NAS\Share\other\.git"),
+            "own share"
+        );
+        assert!(!ok(r"\\nas\share\scan", r"\\nas\other\x"));
+        assert!(!ok(r"\\nas\share\scan", r"\\evil\share\x"));
+        assert!(ok(r"\fake", r"\elsewhere\x"), "both on the current drive");
+    }
+
+    #[test]
+    fn metadata_on_mounted_filesystems_is_never_reached_elsewhere() {
+        let ok = |root: &str, target: &str| {
+            reachable_with(Path::new(root), Path::new(target), Style::UNIX, |_| false)
+        };
+        assert!(ok("/home/me/scan", "/home/me/scan/repo/.git"));
+        assert!(ok("/home/me/scan", "/srv/git/repo.git"));
+        assert!(ok("/home/me/scan", "//192.0.2.1/share"), "just /192.0.2.1");
+        for mounted in [
+            "/net/host/repo.git",
+            "/Network/Servers/host/repo",
+            "/Volumes/Share/repo.git",
+            "/media/me/usb/repo.git",
+            "/mnt/nas/repo.git",
+            "/run/user/1000/gvfs/smb-share:server=x/repo",
+            "relative/x",
+            "../x",
+        ] {
+            assert!(!ok("/home/me/scan", mounted), "{mounted}");
+        }
+        assert!(
+            ok("/Volumes/Share/scan", "/Volumes/Share/other.git"),
+            "same mount"
+        );
+        assert!(!ok("/Volumes/Share/scan", "/Volumes/Other/x.git"));
+        assert!(ok("/media/me/usb/scan", "/media/me/usb/x.git"));
+        assert!(!ok("/media/me/usb/scan", "/media/me/other/x.git"));
     }
 
     #[test]

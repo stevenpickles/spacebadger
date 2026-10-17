@@ -20,19 +20,20 @@
 //!   aggregator spots candidates by name in the batches it applies, a worker
 //!   confirms each with a few small reads, and the aggregator writes what it
 //!   found into the tree as a new revision. Those jobs count as outstanding
-//!   work, so a scan completes only once they're done; a cancel leaves the
-//!   unconfirmed candidates as not checked.
+//!   work, so a scan completes only once they're done, or once they've gone
+//!   [`ScanConfig::git_grace`] without an answer after the last listing; a
+//!   cancel leaves the unconfirmed candidates as not checked.
 
 use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
-use crate::git::{self, Finding, Plan, Signals, Spot};
-use sb_core::git::paths::Style;
+use crate::git::{self, Finding, Plan, Scope, Signals, Spot};
 use sb_core::git::{GitRoot, Problem, RootKind as GitKind};
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +43,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// How long Git probes may go without an answer once every folder is
+/// listed before the scan finishes without them (see
+/// [`ScanConfig::git_grace`]).
+pub const GIT_GRACE: Duration = Duration::from_secs(5);
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -56,6 +62,10 @@ pub struct ScanConfig {
     /// Told how long each of the scanner's holds of the tree's write lock
     /// lasted, for timings; `None` costs nothing.
     pub write_holds: Option<HoldProbe>,
+    /// Once every folder is listed, how long Git probes may go without an
+    /// answer (a read stuck on a share that stopped responding) before the
+    /// scan finishes without them, leaving their candidates timed out.
+    pub git_grace: Duration,
 }
 
 /// Called after the scanner releases the tree's write lock with how long it
@@ -84,6 +94,7 @@ impl Default for ScanConfig {
             progress_interval: Duration::from_millis(150),
             sample_limit: 50,
             write_holds: None,
+            git_grace: GIT_GRACE,
         }
     }
 }
@@ -403,54 +414,66 @@ impl Drop for Written<'_> {
     }
 }
 
-/// What a directory's finished listing says about Git, given the signals its
-/// batches showed and the error if it couldn't be listed at all: a folder
-/// named `.git` without Git's layout leaves its owner unresolved, and one
-/// with the layout (any folder, outside a `.git` folder's own data, where
-/// only a linked worktree's admin folder is noted) is worth a probe.
+/// What a directory's finished listing says about Git, given what its
+/// batches showed, the listing's error if any, and whether some of it was
+/// read: a folder with a Git directory's layout is worth a probe (outside a
+/// `.git` folder's own data, where only a linked worktree's admin folder is
+/// noted), a folder named `.git` without it leaves its owner unresolved,
+/// and otherwise a `.git` file in the folder is followed.
 fn listed_git(
     tree: &mut Tree,
     dir: NodeId,
     path: &Path,
-    signals: Signals,
-    failed: Option<ScanError>,
-) -> Option<Plan> {
+    candidate: Candidate,
+    error: Option<ScanError>,
+    partial: bool,
+) -> Option<(PathBuf, Plan)> {
     let dotgit = path
         .file_name()
         .is_some_and(|n| git::name_eq(n.as_encoded_bytes(), b".git"));
-    if !dotgit && !signals.qualifies() {
-        return None;
-    }
+    let signals = candidate.signals;
     // The scan root has no owner inside the scan; the ancestor probe finds
     // the repository it belongs to.
     let owner = if dotgit { tree.parent(dir) } else { None };
-    if let Some(err) = failed {
-        if let Some(owner) = owner {
-            tree.set_git(GitRoot::unresolved(
+    if signals.qualifies() && (error.is_none() || partial) {
+        if !dotgit && git::inside_dotgit(path) && !signals.is_worktree_admin() {
+            return None;
+        }
+        // A Git directory is probed as one; a `.git` file in it is ignored.
+        return Some((
+            path.to_path_buf(),
+            Plan::AdminDir {
+                dir,
+                dotgit,
                 owner,
-                Problem::Unreadable {
+                signals,
+            },
+        ));
+    }
+    if dotgit {
+        if let Some(owner) = owner {
+            let problem = match error {
+                Some(err) => Problem::Unreadable {
                     kind: err.kind as u8,
                     message: err.message,
                 },
-            ));
+                None => Problem::NotGit,
+            };
+            tree.set_git(GitRoot::unresolved(owner, problem));
         }
         return None;
     }
-    if !signals.qualifies() {
-        if let Some(owner) = owner {
-            tree.set_git(GitRoot::unresolved(owner, Problem::NotGit));
-        }
-        return None;
-    }
-    if !dotgit && git::inside_dotgit(path) && !signals.is_worktree_admin() {
-        return None;
-    }
-    Some(Plan::AdminDir {
-        dir,
-        dotgit,
-        owner,
-        signals,
-    })
+    let (file, name) = candidate.pointer?;
+    tree.set_git(GitRoot::pending(dir));
+    Some((path.join(name), Plan::Pointer { file, dir }))
+}
+
+/// What a folder's listing has shown of Git so far.
+#[derive(Debug, Default)]
+struct Candidate {
+    signals: Signals,
+    /// A `.git` file in it, and its name as listed.
+    pointer: Option<(NodeId, OsString)>,
 }
 
 /// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
@@ -523,6 +546,8 @@ impl Queue {
 struct Aggregator<A> {
     root: PathBuf,
     adapter: Arc<A>,
+    /// What Git probes need to know of the scan.
+    scope: Arc<Scope>,
     config: ScanConfig,
     tree: Arc<RwLock<Tree>>,
     shared: Arc<Shared>,
@@ -535,8 +560,12 @@ struct Aggregator<A> {
     remeasured: HashSet<NodeId>,
     /// Directories with batches applied whose listing hasn't ended yet.
     partial: HashSet<NodeId>,
+    /// Git probes queued or running.
+    git_jobs: u64,
+    /// Since when only Git probes have been left, without an answer.
+    git_quiet_since: Option<Instant>,
     /// Git's names seen so far in directories still being listed.
-    git_signals: HashMap<NodeId, Signals>,
+    git_signals: HashMap<NodeId, Candidate>,
     omissions: Omissions,
     revision: u64,
     published_revision: u64,
@@ -554,9 +583,14 @@ impl<A: FsAdapter> Aggregator<A> {
         on_progress: Box<dyn Fn(&Progress) + Send>,
     ) -> Self {
         let now = Instant::now();
+        let scope = Arc::new(Scope {
+            root: root.clone(),
+            style: adapter.path_style(),
+        });
         Self {
             root,
             adapter,
+            scope,
             config,
             tree,
             shared,
@@ -568,6 +602,8 @@ impl<A: FsAdapter> Aggregator<A> {
             owners: HashMap::new(),
             remeasured: HashSet::new(),
             partial: HashSet::new(),
+            git_jobs: 0,
+            git_quiet_since: None,
             git_signals: HashMap::new(),
             omissions: Omissions::default(),
             revision: 0,
@@ -636,8 +672,12 @@ impl<A: FsAdapter> Aggregator<A> {
             if self.cancelled() {
                 continue;
             }
-            if self.outstanding == 0 {
+            if self.outstanding == 0 || self.git_stalled() {
                 self.queue.close();
+                if self.outstanding > 0 {
+                    // Answers that come later are dropped with the channel.
+                    self.unconfirmed(Problem::TimedOut);
+                }
                 let state = if self.omissions.total() == 0 {
                     ScanState::Complete
                 } else {
@@ -657,10 +697,22 @@ impl<A: FsAdapter> Aggregator<A> {
         }
     }
 
+    /// Whether only Git probes are left and none has answered for
+    /// [`ScanConfig::git_grace`].
+    fn git_stalled(&mut self) -> bool {
+        if self.pending_dirs > 0 || self.outstanding != self.git_jobs {
+            self.git_quiet_since = None;
+            return false;
+        }
+        let since = *self.git_quiet_since.get_or_insert_with(Instant::now);
+        since.elapsed() >= self.config.git_grace
+    }
+
     fn spawn_worker(&self, index: usize, tx: SyncSender<Outcome>) {
         let queue = Arc::clone(&self.queue);
         let adapter = Arc::clone(&self.adapter);
         let shared = Arc::clone(&self.shared);
+        let scope = Arc::clone(&self.scope);
         std::thread::Builder::new()
             .name(format!("sb-scan-worker-{index}"))
             .spawn(move || {
@@ -710,7 +762,7 @@ impl<A: FsAdapter> Aggregator<A> {
                                 result: adapter.measure_file(&path),
                             },
                             Job::Git { path, plan } => Outcome::Git {
-                                finding: git::probe(&*adapter, &path, &plan, Style::native()),
+                                finding: git::probe(&*adapter, &path, &plan, &scope),
                             },
                         }
                     };
@@ -735,6 +787,7 @@ impl<A: FsAdapter> Aggregator<A> {
 
     fn enqueue_git(&mut self, path: PathBuf, plan: Plan) {
         self.outstanding += 1;
+        self.git_jobs += 1;
         self.queue.push(Job::Git { path, plan });
     }
 
@@ -760,7 +813,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 if !entries.is_empty() {
                     self.apply_batch(dir, &path, entries);
                 }
-                let signals = self.git_signals.remove(&dir).unwrap_or_default();
+                let candidate = self.git_signals.remove(&dir).unwrap_or_default();
                 if self.stop.is_some() {
                     return;
                 }
@@ -789,14 +842,14 @@ impl<A: FsAdapter> Aggregator<A> {
                                     err.message
                                 )));
                             }
-                            failed = Some(err);
                         }
+                        failed = Some(err);
                     }
                 }
-                let probe = listed_git(&mut tree, dir, &path, signals, failed);
+                let probe = listed_git(&mut tree, dir, &path, candidate, failed, partial);
                 drop(tree);
                 self.revision += 1;
-                if let Some(plan) = probe {
+                if let Some((path, plan)) = probe {
                     self.enqueue_git(path, plan);
                 }
             }
@@ -820,6 +873,8 @@ impl<A: FsAdapter> Aggregator<A> {
                 }
             }
             Outcome::Git { finding } => {
+                self.git_jobs -= 1;
+                self.git_quiet_since = None;
                 if self.stop.is_some() || finding.is_empty() {
                     return;
                 }
@@ -865,7 +920,6 @@ impl<A: FsAdapter> Aggregator<A> {
         let probe = self.config.write_holds.clone();
         let mut tree = write(&tree_lock, probe.as_ref());
         let mut unreadable = false;
-        let mut git_probes = Vec::new();
         for (entry, known) in entries.into_iter().zip(known) {
             let spot = git::spot(entry.name.as_encoded_bytes(), entry.kind);
             let skipped = match entry.kind {
@@ -883,7 +937,7 @@ impl<A: FsAdapter> Aggregator<A> {
                     detail: None,
                 });
                 if let Some(spot) = spot {
-                    self.spotted(&mut tree, dir, spot, &entry, None, &mut git_probes);
+                    self.spotted(&mut tree, dir, path, spot, &entry, None);
                 }
                 continue;
             }
@@ -932,7 +986,7 @@ impl<A: FsAdapter> Aggregator<A> {
                 break;
             };
             if let Some(spot) = spot {
-                self.spotted(&mut tree, dir, spot, &entry, Some(added), &mut git_probes);
+                self.spotted(&mut tree, dir, path, spot, &entry, Some(added));
             }
         }
         if unreadable {
@@ -949,9 +1003,6 @@ impl<A: FsAdapter> Aggregator<A> {
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);
         }
-        for (file, dir) in git_probes {
-            self.enqueue_git(path.join(".git"), Plan::Pointer { file, dir });
-        }
     }
 
     /// Stops issuing work, marks every unlisted directory as not scanned and
@@ -965,6 +1016,14 @@ impl<A: FsAdapter> Aggregator<A> {
                 tree.set_dir_state(node, DirState::NotScanned);
             }
         }
+        drop(tree);
+        self.unconfirmed(Problem::NotChecked);
+    }
+
+    /// Leaves every Git candidate not yet confirmed unresolved with
+    /// `problem`.
+    fn unconfirmed(&mut self, problem: Problem) {
+        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
         let pending: Vec<NodeId> = tree
             .git()
             .roots()
@@ -972,34 +1031,43 @@ impl<A: FsAdapter> Aggregator<A> {
             .map(|r| r.node)
             .collect();
         for node in pending {
-            tree.set_git(GitRoot::unresolved(node, Problem::NotChecked));
+            tree.set_git(GitRoot::unresolved(node, problem.clone()));
         }
     }
 
     /// Notes what an entry's name says about Git, under the batch's hold of
-    /// the write lock: a `.git` folder or file makes its folder a candidate
-    /// (a file is probed at once, a folder once it's listed), a `.git` link
-    /// is never followed, and Git's other names are signals for the folder.
+    /// the write lock: a `.git` folder makes its folder a candidate, a
+    /// `.git` file is noted to be followed once the folder is listed (unless
+    /// the folder is a Git directory itself), a `.git` link is never
+    /// followed, and Git's other names are signals for the folder. A `.git`
+    /// inside a `.git` folder is ignored: it's data, not a repository.
     fn spotted(
         &mut self,
         tree: &mut Tree,
         dir: NodeId,
+        path: &Path,
         spot: Spot,
         entry: &Entry,
         added: Option<NodeId>,
-        probes: &mut Vec<(NodeId, NodeId)>,
     ) {
         if spot != Spot::DotGit {
             if added.is_some() {
-                spot.add_to(self.git_signals.entry(dir).or_default());
+                spot.add_to(&mut self.git_signals.entry(dir).or_default().signals);
             }
+            return;
+        }
+        let in_git = path
+            .file_name()
+            .is_some_and(|n| git::name_eq(n.as_encoded_bytes(), b".git"))
+            || git::inside_dotgit(path);
+        if in_git {
             return;
         }
         let root = match (entry.kind, added) {
             (EntryKind::Directory, Some(_)) => GitRoot::pending(dir),
             (EntryKind::File, Some(file)) => {
-                probes.push((file, dir));
-                GitRoot::pending(dir)
+                self.git_signals.entry(dir).or_default().pointer = Some((file, entry.name.clone()));
+                return;
             }
             (EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse, _) => {
                 GitRoot::unresolved(dir, Problem::Link)
