@@ -5,14 +5,14 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 ## [Unreleased]
 
 ### Git repositories
-- The scan finds Git repositories and linked worktrees, along with submodules, bare repositories, and nested repositories, by reading a few small files Git keeps. It never runs Git or changes anything, and a folder only counts when its Git data checks out: folders merely named `.git` or `worktrees` don't. What couldn't be confirmed is listed as unresolved, with the reason.
-- A **Repositories** tab lists them largest first, with kind, path, branch, and scanned size, and with a filter on, what matches in each. Selecting one selects it in the map and the details; Enter or double-click opens it.
+- The scan finds Git repositories and linked worktrees, along with submodules, bare repositories, and nested repositories, by reading a few small files Git keeps. It never runs Git or changes anything, and a folder only counts when its Git data checks out: folders merely named `.git` or `worktrees` don't. What couldn't be confirmed is listed as unresolved, with the reason. A `.git` file pointing to a network share or removable drive outside the scan isn't followed ("not read"), and Git data still unread 5 seconds after every folder is listed is given up ("timed out"), so neither can hold up a scan.
+- A **Git** tab lists them largest first, with kind, path, branch, and scanned size, and with a filter on, what matches in each. Selecting one selects it in the map and the details; Enter or double-click opens it.
 - Repository and worktree folders get a thin colored line and a small badge such as `repo` or `worktree` in the map, in every color mode. Color by **Git** shows repository content, linked-worktree content, Git metadata (hatched), and everything else.
 - The details show the repository an item is in, its kind and branch (or detached HEAD), a worktree's main repository or a submodule's superproject, and the repository's scanned size apart from what matches the filter.
 - Nested repositories are counted once in totals, and a worktree's shared Git data counts once, in the main repository where it is. Nothing suggests a repository or worktree is unused or safe to delete.
 
 ### Filter
-- `git:repo`, `git:worktree`, and `git:metadata` keep files in repositories and worktrees, in linked worktrees, or in Git's own data. They narrow everything else (`is:code; git:worktree`), and `!` leaves one out (`git:repo; !git:metadata`). Suggestions offer them.
+- `git:repo`, `git:worktree`, and `git:metadata` keep files in repositories and worktrees, in linked worktrees, or in Git's own data. They narrow everything else (`is:code; git:worktree`), and `!` leaves one out (`git:repo; !git:metadata`); `!git:repo` leaves out worktrees and Git's data too. Suggestions offer them.
 - **All**, **Repos**, and **Worktrees** beside the filter box switch between all files, Git repositories, and linked worktrees, keeping the rest of the filter as typed.
 
 ## [0.3.0] - 2026-10-14
