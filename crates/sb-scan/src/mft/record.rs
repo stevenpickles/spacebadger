@@ -65,15 +65,21 @@ impl std::fmt::Display for RecordError {
 impl std::error::Error for RecordError {}
 
 pub(crate) fn u16_at(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        b.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 
 pub(crate) fn u32_at(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        b.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 pub(crate) fn u64_at(b: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        b.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 fn utf16(bytes: &[u8]) -> Vec<u16> {
@@ -85,11 +91,20 @@ fn utf16(bytes: &[u8]) -> Vec<u16> {
 
 /// Checks and undoes the update-sequence protection in place: every
 /// stride's last two bytes must equal the sequence number and are replaced
-/// by the saved originals.
+/// by the saved originals. The array must cover exactly the record's
+/// strides (`len / 512 + 1` entries, the check value first).
+///
+/// Applying it to a record that is already fixed up changes nothing: a
+/// stride tail that happens to equal the check value is replaced by the
+/// saved original, which is what it already holds.
 pub fn apply_fixups(record: &mut [u8]) -> Result<(), RecordError> {
     let offset = usize::from(u16_at(record, 4).ok_or(RecordError::Malformed)?);
     let count = usize::from(u16_at(record, 6).ok_or(RecordError::Malformed)?);
-    if count < 2 || (count - 1) * STRIDE > record.len() || offset + 2 * count > record.len() {
+    if record.is_empty()
+        || !record.len().is_multiple_of(STRIDE)
+        || count != record.len() / STRIDE + 1
+        || offset + 2 * count > record.len()
+    {
         return Err(RecordError::Malformed);
     }
     let check = [record[offset], record[offset + 1]];
@@ -490,7 +505,8 @@ pub fn parse_record(record: &[u8], number: u64) -> Result<Option<Parsed>, Record
                 } else if attribute.is_named(WOF_STREAM) {
                     parsed.wof = Some(stream);
                 } else {
-                    parsed.streams_allocated += stream.allocated;
+                    parsed.streams_allocated =
+                        parsed.streams_allocated.saturating_add(stream.allocated);
                 }
             }
             ATTR_REPARSE_POINT => {
@@ -602,12 +618,28 @@ pub fn extents(mut pieces: Vec<(u64, Vec<Run>)>) -> Result<Vec<Extent>, RecordEr
     Ok(out)
 }
 
+/// Checks every mapped extent lies on a volume of `total_clusters`.
+pub fn check_bounds(extents: &[Extent], total_clusters: u64) -> Result<(), RecordError> {
+    for e in extents {
+        if let Some(lcn) = e.lcn {
+            let end = lcn.checked_add(e.clusters).ok_or(RecordError::BadRunList)?;
+            if end > total_clusters {
+                return Err(RecordError::BadRunList);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The byte offset on the volume of byte `offset` of a stream laid out in
-/// `extents`; `None` when it's in a hole or past the end.
+/// `extents`; `None` when it's in a hole, past the end, or overflows.
 pub fn volume_offset(extents: &[Extent], cluster: u64, offset: u64) -> Option<u64> {
     let vcn = offset / cluster;
     let e = extents
         .iter()
-        .find(|e| vcn >= e.vcn && vcn < e.vcn + e.clusters)?;
-    Some((e.lcn? + (vcn - e.vcn)) * cluster + offset % cluster)
+        .find(|e| vcn >= e.vcn && vcn - e.vcn < e.clusters)?;
+    e.lcn?
+        .checked_add(vcn - e.vcn)?
+        .checked_mul(cluster)?
+        .checked_add(offset % cluster)
 }

@@ -4,7 +4,7 @@
 
 use super::record::{AttributeList, Parsed, RECORD_MASK};
 use super::{attr, classify, is_cloud};
-use crate::adapter::EntryKind;
+use crate::adapter::{EntryKind, ErrorKind};
 use std::collections::HashMap;
 
 /// The volume's root directory.
@@ -118,15 +118,16 @@ pub struct Totals {
 
 impl Totals {
     fn add(&mut self, other: &Totals) {
-        self.files += other.files;
-        self.directories += other.directories;
-        self.aliases += other.aliases;
-        self.logical += other.logical;
-        self.allocated += other.allocated;
-        self.symlinks += other.symlinks;
-        self.mount_points += other.mount_points;
-        self.special += other.special;
-        self.unknown_reparse += other.unknown_reparse;
+        // Saturating: totals come from on-disk values.
+        self.files = self.files.saturating_add(other.files);
+        self.directories = self.directories.saturating_add(other.directories);
+        self.aliases = self.aliases.saturating_add(other.aliases);
+        self.logical = self.logical.saturating_add(other.logical);
+        self.allocated = self.allocated.saturating_add(other.allocated);
+        self.symlinks = self.symlinks.saturating_add(other.symlinks);
+        self.mount_points = self.mount_points.saturating_add(other.mount_points);
+        self.special = self.special.saturating_add(other.special);
+        self.unknown_reparse = self.unknown_reparse.saturating_add(other.unknown_reparse);
     }
 }
 
@@ -300,27 +301,37 @@ impl Table {
         self.records.get(number as usize).filter(|r| r.in_use)
     }
 
-    /// The file ID listings report for record `number`.
+    /// The file ID listings report for record `number`; 0 for a number
+    /// past the table.
     pub fn reference_of(&self, number: u64) -> u64 {
-        self.records[number as usize].reference(number)
+        self.records
+            .get(number as usize)
+            .map_or(0, |r| r.reference(number))
     }
 
-    /// How a scan treats the record, by the same rules as a listing.
+    /// How a scan treats the record, by the same rules as a listing. A
+    /// number past the table is unreadable.
     pub fn kind(&self, number: u64) -> EntryKind {
-        let r = &self.records[number as usize];
-        classify(r.attributes, r.reparse_tag)
+        match self.records.get(number as usize) {
+            Some(r) => classify(r.attributes, r.reparse_tag),
+            None => EntryKind::Failed(ErrorKind::Unavailable),
+        }
     }
 
     /// Whether the record belongs to a cloud provider, as a listing says.
     pub fn cloud(&self, number: u64) -> bool {
-        let r = &self.records[number as usize];
-        is_cloud(r.attributes, r.reparse_tag)
+        self.records
+            .get(number as usize)
+            .is_some_and(|r| is_cloud(r.attributes, r.reparse_tag))
     }
 
-    /// A record's names (indices for [`Table::name`]).
+    /// A record's names (indices for [`Table::name`]); none for a number
+    /// past the table.
     pub fn names_of(&self, number: u64) -> std::ops::Range<u32> {
-        let r = &self.records[number as usize];
-        r.names_start..r.names_start + r.names_len
+        match self.records.get(number as usize) {
+            Some(r) => r.names_start..r.names_start + r.names_len,
+            None => 0..0,
+        }
     }
 
     pub fn name(&self, index: u32) -> (&Name, &[u16]) {
@@ -403,8 +414,8 @@ impl Table {
                     } else {
                         let r = &self.records[child as usize];
                         t.files += 1;
-                        t.logical += r.logical;
-                        t.allocated += r.allocated;
+                        t.logical = t.logical.saturating_add(r.logical);
+                        t.allocated = t.allocated.saturating_add(r.allocated);
                     }
                 }
                 EntryKind::Symlink => t.symlinks += 1,
@@ -429,7 +440,9 @@ fn apply_streams(record: &mut Record, parsed: &Parsed, stats: &mut Stats) {
     if let Some(wof) = parsed.wof {
         record.wof_allocated = Some(wof.allocated);
     }
-    record.streams_allocated += parsed.streams_allocated;
+    record.streams_allocated = record
+        .streams_allocated
+        .saturating_add(parsed.streams_allocated);
     if let Some(tag) = parsed.reparse_tag {
         record.reparse_tag = tag;
         if parsed.reparse_nonresident {

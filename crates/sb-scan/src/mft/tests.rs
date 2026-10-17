@@ -669,3 +669,158 @@ fn walks_down_from_the_root_with_bottom_up_totals() {
     assert_eq!(sub.nodes.len(), 4);
     assert!(table.walk(41).nodes.is_empty(), "a file isn't walked");
 }
+
+#[test]
+fn numbers_past_the_table_are_safe() {
+    // A name whose parent reference points past the table.
+    let orphan = Builder::new(20, 1)
+        .standard(0x20, 0)
+        .name(frn(9_999, 1), "lost.txt", 1)
+        .data(4)
+        .parse(20);
+    let table = Table::build([vec![orphan]], 32);
+    assert_eq!(table.path(20), "\\<record 9999>\\lost.txt");
+    assert_eq!(table.path(5_000), "\\<record 5000>");
+    assert_eq!(table.names_of(5_000), 0..0);
+    assert_eq!(table.reference_of(5_000), 0);
+    assert_eq!(
+        table.kind(5_000),
+        EntryKind::Failed(crate::adapter::ErrorKind::Unavailable)
+    );
+    assert!(!table.cloud(5_000));
+    assert!(table.walk(5_000).nodes.is_empty());
+}
+
+#[test]
+fn the_update_sequence_must_cover_exactly_the_record() {
+    for count in [0u16, 1, 2, 4] {
+        let mut bytes = Builder::new(40, 1).protected();
+        bytes[6..8].copy_from_slice(&count.to_le_bytes());
+        assert_eq!(
+            apply_fixups(&mut bytes),
+            Err(RecordError::Malformed),
+            "{count}"
+        );
+    }
+    let mut short = Builder::new(40, 1).protected();
+    short.truncate(1000);
+    assert_eq!(apply_fixups(&mut short), Err(RecordError::Malformed));
+    assert_eq!(apply_fixups(&mut []), Err(RecordError::Malformed));
+}
+
+#[test]
+fn runs_must_lie_on_the_volume() {
+    let ext = extents(vec![(
+        0,
+        vec![
+            Run {
+                lcn: Some(90),
+                clusters: 10,
+            },
+            Run {
+                lcn: None,
+                clusters: 50,
+            },
+        ],
+    )])
+    .unwrap();
+    assert_eq!(check_bounds(&ext, 100), Ok(()));
+    assert_eq!(check_bounds(&ext, 99), Err(RecordError::BadRunList));
+    let huge = [Extent {
+        vcn: 0,
+        lcn: Some(u64::MAX - 1),
+        clusters: 4,
+    }];
+    assert_eq!(check_bounds(&huge, u64::MAX), Err(RecordError::BadRunList));
+    assert_eq!(volume_offset(&huge, 4096, 0), None, "overflows");
+}
+
+/// A record with one hand-made attribute after the standard information.
+fn with_attribute(edit: impl FnOnce(&mut [u8])) -> Result<Option<Parsed>, RecordError> {
+    let mut b = Builder::new(60, 1).standard(0x20, 0);
+    b.resident(ATTR_DATA, "", &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut bytes = b.protected();
+    apply_fixups(&mut bytes).unwrap();
+    // The data attribute follows the 96-byte standard information.
+    edit(&mut bytes[0x38 + 96..]);
+    parse_record(&bytes, 60)
+}
+
+#[test]
+fn malformed_attributes_are_rejected() {
+    assert!(with_attribute(|_| {}).unwrap().is_some());
+    let zero = with_attribute(|a| a[4..8].copy_from_slice(&0u32.to_le_bytes()));
+    assert_eq!(zero, Err(RecordError::Malformed), "length 0");
+    let past = with_attribute(|a| a[4..8].copy_from_slice(&4096u32.to_le_bytes()));
+    assert_eq!(past, Err(RecordError::Malformed), "length past the end");
+    let name = with_attribute(|a| {
+        a[9] = 200;
+        a[10..12].copy_from_slice(&24u16.to_le_bytes());
+    });
+    assert_eq!(name, Err(RecordError::Malformed), "name past the attribute");
+    let short = with_attribute(|a| a[8] = 1);
+    assert_eq!(
+        short,
+        Err(RecordError::Malformed),
+        "non-resident under 64 bytes"
+    );
+    let value = with_attribute(|a| a[16..20].copy_from_slice(&999u32.to_le_bytes()));
+    assert_eq!(
+        value,
+        Err(RecordError::Malformed),
+        "value past the attribute"
+    );
+}
+
+/// A small deterministic generator for the fuzz loops.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+#[test]
+fn corrupted_records_never_panic() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let good = Builder::new(36, 1)
+        .standard(0x20, 0)
+        .name(ROOT_REF, "a name.txt", 1)
+        .reparse(tag::SYMLINK)
+        .big_data(0x8000, 8192, 5000, 4096)
+        .attribute_list(&[(0x80, frn(37, 1))])
+        .protected();
+    for _ in 0..20_000 {
+        let mut bytes = good.clone();
+        for _ in 0..1 + rng.next() % 8 {
+            let at = (rng.next() % bytes.len() as u64) as usize;
+            bytes[at] = rng.next() as u8;
+        }
+        let _ = apply_fixups_if_protected(&mut bytes);
+        let _ = parse_record(&bytes, 36);
+        let _ = data_runs(&bytes);
+        let _ = data_stream(&bytes);
+        let _ = attribute_list_location(&bytes);
+    }
+}
+
+#[test]
+fn random_bytes_never_panic() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for _ in 0..20_000 {
+        let len = (rng.next() % 96) as usize;
+        let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        let _ = decode_runs(&bytes);
+        let _ = parse_attribute_list(&bytes);
+        let _ = super::usn::parse_journal(&bytes);
+        let mut record = bytes.clone();
+        record.resize(1024, 0);
+        record[..4].copy_from_slice(b"FILE");
+        let _ = apply_fixups(&mut record);
+        let _ = parse_record(&record, 1);
+    }
+}
