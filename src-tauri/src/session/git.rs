@@ -241,9 +241,15 @@ fn node_at(tree: &Tree, path: &Path, style: paths::Style) -> Option<NodeId> {
 }
 
 /// What the details panel says about `n`'s place in Git. O(depth), plus
-/// one pass over the entries for a repository's linked worktrees; the
-/// root's sizes aren't summed up here (they're 0; the list has them).
-pub(super) fn details(tree: &Tree, n: NodeId) -> Option<proto::GitDetails> {
+/// one pass over the entries for a repository's linked worktrees. The
+/// root's `size` and `matching` are logical sizes, as the details' own
+/// are, `matching` from `filter` when given; `own` and `metadata` aren't
+/// summed up here (they're 0; the list has them).
+pub(super) fn details(
+    tree: &Tree,
+    n: NodeId,
+    filter: Option<&sb_core::search::Search>,
+) -> Option<proto::GitDetails> {
     let git = tree.git();
     if git.is_empty() {
         return None;
@@ -264,6 +270,8 @@ pub(super) fn details(tree: &Tree, n: NodeId) -> Option<proto::GitDetails> {
     let root = found.map(|(r, outside)| {
         let mut row = root_row(tree, r, outside);
         row.files = u64::from(tree.file_count(r));
+        row.size = tree.logical(r);
+        row.matching = filter.map(|s| s.totals(r).logical);
         if let Some((parent, parent_outside)) = (!outside).then(|| enclosing(tree, r)).flatten() {
             row.parent = Some(parent.index() as u32);
             row.parent_outside = parent_outside;
@@ -595,6 +603,19 @@ mod tests {
         assert_eq!(main.matching, Some(1200), "a.rs and the submodule's x.rs");
         assert_eq!(row(&page, node_of(&session, "wt1")).matching, Some(300));
         assert_eq!(page.totals.matching, Some(1200 + 300 + 20));
+        // Details give the root the same matching total the root's own
+        // details give.
+        let wt = node_of(&session, "wt1");
+        let own = session.details(wt, Some(id)).unwrap();
+        let root = own.git.unwrap().root.unwrap();
+        assert_eq!(root.matching, Some(own.matching.unwrap().logical));
+        assert_eq!(root.matching, Some(300));
+        assert_eq!(root.size, 304);
+        let file = node_of(&session, "wt1/b.rs");
+        let git = session.details(file, Some(id)).unwrap().git.unwrap();
+        assert_eq!(git.root.unwrap().matching, Some(300));
+        let untold = session.details(file, None).unwrap().git.unwrap();
+        assert_eq!(untold.root.unwrap().matching, None);
         // A replaced search gives an error, as the other lists do.
         session.search_set("*.txt").unwrap();
         assert!(session.git_roots(&req).is_err());

@@ -834,8 +834,11 @@ impl Session {
         let tree = self.scan.tree();
         let (active, tree, _) = self.read_locked(&tree, search.is_some())?;
         let n = node(&tree, id)?;
-        let matching = search.and_then(|s| current(&active, s).ok()).map(|a| {
-            let t = a.search.totals(n);
+        let filter = search
+            .and_then(|s| current(&active, s).ok())
+            .map(|a| &a.search);
+        let matching = filter.map(|search| {
+            let t = search.totals(n);
             proto::Matching {
                 files: u64::from(t.files),
                 logical: t.logical,
@@ -885,7 +888,7 @@ impl Session {
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
-            git: git::details(&tree, n),
+            git: git::details(&tree, n, filter),
         })
     }
 
