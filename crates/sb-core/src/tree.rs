@@ -458,7 +458,7 @@ impl Tree {
     pub fn add_dir(&mut self, parent: NodeId, name: &OsStr) -> Result<NodeId, CapacityExceeded> {
         debug_assert!(self.is_dir(parent) && !self.is_removed(parent));
         let id = self.push(parent.0, name, flags::DIRECTORY)?;
-        self.estimate(parent, id);
+        self.estimate_dir(parent, id);
         Ok(id)
     }
 
@@ -466,7 +466,7 @@ impl Tree {
     /// if its parent was matched and is still waiting for its listing to
     /// end (only then can it gain children). That much of the parent's own
     /// estimate is now accounted for by `dir`, so it moves there.
-    fn estimate(&mut self, parent: NodeId, dir: NodeId) {
+    fn estimate_dir(&mut self, parent: NodeId, dir: NodeId) {
         let Some(p) = self.prior.as_deref_mut() else {
             return;
         };
@@ -645,7 +645,7 @@ impl Tree {
             }
             if self.flags[i] & flags::DIRECTORY != 0 {
                 if self.dir_state(node) == DirState::Pending {
-                    self.estimate(parent, node);
+                    self.estimate_dir(parent, node);
                 } else {
                     self.take_own(parent, self.logical[i]);
                 }
@@ -1991,5 +1991,114 @@ mod tests {
         }
         let with = t.memory_bytes();
         assert!(with >= repos.len() * std::mem::size_of::<GitRoot>());
+    }
+
+    /// From the review of #62: random earlier scans, random rescans with
+    /// the prior matched and applied at random moments, folders removed,
+    /// failed, or cut off by a cancel. A folder's pending estimate is never
+    /// less than its children's together, and once nothing is waiting every
+    /// one is 0.
+    #[test]
+    fn random_rescans_keep_the_estimates_consistent_and_end_at_zero() {
+        let mut seed = 12345u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut seen = 0u64;
+        for round in 0..120 {
+            let mut old = Tree::new("/r");
+            let mut dirs = vec![NodeId::ROOT];
+            for k in 0..40 {
+                let p = dirs[rnd(dirs.len() as u64) as usize];
+                if rnd(2) == 0 {
+                    let d = old.add_dir(p, format!("d{}", rnd(8)).as_ref()).unwrap();
+                    dirs.push(d);
+                } else {
+                    let s = sizes(rnd(5000) + 1, 1);
+                    old.add_file(p, format!("f{k}").as_ref(), s, None, 0)
+                        .unwrap();
+                }
+            }
+            for &d in &dirs {
+                old.set_dir_state(d, DirState::Listed);
+            }
+            let snap = crate::snapshot::Snapshot::capture(&old, 1, round % 2 == 0);
+            let prior = Arc::new(Prior::new(snap));
+            let mut t = Tree::new("/r");
+            let mut pending = vec![NodeId::ROOT];
+            let mut all = vec![NodeId::ROOT];
+            let mut matched = None;
+            let when = rnd(60);
+            let apply_at = when + rnd(10);
+            let mut step = 0;
+            while !pending.is_empty() {
+                if step == when {
+                    matched = Some(t.match_prior(prior.clone()));
+                }
+                if step == apply_at
+                    && let Some(m) = matched.take()
+                {
+                    t.apply_prior(m);
+                }
+                step += 1;
+                let idx = rnd(pending.len() as u64) as usize;
+                let d = pending[idx];
+                if t.is_removed(d) {
+                    pending.swap_remove(idx);
+                    continue;
+                }
+                match rnd(10) {
+                    0..=3 => {
+                        let c = t.add_dir(d, format!("d{}", rnd(8)).as_ref()).unwrap();
+                        pending.push(c);
+                        all.push(c);
+                    }
+                    4..=6 => {
+                        let s = sizes(rnd(5000), 1);
+                        t.add_file(d, format!("f{step}").as_ref(), s, None, 0)
+                            .unwrap();
+                    }
+                    7 => {
+                        if rnd(4) == 0 && d != NodeId::ROOT {
+                            t.remove(d);
+                        }
+                    }
+                    _ => {
+                        pending.swap_remove(idx);
+                        let state = [DirState::Listed, DirState::Failed, DirState::NotScanned]
+                            [rnd(3) as usize];
+                        t.set_dir_state(d, state);
+                    }
+                }
+                if rnd(50) == 0 {
+                    // A cancel: whatever waits is not scanned.
+                    for &n in &pending {
+                        if !t.is_removed(n) && t.dir_state(n) == DirState::Pending {
+                            t.set_dir_state(n, DirState::NotScanned);
+                        }
+                    }
+                    pending.clear();
+                }
+                for &n in &all {
+                    if !t.is_removed(n) {
+                        let below: u64 = t.children(n).map(|c| t.pending_estimate(c)).sum();
+                        assert!(t.pending_estimate(n) >= below, "round {round}");
+                    }
+                }
+                if t.pending_estimate(NodeId::ROOT) > 0 {
+                    seen += 1;
+                }
+            }
+            if let Some(m) = matched.take() {
+                t.apply_prior(m);
+            }
+            for &n in &all {
+                assert_eq!(t.pending_estimate(n), 0, "round {round}");
+            }
+        }
+        assert!(seen > 100, "estimates were in play: {seen} steps");
     }
 }
