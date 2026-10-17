@@ -525,7 +525,7 @@ pub fn parse_head(bytes: &[u8]) -> Option<Head> {
     let line = first_line(bytes)?;
     if let Some(name) = line.strip_prefix("ref:") {
         let name = name.trim();
-        if !name.starts_with("refs/") || name.len() == "refs/".len() || has_space(name) {
+        if !name.starts_with("refs/") || name.ends_with('/') || has_space(name) {
             return None;
         }
         return Some(match name.strip_prefix("refs/heads/") {
@@ -539,7 +539,8 @@ pub fn parse_head(bytes: &[u8]) -> Option<Head> {
 }
 
 /// Parses a `.git` file: `gitdir: <path>` on its first line. Returns the
-/// path as written (relative to the file's folder unless absolute).
+/// path as written (relative to the file's folder unless absolute). A path
+/// that isn't UTF-8 is malformed here, though Git would accept it.
 pub fn parse_pointer(bytes: &[u8]) -> Result<&str, Problem> {
     const NOT_POINTER: &str = ".git file doesn't name a Git directory";
     let line = first_line(bytes).ok_or(Problem::Malformed(NOT_POINTER))?;
@@ -571,7 +572,9 @@ pub struct CoreConfig {
 
 /// Reads `core.bare` and `core.worktree` from a Git config file: sections
 /// and keys ignoring case, the last value winning, quotes and trailing
-/// comments removed. `include` and `includeIf` aren't followed.
+/// comments removed. `include` and `includeIf` aren't followed, and a value
+/// continued onto the next line (a trailing `\`) is read only up to the
+/// line's end.
 pub fn parse_config_core(bytes: &[u8]) -> CoreConfig {
     let text = String::from_utf8_lossy(bytes);
     let mut config = CoreConfig::default();
@@ -592,7 +595,8 @@ pub fn parse_config_core(bytes: &[u8]) -> CoreConfig {
         }
         let (key, value) = match line.split_once('=') {
             Some((k, v)) => (k.trim(), Some(config_value(v))),
-            None => (line, None),
+            // `bare # comment`: a key alone, before its comment.
+            None => (line.split(['#', ';']).next().unwrap_or("").trim(), None),
         };
         if key.eq_ignore_ascii_case("bare") {
             // A key without a value is true.
@@ -641,11 +645,12 @@ fn config_value(raw: &str) -> String {
 }
 
 /// The first line of a small text file, without a byte-order mark or line
-/// ending. `None` when it isn't UTF-8.
+/// ending. `None` when that line isn't UTF-8; what follows it doesn't
+/// matter.
 fn first_line(bytes: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let line = text.split('\n').next().unwrap_or("");
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let line = bytes.split(|&b| b == b'\n').next().unwrap_or(b"");
+    let line = std::str::from_utf8(line).ok()?;
     Some(line.strip_suffix('\r').unwrap_or(line))
 }
 
@@ -1198,6 +1203,7 @@ mod tests {
             b"hello",
             b"ref: main",
             b"ref: refs/",
+            b"ref: refs/heads/",
             b"ref: refs/heads/a b",
             b"0123456789",
             b"\xff\xfe",
@@ -1229,6 +1235,13 @@ mod tests {
         assert_eq!(parse_path_file(b"../..\n"), Some("../.."));
         assert_eq!(parse_path_file(b"/w/app/.git\r\n"), Some("/w/app/.git"));
         assert_eq!(parse_path_file(b"\n"), None);
+        // Only the first line has to be text.
+        assert_eq!(parse_pointer(b"gitdir: /x\n\xff\xfe"), Ok("/x"));
+        assert_eq!(parse_path_file(b"../..\r\n\xff"), Some("../.."));
+        assert_eq!(
+            parse_head(b"ref: refs/heads/main\n\xff"),
+            Some(Head::Branch("main".into()))
+        );
     }
 
     #[test]
@@ -1237,6 +1250,8 @@ mod tests {
             b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n[remote \"origin\"]\n\tbare = false\n",
         );
         assert_eq!(c.bare, Some(true), "other sections don't count");
+        assert_eq!(parse_config_core(b"[core]\n bare # yes\n").bare, Some(true));
+        assert_eq!(parse_config_core(b"[core]\n bare ; yes\n").bare, Some(true));
         for (value, bare) in [
             ("yes", Some(true)),
             ("On", Some(true)),
