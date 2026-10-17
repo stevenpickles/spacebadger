@@ -498,11 +498,16 @@ fn place(bytes: &[u8], style: Style) -> Place<'_> {
 
 /// How many names after `/` make up the folder of one mount under a folder
 /// where Linux and macOS mount other filesystems: `/mnt/x`,
-/// `/media/user/x`, `/run/user/1000/gvfs/x`.
+/// `/media/user/x`, `/run/media/user/x`, `/run/user/1000/gvfs/x`. Names
+/// are lower case when the filesystem ignores case.
 fn mount_of(names: &[&[u8]]) -> Option<usize> {
     match names {
-        [b"net" | b"Network" | b"Volumes" | b"mnt", ..] => Some(2),
+        [
+            b"net" | b"Network" | b"network" | b"Volumes" | b"volumes" | b"mnt",
+            ..,
+        ] => Some(2),
         [b"media", ..] => Some(3),
+        [b"run", b"media", ..] => Some(4),
         [b"run", b"user", _, b"gvfs", ..] => Some(5),
         _ => None,
     }
@@ -552,7 +557,13 @@ pub fn reachable_with(
     let names = |p: &[u8]| -> Vec<Vec<u8>> {
         p.split(|&b| b == b'/')
             .filter(|n| !n.is_empty())
-            .map(<[u8]>::to_vec)
+            .map(|n| {
+                if style.fold_case {
+                    n.to_ascii_lowercase()
+                } else {
+                    n.to_vec()
+                }
+            })
             .collect()
     };
     let (t, r) = (names(t), names(r));
@@ -764,6 +775,20 @@ mod tests {
         assert!(!ok("/Volumes/Share/scan", "/Volumes/Other/x.git"));
         assert!(ok("/media/me/usb/scan", "/media/me/usb/x.git"));
         assert!(!ok("/media/me/usb/scan", "/media/me/other/x.git"));
+        assert!(!ok("/home/me/scan", "/run/media/me/usb/x.git"));
+        assert!(ok("/run/media/me/usb/scan", "/run/media/me/usb/x.git"));
+        assert!(ok("/home/me/scan", "/NET/host/x"), "case matters here");
+
+        let mac = |root: &str, target: &str| {
+            reachable_with(Path::new(root), Path::new(target), Style::MACOS, |_| false)
+        };
+        for mounted in ["/NET/host/x", "/volumes/Share/x", "/network/Servers/x"] {
+            assert!(!mac("/Users/me/scan", mounted), "{mounted}");
+        }
+        assert!(
+            mac("/Volumes/Share/scan", "/volumes/share/x.git"),
+            "same mount"
+        );
     }
 
     #[test]
