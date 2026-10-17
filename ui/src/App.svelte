@@ -44,7 +44,7 @@
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
   import { formatBytes, KILO, plural } from "./lib/format";
-  import { KIND_OTHER, LAYOUT_PROVISIONAL, type DecodedLayout } from "./lib/layoutWire";
+  import { isFiller, KIND_OTHER, LAYOUT_PROVISIONAL, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
@@ -797,7 +797,7 @@
     const l = layout;
     if (!selection?.other || !l) return null;
     for (let i = 0; i < l.count; i++) {
-      if (l.kind[i] === KIND_OTHER && l.node[i] === selection.node) {
+      if (l.kind[i] === KIND_OTHER && l.node[i] === selection.node && !isFiller(l, i)) {
         return { weight: l.weight[i]!, items: l.items[i]! };
       }
     }

@@ -902,7 +902,11 @@
     const l = layout;
     if (!l || l.count === 0) return -1;
     const cur = selectedIndex(l, selection);
-    if (cur < 0) return 0;
+    // Nothing selected: start at the first item (a filler is none).
+    if (cur < 0) {
+      for (let i = 0; i < l.count; i++) if (!isFiller(l, i)) return i;
+      return -1;
+    }
     const cx = l.x[cur]! + l.w[cur]! / 2;
     const cy = l.y[cur]! + l.h[cur]! / 2;
     const depth = l.depth[cur];
