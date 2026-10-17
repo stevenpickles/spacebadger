@@ -11,6 +11,8 @@
   import {
     changeColor,
     depthColor,
+    gitAccent,
+    gitColor,
     typeModeFolderColor,
     otherSmallColor,
     isDarkFill,
@@ -22,6 +24,10 @@
   import {
     decodeLayout,
     FILE_TYPES,
+    GIT_BADGES,
+    GIT_METADATA,
+    GIT_OTHER,
+    gitClassOf,
     hitTest,
     KIND_FILE,
     KIND_FOLDER,
@@ -333,7 +339,43 @@
     if (colors === "type") {
       return kind === KIND_FOLDER ? typeModeFolderColor(dark) : typeColor(l.ftype[i]!, dark);
     }
+    if (colors === "git") return gitColor(gitClassOf(l.rflags[i]!), kind === KIND_FOLDER, dark);
     return depthColor(l.depth[i]!, kind === KIND_FOLDER, dark);
+  }
+
+  /** The tooltip's words for each Git class, by GIT_* value. */
+  const GIT_CONTENT = ["not in a detected repository","repository content", "linked worktree content", "Git metadata"];
+
+  /** A folder's Git root badge (see GIT_BADGES); 0 for none and for files. */
+  function badgeOf(l: DecodedLayout, i: number): number {
+    return l.kind[i] === KIND_FOLDER ? l.ftype[i]! : 0;
+  }
+
+  /** Faint diagonal lines over Git metadata, made once per theme. */
+  let hatches: { dark: boolean; pattern: CanvasPattern }[] = [];
+
+  function hatchFor(ctx: CanvasRenderingContext2D, isDark: boolean): CanvasPattern | null {
+    const cached = hatches.find((h) => h.dark === isDark);
+    if (cached) return cached.pattern;
+    const tile = document.createElement("canvas");
+    tile.width = tile.height = 6;
+    const t = tile.getContext("2d");
+    if (!t) return null;
+    t.strokeStyle = isDark ? "rgb(255 255 255 / 0.14)" : "rgb(0 0 0 / 0.12)";
+    t.lineWidth = 1;
+    t.beginPath();
+    // One line corner to corner, plus the corners it leaves, so tiles join.
+    t.moveTo(0, 6);
+    t.lineTo(6, 0);
+    t.moveTo(-1, 1);
+    t.lineTo(1, -1);
+    t.moveTo(5, 7);
+    t.lineTo(7, 5);
+    t.stroke();
+    const pattern = ctx.createPattern(tile, "repeat");
+    if (!pattern) return null;
+    hatches = [...hatches, { dark: isDark, pattern }];
+    return pattern;
   }
 
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
@@ -407,6 +449,7 @@
     top.font = `${p.fontSize}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
     top.textBaseline = "alphabetic";
     const gap = p.gap;
+    const hatch = colors === "git" ? hatchFor(ctx, dark) : null;
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -420,12 +463,26 @@
       if (w > 2 && h > 2) ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
       else ctx.fillRect(x, y, w, h);
 
+      // Git metadata is hatched in Git mode, so it isn't told by color alone.
+      if (hatch && kind !== KIND_OTHER && w > 4 && h > 4 && gitClassOf(l.rflags[i]!) === GIT_METADATA) {
+        ctx.fillStyle = hatch;
+        ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
+      }
+
       if (kind === KIND_FOLDER && l.rflags[i]! & RF_INCOMPLETE) {
         ctx.strokeStyle = p.incomplete;
         ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
         ctx.setLineDash([]);
+      }
+
+      // Repository and worktree roots: a thin accent along the top, in
+      // every color mode; the badge on the label says which kind.
+      const badge = badgeOf(l, i);
+      if (badge !== 0 && w > 6 && h > 4) {
+        ctx.fillStyle = gitAccent(badge, dark);
+        ctx.fillRect(x + 0.5, y + 0.5, w - 1, 2);
       }
     }
 
@@ -531,8 +588,11 @@
         label(ctx, name!, x + 4, y + line1, room);
         if (sizeWidth <= room) ctx.fillText(size, x + 4, y + line2);
       } else if (room >= sizeWidth + 30) {
-        // One line: the size right-aligned, the name cut to fit before it.
-        label(ctx, name!, x + 4, y + line1, room - sizeWidth - 6);
+        // One line: the size right-aligned, the name cut to fit before it,
+        // after a Git root's badge when there's room for both.
+        const badge = header ? badgeOf(l, i) : 0;
+        const pill = badge !== 0 ? drawBadge(ctx, badge, x + 4, y, room - sizeWidth - 36) : 0;
+        label(ctx, name!, x + 4 + pill, y + line1, room - sizeWidth - 6 - pill);
         ctx.fillText(size, x + w - 4 - sizeWidth, y + line1);
       } else if (sizeWidth <= room) {
         // The size matters most, so it wins when both don't fit.
@@ -540,6 +600,38 @@
       }
     }
     ctx.restore();
+  }
+
+  /**
+   * Draws a Git root's badge, a small text pill in its kind's accent, at
+   * `x` on the header line of a tile whose top is `top`, if it fits in
+   * `max`. Returns the width it took, gap included, or 0.
+   */
+  function drawBadge(ctx: CanvasRenderingContext2D, badge: number, x: number, top: number, max: number): number {
+    const p = palette;
+    const text = GIT_BADGES[badge]?.short;
+    if (!text) return 0;
+    const font = ctx.font;
+    const small = Math.max(8, p.fontSize - 2);
+    ctx.font = `600 ${small}px system-ui, -apple-system, 'Segoe UI', sans-serif`;
+    const w = measure(ctx, text) + 8;
+    if (w > max) {
+      ctx.font = font;
+      return 0;
+    }
+    const color = gitAccent(badge, dark);
+    const h = p.fontSize - 1;
+    const y = top + 3;
+    const fill = ctx.fillStyle;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 2);
+    ctx.fill();
+    ctx.fillStyle = isDarkFill(color) ? p.textLight : p.textDark;
+    ctx.fillText(text, x + 4, y + h / 2 + small * 0.36);
+    ctx.font = font;
+    ctx.fillStyle = fill;
+    return w + 4;
   }
 
   /** Strokes a band `width` px wide, `inset` px inside the rectangle. */
@@ -892,6 +984,9 @@
     if (folder) lines.push(d ? plural(d.files, "file") : null);
     if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned");
     if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
+    const badge = badgeOf(l, i);
+    if (badge !== 0) lines.push(GIT_BADGES[badge]!.name);
+    if (colors === "git") lines.push(`Git: ${GIT_CONTENT[gitClassOf(l.rflags[i]!)] ?? GIT_CONTENT[GIT_OTHER]}`);
     return { title: d?.name ?? l.labels.get(i) ?? "", path: d ? d.path : null, lines };
   });
 
