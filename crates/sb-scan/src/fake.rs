@@ -204,6 +204,12 @@ impl FakeFs {
         self.insert_abs(PathBuf::from(path), Self::text_node(text))
     }
 
+    /// An entry of `kind` (a link, say) at the absolute `path` outside
+    /// [`FakeFs::ROOT`].
+    pub fn outside_other(&self, path: &str, kind: EntryKind) -> &Self {
+        self.insert_abs(PathBuf::from(path), Node::Other(kind))
+    }
+
     /// A folder at the absolute `path` outside [`FakeFs::ROOT`].
     pub fn outside_dir(&self, path: &str) -> &Self {
         self.insert_abs(PathBuf::from(path), Node::Dir)

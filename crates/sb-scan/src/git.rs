@@ -396,7 +396,8 @@ fn pointer_target<A: FsAdapter + ?Sized>(
     let target = paths::resolve(folder, parse_pointer(&bytes)?, style);
     // Nothing is opened where a crafted path could send it: another
     // computer, a device, a drive that may not answer.
-    if !reachable(fs, &scope.root, &target, style) {
+    if !reachable(fs, &scope.root, &target, style) || through_link(fs, &scope.root, &target, style)
+    {
         return Err(Problem::NotRead);
     }
     let head = match read_head(fs, &target.join("HEAD")) {
@@ -406,7 +407,9 @@ fn pointer_target<A: FsAdapter + ?Sized>(
         Err(err) => return Err(problem(err)),
     };
     if let Some(common) = read_path(fs, &target, "commondir", style)? {
-        if !reachable(fs, &scope.root, &common, style) {
+        if !reachable(fs, &scope.root, &common, style)
+            || through_link(fs, &scope.root, &common, style)
+        {
             return Err(Problem::NotRead);
         }
         // The main repository's Git directory must be one.
@@ -448,6 +451,40 @@ fn pointer_target<A: FsAdapter + ?Sized>(
         git_dir: Some(target),
         ..GitRoot::new(node, kind)
     })
+}
+
+/// Whether reaching `target` passes through a link, junction or mount
+/// redirection, which could lead anywhere [`reachable`] wouldn't: checked
+/// folder by folder without following, from the scan root for a target
+/// inside the scan, else from the filesystem's root. A folder that isn't
+/// there ends the check; reading it then fails on its own.
+fn through_link<A: FsAdapter + ?Sized>(fs: &A, root: &Path, target: &Path, style: Style) -> bool {
+    let (mut at, rest): (PathBuf, Vec<std::ffi::OsString>) =
+        match paths::relative_to(root, target, style) {
+            Some(names) => (root.to_path_buf(), names),
+            None => {
+                let mut base = PathBuf::new();
+                let mut names = Vec::new();
+                for c in target.components() {
+                    match c {
+                        Component::Prefix(_) | Component::RootDir => base.push(c),
+                        other => names.push(other.as_os_str().to_owned()),
+                    }
+                }
+                (base, names)
+            }
+        };
+    for name in rest {
+        at.push(name);
+        match fs.stat_kind(&at) {
+            Ok(EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse) => {
+                return true;
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Where a path is, by its prefix.
