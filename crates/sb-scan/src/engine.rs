@@ -70,6 +70,10 @@ pub const BIG_SHARE: u32 = 100;
 /// than any share (at most a million).
 const CHANGED: u32 = 2_000_000;
 
+/// The priority of a `.git` folder's listing: in the lane served first (see
+/// [`Queue`]), since a Git probe waits for it.
+const GIT_DIR: u32 = u32::MAX;
+
 /// Where folder `dir`, just found with modified time `modified`, is listed
 /// while the tree has a prior scan that finished at `since` (milliseconds
 /// since the Unix epoch). Measured on rescans, the map's error comes from
@@ -595,7 +599,8 @@ enum Outcome {
 
 /// Workers' jobs in three lanes:
 ///
-/// - Git probes and re-measures, which are few, small, and wanted soon;
+/// - Git probes, listings of `.git` folders (which a probe of the folder
+///   above waits for), and re-measures: few, small, and wanted soon;
 /// - listings of folders a prior puts ahead (see [`listing_priority`]),
 ///   highest priority first;
 /// - other listings, in the order queued.
@@ -633,6 +638,7 @@ impl Jobs {
         let seq = self.seq();
         match job {
             Job::Measure { .. } | Job::Git { .. } => self.soon.push_back((seq, job)),
+            Job::List { .. } if priority == GIT_DIR => self.soon.push_back((seq, job)),
             Job::List { .. } if priority >= BIG_SHARE => self.big.push(Big { priority, seq, job }),
             Job::List { .. } => self.fifo.push_back((seq, job)),
         }
@@ -1204,9 +1210,13 @@ impl<A: FsAdapter> Aggregator<A> {
             let added = if entry.kind == EntryKind::Directory {
                 tree.add_dir(dir, &entry.name).inspect(|&id| {
                     tree.set_id(id, fingerprint(entry.id));
-                    let priority = since.map_or(0, |since| {
-                        listing_priority(&tree, id, entry.modified, since)
-                    });
+                    let priority = if spot == Some(Spot::DotGit) {
+                        GIT_DIR
+                    } else {
+                        since.map_or(0, |since| {
+                            listing_priority(&tree, id, entry.modified, since)
+                        })
+                    };
                     subdirs.push((id, path.join(&entry.name), entry.modified, priority));
                 })
             } else {
@@ -1557,7 +1567,9 @@ mod tests {
             },
             0,
         );
+        q.push(list(1_000), GIT_DIR);
         assert_eq!(name(q.pop().unwrap()), "probe");
+        assert_eq!(name(q.pop().unwrap()), "1000", "a .git folder's listing");
         assert_eq!(name(q.pop().unwrap()), "999");
         // Once the ordered listings are done, the rest go in the order
         // queued again.
