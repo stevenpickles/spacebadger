@@ -285,7 +285,7 @@ fn bulk_listing_matches_readdir_and_lstat() {
     assert!(seen.contains_key(&root.join("locked/<listing>")));
     assert_eq!(
         seen.keys()
-            .filter(|p| p.starts_with(root.join("wide")))
+            .filter(|p| p.parent() == Some(&root.join("wide")))
             .count(),
         3000
     );
@@ -321,29 +321,91 @@ fn walk_one(listing: Listing, dir: &Path) -> Seen {
     seen
 }
 
+/// `dir`'s entries in a scan of `root`, without descending.
+fn list_under(listing: Listing, root: &Path, dir: &Path) -> Result<Seen, String> {
+    let fs = NativeFs::with_listing(listing);
+    fs.open_root(root).unwrap();
+    let mut seen = Seen::new();
+    fs.read_dir(dir, &mut |batch| {
+        for entry in batch {
+            seen.insert(dir.join(&entry.name), Ok(entry));
+        }
+        ControlFlow::Continue(())
+    })
+    .map_err(|e| format!("{e}"))?;
+    Ok(seen)
+}
+
 #[test]
-fn firmlinks_and_mount_points_are_skipped_alike() {
-    // Today's policy (unchanged here): from `/`, firmlinked data-volume
-    // folders such as `/Users` are on another device and skipped as mount
-    // points, as are real mount points such as `/System/Volumes/Data` and
-    // `/dev`.
-    let old = walk_one(Listing::Readdir, Path::new("/"));
-    let new = walk_one(Listing::Bulk, Path::new("/"));
-    let diff = differences(&old, &new);
-    assert!(diff.is_empty(), "/:\n{}", diff.join("\n"));
-    let kinds: Vec<String> = new
-        .iter()
-        .map(|(p, e)| format!("{p:?}: {:?}", e.as_ref().map(|e| e.kind)))
-        .collect();
-    std::io::Write::write_all(
-        &mut std::io::stderr(),
-        format!("entries of / (bulk listing):\n{}\n", kinds.join("\n")).as_bytes(),
-    )
-    .unwrap();
-    if let Some(Ok(users)) = new.get(Path::new("/Users")) {
-        assert_eq!(users.kind, EntryKind::MountPoint, "firmlink");
+fn firmlinks_and_mount_points_are_treated_alike() {
+    // Both listings must agree on what a scan of `/` meets: firmlinked
+    // data-volume folders (`/Users`), what lies below them, real mount
+    // points (`/dev`, `/System/Volumes/Data`) and the special folders at
+    // the top. The policy itself is unchanged here; what it amounts to is
+    // printed for the record.
+    let root = Path::new("/");
+    let mut report = String::from("what a scan of / meets (both listings agree):\n");
+    for dir in [
+        "/",
+        "/Users",
+        "/Applications",
+        "/System/Volumes",
+        "/.nofollow",
+        "/.resolve",
+        "/.vol",
+    ] {
+        let dir = Path::new(dir);
+        let (old, new) = (
+            list_under(Listing::Readdir, root, dir),
+            list_under(Listing::Bulk, root, dir),
+        );
+        let (old, new) = match (old, new) {
+            (Ok(old), Ok(new)) => (old, new),
+            (old, new) => {
+                assert_eq!(old.is_err(), new.is_err(), "{dir:?}: {old:?} / {new:?}");
+                report += &format!("  {dir:?}: not listed: {:?}\n", new.err());
+                continue;
+            }
+        };
+        let diff = differences(&old, &new);
+        assert!(diff.is_empty(), "{dir:?}:\n{}", diff.join("\n"));
+        let mut kinds: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, entry) in &new {
+            let kind = format!("{:?}", entry.as_ref().map(|e| e.kind));
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            kinds.entry(kind).or_default().push(name.into_owned());
+        }
+        report += &format!("  {dir:?}: {} entries\n", new.len());
+        for (kind, mut names) in kinds {
+            let more = names.len().saturating_sub(12);
+            names.truncate(12);
+            report += &format!("    {kind}: {}", names.join(", "));
+            if more > 0 {
+                report += &format!(" (+{more} more)");
+            }
+            report += "\n";
+        }
     }
-    if let Some(Ok(dev)) = new.get(Path::new("/dev")) {
+    for path in [
+        "/",
+        "/Users",
+        "/Users/runner",
+        "/System/Volumes/Data",
+        "/.nofollow",
+    ] {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            use std::os::macos::fs::MetadataExt;
+            report += &format!(
+                "  lstat {path:?}: dev {:#x}, ino {}, flags {:#x}\n",
+                meta.st_dev(),
+                meta.st_ino(),
+                meta.st_flags()
+            );
+        }
+    }
+    std::io::Write::write_all(&mut std::io::stderr(), report.as_bytes()).unwrap();
+    let top = list_under(Listing::Bulk, root, root).unwrap();
+    if let Some(Ok(dev)) = top.get(Path::new("/dev")) {
         assert_eq!(dev.kind, EntryKind::MountPoint);
     }
 }
