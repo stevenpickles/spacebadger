@@ -193,7 +193,8 @@
 
   function sizeTitle(r: GitRootRow): string {
     const lines = [`Scanned: ${exactBytes(r.size)}`];
-    if (r.nested > 0) lines.push(`Of that, in nested repositories: ${formatBytes(r.size - r.own)}`);
+    // `own` leaves out the root's own Git metadata as well as nested roots.
+    if (r.nested > 0) lines.push(`Of that, in nested repositories: ${formatBytes(r.size - r.own - r.metadata)}`);
     if (r.metadata > 0) lines.push(`Git metadata: ${formatBytes(r.metadata)}`);
     if (r.matching !== null) lines.push(`Matching the filter: ${exactBytes(r.matching)}`);
     return lines.join("\n");
