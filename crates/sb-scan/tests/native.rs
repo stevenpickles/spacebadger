@@ -24,8 +24,8 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         #[cfg(windows)]
-        remove_junctions(&self.0);
-        let _ = std::fs::remove_dir_all(&self.0);
+        remove_junctions(&verbatim(&self.0));
+        let _ = std::fs::remove_dir_all(verbatim(&self.0));
     }
 }
 
@@ -41,6 +41,16 @@ fn remove_junctions(dir: &Path) {
         } else if meta.is_dir() {
             remove_junctions(&entry.path());
         }
+    }
+}
+
+/// `path` in the `\\?\` form on Windows, where names ending in a dot or a
+/// space survive only that way; as it is elsewhere.
+fn verbatim(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -452,6 +462,11 @@ fn folders_past_the_open_limit_are_opened_by_path_with_the_same_result() {
             write(&tmp.0.join(format!("d{d}/s{s}/g.bin")), 7);
         }
     }
+    // Names Windows only keeps through `\\?\` paths.
+    let odd = verbatim(&tmp.0);
+    write(&odd.join("d0").join("foo.").join("x.bin"), 3);
+    write(&odd.join("d0").join("foo.").join("inner").join("y.bin"), 4);
+    write(&odd.join("d1").join("bar ").join("z.bin"), 5);
     let scan_with = |open_dirs| {
         let config = ScanConfig {
             open_dirs,
@@ -461,12 +476,19 @@ fn folders_past_the_open_limit_are_opened_by_path_with_the_same_result() {
         let tree = s.tree();
         let progress = s.wait();
         assert_eq!(progress.state, ScanState::Complete);
-        assert_eq!(progress.files, 48);
+        assert_eq!(progress.files, 51);
         let tree = tree.read().unwrap();
+        for (path, size) in [
+            ("d0/foo./x.bin", 3),
+            ("d0/foo./inner/y.bin", 4),
+            ("d1/bar /z.bin", 5),
+        ] {
+            assert_eq!(tree.logical(find(&tree, path)), size, "{path}");
+        }
         contents(&tree)
     };
     let all = scan_with(sb_scan::OPEN_DIRS);
-    assert_eq!(all.len(), 1 + 6 + 24 + 24 + 48);
+    assert_eq!(all.len(), 1 + 6 + 24 + 24 + 48 + 3 + 3);
     assert_eq!(scan_with(0), all);
     assert_eq!(scan_with(1), all);
 }

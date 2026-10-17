@@ -132,9 +132,52 @@ fn scan_error(err: windows::core::Error) -> ScanError {
     ScanError::new(kind, err.message())
 }
 
-/// NUL-terminated wide path in the `\\?\` form so long paths work.
+/// Whether `path` is already absolute and normal: a drive or UNC prefix, a
+/// root, and then only names between single `\` separators (no `.`, `..`
+/// or `/`). The scan's paths are: the app makes the root absolute once and
+/// the engine joins listed names onto it. Such a path goes into the `\\?\`
+/// form as it is, because `std::path::absolute` (`GetFullPathNameW`) would
+/// strip trailing dots and spaces from every name, and a listed `foo.` would
+/// then open `foo`.
+fn is_normal(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    let known = matches!(
+        prefix.kind(),
+        Prefix::Disk(_)
+            | Prefix::UNC(..)
+            | Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(..)
+    );
+    if !known || components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let text = path.as_os_str().to_string_lossy();
+    let Some(rest) = text
+        .get(prefix.as_os_str().to_string_lossy().len()..)
+        .and_then(|rest| rest.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    let rest = rest.strip_suffix('\\').unwrap_or(rest);
+    rest.is_empty()
+        || rest
+            .split('\\')
+            .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains('/'))
+}
+
+/// NUL-terminated wide path in the `\\?\` form so long paths work. A path
+/// that isn't [`is_normal`] is made absolute first.
 fn wide(path: &Path) -> Vec<u16> {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = if is_normal(path) {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
     let text: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     let starts = |prefix: &str| text.starts_with(&prefix.encode_utf16().collect::<Vec<_>>());
     let mut out: Vec<u16> = if starts(r"\\?\") || starts(r"\\.\") {
@@ -1050,6 +1093,25 @@ mod tests {
         assert!(open_relative(&parent, &name("missing")).is_none());
         drop((child, by_path, parent));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_trailing_dots_and_spaces_in_normal_paths() {
+        let text = |p: &str| String::from_utf16(&wide(Path::new(p))[..]).unwrap();
+        assert_eq!(text(r"C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        assert_eq!(text(r"C:\a\bar "), "\\\\?\\C:\\a\\bar \0");
+        assert_eq!(text(r"C:\"), "\\\\?\\C:\\\0");
+        assert_eq!(
+            text(r"\\server\share\x."),
+            "\\\\?\\UNC\\server\\share\\x.\0"
+        );
+        assert_eq!(text(r"\\?\C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        // Anything else is made absolute first.
+        assert_eq!(text(r"C:\a\.\b\..\c"), "\\\\?\\C:\\a\\c\0");
+        assert_eq!(text("C:/a/b"), "\\\\?\\C:\\a\\b\0");
+        assert_eq!(text(r"C:\a\\b"), "\\\\?\\C:\\a\\b\0");
+        assert!(!is_normal(Path::new("relative")));
+        assert!(!is_normal(Path::new(r"C:relative")));
     }
 
     #[test]

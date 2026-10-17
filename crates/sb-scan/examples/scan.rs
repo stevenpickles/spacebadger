@@ -29,6 +29,8 @@ fn main() {
         args.next()
             .expect("usage: scan <root> [--workers N] [--cancel-after-ms N]"),
     );
+    // As the app does: absolute once, so listed names join on unchanged.
+    let root = std::path::absolute(&root).unwrap_or(root);
     let mut config = sb_scan::native::scan_config(&root);
     let mut cancel_after = None;
     while let Some(flag) = args.next() {
