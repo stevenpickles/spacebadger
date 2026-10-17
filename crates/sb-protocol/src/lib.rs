@@ -13,13 +13,15 @@ use ts_rs::TS;
 
 pub mod compare;
 pub mod duplicates;
+pub mod git;
 pub mod wire;
 
 pub use compare::*;
 pub use duplicates::*;
+pub use git::*;
 
 /// Incremented whenever a command or event shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Name of the event that carries [`ScanStatus`] updates.
 pub const SCAN_STATUS_EVENT: &str = "scan-status";
@@ -126,6 +128,9 @@ pub struct ScanStatus {
     #[ts(type = "number")]
     pub revision: u64,
     pub omissions: Vec<OmissionGroup>,
+    /// Git repositories, worktrees and unresolved candidates found so far
+    /// (see [`GitRootsPage`]), including one above the scan root.
+    pub git_roots: u32,
 }
 
 /// The filter caught up with a scan status after requests had been
@@ -252,6 +257,9 @@ pub struct NodeDetails {
     /// What a filter matches at or under this node, when the request named
     /// the current search.
     pub matching: Option<Matching>,
+    /// Where the node stands in Git; `None` when the scan found no
+    /// repositories.
+    pub git: Option<GitDetails>,
 }
 
 /// Files matching a filter at or under a node.

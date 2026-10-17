@@ -883,6 +883,7 @@ impl Session {
             alias_of: tree.alias_owner(n).map(|o| display_path(&tree.path(o))),
             ancestors,
             matching,
+            git: None,
         })
     }
 
@@ -1419,6 +1420,7 @@ pub fn status(root: &str, p: &Progress) -> proto::ScanStatus {
         pending_dirs: p.pending_dirs,
         revision: p.revision,
         omissions,
+        git_roots: p.git_roots,
     }
 }
 

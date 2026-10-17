@@ -206,6 +206,9 @@ pub struct Progress {
     /// when it hasn't moved.
     pub revision: u64,
     pub omissions: Omissions,
+    /// Git repositories, worktrees and unresolved candidates found so far
+    /// (see `sb_core::git::GitIndex::listed_count`).
+    pub git_roots: u32,
 }
 
 impl Progress {
@@ -223,6 +226,7 @@ impl Progress {
             pending_dirs: 1,
             revision: 0,
             omissions: Omissions::default(),
+            git_roots: 0,
         }
     }
 
@@ -235,6 +239,7 @@ impl Progress {
         self.allocated = tree.allocated(root);
         self.unknown_allocation_files = u64::from(tree.unknown_allocation_files(root));
         self.hardlink_aliases = tree.alias_count() as u64;
+        self.git_roots = tree.git().listed_count();
     }
 }
 
