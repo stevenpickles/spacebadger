@@ -599,11 +599,11 @@ enum Outcome {
 
 /// Workers' jobs in three lanes:
 ///
-/// - Git probes, listings of `.git` folders (which a probe of the folder
-///   above waits for), and re-measures: few, small, and wanted soon;
+/// - Git probes and listings of `.git` folders (which a probe of the folder
+///   above waits for): few, small, and wanted soon;
 /// - listings of folders a prior puts ahead (see [`listing_priority`]),
 ///   highest priority first;
-/// - other listings, in the order queued.
+/// - other listings and re-measures, in the order queued.
 ///
 /// While the ordered lane has listings, the first lane is served before
 /// it; otherwise the first and last lanes are served together in the order
@@ -617,7 +617,7 @@ struct Queue {
 
 #[derive(Default)]
 struct Jobs {
-    /// Git probes and re-measures, with when each was queued.
+    /// Git probes and `.git` listings, with when each was queued.
     soon: VecDeque<(u64, Job)>,
     big: BinaryHeap<Big>,
     /// Other listings, with when each was queued.
@@ -637,7 +637,9 @@ impl Jobs {
     fn put(&mut self, job: Job, priority: u32) {
         let seq = self.seq();
         match job {
-            Job::Measure { .. } | Job::Git { .. } => self.soon.push_back((seq, job)),
+            Job::Git { .. } => self.soon.push_back((seq, job)),
+            // Nothing reads a re-measure before the scan ends, so it waits in turn.
+            Job::Measure { .. } => self.fifo.push_back((seq, job)),
             Job::List { .. } if priority == GIT_DIR => self.soon.push_back((seq, job)),
             Job::List { .. } if priority >= BIG_SHARE => self.big.push(Big { priority, seq, job }),
             Job::List { .. } => self.fifo.push_back((seq, job)),
@@ -1480,10 +1482,10 @@ mod tests {
         );
         q.push(list(7), 500_000);
         let order: Vec<String> = (0..8).map(|_| name(q.pop().unwrap())).collect();
-        // The Git probe and the re-measure go ahead of the ordered
-        // listings; those go highest first, ties to the one queued first;
-        // then the rest in the order queued.
-        assert_eq!(order, ["probe", "6", "4", "7", "2", "5", "1", "3"]);
+        // The Git probe goes ahead of the ordered listings; those go
+        // highest first, ties to the one queued first; then the rest,
+        // re-measure included, in the order queued.
+        assert_eq!(order, ["probe", "4", "7", "2", "5", "1", "3", "6"]);
     }
 
     #[test]
