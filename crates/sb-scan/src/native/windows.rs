@@ -625,8 +625,6 @@ impl FsAdapter for WindowsFs {
                 .encode_utf16()
                 .chain([0])
                 .collect();
-            const DRIVE_FIXED: u32 = 3;
-            const DRIVE_RAMDISK: u32 = 6;
             let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
             known[slot] = if matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK) {
                 1
@@ -707,19 +705,30 @@ fn try_enable_backup_privilege() -> windows::core::Result<bool> {
     Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
 }
 
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+const DRIVE_RAMDISK: u32 = 6;
+
 /// Whether `path` is on a network share (UNC path or mapped network drive).
 pub fn is_remote(path: &Path) -> bool {
+    drive_type(path) == Some(DRIVE_REMOTE)
+}
+
+/// Whether `path` is on a local fixed disk or a RAM disk.
+pub fn is_local_fixed(path: &Path) -> bool {
+    matches!(drive_type(path), Some(DRIVE_FIXED | DRIVE_RAMDISK))
+}
+
+/// `GetDriveTypeW` of the volume holding `path`; a UNC path is remote.
+fn drive_type(path: &Path) -> Option<u32> {
     let path = wide(path);
-    let unc: Vec<u16> = r"\?\UNC\".encode_utf16().collect();
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
     if path.starts_with(&unc) {
-        return true;
+        return Some(DRIVE_REMOTE);
     }
     let mut volume = vec![0u16; path.len() + 1];
-    if unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.is_err() {
-        return false;
-    }
-    const DRIVE_REMOTE: u32 = 4;
-    unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) == DRIVE_REMOTE }
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.ok()?;
+    Some(unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) })
 }
 
 /// Capacity and free space of the volume holding `path`, whether `path` is

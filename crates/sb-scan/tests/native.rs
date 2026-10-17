@@ -194,13 +194,18 @@ fn missing_root_fails() {
 }
 
 #[test]
-fn local_folders_use_the_default_worker_count() {
+fn local_folders_use_more_workers_on_fixed_disks() {
     let local = std::env::temp_dir();
     assert!(!sb_scan::native::is_remote(&local));
-    assert_eq!(
-        sb_scan::native::scan_config(&local).workers,
-        ScanConfig::default().workers
-    );
+    let workers = sb_scan::native::scan_config(&local).workers;
+    if cfg!(windows) {
+        assert!(sb_scan::native::is_local_fixed(&local));
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let (low, high) = sb_scan::native::LOCAL_WORKERS;
+        assert_eq!(workers, cores.clamp(low, high));
+    } else {
+        assert_eq!(workers, ScanConfig::default().workers);
+    }
 }
 
 #[test]

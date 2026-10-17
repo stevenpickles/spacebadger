@@ -70,11 +70,34 @@ pub fn volume_info(root: &Path) -> Option<VolumeInfo> {
     }
 }
 
-/// Scan settings suited to `root`: fewer workers for network shares.
+/// Concurrent listings for roots on local fixed disks (Windows): one per
+/// core between these bounds. Measured on NVMe, listing time falls until
+/// about 16 and then flattens as the kernel's per-directory work grows with
+/// contention.
+pub const LOCAL_WORKERS: (usize, usize) = (4, 16);
+
+/// Whether `root` is on a local fixed disk where more concurrent listings
+/// pay off. Only Windows is measured; elsewhere `false`, which keeps the
+/// default worker count.
+pub fn is_local_fixed(root: &Path) -> bool {
+    #[cfg(windows)]
+    return windows::is_local_fixed(root);
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        false
+    }
+}
+
+/// Scan settings suited to `root`: fewer workers for network shares, more
+/// for local fixed disks.
 pub fn scan_config(root: &Path) -> ScanConfig {
     let mut config = ScanConfig::default();
     if is_remote(root) {
         config.workers = config.workers.min(REMOTE_WORKERS);
+    } else if is_local_fixed(root) {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        config.workers = cores.clamp(LOCAL_WORKERS.0, LOCAL_WORKERS.1);
     }
     config
 }
