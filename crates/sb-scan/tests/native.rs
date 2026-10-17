@@ -204,17 +204,25 @@ fn missing_root_fails() {
 }
 
 #[test]
-fn local_folders_use_more_workers_on_fixed_disks() {
+fn fixed_disks_open_folders_relative_and_use_more_workers_without_seeks() {
     let local = std::env::temp_dir();
     assert!(!sb_scan::native::is_remote(&local));
-    let workers = sb_scan::native::scan_config(&local).workers;
+    let config = sb_scan::native::scan_config(&local);
+    let default = ScanConfig::default();
+    assert_eq!(default.open_dirs, 0, "by path unless asked");
     if cfg!(windows) {
         assert!(sb_scan::native::is_local_fixed(&local));
+        assert_eq!(config.open_dirs, sb_scan::OPEN_DIRS);
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let (low, high) = sb_scan::native::LOCAL_WORKERS;
-        assert_eq!(workers, cores.clamp(low, high));
+        let expected = if sb_scan::native::no_seek_penalty(&local) {
+            cores.clamp(low, high)
+        } else {
+            default.workers
+        };
+        assert_eq!(config.workers, expected);
     } else {
-        assert_eq!(workers, ScanConfig::default().workers);
+        assert_eq!((config.workers, config.open_dirs), (default.workers, 0));
     }
 }
 

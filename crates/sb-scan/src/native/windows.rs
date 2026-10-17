@@ -54,11 +54,15 @@ use windows::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
     FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
-    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
 };
 use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
-use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
+use windows::Win32::System::Ioctl::{
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY,
+    NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_PROPERTY_QUERY,
+    StorageDeviceSeekPenaltyProperty,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
 
@@ -631,6 +635,8 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
 
 /// Bytes of directory records read per call.
 const LIST_BUFFER_BYTES: usize = 64 * 1024;
+// Held as u64s, which keep records 8-byte aligned as the call requires.
+const _: () = assert!(LIST_BUFFER_BYTES % size_of::<u64>() == 0);
 
 thread_local! {
     /// Each listing thread's buffer for directory records, allocated once
@@ -909,6 +915,61 @@ pub fn is_remote(path: &Path) -> bool {
 /// Whether `path` is on a local fixed disk or a RAM disk.
 pub fn is_local_fixed(path: &Path) -> bool {
     matches!(drive_type(path), Some(DRIVE_FIXED | DRIVE_RAMDISK))
+}
+
+/// Whether the disk under `path`'s volume has no seek penalty (an SSD or
+/// NVMe drive), by `IOCTL_STORAGE_QUERY_PROPERTY` on the volume opened for
+/// no access, which needs no rights. `None` when the volume or its driver
+/// doesn't say (a volume spanning disks, say).
+pub fn no_seek_penalty(path: &Path) -> Option<bool> {
+    let path = wide(path);
+    let mut mount = vec![0u16; path.len() + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut mount) }.ok()?;
+    let mut volume = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut volume) }.ok()?;
+    // "\\?\Volume{...}\" names the root folder; without the backslash, the
+    // volume device.
+    let len = volume.iter().position(|&c| c == 0)?;
+    if len == 0 || volume[len - 1] != u16::from(b'\\') {
+        return None;
+    }
+    volume[len - 1] = 0;
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(volume.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: CreateFileW returned a valid handle that we now own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        ..Default::default()
+    };
+    let mut answer = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            raw(&handle),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some((&raw const query).cast::<c_void>()),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some((&raw mut answer).cast::<c_void>()),
+            size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .ok()?;
+    (returned as usize >= size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>())
+        .then_some(!answer.IncursSeekPenalty)
 }
 
 /// `GetDriveTypeW` of the volume holding `path`; a UNC path is remote.
