@@ -44,7 +44,7 @@
   import Announcer from "./lib/Announcer.svelte";
   import { announce } from "./lib/announce.svelte";
   import { formatBytes, KILO, plural } from "./lib/format";
-  import { KIND_OTHER, type DecodedLayout } from "./lib/layoutWire";
+  import { KIND_OTHER, LAYOUT_PROVISIONAL, type DecodedLayout } from "./lib/layoutWire";
   import Omissions from "./lib/Omissions.svelte";
   import type { DeleteReport } from "./lib/protocol/DeleteReport";
   import type { DuplicateFile } from "./lib/protocol/DuplicateFile";
@@ -1276,7 +1276,12 @@
             {/if}
           </div>
         {/if}
-        <Legend mode={colors} {since} filtered={search !== null} />
+        <Legend
+          mode={colors}
+          {since}
+          filtered={search !== null}
+          estimated={layout !== null && (layout.flags & LAYOUT_PROVISIONAL) !== 0}
+        />
       {/if}
     </main>
     <aside>
