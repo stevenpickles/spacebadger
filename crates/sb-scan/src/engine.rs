@@ -73,9 +73,10 @@ pub struct ScanConfig {
     pub open_dirs: usize,
 }
 
-/// Default for [`ScanConfig::open_dirs`]. Folders are listed newest first,
-/// so the ones kept open are few (about depth × workers) unless folders are
-/// very deep; the cap bounds the kernel memory they pin either way.
+/// Default for [`ScanConfig::open_dirs`]. Folders are listed breadth first,
+/// so a folder stays open until the scan has worked through the rest of its
+/// level; the cap bounds the kernel memory open folders pin, and past it
+/// folders open by path (about half of them on `C:\Windows`).
 pub const OPEN_DIRS: usize = 4096;
 
 /// Called after the scanner releases the tree's write lock with how long it
@@ -568,30 +569,19 @@ enum Outcome {
     Stopped { dir: NodeId },
 }
 
-/// Jobs waiting for a worker: re-measures and Git probes first, in order,
-/// then listings newest first, so a folder kept open for its subfolders is
-/// closed soon after they're opened and few are open at once.
+/// Jobs waiting for a worker, in order. Listings stay breadth first
+/// (rather than newest first, which keeps fewer folders open) because the
+/// first name of a hard-linked file to be listed owns its allocation, and
+/// breadth first keeps that the shallowest name, as it has been.
 #[derive(Default)]
 struct Queue {
-    state: Mutex<Waiting>,
+    state: Mutex<(VecDeque<Job>, bool)>,
     ready: Condvar,
-}
-
-#[derive(Default)]
-struct Waiting {
-    others: VecDeque<Job>,
-    lists: Vec<Job>,
-    closed: bool,
 }
 
 impl Queue {
     fn push(&self, job: Job) {
-        let mut state = self.state.lock().unwrap();
-        match job {
-            Job::List { .. } => state.lists.push(job),
-            _ => state.others.push_back(job),
-        }
-        drop(state);
+        self.state.lock().unwrap().0.push_back(job);
         self.ready.notify_one();
     }
 
@@ -599,10 +589,10 @@ impl Queue {
     fn pop(&self) -> Option<Job> {
         let mut state = self.state.lock().unwrap();
         loop {
-            if state.closed {
+            if state.1 {
                 return None;
             }
-            if let Some(job) = state.others.pop_front().or_else(|| state.lists.pop()) {
+            if let Some(job) = state.0.pop_front() {
                 return Some(job);
             }
             state = self.ready.wait(state).unwrap();
@@ -611,11 +601,9 @@ impl Queue {
 
     fn close(&self) -> Vec<Job> {
         let mut state = self.state.lock().unwrap();
-        state.closed = true;
+        state.1 = true;
         self.ready.notify_all();
-        let mut jobs: Vec<Job> = state.others.drain(..).collect();
-        jobs.append(&mut state.lists);
-        jobs
+        state.0.drain(..).collect()
     }
 }
 
