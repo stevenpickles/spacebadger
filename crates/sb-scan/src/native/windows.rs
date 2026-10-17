@@ -450,11 +450,6 @@ fn filetime(ticks: i64) -> Option<SystemTime> {
 pub struct WindowsFs {
     /// Set once the extended class is found unsupported on this volume.
     use_both_dir_info: AtomicBool,
-    /// Set by [`FsAdapter::open_root`] when the root's volume fills listing
-    /// buffers (see [`short_reads_end`]), so a listing whose buffer comes
-    /// back with room for another entry is complete and the call that would
-    /// only say "no more files" is skipped.
-    short_reads_end: AtomicBool,
     /// Per drive letter: 0 not asked yet, 1 local, 2 not.
     local_drives: Mutex<[u8; 26]>,
 }
@@ -494,14 +489,12 @@ impl WindowsFs {
         buffer: &mut [u64],
         out: &mut Batcher<'_, '_>,
     ) -> Result<(), ScanError> {
-        let short_ends = self.short_reads_end.load(Ordering::Relaxed);
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
             match list_with::<FILE_ID_EXTD_DIR_INFO>(
                 handle,
                 FileIdExtdDirectoryInformation,
                 buffer,
                 out,
-                short_ends,
             ) {
                 // Only before any entry was read, so none is listed twice.
                 Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
@@ -510,13 +503,7 @@ impl WindowsFs {
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(
-            handle,
-            FileIdBothDirectoryInformation,
-            buffer,
-            out,
-            short_ends,
-        )
+        list_with::<FILE_ID_BOTH_DIR_INFO>(handle, FileIdBothDirectoryInformation, buffer, out)
     }
 }
 
@@ -544,9 +531,6 @@ impl Listed {
 /// A directory-information record with a trailing UTF-16 name.
 trait DirInfo: Copy {
     const NAME_OFFSET: usize;
-    /// Bytes the largest record takes: a 255-unit name, the most NTFS and
-    /// ReFS allow, rounded up to the 8-byte alignment records keep.
-    const MAX_RECORD: usize = (Self::NAME_OFFSET + 255 * 2).next_multiple_of(8);
     fn next(&self) -> u32;
     /// Name length in UTF-16 units.
     fn name_len(&self) -> usize;
@@ -665,22 +649,17 @@ fn query_dir(
 }
 
 /// Reads a directory a buffer at a time, passing each entry on as it's
-/// decoded; stops early when the batcher says so. With `short_ends` (see
-/// [`short_reads_end`]), a buffer that comes back with room for another
-/// entry ends the listing without the call that would say so.
+/// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
     class: FILE_INFORMATION_CLASS,
     buffer: &mut [u64],
     out: &mut Batcher<'_, '_>,
-    short_ends: bool,
 ) -> Result<(), ScanError> {
     loop {
-        let Some(filled) = query_dir(handle, class, buffer)? else {
+        if query_dir(handle, class, buffer)?.is_none() {
             return Ok(());
-        };
-        // With room left for the largest entry, these were the last ones.
-        let last = short_ends && filled + T::MAX_RECORD <= size_of_val(buffer);
+        }
         let base = buffer.as_ptr().cast::<u8>();
         let mut offset = 0usize;
         loop {
@@ -704,9 +683,6 @@ fn list_with<T: DirInfo>(
             }
             offset += record.next() as usize;
         }
-        if last {
-            return Ok(());
-        }
     }
 }
 
@@ -714,8 +690,6 @@ impl FsAdapter for WindowsFs {
     fn open_root(&self, root: &Path) -> Result<RootKind, ScanError> {
         let handle = open(root, FILE_READ_ATTRIBUTES.0)?;
         let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(&handle, FileAttributeTagInfo)?;
-        self.short_reads_end
-            .store(short_reads_end(root), Ordering::Relaxed);
         Ok(
             match classify(tag_info.FileAttributes, tag_info.ReparseTag) {
                 EntryKind::Directory => RootKind::Directory,
@@ -906,41 +880,6 @@ fn drive_type(path: &Path) -> Option<u32> {
     Some(unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) })
 }
 
-/// The filesystem name ("NTFS", say) of the volume whose root path is
-/// `volume` (NUL-terminated).
-fn filesystem_name(volume: &[u16]) -> Option<String> {
-    let mut name = [0u16; 64];
-    unsafe {
-        GetVolumeInformationW(
-            PCWSTR(volume.as_ptr()),
-            None,
-            None,
-            None,
-            None,
-            Some(&mut name),
-        )
-    }
-    .ok()?;
-    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-    Some(String::from_utf16_lossy(&name[..len]))
-}
-
-/// Whether listings of folders on `root`'s volume end as soon as a buffer
-/// comes back with room left for another entry: a local fixed NTFS or ReFS
-/// volume, which fill each buffer until the next entry wouldn't fit. Never
-/// a share, whose server may return less.
-fn short_reads_end(root: &Path) -> bool {
-    if !is_local_fixed(root) {
-        return false;
-    }
-    let path = wide(root);
-    let mut volume = vec![0u16; path.len() + 1];
-    if unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.is_err() {
-        return false;
-    }
-    matches!(filesystem_name(&volume).as_deref(), Some("NTFS" | "ReFS"))
-}
-
 /// Capacity and free space of the volume holding `path`, whether `path` is
 /// its top folder, and the NTFS master file table's size when the volume
 /// can be queried (usually only when elevated).
@@ -959,7 +898,25 @@ pub fn volume_info(path: &Path) -> Option<super::VolumeInfo> {
         )
     }
     .ok()?;
-    let filesystem = filesystem_name(&volume);
+    let mut fs_name = [0u16; 64];
+    let filesystem = unsafe {
+        GetVolumeInformationW(
+            PCWSTR(volume.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_name),
+        )
+    }
+    .ok()
+    .map(|()| {
+        let len = fs_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(fs_name.len());
+        String::from_utf16_lossy(&fs_name[..len])
+    });
     let metadata = if filesystem.as_deref() == Some("NTFS") {
         ntfs_mft_bytes(&volume[..volume_len])
     } else {
@@ -1096,14 +1053,8 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_records_have_room_for_the_longest_names() {
-        assert_eq!(FILE_ID_EXTD_DIR_INFO::MAX_RECORD, 600);
-        assert_eq!(FILE_ID_BOTH_DIR_INFO::MAX_RECORD, 616);
-    }
-
-    #[test]
-    fn listings_that_end_at_a_buffer_with_room_miss_nothing() {
-        let dir = std::env::temp_dir().join(format!("sb-short-ends-{}", std::process::id()));
+    fn listings_spanning_several_buffers_miss_nothing() {
+        let dir = std::env::temp_dir().join(format!("sb-long-listing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Longest names fill a buffer with a few hundred records; short
@@ -1117,8 +1068,6 @@ mod tests {
         }
         let fs = WindowsFs::new();
         assert_eq!(fs.open_root(&dir), Ok(RootKind::Directory));
-        // The temporary folder is on a local NTFS disk here and in CI.
-        assert!(fs.short_reads_end.load(Ordering::Relaxed));
         let mut listed = Vec::new();
         fs.read_dir(&dir, &mut |batch| {
             listed.extend(batch.into_iter().map(|e| e.name.into_string().unwrap()));
