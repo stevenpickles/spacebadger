@@ -638,9 +638,11 @@ impl FsAdapter for WindowsFs {
     }
 }
 
-/// Opens Git metadata for its attributes as [`open`] does, and as the
-/// file's owner only identifies us: a path that reaches a server anyway
-/// can't act with our credentials.
+/// Opens Git metadata for its attributes as [`open`] does, allowing a
+/// server only to identify us, not to impersonate us. That doesn't stop
+/// SMB from authenticating (and so sending a credential hash) if a path
+/// reaches a server; what keeps metadata reads off other computers is the
+/// target policy in `crate::git::reachable`.
 fn open_metadata(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
     open_with(
         path,
