@@ -181,6 +181,15 @@ impl ChildIndex {
         self.children = kids;
     }
 
+    /// Orders every folder's children (see [`ChildIndex::sort`]).
+    pub(crate) fn sort_all(&mut self, snap: &Snapshot) {
+        for e in 0..snap.len() as u32 {
+            if self.child_start[e as usize + 1] - self.child_start[e as usize] > 1 {
+                self.sort(snap, e);
+            }
+        }
+    }
+
     /// Where `entry`'s children named `folded` (as compared) are, within
     /// [`ChildIndex::children`]; the folder's children must be sorted.
     pub(crate) fn named(

@@ -12,10 +12,12 @@
 //! parent and report zero sizes.
 
 use crate::git::{GitClass, GitIndex, GitRoot, Problem, RootKind};
+use crate::prior::Prior;
 use crate::size::Allocated;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NONE: u32 = u32::MAX;
@@ -270,6 +272,30 @@ pub struct Tree {
     /// Git repositories, worktrees and metadata found in the scan. A side
     /// table, not a column: only nodes with [`flags::GIT`] have entries.
     git: GitIndex,
+    /// The previous scan's sizes for folders still to be listed, while a
+    /// rescan runs (see [`Tree::set_prior`]).
+    prior: Option<Box<Provisional>>,
+}
+
+/// Estimates from a [`Prior`] for the folders not yet listed.
+///
+/// A folder matched with a snapshot entry when it's created is estimated at
+/// that entry's logical size until its listing ends (whatever the outcome:
+/// listed, failed, or not scanned). `pending[D]` is the sum of the
+/// estimates of the folders at or under `D` still waiting, kept up to date
+/// with two walks up the tree per folder (one when it's created, one when
+/// its listing ends), as file sizes are. So once every folder is listed,
+/// every `pending` is 0 again.
+struct Provisional {
+    prior: Arc<Prior>,
+    /// Pending folders matched with a snapshot entry → that entry: its
+    /// size is the folder's estimate, and its children are where the
+    /// folder's subfolders are looked up as they're added.
+    entries: HashMap<u32, u32>,
+    /// Per node: estimates of the unlisted folders at or under it.
+    pending: Column<u64>,
+    /// Folded names, reused.
+    buf: Vec<u8>,
 }
 
 impl std::fmt::Debug for Tree {
@@ -306,6 +332,7 @@ impl Tree {
             dir_count: 0,
             changes: Vec::new(),
             git: GitIndex::default(),
+            prior: None,
         };
         tree.push(NONE, OsStr::new(""), flags::DIRECTORY)
             .expect("empty tree has capacity for its root");
@@ -370,6 +397,9 @@ impl Tree {
             self.files.grow(0);
             self.modified.grow(0);
             self.ids.grow(0);
+            if let Some(p) = &mut self.prior {
+                p.pending.grow(0);
+            }
         }
         self.len += 1;
         // Every slot is set, so nothing written past the end before (which
@@ -387,6 +417,9 @@ impl Tree {
         self.files[i] = 0;
         self.modified[i] = 0;
         self.ids[i] = 0;
+        if let Some(p) = &mut self.prior {
+            p.pending[i] = 0;
+        }
         if let Some(p) = parent_slot {
             self.next_sibling[i] = self.first_child[p];
             self.first_child[p] = id;
@@ -400,7 +433,125 @@ impl Tree {
     /// Adds an empty directory under `parent` in the [`DirState::Pending`] state.
     pub fn add_dir(&mut self, parent: NodeId, name: &OsStr) -> Result<NodeId, CapacityExceeded> {
         debug_assert!(self.is_dir(parent) && !self.is_removed(parent));
-        self.push(parent.0, name, flags::DIRECTORY)
+        let id = self.push(parent.0, name, flags::DIRECTORY)?;
+        self.estimate(parent, id);
+        Ok(id)
+    }
+
+    /// Gives new folder `dir` the size its namesake had in the prior scan,
+    /// if its parent was matched and is still waiting for its listing to
+    /// end (only then can it gain children).
+    fn estimate(&mut self, parent: NodeId, dir: NodeId) {
+        let Some(p) = self.prior.as_deref_mut() else {
+            return;
+        };
+        let Some(&parent_entry) = p.entries.get(&parent.0) else {
+            return;
+        };
+        let i = dir.index();
+        let name = self.names.get(self.name_start[i], self.name_len[i]);
+        let Some(entry) = p.prior.child_dir(parent_entry, name, &mut p.buf) else {
+            return;
+        };
+        p.entries.insert(dir.0, entry);
+        let estimate = p.prior.logical(entry);
+        self.shift_pending(dir, estimate, true);
+    }
+
+    /// Adds `amount` to (or takes it from) the pending estimate of `node`
+    /// and every ancestor.
+    fn shift_pending(&mut self, node: NodeId, amount: u64, add: bool) {
+        let Some(p) = self.prior.as_deref_mut() else {
+            return;
+        };
+        if amount == 0 {
+            return;
+        }
+        let mut n = node.0;
+        while n != NONE {
+            let i = n as usize;
+            if add {
+                p.pending[i] += amount;
+            } else {
+                p.pending[i] -= amount;
+            }
+            n = self.parent[i];
+        }
+    }
+
+    /// Estimates the folders not yet listed from `prior`, the snapshot of
+    /// an earlier scan of the same root, until each one's listing ends.
+    /// Replaces any earlier prior. Folders already in the tree are matched
+    /// from the root down, so it can come once the scan has begun.
+    ///
+    /// The estimates are kept apart from the measured sizes: nothing but
+    /// the treemap layout's provisional weight reads them, and they never
+    /// change any total, count, or comparison.
+    pub fn set_prior(&mut self, prior: Arc<Prior>) {
+        let mut pending = Column::new();
+        for _ in 0..self.parent.chunks.len() {
+            pending.grow(0);
+        }
+        self.prior = Some(Box::new(Provisional {
+            prior,
+            entries: HashMap::new(),
+            pending,
+            buf: Vec::new(),
+        }));
+        // Folders still waiting take their estimates; listed ones are
+        // passed through to reach the waiting ones under them.
+        let mut stack = vec![(NodeId::ROOT, 0u32)];
+        while let Some((dir, entry)) = stack.pop() {
+            match self.dir_state(dir) {
+                DirState::Pending => {
+                    let p = self.prior.as_deref_mut().expect("just set");
+                    p.entries.insert(dir.0, entry);
+                    let estimate = p.prior.logical(entry);
+                    self.shift_pending(dir, estimate, true);
+                }
+                DirState::Listed => {}
+                DirState::Failed | DirState::NotScanned => continue,
+            }
+            let p = self.prior.as_deref_mut().expect("just set");
+            let mut c = self.first_child[dir.index()];
+            while c != NONE {
+                let i = c as usize;
+                if self.flags[i] & (flags::DIRECTORY | flags::REMOVED) == flags::DIRECTORY {
+                    let name = self.names.get(self.name_start[i], self.name_len[i]);
+                    if let Some(e) = p.prior.child_dir(entry, name, &mut p.buf) {
+                        stack.push((NodeId(c), e));
+                    }
+                }
+                c = self.next_sibling[i];
+            }
+        }
+    }
+
+    /// Forgets the prior and its estimates (and the memory they take).
+    pub fn clear_prior(&mut self) {
+        self.prior = None;
+    }
+
+    /// When the scan the estimates come from finished (milliseconds since
+    /// the Unix epoch), while the tree has a prior.
+    pub fn prior_created_ms(&self) -> Option<u64> {
+        self.prior.as_ref().map(|p| p.prior.created_ms())
+    }
+
+    /// The estimated bytes of the folders at or under `node` still waiting
+    /// for their listings. For the treemap's provisional weight only, so
+    /// private to this crate: nothing that reports a size may read it.
+    pub(crate) fn pending_estimate(&self, node: NodeId) -> u64 {
+        match &self.prior {
+            Some(p) => *p.pending.at(self.checked(node)),
+            None => 0,
+        }
+    }
+
+    /// Whether part of `node`'s area on the map is estimated from the prior
+    /// scan: a folder with unlisted folders at or under it that it knew.
+    pub fn is_provisional(&self, node: NodeId) -> bool {
+        self.pending_estimate(node) > 0
     }
 
     /// Adds a file under `parent` and adds its sizes to every ancestor.
@@ -488,10 +639,22 @@ impl Tree {
         }
     }
 
+    /// Sets a folder's state. A folder leaving [`DirState::Pending`] drops
+    /// its estimate (see [`Tree::set_prior`]): its listing has ended, so its
+    /// own entries now speak for it.
     pub fn set_dir_state(&mut self, dir: NodeId, state: DirState) {
         debug_assert!(self.is_dir(dir));
         let i = self.checked(dir).0;
+        let was = self.dir_state[i];
         self.dir_state[i] = state as u8;
+        if was == DirState::Pending as u8
+            && state != DirState::Pending
+            && let Some(p) = self.prior.as_deref_mut()
+            && let Some(entry) = p.entries.remove(&dir.0)
+        {
+            let estimate = p.prior.logical(entry);
+            self.shift_pending(dir, estimate, false);
+        }
     }
 
     /// Notes that some of `dir`'s entries couldn't be read (see
@@ -673,6 +836,10 @@ impl Tree {
             t.unknown[a] -= unknown;
             t.files[a] -= files;
         });
+        if let Some(p) = self.parent(node) {
+            let pending = self.pending_estimate(node);
+            self.shift_pending(p, pending, false);
+        }
         self.unlink(node);
 
         let mut orphaned = Vec::new();
@@ -700,6 +867,10 @@ impl Tree {
                 }
             }
             self.flags[j] |= flags::REMOVED;
+            if let Some(p) = self.prior.as_deref_mut() {
+                p.entries.remove(&n);
+                p.pending[j] = 0;
+            }
             self.logical[j] = 0;
             self.allocated[j] = 0;
             self.unknown[j] = 0;
@@ -864,6 +1035,10 @@ impl Tree {
             + self.alias_owner.capacity() * 16
             + self.changes.capacity() * 4
             + self.git.memory_bytes()
+            + self
+                .prior
+                .as_ref()
+                .map_or(0, |p| p.pending.bytes() + p.entries.capacity() * 8)
     }
 }
 
@@ -1479,6 +1654,123 @@ mod tests {
         // Removed nodes take no new entries.
         t.set_git(GitRoot::new(nested, RootKind::Repository));
         assert!(t.git().get(nested).is_none());
+    }
+
+    /// A finished scan of /r: a/{b/(400), c/(100), 10}, d/(50), 1, as a
+    /// prior; a later scan of /r then finds what the tests add.
+    fn prior() -> Arc<Prior> {
+        let mut t = Tree::new("/r");
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        let d = t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap();
+        for (dir, n, size) in [(b, "x", 400), (c, "y", 100), (a, "z", 10), (d, "w", 50)] {
+            t.add_file(dir, n.as_ref(), sizes(size, size), None, 0)
+                .unwrap();
+        }
+        t.add_file(NodeId::ROOT, "v".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        for n in [NodeId::ROOT, a, b, c, d] {
+            t.set_dir_state(n, DirState::Listed);
+        }
+        Arc::new(Prior::new(crate::snapshot::Snapshot::capture(
+            &t, 1_000, true,
+        )))
+    }
+
+    fn pending(t: &Tree, nodes: &[NodeId]) -> Vec<u64> {
+        nodes.iter().map(|&n| t.pending_estimate(n)).collect()
+    }
+
+    #[test]
+    fn folders_carry_their_prior_size_until_listed() {
+        let mut t = Tree::new("/r");
+        assert_eq!(t.prior_created_ms(), None);
+        t.set_prior(prior());
+        assert_eq!(t.prior_created_ms(), Some(1_000));
+        let root = NodeId::ROOT;
+        assert_eq!(pending(&t, &[root]), [561], "the root itself waits");
+
+        // The root's listing: a (matched ignoring case), d, and a new e.
+        let a = t.add_dir(root, "A".as_ref()).unwrap();
+        let d = t.add_dir(root, "d".as_ref()).unwrap();
+        let e = t.add_dir(root, "e".as_ref()).unwrap();
+        t.add_file(root, "v".as_ref(), sizes(1, 1), None, 0)
+            .unwrap();
+        assert_eq!(pending(&t, &[root, a, d, e]), [561 + 510 + 50, 510, 50, 0]);
+        t.set_dir_state(root, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a, d]), [560, 510, 50]);
+        assert!(t.is_provisional(root) && t.is_provisional(a) && !t.is_provisional(e));
+
+        // a's listing: b, c (now bigger), a file; b's listing.
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        t.add_file(a, "z".as_ref(), sizes(10, 10), None, 0).unwrap();
+        t.set_dir_state(a, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a, b, c]), [550, 500, 400, 100]);
+        t.add_file(b, "x".as_ref(), sizes(400, 400), None, 0)
+            .unwrap();
+        t.set_dir_state(b, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a, b, c]), [150, 100, 0, 100]);
+        // Every outcome ends the wait: failed, and not scanned.
+        t.set_dir_state(c, DirState::Failed);
+        t.set_dir_state(d, DirState::NotScanned);
+        t.set_dir_state(e, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a, c, d]), [0, 0, 0, 0]);
+        // Measured sizes never saw an estimate.
+        assert_eq!(t.logical(root), 411);
+        assert_eq!(t.logical(a), 410);
+
+        // A folder under one already listed, and one under a new folder,
+        // have nothing to look up.
+        let late = t.add_dir(e, "b".as_ref()).unwrap();
+        assert_eq!(t.pending_estimate(late), 0);
+        t.clear_prior();
+        assert_eq!(t.prior_created_ms(), None);
+        assert_eq!(t.pending_estimate(root), 0);
+    }
+
+    #[test]
+    fn a_prior_arriving_mid_scan_estimates_the_folders_still_waiting() {
+        let mut t = Tree::new("/r");
+        let root = NodeId::ROOT;
+        let a = t.add_dir(root, "a".as_ref()).unwrap();
+        let d = t.add_dir(root, "d".as_ref()).unwrap();
+        t.set_dir_state(root, DirState::Listed);
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        t.set_dir_state(a, DirState::Listed);
+        t.set_dir_state(d, DirState::Failed);
+        t.set_prior(prior());
+        // b waits; d failed; a and the root are listed.
+        assert_eq!(pending(&t, &[root, a, b, d]), [400, 400, 400, 0]);
+        // c arrives under a, which is listed: nothing to look it up in.
+        let c = t.add_dir(a, "c".as_ref()).unwrap();
+        assert_eq!(t.pending_estimate(c), 0);
+        t.set_dir_state(b, DirState::Listed);
+        assert_eq!(pending(&t, &[root, a, b]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn estimates_grow_into_new_chunks_and_leave_with_removed_folders() {
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        // Enough files to push the folders into later chunks.
+        for i in 0..CHUNK + 5 {
+            t.add_file(NodeId::ROOT, format!("f{i}").as_ref(), sizes(1, 1), None, 0)
+                .unwrap();
+        }
+        let b = t.add_dir(a, "b".as_ref()).unwrap();
+        assert!(b.index() > CHUNK);
+        assert_eq!(
+            pending(&t, &[NodeId::ROOT, a, b]),
+            [561 + 510 + 400, 910, 400]
+        );
+        assert!(t.memory_bytes() > 0);
+        assert!(t.remove(a));
+        assert_eq!(pending(&t, &[NodeId::ROOT, a, b]), [561, 0, 0]);
+        t.set_dir_state(NodeId::ROOT, DirState::Listed);
+        assert_eq!(t.pending_estimate(NodeId::ROOT), 0);
     }
 
     #[test]

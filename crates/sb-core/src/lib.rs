@@ -7,6 +7,7 @@ pub mod export;
 pub mod filetype;
 pub mod git;
 pub mod layout;
+pub mod prior;
 pub mod ranking;
 pub mod search;
 pub mod selection;
