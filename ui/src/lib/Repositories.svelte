@@ -213,15 +213,15 @@
       onopen={(r) => onopen(r.node)}
       {ondelete}
     >
-      {#snippet kind(r)}
-        {@const badge = KIND_BADGE[r.kind]}
-        <span class="badge" style:--kind={gitAccent(badge, theme.dark)} title={GIT_BADGES[badge]!.name}
-          >{GIT_BADGES[badge]!.short}</span
-        >
-      {/snippet}
       {#snippet main(r)}
         {@const more = facts(r)}
-        <span class="row-name name">{r.name}</span>
+        {@const badge = KIND_BADGE[r.kind]}
+        <span class="first">
+          <span class="badge" style:--kind={gitAccent(badge, theme.dark)} title={GIT_BADGES[badge]!.name}
+            >{GIT_BADGES[badge]!.short}</span
+          >
+          <span class="row-name">{r.name}</span>
+        </span>
         <span class="line path"><bdi>{r.path}</bdi></span>
         {#if more}<span class="line" class:problem={r.problem !== null}>{more}</span>{/if}
       {/snippet}
@@ -275,8 +275,11 @@
   .note {
     color: var(--accent);
   }
-  .name {
-    display: block;
+  .first {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
   }
   .line {
     display: block;
@@ -298,19 +301,14 @@
   /* A text pill in the kind's hue: the word carries the meaning, the color
      only echoes the map's accent. */
   .badge {
-    display: inline-block;
-    max-width: 100%;
-    box-sizing: border-box;
+    flex: none;
     padding: 0 5px;
     border: 1px solid var(--kind);
     border-left-width: 3px;
     border-radius: var(--radius);
     color: var(--fg);
     font-size: var(--fs-xs);
-    line-height: 16px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    vertical-align: middle;
+    line-height: 14px;
   }
   .sizes {
     display: flex;
