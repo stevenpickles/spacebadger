@@ -866,11 +866,30 @@ mod tests {
             let _ = sink.send(u);
         });
         let id = session.search_set("git:repo").unwrap().unwrap().search;
-        until("the job catches up", || {
-            totals(&session.search_summary(id).unwrap()) == fresh(&session, "git:repo")
+        // b's Git directory is still being listed: wait until only c is
+        // left (a status published once its last listing is in, possibly
+        // coalesced late) and the job has caught up with that status. Read
+        // directly, so these checks aren't requests reading behind. From
+        // here the only work left that can change the tree is b's probe.
+        until("only c is left to list and the job has caught up", || {
+            let p = session.scan.progress();
+            p.pending_dirs == 1
+                && session.filter.nudged.load(Ordering::SeqCst) == p.revision
+                && session
+                    .filter
+                    .active
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|a| a.revision == p.revision)
         });
-        let before = session.search_summary(id).unwrap().files;
+        let quiet = session.scan.progress().revision;
+        let caught = session.search_summary(id).unwrap();
+        assert_eq!(caught.revision, quiet);
+        assert_eq!(totals(&caught), fresh(&session, "git:repo"));
+        let before = caught.files;
         assert_eq!(before, 300 + 3, "a's checkout and Git data");
+        assert!(!session.filter.read_behind.load(Ordering::SeqCst));
         let held = &session.filter.steps_left;
         held.store(0, Ordering::SeqCst);
         // b's probe answers: a revision that only changes Git data. Then
