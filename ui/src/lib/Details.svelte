@@ -277,6 +277,13 @@
       <dd>{folderStates[d.folder]}</dd>
     {/if}
   </dl>
+  {#if d.estimatedFrom !== null}
+    <!-- Only the map's area is estimated; every number here is measured. -->
+    <p class="note">
+      ≈ Its area on the map is estimated from the scan of {formatDate(d.estimatedFrom / 1000)} until the
+      folders in it are scanned. The sizes above are what has been found so far.
+    </p>
+  {/if}
   {#if d.git && (d.git.content || d.git.root)}
     {@render gitGroup(d, d.git)}
   {/if}

@@ -20,10 +20,11 @@
     type ColorMode,
   } from "./colors";
   import { MARK_UNKNOWN } from "./compare";
-  import { formatBytes, formatCount, percent, plural, shortcut } from "./format";
+  import { formatBytes, formatCount, formatDate, percent, plural, shortcut } from "./format";
   import {
     decodeLayout,
     FILE_TYPES,
+    LAYOUT_PROVISIONAL,
     GIT_BADGES,
     GIT_METADATA,
     GIT_OTHER,
@@ -32,7 +33,9 @@
     KIND_FILE,
     KIND_FOLDER,
     KIND_OTHER,
+    RF_EXPANDED,
     RF_HEADER,
+    RF_PENDING,
     RF_INCOMPLETE,
     type DecodedLayout,
   } from "./layoutWire";
@@ -378,6 +381,41 @@
     return pattern;
   }
 
+  /** Denser lines the other way over area estimated from an earlier scan,
+   * so it isn't taken for Git metadata's hatching; made once per theme. */
+  let estimateHatches: { dark: boolean; pattern: CanvasPattern }[] = [];
+
+  function estimateHatchFor(ctx: CanvasRenderingContext2D, isDark: boolean): CanvasPattern | null {
+    const cached = estimateHatches.find((h) => h.dark === isDark);
+    if (cached) return cached.pattern;
+    const tile = document.createElement("canvas");
+    tile.width = tile.height = 4;
+    const t = tile.getContext("2d");
+    if (!t) return null;
+    t.strokeStyle = isDark ? "rgb(255 255 255 / 0.28)" : "rgb(0 0 0 / 0.22)";
+    t.lineWidth = 1;
+    t.beginPath();
+    t.moveTo(0, 0);
+    t.lineTo(4, 4);
+    t.moveTo(3, -1);
+    t.lineTo(5, 1);
+    t.moveTo(-1, 3);
+    t.lineTo(1, 5);
+    t.stroke();
+    const pattern = ctx.createPattern(tile, "repeat");
+    if (!pattern) return null;
+    estimateHatches = [...estimateHatches, { dark: isDark, pattern }];
+    return pattern;
+  }
+
+  /** Whether rectangle `i` is drawn as estimated: part of its area stands
+   * for folders not listed yet, and its contents don't show where (it isn't
+   * expanded, or it's still being listed itself). */
+  function estimated(l: DecodedLayout, i: number): boolean {
+    const f = l.rflags[i]!;
+    return l.provisional[i] === 1 && (!(f & RF_EXPANDED) || (f & RF_PENDING) !== 0);
+  }
+
   function fit(ctx: CanvasRenderingContext2D, text: string, max: number): string {
     if (max <= 8) return "";
     if (measure(ctx, text) <= max) return text;
@@ -450,6 +488,7 @@
     top.textBaseline = "alphabetic";
     const gap = p.gap;
     const hatch = colors === "git" ? hatchFor(ctx, dark) : null;
+    const estimateHatch = l.flags & LAYOUT_PROVISIONAL ? estimateHatchFor(ctx, dark) : null;
 
     for (let i = 0; i < l.count; i++) {
       const x = l.x[i]!;
@@ -466,6 +505,18 @@
       // Git metadata is hatched in Git mode, so it isn't told by color alone.
       if (hatch && kind !== KIND_OTHER && w > 4 && h > 4 && gitClassOf(l.rflags[i]!) === GIT_METADATA) {
         ctx.fillStyle = hatch;
+        ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
+      }
+
+      // Area estimated from the last scan: faded toward the background and
+      // hatched, in every color mode, until the folders are listed. An
+      // expanded folder's contents show where the estimate is.
+      if (estimateHatch && estimated(l, i) && w > 2 && h > 2) {
+        ctx.globalAlpha = 0.5;
+        ctx.fillStyle = gap;
+        ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = estimateHatch;
         ctx.fillRect(x + 0.5, y + 0.5, w - 1, h - 1);
       }
 
@@ -569,8 +620,10 @@
     ctx.beginPath();
     ctx.rect(x, y, w, h);
     ctx.clip();
-    // Dark or light text, whichever contrasts with this tile.
-    ctx.fillStyle = isDarkFill(fillFor(l, i)) ? p.textLight : p.textDark;
+    // Dark or light text, whichever contrasts with this tile; an estimated
+    // tile is faded toward the background, so it takes the theme's ink.
+    if (estimated(l, i)) ctx.fillStyle = dark ? p.textLight : p.textDark;
+    else ctx.fillStyle = isDarkFill(fillFor(l, i)) ? p.textLight : p.textDark;
     const room = w - 8;
     if (kind === KIND_OTHER) {
       // Shorter wordings as the region narrows.
@@ -579,6 +632,9 @@
         (t) => measure(ctx, t) <= room,
       );
       if (text) ctx.fillText(text, x + 4, y + line1);
+    } else if (estimated(l, i)) {
+      // Its size isn't known yet, and the estimate is no number to show.
+      label(ctx, name!, x + 4, y + line1, room);
     } else {
       // The size in full, or none where it doesn't fit.
       const size = formatBytes(l.weight[i]!);
@@ -794,8 +850,9 @@
     if (!l) return;
     const size = formatBytes(l.weight[i]!);
     const share = shareOfParent(l, i);
+    const guess = l.provisional[i] ? "still being scanned, area estimated from the last scan" : null;
     const say = (name: string, kind: string) =>
-      announce([name, size, share, kind].filter(Boolean).join(", "));
+      announce([name, size, share, kind, guess].filter(Boolean).join(", "));
     const kind = l.kind[i];
     if (kind === KIND_OTHER) {
       say(plural(l.items[i]!, "small item"), "merged");
@@ -970,19 +1027,24 @@
     const i = tipIndex;
     if (!l || i < 0) return null;
     const share = shareOfParent(l, i);
-    const size = [formatBytes(l.weight[i]!), share].filter(Boolean).join(" · ");
+    const provisional = l.provisional[i] === 1;
+    const found = formatBytes(l.weight[i]!);
+    const size = provisional ? `${found} found so far` : [found, share].filter(Boolean).join(" · ");
+    // Where the area comes from while folders under it wait to be listed.
+    const estimate = provisional
+      ? `≈ Area estimated from the scan of ${formatDate(l.estimatedFrom)}`
+      : null;
     if (l.kind[i] === KIND_OTHER) {
-      return {
-        title: plural(l.items[i]!, "small item"),
-        path: undefined,
-        lines: [`${size} combined`, "Too small to draw individually"],
-      };
+      const lines = [provisional ? size : `${size} combined`, "Too small to draw individually"];
+      if (estimate) lines.push(estimate);
+      return { title: plural(l.items[i]!, "small item"), path: undefined, lines };
     }
     const d = tipDetails;
     const folder = l.kind[i] === KIND_FOLDER;
     const lines: (string | null)[] = [size];
     if (folder) lines.push(d ? plural(d.files, "file") : null);
     if (folder && l.rflags[i]! & RF_INCOMPLETE) lines.push("Not fully scanned");
+    if (estimate) lines.push(estimate);
     if (colors === "type" && !folder) lines.push(`Type: ${FILE_TYPES[l.ftype[i]!]}`);
     const badge = badgeOf(l, i);
     if (badge !== 0) lines.push(GIT_BADGES[badge]!.name);
