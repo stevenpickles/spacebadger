@@ -11,11 +11,14 @@
 //!   children drawn on their own are ordered; the rest are just summed.
 //! - With a filename [`Search`], areas come from matching files only, and
 //!   folders without matches are left out.
+//! - Every rectangle carries its [`GitClass`] in its flags, passed down from
+//!   folder to contents, so drawing needs no lookups.
 //!
 //! Coordinates are in the caller's units (CSS pixels for the interface).
 //! Rectangles are emitted parent before child, so drawing in order paints
 //! nested content on top and hit testing in reverse finds the deepest one.
 
+use crate::git::GitClass;
 use crate::search::Search;
 use crate::tree::{DirState, NodeId, Tree, flags};
 use std::cmp::Reverse;
@@ -377,7 +380,7 @@ pub fn layout(
         w: params.width,
         h: params.height,
     };
-    ctx.fill(view, full, 1);
+    ctx.fill(view, full, 1, tree.git_class(view));
     while let Some(next) = ctx.queue.pop() {
         if ctx.rects.len() >= params.max_rects {
             out.truncated = true;
@@ -487,11 +490,17 @@ impl Ctx<'_> {
         if has_header {
             rect.flags |= rect_flags::HEADER;
         }
-        self.fill(r.node, inner, r.depth.saturating_add(1));
+        self.fill(
+            r.node,
+            inner,
+            r.depth.saturating_add(1),
+            git_class_of(r.flags),
+        );
     }
 
-    /// Squarifies `dir`'s children into `area`.
-    fn fill(&mut self, dir: NodeId, area: Area, depth: u8) {
+    /// Squarifies `dir`'s children into `area`; `class` is `dir`'s Git
+    /// class, which its contents have unless they have entries of their own.
+    fn fill(&mut self, dir: NodeId, area: Area, depth: u8, class: GitClass) {
         let tree = self.tree;
         let total = self.metric.weight_in(tree, self.filter, dir);
         if total == 0 {
@@ -528,7 +537,10 @@ impl Ctx<'_> {
         squarify(&areas, area, &mut placed);
         for (item, a) in items.into_iter().zip(placed) {
             let rect = match item {
-                Item::Node(node, weight) => node_rect(self.tree, node, weight, a, depth),
+                Item::Node(node, weight) => {
+                    let class = tree.git_own(node).unwrap_or(class);
+                    node_rect(tree, node, weight, a, depth, class)
+                }
                 Item::Other(weight, count) => LayoutRect {
                     node: dir,
                     x: a.x,
@@ -537,7 +549,7 @@ impl Ctx<'_> {
                     h: a.h,
                     depth,
                     kind: RectKind::OtherSmall,
-                    flags: 0,
+                    flags: git_flags(class),
                     weight,
                     count,
                 },
@@ -554,9 +566,27 @@ impl Ctx<'_> {
     }
 }
 
-fn node_rect(tree: &Tree, node: NodeId, weight: u64, a: Area, depth: u8) -> LayoutRect {
+/// [`LayoutRect::flags`] bits for a Git class.
+fn git_flags(class: GitClass) -> u8 {
+    (class as u8) << rect_flags::GIT_SHIFT
+}
+
+/// The Git class [`LayoutRect::flags`] carry.
+pub fn git_class_of(flags: u8) -> GitClass {
+    GitClass::from_u8((flags & rect_flags::GIT_MASK) >> rect_flags::GIT_SHIFT)
+}
+
+/// `class` is the node's Git class.
+fn node_rect(
+    tree: &Tree,
+    node: NodeId,
+    weight: u64,
+    a: Area,
+    depth: u8,
+    class: GitClass,
+) -> LayoutRect {
     let node_flags = tree.flags(node);
-    let mut f = 0;
+    let mut f = git_flags(class);
     if node_flags & flags::CLOUD != 0 {
         f |= rect_flags::CLOUD;
     }
@@ -676,6 +706,7 @@ fn area(x: f64, y: f64, w: f64, h: f64) -> Area {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{GitRoot, RootKind};
     use crate::size::Allocated;
     use crate::tree::FileSizes;
     use std::ffi::OsStr;
@@ -995,6 +1026,67 @@ mod tests {
         assert_eq!(l.rects[0].weight, 300, "folder weight counts matches only");
     }
 
+    #[test]
+    fn rects_carry_the_git_class_from_folder_to_contents() {
+        let mut t = Tree::new("/r");
+        let repo = dir(&mut t, NodeId::ROOT, "repo");
+        let dot = dir(&mut t, repo, ".git");
+        let pack = file(&mut t, dot, "pack", 4_000);
+        let src = dir(&mut t, repo, "src");
+        let main = file(&mut t, src, "main.rs", 3_000);
+        // Many tiny files, merged into one small-items rectangle.
+        for i in 0..50 {
+            file(&mut t, src, &format!("tiny{i}"), 1);
+        }
+        let wt = dir(&mut t, repo, "wt");
+        let pointer = file(&mut t, wt, ".git", 1_000);
+        let wt_file = file(&mut t, wt, "a.txt", 2_000);
+        let loose = file(&mut t, NodeId::ROOT, "loose", 5_000);
+        t.set_git(GitRoot::new(repo, RootKind::Repository));
+        t.set_git(GitRoot::new(dot, RootKind::DotGit));
+        t.set_git(GitRoot::new(wt, RootKind::LinkedWorktree));
+        t.set_git(GitRoot::new(pointer, RootKind::DotGit));
+
+        let class = |l: &Layout, n: NodeId, kind: RectKind| {
+            let r = l.rects.iter().find(|r| r.node == n && r.kind == kind);
+            git_class_of(r.unwrap_or_else(|| panic!("no rect for {n:?}")).flags)
+        };
+        // Small enough that the tiny files are merged.
+        let l = run(&t, NodeId::ROOT, &LayoutParams::new(200.0, 150.0));
+        assert_eq!(class(&l, loose, RectKind::File), GitClass::Other);
+        assert_eq!(class(&l, repo, RectKind::Folder), GitClass::Checkout);
+        assert_eq!(class(&l, src, RectKind::Folder), GitClass::Checkout);
+        assert_eq!(class(&l, main, RectKind::File), GitClass::Checkout);
+        assert_eq!(
+            class(&l, src, RectKind::OtherSmall),
+            GitClass::Checkout,
+            "small items take their folder's class"
+        );
+        assert_eq!(class(&l, dot, RectKind::Folder), GitClass::Metadata);
+        assert_eq!(class(&l, pack, RectKind::File), GitClass::Metadata);
+        assert_eq!(class(&l, wt, RectKind::Folder), GitClass::Worktree);
+        assert_eq!(class(&l, wt_file, RectKind::File), GitClass::Worktree);
+        assert_eq!(class(&l, pointer, RectKind::File), GitClass::Metadata);
+        // The other bits are untouched.
+        let r = l.rects.iter().find(|r| r.node == repo).unwrap();
+        assert_eq!(
+            r.flags & !rect_flags::GIT_MASK,
+            rect_flags::HEADER | rect_flags::EXPANDED
+        );
+
+        // A view inside the repository starts from its class.
+        let l = run(&t, src, &LayoutParams::new(800.0, 600.0));
+        assert_eq!(class(&l, main, RectKind::File), GitClass::Checkout);
+        let l = run(&t, wt, &LayoutParams::new(800.0, 600.0));
+        assert_eq!(class(&l, wt_file, RectKind::File), GitClass::Worktree);
+        assert_eq!(class(&l, pointer, RectKind::File), GitClass::Metadata);
+
+        // Above the scan root, everything is in that repository.
+        t.set_git_above("/".into(), GitRoot::new(NodeId::ROOT, RootKind::Repository));
+        let l = run(&t, NodeId::ROOT, &LayoutParams::new(800.0, 600.0));
+        assert_eq!(class(&l, loose, RectKind::File), GitClass::Checkout);
+    }
+
     /// The layout as it was before small children were set aside up front:
     /// every child with a weight is ordered (and its rank remembered) before
     /// the small ones are merged. Kept to show the new one draws the same.
@@ -1170,7 +1262,10 @@ mod tests {
                 squarify(&areas, area, &mut placed);
                 for (item, a) in items.into_iter().zip(placed) {
                     let rect = match item {
-                        Item::Node(node, weight) => node_rect(tree, node, weight, a, depth),
+                        // Classes looked up afresh, not passed down.
+                        Item::Node(node, weight) => {
+                            node_rect(tree, node, weight, a, depth, tree.git_class(node))
+                        }
                         Item::Other(weight, count) => LayoutRect {
                             node: dir,
                             x: a.x,
@@ -1179,7 +1274,7 @@ mod tests {
                             h: a.h,
                             depth,
                             kind: RectKind::OtherSmall,
-                            flags: 0,
+                            flags: git_flags(tree.git_class(dir)),
                             weight,
                             count,
                         },
@@ -1289,6 +1384,18 @@ mod tests {
                 t.mark_unreadable_entries(d);
             }
         }
+        // Git entries here and there, nested ones included.
+        for i in 0..t.len() {
+            if rng.below(40) == 0 {
+                let kind = [
+                    RootKind::Repository,
+                    RootKind::LinkedWorktree,
+                    RootKind::DotGit,
+                    RootKind::Unresolved,
+                ][rng.below(4) as usize];
+                t.set_git(GitRoot::new(NodeId::from_index(i as u32), kind));
+            }
+        }
         t
     }
 
@@ -1310,6 +1417,7 @@ mod tests {
             "b",
             "*.a; !dir:d1*",
             "size:>1KB",
+            "git:repo; !git:metadata",
             "nothing matches",
         ] {
             let mut s = Search::new(Matcher::new(q).unwrap());

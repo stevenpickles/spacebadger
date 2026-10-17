@@ -1,0 +1,857 @@
+//! The Git repositories and linked worktrees the scan found: the list the
+//! Repositories tab shows, what the details say about a node's place in
+//! Git, and the badge a root folder's rectangle carries.
+//!
+//! Nothing here touches the disk or runs Git: everything comes from the
+//! entries the scanner recorded in the tree. Paths in those entries (a
+//! worktree's common directory, a submodule's Git directory) are matched to
+//! nodes by name, from the scan root down, only for the rows asked for.
+
+use super::filter::current;
+use super::{MAX_PAGE, Session, display_path, metric, node_name};
+use sb_core::git::{self, GitClass, GitRoot, Head, RootKind, RootSummary, paths};
+use sb_core::tree::{NodeId, Tree, flags};
+use sb_protocol as proto;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+impl Session {
+    /// A page of the listed Git roots, largest first by the request's
+    /// metric, with totals that count each byte once; with `search`, also
+    /// what that filter matches in each. Summing up is linear in the
+    /// entries times their depth, under the search's and the tree's read
+    /// locks; the rows' links are resolved one row at a time, stopping
+    /// between rows if this request is superseded.
+    pub fn git_roots(&self, req: &proto::GitRootsRequest) -> Result<proto::GitRootsPage, String> {
+        let tree_lock = self.scan.tree();
+        let (search, tree, progress) = self.read_locked(&tree_lock, req.search.is_some())?;
+        crate::runner::check()?;
+        let filter = match req.search {
+            Some(id) => Some(&current(&search, id)?.search),
+            None => None,
+        };
+        let (summaries, totals) = git::summarize(&tree, filter, metric(req.metric));
+        crate::runner::check()?;
+        let nested = nested_counts(&tree, &summaries);
+        let total = summaries.len();
+        let start = (req.offset as usize).min(total);
+        let end = start
+            .saturating_add(req.limit.min(MAX_PAGE) as usize)
+            .min(total);
+        let mut rows = Vec::with_capacity(end - start);
+        for (i, s) in summaries[start..end].iter().enumerate() {
+            crate::runner::check()?;
+            let mut row = root_row(&tree, s.node, s.outside);
+            row.size = s.size;
+            row.own = s.own;
+            row.metadata = s.metadata;
+            row.matching = s.matching;
+            row.files = u64::from(s.files);
+            row.parent = s.parent.map(|p| p.index() as u32);
+            row.parent_outside = s.parent_outside;
+            row.nested = nested[start + i];
+            rows.push(row);
+        }
+        Ok(proto::GitRootsPage {
+            generation: self.generation(),
+            revision: progress.revision,
+            offset: start as u32,
+            total: total as u32,
+            rows,
+            totals: proto::GitTotalsWire {
+                roots: totals.roots,
+                worktrees: totals.worktrees,
+                unresolved: totals.unresolved,
+                checkout: totals.checkout,
+                worktree: totals.worktree,
+                metadata: totals.metadata,
+                union: totals.union,
+                matching: totals.matching,
+            },
+            discovering: !progress.state.is_finished(),
+        })
+    }
+}
+
+/// For each row, how many other rows are inside it, found through the
+/// folders above each row, unresolved ones included; the row for the
+/// repository above the scan root has every other row inside it.
+fn nested_counts(tree: &Tree, rows: &[RootSummary]) -> Vec<u32> {
+    // Rows are (node, outside): the scan root can have a row of its own
+    // besides the one for the repository above it.
+    let at: HashMap<(NodeId, bool), usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((r.node, r.outside), i))
+        .collect();
+    let outside = at.get(&(NodeId::ROOT, true)).copied();
+    let mut nested = vec![0u32; rows.len()];
+    for r in rows.iter().filter(|r| !r.outside) {
+        let mut cur = tree.parent(r.node);
+        while let Some(a) = cur {
+            if let Some(&j) = at.get(&(a, false)) {
+                nested[j] += 1;
+            }
+            cur = tree.parent(a);
+        }
+        if let Some(j) = outside {
+            nested[j] += 1;
+        }
+    }
+    nested
+}
+
+/// The entry a row stands for.
+fn entry_of(tree: &Tree, node: NodeId, outside: bool) -> Option<(&GitRoot, Option<&Path>)> {
+    if outside {
+        tree.git().above().map(|(path, r)| (r, Some(path)))
+    } else {
+        tree.git_entry(node).map(|r| (r, None))
+    }
+}
+
+/// A row for the listed root at `node` (or above the scan root), with
+/// everything but the sizes, the parent, and the count of nested rows.
+pub(super) fn root_row(tree: &Tree, node: NodeId, outside: bool) -> proto::GitRootRow {
+    let entry = entry_of(tree, node, outside);
+    let (name, path) = match entry {
+        Some((_, Some(above))) => (
+            above
+                .file_name()
+                .map_or_else(|| display_path(above), |n| n.to_string_lossy().into_owned()),
+            display_path(above),
+        ),
+        _ => (node_name(tree, node), display_path(&tree.path(node))),
+    };
+    let root = entry.map(|(r, _)| r);
+    let shown = |p: &Option<PathBuf>| p.as_deref().map(display_path);
+    proto::GitRootRow {
+        node: node.index() as u32,
+        name,
+        path,
+        kind: root.map_or(proto::GitRootKind::Unresolved, |r| root_kind(r.kind)),
+        head: root.and_then(|r| r.head.as_ref()).map(head),
+        parent: None,
+        parent_outside: false,
+        repository: root.and_then(|r| repository(tree, r)),
+        size: 0,
+        own: 0,
+        metadata: 0,
+        matching: None,
+        files: 0,
+        nested: 0,
+        problem: root
+            .and_then(|r| r.problem.as_ref())
+            .map(ToString::to_string),
+        recorded_at: root.and_then(|r| shown(&r.recorded_at)),
+        worktree: root
+            .filter(|r| r.kind != RootKind::LinkedWorktree)
+            .and_then(|r| shown(&r.worktree)),
+        outside,
+        // Above the scan root, most of the repository isn't scanned. Inside
+        // the scan, only the root folder's own listing is known here, as
+        // for the map's incomplete folders: the tree keeps no record of
+        // problems deeper down short of walking the subtree.
+        partial: outside || !tree.fully_listed(node),
+    }
+}
+
+fn root_kind(kind: RootKind) -> proto::GitRootKind {
+    match kind {
+        RootKind::Repository => proto::GitRootKind::Repository,
+        RootKind::LinkedWorktree => proto::GitRootKind::LinkedWorktree,
+        RootKind::Submodule => proto::GitRootKind::Submodule,
+        RootKind::SeparateGitDir => proto::GitRootKind::SeparateGitDir,
+        RootKind::Bare => proto::GitRootKind::Bare,
+        RootKind::GitDir => proto::GitRootKind::GitDir,
+        // Not listed; a row never stands for one.
+        RootKind::Unresolved | RootKind::Pending | RootKind::DotGit | RootKind::WorktreeAdmin => {
+            proto::GitRootKind::Unresolved
+        }
+    }
+}
+
+fn head(h: &Head) -> proto::GitHead {
+    match h {
+        Head::Branch(name) => proto::GitHead::Branch { name: name.clone() },
+        Head::Ref(name) => proto::GitHead::Ref { name: name.clone() },
+        Head::Detached(commit) => proto::GitHead::Detached {
+            commit: commit.clone(),
+        },
+    }
+}
+
+/// The repository a root belongs to: a linked worktree's main repository
+/// (the folder holding its common `.git`, or a bare common directory
+/// itself), a submodule's superproject, a separate Git directory.
+///
+/// A submodule's superproject is the checkout it's in: the nearest listed
+/// checkout around it, which for a submodule of a submodule is the outer
+/// submodule. Only when there's none is it read from the Git directory's
+/// path, as the folder holding the `.git` whose `modules` hold it.
+fn repository(tree: &Tree, root: &GitRoot) -> Option<proto::GitLink> {
+    let style = paths::Style::native();
+    let target = match root.kind {
+        RootKind::LinkedWorktree => {
+            let common = root.common_dir.as_deref()?;
+            if is_named(common, ".git", style) {
+                common.parent()?.to_path_buf()
+            } else {
+                common.to_path_buf()
+            }
+        }
+        RootKind::Submodule => {
+            if let Some(link) = superproject(tree, root.node) {
+                return Some(link);
+            }
+            modules_owner(root, style)?
+        }
+        RootKind::SeparateGitDir => root.git_dir.clone()?,
+        _ => return None,
+    };
+    Some(proto::GitLink {
+        path: display_path(&target),
+        node: node_at(tree, &target, style).map(|n| n.index() as u32),
+    })
+}
+
+/// The checkout a submodule at `node` is in: the nearest listed root
+/// around it with checkout or worktree content, in the scan or above it.
+fn superproject(tree: &Tree, node: NodeId) -> Option<proto::GitLink> {
+    let checkout = |r: &GitRoot| {
+        r.kind.listed()
+            && matches!(
+                r.kind.class(),
+                Some(GitClass::Checkout | GitClass::Worktree)
+            )
+    };
+    let mut cur = tree.parent(node);
+    while let Some(a) = cur {
+        if tree.git_entry(a).is_some_and(checkout) {
+            return Some(proto::GitLink {
+                path: display_path(&tree.path(a)),
+                node: Some(a.index() as u32),
+            });
+        }
+        cur = tree.parent(a);
+    }
+    tree.git()
+        .above()
+        .filter(|(_, r)| checkout(r))
+        .map(|(path, _)| proto::GitLink {
+            path: display_path(path),
+            node: None,
+        })
+}
+
+/// The folder holding the `.git` whose `modules` hold a submodule's Git
+/// directory.
+fn modules_owner(root: &GitRoot, style: paths::Style) -> Option<PathBuf> {
+    Some(
+        root.git_dir
+            .as_deref()?
+            .ancestors()
+            .find(|a| {
+                is_named(a, "modules", style)
+                    && a.parent().is_some_and(|g| is_named(g, ".git", style))
+            })?
+            .parent()?
+            .parent()?
+            .to_path_buf(),
+    )
+}
+
+fn is_named(path: &Path, name: &str, style: paths::Style) -> bool {
+    path.file_name()
+        .is_some_and(|n| same_name(n, OsStr::new(name), style))
+}
+
+/// Names compared as the file system would, ignoring ASCII case where it
+/// folds case (other letters are compared exactly), without allocating.
+fn same_name(a: &OsStr, b: &OsStr, style: paths::Style) -> bool {
+    if style.fold_case {
+        a.as_encoded_bytes()
+            .eq_ignore_ascii_case(b.as_encoded_bytes())
+    } else {
+        a == b
+    }
+}
+
+/// The node at `path`, found by name from the scan root down; `None` when
+/// it's outside the scan or wasn't found (or removed).
+fn node_at(tree: &Tree, path: &Path, style: paths::Style) -> Option<NodeId> {
+    let parts = paths::relative_to(tree.root_path(), path, style)?;
+    let mut cur = NodeId::ROOT;
+    for part in &parts {
+        cur = tree
+            .children(cur)
+            .find(|&c| !tree.is_removed(c) && same_name(tree.name(c), part, style))?;
+    }
+    Some(cur)
+}
+
+/// What the details panel says about `n`'s place in Git. O(depth), plus a
+/// look in a repository's `.git/worktrees` for its linked worktrees. The
+/// root's `size` and `matching` are logical sizes, as the details' own
+/// are, `matching` from `filter` when given; `own` and `metadata` aren't
+/// summed up here (they're 0; the list has them).
+pub(super) fn details(
+    tree: &Tree,
+    n: NodeId,
+    filter: Option<&sb_core::search::Search>,
+) -> Option<proto::GitDetails> {
+    let git = tree.git();
+    if git.is_empty() {
+        return None;
+    }
+    let content = match tree.git_class(n) {
+        GitClass::Other => None,
+        GitClass::Checkout => Some(proto::GitContent::Checkout),
+        GitClass::Worktree => Some(proto::GitContent::Worktree),
+        GitClass::Metadata => Some(proto::GitContent::Metadata),
+    };
+    let found = match tree.git_root_of(n) {
+        Some(r) => Some((r, false)),
+        None => git
+            .above()
+            .filter(|(_, r)| r.kind.listed())
+            .map(|_| (NodeId::ROOT, true)),
+    };
+    let root = found.map(|(r, outside)| {
+        let mut row = root_row(tree, r, outside);
+        row.files = u64::from(tree.file_count(r));
+        row.size = tree.logical(r);
+        row.matching = filter.map(|s| s.totals(r).logical);
+        if let Some((parent, parent_outside)) = (!outside).then(|| enclosing(tree, r)).flatten() {
+            row.parent = Some(parent.index() as u32);
+            row.parent_outside = parent_outside;
+        }
+        row
+    });
+    if content.is_none() && root.is_none() {
+        return None;
+    }
+    let worktrees_registered = found
+        .filter(|&(_, outside)| !outside)
+        .and_then(|(r, _)| registered_worktrees(tree, r));
+    Some(proto::GitDetails {
+        content,
+        root,
+        worktrees_registered,
+    })
+}
+
+/// The nearest listed root with a class around `node`, and whether it's
+/// the repository above the scan root, as `RootSummary::parent` and
+/// `parent_outside` give them.
+fn enclosing(tree: &Tree, node: NodeId) -> Option<(NodeId, bool)> {
+    let mut cur = tree.parent(node);
+    while let Some(a) = cur {
+        if tree
+            .git_entry(a)
+            .is_some_and(|r| r.kind.listed() && r.kind.class().is_some())
+        {
+            return Some((a, false));
+        }
+        cur = tree.parent(a);
+    }
+    tree.git()
+        .above()
+        .filter(|(_, r)| r.kind.listed() && r.kind.class().is_some())
+        .map(|_| (NodeId::ROOT, true))
+}
+
+/// For a repository whose Git directory is in the scan: the linked
+/// worktrees registered there (its `worktrees/<id>` folders), and how many
+/// of their checkouts are in the scan too. `None` when none are known.
+/// Looks only in the repository's folder and its `.git/worktrees`.
+fn registered_worktrees(tree: &Tree, repo: NodeId) -> Option<(u32, u32)> {
+    let style = paths::Style::native();
+    let child = |dir: NodeId, name: &str| {
+        tree.children(dir)
+            .find(|&c| !tree.is_removed(c) && same_name(tree.name(c), OsStr::new(name), style))
+    };
+    // `<repo>/.git/worktrees/<id>`, or `<bare>/worktrees/<id>`.
+    let git_dir = match tree.git_entry(repo)?.kind {
+        RootKind::Repository => child(repo, ".git").filter(|&d| {
+            tree.git_entry(d)
+                .is_some_and(|r| r.kind == RootKind::DotGit)
+        })?,
+        RootKind::Bare | RootKind::GitDir => repo,
+        _ => return None,
+    };
+    let list = child(git_dir, "worktrees")?;
+    let (mut registered, mut here) = (0u32, 0u32);
+    for id in tree.children(list) {
+        let Some(admin) = tree
+            .git_entry(id)
+            .filter(|r| r.kind == RootKind::WorktreeAdmin)
+        else {
+            continue;
+        };
+        if tree.is_removed(id) {
+            continue;
+        }
+        registered += 1;
+        let checkout = admin.worktree.as_deref().and_then(|p| {
+            // The checkout's folder; the admin folder may name its `.git`.
+            let folder = if is_named(p, ".git", style) {
+                p.parent()?
+            } else {
+                p
+            };
+            node_at(tree, folder, style)
+        });
+        if checkout.is_some_and(|c| {
+            tree.git_entry(c)
+                .is_some_and(|r| r.kind == RootKind::LinkedWorktree)
+        }) {
+            here += 1;
+        }
+    }
+    (registered > 0).then_some((registered, here))
+}
+
+/// Byte 35 of a folder's rectangle: the kind of Git root it is, if any.
+pub(super) fn badge(tree: &Tree, node: NodeId) -> u8 {
+    use proto::wire::git_badge;
+    if tree.flags(node) & flags::GIT == 0 {
+        return git_badge::NONE;
+    }
+    match tree.git_entry(node).map(|r| r.kind) {
+        Some(RootKind::Repository) => git_badge::REPOSITORY,
+        Some(RootKind::LinkedWorktree) => git_badge::LINKED_WORKTREE,
+        Some(RootKind::Submodule) => git_badge::SUBMODULE,
+        Some(RootKind::SeparateGitDir) => git_badge::SEPARATE_GIT_DIR,
+        Some(RootKind::Bare) => git_badge::BARE,
+        Some(RootKind::GitDir) => git_badge::GIT_DIR,
+        Some(RootKind::Unresolved) => git_badge::UNRESOLVED,
+        _ => git_badge::NONE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sb_core::git::Problem;
+    use sb_scan::ScanConfig;
+    use sb_scan::fake::FakeFs;
+    use std::time::{Duration, Instant};
+
+    /// A Git directory at `at`: `HEAD` holding `head`, `config`, a pack of
+    /// `pack` bytes, and `refs`.
+    fn git_dir(fs: &FakeFs, at: &str, head: &str, pack: u64) {
+        fs.text(&format!("{at}/HEAD"), head)
+            .text(&format!("{at}/config"), "[core]\n")
+            .file(&format!("{at}/objects/pack/p.pack"), pack, pack)
+            .dir(&format!("{at}/refs/heads"));
+    }
+
+    /// A finished scan of Git layouts as they'd be on disk, which detection
+    /// finds:
+    ///
+    /// ```text
+    /// main/        repository on main: src/a.rs 1000, .git/ (pack 500,
+    ///              worktrees/wt1, modules/sub, modules/sub/modules/deep)
+    ///   vendor/sub/       submodule: .git file, x.rs 200
+    ///     deep/           its submodule: .git file, d.txt 5
+    /// wt1/         linked worktree of main, detached: .git file, b.rs 300
+    /// broken/      a .git folder without Git data, holding
+    ///   inner/            a repository: i.rs 20
+    /// other/c.txt  50
+    /// ```
+    fn scanned() -> Session {
+        let fs = FakeFs::new();
+        git_dir(&fs, "main/.git", "ref: refs/heads/main\n", 500);
+        fs.file("main/src/a.rs", 1000, 1000);
+        fs.text(
+            "main/.git/worktrees/wt1/HEAD",
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .text("main/.git/worktrees/wt1/commondir", "../..\n")
+        .text("main/.git/worktrees/wt1/gitdir", "/fake/wt1/.git\n")
+        .text("wt1/.git", "gitdir: ../main/.git/worktrees/wt1\n")
+        .file("wt1/b.rs", 300, 300);
+        git_dir(&fs, "main/.git/modules/sub", "ref: refs/heads/main\n", 7);
+        fs.text("main/vendor/sub/.git", "gitdir: ../../.git/modules/sub\n")
+            .file("main/vendor/sub/x.rs", 200, 200);
+        git_dir(
+            &fs,
+            "main/.git/modules/sub/modules/deep",
+            "ref: refs/heads/main\n",
+            3,
+        );
+        fs.text(
+            "main/vendor/sub/deep/.git",
+            "gitdir: ../../../.git/modules/sub/modules/deep\n",
+        )
+        .file("main/vendor/sub/deep/d.txt", 5, 5);
+        fs.file("broken/.git/notes.txt", 9, 9);
+        git_dir(&fs, "broken/inner/.git", "ref: refs/heads/main\n", 6);
+        fs.file("broken/inner/i.rs", 20, 20)
+            .file("other/c.txt", 50, 50);
+        let session = Session::start_on(fs.root(), fs, ScanConfig::default(), None, None, |_| {});
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !session.scan.progress().state.is_finished() {
+            assert!(Instant::now() < deadline, "scan never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        session
+    }
+
+    /// The logical size of `path` in the scan.
+    fn size(session: &Session, path: &str) -> u64 {
+        let tree = session.scan.tree();
+        let tree = tree.read().unwrap();
+        tree.logical(at(&tree, path))
+    }
+
+    /// The node at `path` under the scan root.
+    fn at(tree: &Tree, path: &str) -> NodeId {
+        path.split('/').fold(NodeId::ROOT, |n, name| {
+            tree.children(n)
+                .find(|&c| tree.name(c) == name)
+                .unwrap_or_else(|| panic!("no {path}"))
+        })
+    }
+
+    fn node_of(session: &Session, path: &str) -> u32 {
+        if path.is_empty() {
+            return 0;
+        }
+        let tree = session.scan.tree();
+        let tree = tree.read().unwrap();
+        at(&tree, path).index() as u32
+    }
+
+    fn request(session: &Session, offset: u32, limit: u32) -> proto::GitRootsRequest {
+        proto::GitRootsRequest {
+            generation: session.generation(),
+            metric: proto::Metric::Logical,
+            search: None,
+            offset,
+            limit,
+        }
+    }
+
+    fn row(page: &proto::GitRootsPage, node: u32) -> &proto::GitRootRow {
+        page.rows
+            .iter()
+            .find(|r| r.node == node && !r.outside)
+            .unwrap_or_else(|| panic!("no row for {node}"))
+    }
+
+    #[test]
+    fn lists_roots_largest_first_a_page_at_a_time() {
+        let session = scanned();
+        let all = session.git_roots(&request(&session, 0, 100)).unwrap();
+        assert_eq!(all.total, 6, "main, sub, deep, wt1, broken, inner");
+        assert_eq!(
+            all.total,
+            session.status().git_roots,
+            "as the status counts"
+        );
+        assert!(!all.discovering);
+        assert_eq!(all.revision, session.scan.progress().revision);
+        let names: Vec<&str> = all.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["main", "wt1", "sub", "broken", "inner", "deep"]);
+        let sizes: Vec<u64> = all.rows.iter().map(|r| r.size).collect();
+        assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+
+        let first = session.git_roots(&request(&session, 0, 4)).unwrap();
+        let rest = session.git_roots(&request(&session, 4, 4)).unwrap();
+        assert_eq!((first.offset, rest.offset), (0, 4));
+        assert_eq!((first.rows.len(), rest.rows.len()), (4, 2));
+        assert_eq!([first.rows, rest.rows].concat(), all.rows);
+        let past = session.git_roots(&request(&session, 9, 2)).unwrap();
+        assert_eq!((past.offset, past.rows.len(), past.total), (6, 0, 6));
+
+        let main = row(&all, node_of(&session, "main"));
+        assert_eq!(main.kind, proto::GitRootKind::Repository);
+        assert_eq!(
+            main.head,
+            Some(proto::GitHead::Branch {
+                name: "main".into()
+            })
+        );
+        assert_eq!(main.size, size(&session, "main"));
+        assert_eq!(
+            main.own,
+            size(&session, "main")
+                - size(&session, "main/.git")
+                - size(&session, "main/vendor/sub"),
+            "less its .git and the submodule"
+        );
+        assert_eq!(
+            main.metadata,
+            size(&session, "main/.git"),
+            "all of its .git: the worktree's admin folder and the submodules' Git directories too"
+        );
+        assert_eq!((main.nested, main.parent), (2, None));
+        assert!(!main.partial && !main.outside);
+        assert_eq!(main.matching, None);
+
+        let sub = row(&all, node_of(&session, "main/vendor/sub"));
+        assert_eq!(sub.kind, proto::GitRootKind::Submodule);
+        assert_eq!((sub.parent, sub.nested), (Some(main.node), 1));
+        let superproject = sub.repository.as_ref().unwrap();
+        assert_eq!(superproject.node, Some(main.node), "{superproject:?}");
+        assert_eq!(sub.metadata, size(&session, "main/vendor/sub/.git"));
+
+        let wt = row(&all, node_of(&session, "wt1"));
+        assert_eq!(wt.kind, proto::GitRootKind::LinkedWorktree);
+        assert_eq!(
+            wt.head,
+            Some(proto::GitHead::Detached {
+                commit: "0123456789ab".into()
+            })
+        );
+        let repo = wt.repository.as_ref().unwrap();
+        assert_eq!(repo.node, Some(main.node));
+        assert_eq!(
+            repo.path,
+            display_path(&paths::normalize(
+                Path::new(&main.path),
+                paths::Style::native()
+            )),
+            "the folder holding the common .git"
+        );
+        assert_eq!(wt.recorded_at, None, "where Git says it is");
+        assert_eq!(
+            (wt.own, wt.metadata),
+            (300, size(&session, "wt1/.git")),
+            "shared data counts in main"
+        );
+
+        let broken = row(&all, node_of(&session, "broken"));
+        assert_eq!(broken.kind, proto::GitRootKind::Unresolved);
+        assert_eq!(
+            broken.problem.as_deref(),
+            Some("folder named .git without Git data")
+        );
+        assert_eq!(broken.nested, 1, "the repository inside it");
+        let inner = row(&all, node_of(&session, "broken/inner"));
+        assert_eq!(inner.parent, None, "unresolved rows aren't parents");
+
+        assert_eq!(
+            (
+                all.totals.roots,
+                all.totals.worktrees,
+                all.totals.unresolved
+            ),
+            (4, 1, 1)
+        );
+        assert_eq!(
+            all.totals.union,
+            size(&session, "main") + size(&session, "wt1") + size(&session, "broken/inner"),
+            "each byte once; broken's own content isn't in Git"
+        );
+        assert_eq!(all.totals.matching, None);
+    }
+
+    #[test]
+    fn rows_carry_matching_sizes_for_a_search() {
+        let session = scanned();
+        let id = session.search_set("*.rs").unwrap().unwrap().search;
+        let mut req = request(&session, 0, 100);
+        req.search = Some(id);
+        let page = session.git_roots(&req).unwrap();
+        let main = row(&page, node_of(&session, "main"));
+        assert_eq!(main.matching, Some(1200), "a.rs and the submodule's x.rs");
+        assert_eq!(row(&page, node_of(&session, "wt1")).matching, Some(300));
+        assert_eq!(page.totals.matching, Some(1200 + 300 + 20));
+        // Details give the root the same matching total the root's own
+        // details give.
+        let wt = node_of(&session, "wt1");
+        let own = session.details(wt, Some(id)).unwrap();
+        let root = own.git.unwrap().root.unwrap();
+        assert_eq!(root.matching, Some(own.matching.unwrap().logical));
+        assert_eq!(root.matching, Some(300));
+        assert_eq!(root.size, size(&session, "wt1"));
+        let file = node_of(&session, "wt1/b.rs");
+        let git = session.details(file, Some(id)).unwrap().git.unwrap();
+        assert_eq!(git.root.unwrap().matching, Some(300));
+        let untold = session.details(file, None).unwrap().git.unwrap();
+        assert_eq!(untold.root.unwrap().matching, None);
+        // A replaced search gives an error, as the other lists do.
+        session.search_set("*.txt").unwrap();
+        assert!(session.git_roots(&req).is_err());
+    }
+
+    #[test]
+    fn the_repository_above_the_scan_root_is_a_row_of_its_own() {
+        let session = scanned();
+        session
+            .scan
+            .edit_finished(|t| {
+                t.set_git_above(
+                    PathBuf::from("/"),
+                    GitRoot {
+                        head: Some(Head::Branch("trunk".into())),
+                        ..GitRoot::new(NodeId::ROOT, RootKind::Repository)
+                    },
+                )
+            })
+            .unwrap();
+        let page = session.git_roots(&request(&session, 0, 100)).unwrap();
+        assert_eq!(page.total, 7);
+        assert_eq!(page.total, session.status().git_roots);
+        let outside = &page.rows[0];
+        assert!(outside.outside, "it holds the whole scan, so it's first");
+        assert_eq!(outside.node, 0);
+        assert_eq!(outside.kind, proto::GitRootKind::Repository);
+        assert_eq!(
+            outside.head,
+            Some(proto::GitHead::Branch {
+                name: "trunk".into()
+            })
+        );
+        assert_eq!(outside.path, display_path(Path::new("/")));
+        assert!(outside.partial, "most of it isn't scanned");
+        assert_eq!(outside.nested, 6, "every other row");
+        let main = row(&page, node_of(&session, "main"));
+        assert_eq!((main.parent, main.parent_outside), (Some(0), true));
+        let sub = row(&page, node_of(&session, "main/vendor/sub"));
+        assert_eq!((sub.parent, sub.parent_outside), (Some(main.node), false));
+        let details = session.details(main.node, None).unwrap().git.unwrap();
+        let root = details.root.unwrap();
+        assert_eq!((root.parent, root.parent_outside), (Some(0), true));
+    }
+
+    #[test]
+    fn a_submodule_of_a_submodule_links_to_the_outer_one() {
+        let session = scanned();
+        let page = session.git_roots(&request(&session, 0, 100)).unwrap();
+        let sub = node_of(&session, "main/vendor/sub");
+        let deep = row(&page, node_of(&session, "main/vendor/sub/deep"));
+        let link = deep.repository.as_ref().unwrap();
+        assert_eq!(link.node, Some(sub), "the checkout it's in");
+        assert_eq!(link.path, row(&page, sub).path);
+        assert_eq!(deep.parent, Some(sub));
+        assert_eq!(deep.kind, proto::GitRootKind::Submodule);
+
+        // Found only by its Git directory's path when nothing listed is
+        // around it: a case detection doesn't make here, so set by hand
+        // once the scan has finished.
+        session
+            .scan
+            .edit_finished(|t| {
+                t.set_git(GitRoot::unresolved(at(t, "main"), Problem::NotGit));
+                t.set_git(GitRoot::unresolved(
+                    at(t, "main/vendor/sub"),
+                    Problem::NotGit,
+                ));
+            })
+            .unwrap();
+        let page = session.git_roots(&request(&session, 0, 100)).unwrap();
+        let deep = row(&page, node_of(&session, "main/vendor/sub/deep"));
+        let link = deep.repository.as_ref().unwrap();
+        assert_eq!(link.node, Some(node_of(&session, "main")));
+    }
+
+    #[test]
+    fn a_superseded_page_stops() {
+        let session = scanned();
+        let req = request(&session, 0, 100);
+        let stopped = crate::runner::as_superseded(|| session.git_roots(&req));
+        assert_eq!(stopped.err(), Some(proto::SUPERSEDED.to_owned()));
+        assert!(session.git_roots(&req).is_ok());
+    }
+
+    #[test]
+    fn details_say_where_a_node_is_in_git() {
+        let session = scanned();
+        let details = |path: &str| session.details(node_of(&session, path), None).unwrap().git;
+        let main = node_of(&session, "main");
+
+        let wt = details("wt1/b.rs").unwrap();
+        assert_eq!(wt.content, Some(proto::GitContent::Worktree));
+        let root = wt.root.unwrap();
+        assert_eq!(root.node, node_of(&session, "wt1"));
+        assert_eq!(root.kind, proto::GitRootKind::LinkedWorktree);
+        assert_eq!(root.repository.unwrap().node, Some(main));
+        assert_eq!(root.files, 2);
+        assert_eq!(wt.worktrees_registered, None);
+
+        let meta = details("main/.git/objects/pack/p.pack").unwrap();
+        assert_eq!(meta.content, Some(proto::GitContent::Metadata));
+        assert_eq!(meta.root.as_ref().unwrap().node, main);
+        assert_eq!(
+            meta.worktrees_registered,
+            Some((1, 1)),
+            "wt1 is registered in main's .git and in the scan"
+        );
+        let pointer = details("wt1/.git").unwrap();
+        assert_eq!(pointer.content, Some(proto::GitContent::Metadata));
+
+        let nested = details("main/vendor/sub/x.rs").unwrap();
+        assert_eq!(nested.content, Some(proto::GitContent::Checkout));
+        assert_eq!(nested.root.unwrap().parent, Some(main));
+
+        let unresolved = details("broken").unwrap();
+        assert_eq!(unresolved.content, None);
+        assert_eq!(
+            unresolved.root.unwrap().kind,
+            proto::GitRootKind::Unresolved
+        );
+        assert_eq!(details("other/c.txt"), None, "not in any repository");
+        assert_eq!(details(""), None, "the scan root isn't in one");
+
+        session
+            .scan
+            .edit_finished(|t| {
+                t.set_git_above(
+                    PathBuf::from("/"),
+                    GitRoot::new(NodeId::ROOT, RootKind::Repository),
+                )
+            })
+            .unwrap();
+        let root = details("").unwrap();
+        assert_eq!(root.content, Some(proto::GitContent::Checkout));
+        let above = root.root.unwrap();
+        assert!(above.outside && above.node == 0);
+        assert!(details("other/c.txt").unwrap().root.unwrap().outside);
+    }
+
+    #[test]
+    fn root_folders_carry_a_badge_and_rects_their_class() {
+        let session = scanned();
+        let bytes = session
+            .layout(&proto::LayoutRequest {
+                generation: session.generation(),
+                request: 1,
+                view: 0,
+                metric: proto::Metric::Logical,
+                width: 1600.0,
+                height: 1200.0,
+                search: None,
+            })
+            .unwrap();
+        let count = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+        let rects = &bytes[proto::wire::HEADER_LEN..][..count * proto::wire::RECT_LEN];
+        // Folders' (class, badge).
+        let folders: HashMap<u32, (u8, u8)> = rects
+            .chunks_exact(proto::wire::RECT_LEN)
+            .filter(|r| r[33] == 1)
+            .map(|r| {
+                let node = u32::from_le_bytes(r[16..20].try_into().unwrap());
+                (node, (r[34] >> 6, r[35]))
+            })
+            .collect();
+        use proto::wire::git_badge;
+        let of = |path: &str| folders.get(&node_of(&session, path)).copied();
+        assert_eq!(of("main"), Some((1, git_badge::REPOSITORY)));
+        assert_eq!(
+            of("main/.git"),
+            Some((3, git_badge::NONE)),
+            "metadata, no badge"
+        );
+        assert_eq!(of("main/src"), Some((1, git_badge::NONE)));
+        assert_eq!(of("main/vendor/sub"), Some((1, git_badge::SUBMODULE)));
+        assert_eq!(of("wt1"), Some((2, git_badge::LINKED_WORKTREE)));
+        assert_eq!(of("broken"), Some((0, git_badge::UNRESOLVED)));
+        assert_eq!(of("broken/inner"), Some((1, git_badge::REPOSITORY)));
+        assert_eq!(of("other"), Some((0, git_badge::NONE)));
+    }
+}

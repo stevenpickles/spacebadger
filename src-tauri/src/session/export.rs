@@ -393,12 +393,13 @@ mod tests {
         let size = format_bytes(8000, SYSTEM_KILO);
         assert_eq!(
             lines[1],
-            format!("{},old,folder,8000,{size},2,,98.77,", display_path(&old)),
-            "folders have no modified time"
+            format!("{},old,folder,8000,{size},2,,98.77,,", display_path(&old)),
+            "folders have no modified time, and nothing is in Git"
         );
         // A file's: local time with the offset in effect then.
         let a = lines.iter().find(|l| l.contains(",a.log,")).unwrap();
-        let modified = a.rsplit(',').next().unwrap();
+        // Second to last, before the Git column.
+        let modified = a.rsplit(',').nth(1).unwrap();
         let parsed = chrono::DateTime::parse_from_rfc3339(modified).unwrap();
         let written = std::fs::metadata(session.root.join("old").join("logs").join("a.log"))
             .unwrap()
@@ -416,6 +417,46 @@ mod tests {
             "a name with a comma is one quoted field"
         );
         assert!(text.contains(",'=keep.txt,file,100,"), "formula guard");
+    }
+
+    #[test]
+    fn exports_where_items_are_in_git() {
+        use sb_core::git::{GitRoot, RootKind};
+        let (tmp, session) = scanned("git");
+        session
+            .scan
+            .edit_finished(|t| {
+                let old = t
+                    .children(NodeId::ROOT)
+                    .find(|&c| t.name(c) == "old")
+                    .unwrap();
+                t.set_git(GitRoot::new(old, RootKind::Repository));
+            })
+            .unwrap();
+        let path = tmp.0.join("out").join("git.csv");
+        let req = request(&session, proto::ExportFormat::Csv);
+        session.export(&req, &path, || true, |_| {}).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(",Modified,Git\r\n"));
+        let git: Vec<&str> = text
+            .split("\r\n")
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.rsplit(',').next().unwrap())
+            .collect();
+        assert_eq!(git, ["checkout", "checkout", "checkout", "checkout", ""]);
+
+        let path = tmp.0.join("out").join("git.txt");
+        let req = request(&session, proto::ExportFormat::Report);
+        session.export(&req, &path, || true, |_| {}).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(text.contains("Git repositories (1 of 1)\n"), "{text}");
+        assert!(
+            text.contains("In Git repositories under this folder: "),
+            "{text}"
+        );
     }
 
     #[test]
