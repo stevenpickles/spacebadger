@@ -51,6 +51,11 @@ problem: string | null,
  */
 recordedAt: string | null, 
 /**
+ * `core.worktree` from the repository's config, as written. Shown,
+ * not applied: the content isn't moved there.
+ */
+worktree: string | null, 
+/**
  * Found above the scan root, which is inside it.
  */
 outside: boolean, 

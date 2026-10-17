@@ -103,6 +103,9 @@ pub struct GitRootRow {
     /// Where a linked worktree's Git directory says it is, when that isn't
     /// where it was found. Information only.
     pub recorded_at: Option<String>,
+    /// `core.worktree` from the repository's config, as written. Shown,
+    /// not applied: the content isn't moved there.
+    pub worktree: Option<String>,
     /// Found above the scan root, which is inside it.
     pub outside: bool,
     /// Some of the folder couldn't be read or wasn't scanned.
@@ -220,6 +223,7 @@ mod tests {
             nested: 0,
             problem: None,
             recorded_at: Some("/old/app".into()),
+            worktree: None,
             outside: false,
             partial: false,
         };
