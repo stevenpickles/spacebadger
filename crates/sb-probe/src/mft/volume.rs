@@ -30,8 +30,8 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING,
     FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationW,
-    OPEN_EXISTING,
+    FileAttributeTagInfo, FileIdInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+    GetVolumeInformationW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
@@ -42,6 +42,9 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
 const MIB: u64 = 1 << 20;
+/// Largest non-resident attribute list read for `$MFT`; real ones are a
+/// few KiB.
+const MAX_ATTRIBUTE_LIST: u64 = 256 * 1024;
 /// Seconds from 1601-01-01 (`FILETIME`) to the Unix epoch.
 const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
 
@@ -65,6 +68,12 @@ fn long_path(path: &Path) -> Vec<u16> {
 
 fn raw(handle: &impl AsRawHandle) -> HANDLE {
     HANDLE(handle.as_raw_handle())
+}
+
+/// `GetDriveTypeW` for the drive's root.
+fn drive_type(letter: char) -> u32 {
+    let root = wide(&format!("{letter}:\\"));
+    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) }
 }
 
 fn filesystem(letter: char) -> Option<String> {
@@ -188,6 +197,7 @@ struct Volume {
     record_size: u64,
     mft_valid: u64,
     mft_start_lcn: u64,
+    total_clusters: u64,
 }
 
 impl Volume {
@@ -235,6 +245,7 @@ impl Volume {
             record_size: u64::from(data.BytesPerFileRecordSegment),
             mft_valid: data.MftValidDataLength as u64,
             mft_start_lcn: data.MftStartLcn as u64,
+            total_clusters: data.TotalClusters as u64,
         };
         let sane = |v: u64| v.is_power_of_two() && (512..=2 * MIB).contains(&v);
         if !sane(volume.sector) || !sane(volume.cluster) || !sane(volume.record_size) {
@@ -277,10 +288,11 @@ impl Volume {
                 .iter()
                 .find(|e| vcn >= e.vcn && vcn < e.vcn + e.clusters)
                 .ok_or_else(|| format!("stream offset {pos:#x} isn't mapped"))?;
-            let lcn = e.lcn.ok_or("sparse run in a metadata stream")?;
+            e.lcn.ok_or("sparse run in a metadata stream")?;
             let extent_end = (e.vcn + e.clusters) * self.cluster;
             let take = (offset + len).min(extent_end) - pos;
-            let at = (lcn + vcn - e.vcn) * self.cluster + pos % self.cluster;
+            let at = record::volume_offset(extents, self.cluster, pos)
+                .ok_or_else(|| format!("stream offset {pos:#x} maps past the volume"))?;
             let start = at - at % self.sector;
             let mut buf = Aligned::new(self.round_up(at + take - start) as usize);
             self.read_exact_at(&mut buf, start)?;
@@ -308,12 +320,20 @@ impl Volume {
     fn mft_extents(&self) -> Result<Vec<Extent>, String> {
         let rec0 = self.record_zero()?;
         let bad = |e: RecordError| format!("record 0: {e}");
+        let sequence = record::parse_record(&rec0, 0)
+            .map_err(bad)?
+            .ok_or("record 0 isn't in use")?
+            .sequence;
         let mut pieces = record::data_runs(&rec0).map_err(bad)?;
         let entries = match record::attribute_list_location(&rec0).map_err(bad)? {
             None => Vec::new(),
             Some(ListLocation::Resident(entries)) => entries,
             Some(ListLocation::NonResident { runs, length }) => {
+                if length > MAX_ATTRIBUTE_LIST {
+                    return Err(format!("record 0: a {length}-byte attribute list"));
+                }
                 let extents = record::extents(vec![(0, runs)]).map_err(bad)?;
+                record::check_bounds(&extents, self.total_clusters).map_err(bad)?;
                 let bytes = self.read_stream(&extents, 0, length)?;
                 record::parse_attribute_list(&bytes).map_err(bad)?
             }
@@ -331,11 +351,28 @@ impl Volume {
         }
         for segment in segments {
             let known = record::extents(pieces.clone()).map_err(bad)?;
-            let mut rec = self.read_stream(&known, segment * self.record_size, self.record_size)?;
-            record::apply_fixups(&mut rec).map_err(|e| format!("$MFT segment {segment}: {e}"))?;
+            record::check_bounds(&known, self.total_clusters).map_err(bad)?;
+            let at = segment
+                .checked_mul(self.record_size)
+                .ok_or("$MFT segment number overflows")?;
+            let mut rec = self.read_stream(&known, at, self.record_size)?;
+            let seg_err = |e: String| format!("$MFT segment {segment}: {e}");
+            record::apply_fixups(&mut rec).map_err(|e| seg_err(e.to_string()))?;
+            // Must be an in-use extension of record 0 at its own number.
+            let parsed = record::parse_record(&rec, segment)
+                .map_err(|e| seg_err(e.to_string()))?
+                .ok_or_else(|| seg_err("not in use".into()))?;
+            if parsed.base != u64::from(sequence) << 48 {
+                return Err(seg_err(format!(
+                    "base reference {:#x} isn't record 0",
+                    parsed.base
+                )));
+            }
             pieces.extend(record::data_runs(&rec).map_err(bad)?);
         }
-        record::extents(pieces).map_err(bad)
+        let extents = record::extents(pieces).map_err(bad)?;
+        record::check_bounds(&extents, self.total_clusters).map_err(bad)?;
+        Ok(extents)
     }
 
     /// Re-reads one record through NTFS (from its cache), for records torn
@@ -370,9 +407,15 @@ impl Volume {
         })
     }
 
-    /// Journal records from `from` up to `until`.
-    fn read_journal(&self, mut from: u64, id: u64, until: u64) -> Result<Vec<UsnRecord>, String> {
-        let mut records = Vec::new();
+    /// Hands each journal record from `from` up to `until` to `each` as
+    /// it's read, so the journal is never held whole.
+    fn read_journal(
+        &self,
+        mut from: u64,
+        id: u64,
+        until: u64,
+        mut each: impl FnMut(UsnRecord),
+    ) -> Result<(), String> {
         let mut out = vec![0u8; MIB as usize];
         loop {
             let mut input = [0u8; 40];
@@ -382,9 +425,9 @@ impl Volume {
             let n = ioctl(&self.file, FSCTL_READ_USN_JOURNAL, &input, &mut out)
                 .map_err(|e| e.message())?;
             let (next, batch) = parse_journal(&out[..n]);
-            records.extend(batch);
+            batch.into_iter().for_each(&mut each);
             if n <= 8 || next >= until || next <= from {
-                return Ok(records);
+                return Ok(());
             }
             from = next;
         }
@@ -537,12 +580,14 @@ fn fill(
             .iter()
             .find(|e| vcn >= e.vcn && vcn < e.vcn + e.clusters)
             .ok_or_else(|| format!("$MFT offset {at:#x} isn't mapped"))?;
-        let lcn = e.lcn.ok_or("sparse run in $MFT")?;
+        e.lcn.ok_or("sparse run in $MFT")?;
         let take = (pos + len).min((e.vcn + e.clusters) * c) - at;
         let from = (at - pos) as usize;
         let size = volume.round_up(take) as usize;
         let to = (from + size).min(buf.len());
-        volume.read_exact_at(&mut buf[from..to], (lcn + vcn - e.vcn) * c + at % c)?;
+        let offset = record::volume_offset(extents, c, at)
+            .ok_or_else(|| format!("$MFT offset {at:#x} maps past the volume"))?;
+        volume.read_exact_at(&mut buf[from..to], offset)?;
         at += take;
     }
     Ok(())
@@ -727,6 +772,9 @@ struct Timing {
     read_parse_wall_s: f64,
     reread_s: f64,
     build_s: f64,
+    /// Read and parse, torn-record re-reads, and the table build: the
+    /// whole cost before a tree could be shown.
+    read_parse_build_s: f64,
     walk_s: f64,
     listing_walk_s: Option<f64>,
     compare_s: Option<f64>,
@@ -766,12 +814,27 @@ struct Report {
     timing: Timing,
     /// The ≤ 4 s read-and-parse gate (meaningful on a cold cache only).
     read_parse_within_4s: bool,
+    /// The same budget held to read, parse and build.
+    read_parse_build_within_4s: bool,
     changes: Changes,
     comparison: Option<Comparison>,
 }
 
 pub fn run(letter: char, opts: &MftOpts) -> Result<(String, bool), Failure> {
     let started = Instant::now();
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOTE: u32 = 4;
+    match drive_type(letter) {
+        DRIVE_REMOTE => {
+            return Err(Failure::Refused(format!(
+                "{letter}: is a network drive: its file table isn't on this computer"
+            )));
+        }
+        0 | DRIVE_NO_ROOT_DIR => {
+            return Err(Failure::Refused(format!("{letter}: isn't a volume")));
+        }
+        _ => {}
+    }
     let fs_name = filesystem(letter)
         .ok_or_else(|| Failure::Refused(format!("{letter}: isn't a readable volume")))?;
     if fs_name != "NTFS" {
@@ -830,6 +893,7 @@ pub fn run(letter: char, opts: &MftOpts) -> Result<(String, bool), Failure> {
     chunks.push(recovered);
     let table = Table::build(chunks, read.records);
     let build_s = build_started.elapsed().as_secs_f64();
+    let read_parse_build_s = read.wall.as_secs_f64() + reread_s + build_s;
     let walk_started = Instant::now();
     let walk = table.walk(ROOT);
     let walk_s = walk_started.elapsed().as_secs_f64();
@@ -903,25 +967,27 @@ pub fn run(letter: char, opts: &MftOpts) -> Result<(String, bool), Failure> {
                     end.first
                 };
                 let window = start_time.saturating_sub(opts.lag_secs * 10_000_000);
-                match volume.read_journal(from, end.id, end.next) {
-                    Ok(records) => {
-                        for r in records {
-                            let during = r.usn >= start.next;
-                            if !during && r.timestamp < window {
-                                continue;
-                            }
-                            if during {
-                                changes.records_during += 1;
-                            } else {
-                                changes.records_in_lag_window += 1;
-                            }
-                            if changed.insert(r.file & RECORD_MASK)
-                                && changes.samples.len() < opts.samples
-                            {
-                                changes.samples.push(String::from_utf16_lossy(&r.name));
-                            }
-                        }
+                let (samples, mut during, mut before) = (opts.samples, 0, 0);
+                let mut names = Vec::new();
+                let result = volume.read_journal(from, end.id, end.next, |r| {
+                    let is_during = r.usn >= start.next;
+                    if !is_during && r.timestamp < window {
+                        return;
                     }
+                    if is_during {
+                        during += 1;
+                    } else {
+                        before += 1;
+                    }
+                    if changed.insert(r.file & RECORD_MASK) && names.len() < samples {
+                        names.push(String::from_utf16_lossy(&r.name));
+                    }
+                });
+                changes.records_during = during;
+                changes.records_in_lag_window = before;
+                changes.samples = names;
+                match result {
+                    Ok(()) => {}
                     Err(e) => {
                         changes.lost = true;
                         changes.error = Some(format!("FSCTL_READ_USN_JOURNAL: {e}"));
@@ -993,6 +1059,7 @@ pub fn run(letter: char, opts: &MftOpts) -> Result<(String, bool), Failure> {
             read_parse_wall_s: read.wall.as_secs_f64(),
             reread_s,
             build_s,
+            read_parse_build_s,
             walk_s,
             listing_walk_s,
             compare_s,
@@ -1000,6 +1067,7 @@ pub fn run(letter: char, opts: &MftOpts) -> Result<(String, bool), Failure> {
             total_s: started.elapsed().as_secs_f64(),
         },
         read_parse_within_4s: read.wall <= Duration::from_secs(4),
+        read_parse_build_within_4s: read_parse_build_s <= 4.0,
         changes,
         comparison,
     };
@@ -1124,6 +1192,7 @@ mod tests {
             record_size: RS as u64,
             mft_valid: 32 * RS as u64,
             mft_start_lcn: 10,
+            total_clusters: 48,
         };
         let extents = volume.mft_extents().unwrap();
         assert_eq!(extents.len(), 3);
