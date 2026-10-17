@@ -79,15 +79,21 @@ const CHANGED: u32 = 2_000_000;
 /// unchanged folders that held at least [`BIG_SHARE`] of the root, biggest
 /// first, then the rest in order found (0). Changes inside a file don't
 /// touch its folder's time, so a file that grew in place is found in turn.
+///
+/// Modified times only order listings, never change what's found, so
+/// inexact ones only cost time: the snapshot's time is when its scan
+/// finished, so a folder changed during that scan after it was listed looks
+/// unchanged; network shares keep the server's clock; and FAT and exFAT
+/// keep local time, so after a change of time zone or daylight saving
+/// time, folders on them can look changed or unchanged by up to the shift.
 fn listing_priority(tree: &Tree, dir: NodeId, modified: Option<SystemTime>, since: u64) -> u32 {
-    let share = tree.listing_priority(dir);
     let newer = modified
         .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
         .is_some_and(|d| d.as_millis() > u128::from(since));
-    if newer || !tree.is_provisional(dir) {
-        CHANGED.saturating_add(share)
-    } else {
-        share
+    match tree.listing_priority(dir) {
+        Some(share) if !newer => share,
+        // New since, or changed since.
+        share => CHANGED.saturating_add(share.unwrap_or(0)),
     }
 }
 
@@ -1487,6 +1493,8 @@ mod tests {
                 .unwrap();
             before.set_dir_state(d, DirState::Listed);
         }
+        let empty = before.add_dir(NodeId::ROOT, "empty".as_ref()).unwrap();
+        before.set_dir_state(empty, DirState::Listed);
         before.set_dir_state(NodeId::ROOT, DirState::Listed);
         let since = 5_000;
         let prior = Prior::new(Snapshot::capture(&before, since, true));
@@ -1503,6 +1511,7 @@ mod tests {
         assert_eq!(order("small", None), 10, "too small to go ahead");
         assert_eq!(order("touched", at(since + 1)), CHANGED + 990);
         assert_eq!(order("new", at(1)), CHANGED, "nothing to go by");
+        assert_eq!(order("empty", at(since)), 0, "unchanged and empty");
     }
 
     #[test]
