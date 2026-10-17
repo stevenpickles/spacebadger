@@ -476,6 +476,13 @@ struct Candidate {
     pointer: Option<(NodeId, OsString)>,
 }
 
+/// How a directory's listing ended: its result, and whether any of its
+/// entries were added.
+struct ListingEnd {
+    result: Result<(), ScanError>,
+    partial: bool,
+}
+
 /// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
 enum Job {
     List { dir: NodeId, path: PathBuf },
@@ -799,7 +806,7 @@ impl<A: FsAdapter> Aggregator<A> {
         match outcome {
             Outcome::Batch { dir, path, entries } => {
                 self.partial.insert(dir);
-                self.apply_batch(dir, &path, entries);
+                self.apply_batch(dir, &path, entries, None);
                 self.revision += 1;
             }
             Outcome::Listed {
@@ -810,44 +817,18 @@ impl<A: FsAdapter> Aggregator<A> {
             } => {
                 self.pending_dirs -= 1;
                 let partial = self.partial.remove(&dir) || !entries.is_empty();
-                if !entries.is_empty() {
-                    self.apply_batch(dir, &path, entries);
-                }
-                let candidate = self.git_signals.remove(&dir).unwrap_or_default();
-                if self.stop.is_some() {
-                    return;
-                }
-                let tree_lock = Arc::clone(&self.tree);
-                let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
-                let mut failed = None;
-                match result {
-                    Ok(()) => tree.set_dir_state(dir, DirState::Listed),
-                    Err(err) => {
-                        let reason = OmissionReason::from_error(err.kind);
-                        self.omissions
-                            .add(reason, self.config.sample_limit, || OmissionSample {
-                                path: path.clone(),
-                                detail: Some(err.message.clone()),
-                            });
-                        if partial {
-                            // Listed in part: the entries already added stay,
-                            // and the folder counts as not fully read.
-                            tree.set_dir_state(dir, DirState::Listed);
-                            tree.mark_unreadable_entries(dir);
-                        } else {
-                            tree.set_dir_state(dir, DirState::Failed);
-                            if dir == NodeId::ROOT {
-                                self.stop = Some(ScanState::Failed(format!(
-                                    "The selected folder can't be listed: {}",
-                                    err.message
-                                )));
-                            }
-                        }
-                        failed = Some(err);
+                let end = ListingEnd { result, partial };
+                // The last batch and the listing's end share one hold.
+                let probe = if entries.is_empty() {
+                    if self.stop.is_some() {
+                        return;
                     }
-                }
-                let probe = listed_git(&mut tree, dir, &path, candidate, failed, partial);
-                drop(tree);
+                    let tree_lock = Arc::clone(&self.tree);
+                    let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
+                    self.end_listing(&mut tree, dir, &path, end)
+                } else {
+                    self.apply_batch(dir, &path, entries, Some(end))
+                };
                 self.revision += 1;
                 if let Some((path, plan)) = probe {
                     self.enqueue_git(path, plan);
@@ -895,10 +876,18 @@ impl<A: FsAdapter> Aggregator<A> {
     }
 
     /// Adds one batch of `dir`'s entries under one hold of the write lock,
-    /// then queues the subdirectories and re-measures it found.
-    fn apply_batch(&mut self, dir: NodeId, path: &Path, entries: Vec<Entry>) {
+    /// ending the listing there too when it's the last batch, then queues
+    /// the subdirectories and re-measures it found. Returns the Git probe
+    /// the listing's end asks for.
+    fn apply_batch(
+        &mut self,
+        dir: NodeId,
+        path: &Path,
+        entries: Vec<Entry>,
+        end: Option<ListingEnd>,
+    ) -> Option<(PathBuf, Plan)> {
         if self.stop.is_some() {
-            return;
+            return None;
         }
         let limit = self.config.sample_limit;
         let mut subdirs = Vec::new();
@@ -992,10 +981,14 @@ impl<A: FsAdapter> Aggregator<A> {
         if unreadable {
             tree.mark_unreadable_entries(dir);
         }
+        let probe = match end {
+            Some(end) if self.stop.is_none() => self.end_listing(&mut tree, dir, path, end),
+            _ => None,
+        };
         drop(tree);
         self.owners.extend(first_names);
         if self.stop.is_some() {
-            return;
+            return None;
         }
         for (id, path) in subdirs {
             self.enqueue_list(id, path);
@@ -1003,6 +996,49 @@ impl<A: FsAdapter> Aggregator<A> {
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);
         }
+        probe
+    }
+
+    /// Marks `dir` listed (or failed) once its last batch is in, under the
+    /// caller's hold of the write lock, and says what its listing showed of
+    /// Git.
+    fn end_listing(
+        &mut self,
+        tree: &mut Tree,
+        dir: NodeId,
+        path: &Path,
+        end: ListingEnd,
+    ) -> Option<(PathBuf, Plan)> {
+        let ListingEnd { result, partial } = end;
+        let candidate = self.git_signals.remove(&dir).unwrap_or_default();
+        let mut failed = None;
+        match result {
+            Ok(()) => tree.set_dir_state(dir, DirState::Listed),
+            Err(err) => {
+                let reason = OmissionReason::from_error(err.kind);
+                self.omissions
+                    .add(reason, self.config.sample_limit, || OmissionSample {
+                        path: path.to_path_buf(),
+                        detail: Some(err.message.clone()),
+                    });
+                if partial {
+                    // Listed in part: the entries already added stay, and
+                    // the folder counts as not fully read.
+                    tree.set_dir_state(dir, DirState::Listed);
+                    tree.mark_unreadable_entries(dir);
+                } else {
+                    tree.set_dir_state(dir, DirState::Failed);
+                    if dir == NodeId::ROOT {
+                        self.stop = Some(ScanState::Failed(format!(
+                            "The selected folder can't be listed: {}",
+                            err.message
+                        )));
+                    }
+                }
+                failed = Some(err);
+            }
+        }
+        listed_git(tree, dir, path, candidate, failed, partial)
     }
 
     /// Stops issuing work, marks every unlisted directory as not scanned and

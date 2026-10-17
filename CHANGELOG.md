@@ -17,6 +17,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ### Scanning
 - macOS lists folders with `getattrlistbulk`, one call per batch of entries instead of two per entry, with the same results; `SB_MACOS_LISTING=readdir` switches back to the old listing.
+- Scans of SSD and NVMe drives on Windows are faster: up to 16 folders are listed at once (one per core) where the disk has no seek penalty, and listing does less work per folder. Sizes, counts and what's left out are unchanged.
+- Windows: folders and files whose names end in a dot or a space are now scanned; before, such a folder was listed under the name without them or reported as vanished.
 
 ### Map
 - Rescanning a folder draws the map at once: folders not scanned yet take the size they had in the last saved scan, faded and hatched, until their own contents arrive. Their tooltips and details say which scan the estimate comes from; every number shown, exported, compared, or totalled is still only what this scan has found.

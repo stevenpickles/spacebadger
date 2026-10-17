@@ -15,7 +15,7 @@ use sb_core::layout::{self, LayoutParams, Metric, OrderCache};
 use sb_core::search::{Matcher, Search};
 use sb_core::snapshot::{self, Snapshot};
 use sb_core::tree::NodeId;
-use sb_scan::{NativeFs, Scan, ScanConfig};
+use sb_scan::{NativeFs, Scan};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,9 @@ fn main() {
         args.next()
             .expect("usage: scan <root> [--workers N] [--cancel-after-ms N]"),
     );
-    let mut config = ScanConfig::default();
+    // As the app does: absolute once, so listed names join on unchanged.
+    let root = std::path::absolute(&root).unwrap_or(root);
+    let mut config = sb_scan::native::scan_config(&root);
     let mut cancel_after = None;
     while let Some(flag) = args.next() {
         let value: u64 = args

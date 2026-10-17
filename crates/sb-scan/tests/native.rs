@@ -24,8 +24,8 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         #[cfg(windows)]
-        remove_junctions(&self.0);
-        let _ = std::fs::remove_dir_all(&self.0);
+        remove_junctions(&verbatim(&self.0));
+        let _ = std::fs::remove_dir_all(verbatim(&self.0));
     }
 }
 
@@ -41,6 +41,16 @@ fn remove_junctions(dir: &Path) {
         } else if meta.is_dir() {
             remove_junctions(&entry.path());
         }
+    }
+}
+
+/// `path` in the `\\?\` form on Windows, where names ending in a dot or a
+/// space survive only that way; as it is elsewhere.
+fn verbatim(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -194,13 +204,24 @@ fn missing_root_fails() {
 }
 
 #[test]
-fn local_folders_use_the_default_worker_count() {
+fn fixed_disks_without_seeks_use_more_workers() {
     let local = std::env::temp_dir();
     assert!(!sb_scan::native::is_remote(&local));
-    assert_eq!(
-        sb_scan::native::scan_config(&local).workers,
-        ScanConfig::default().workers
-    );
+    let config = sb_scan::native::scan_config(&local);
+    let default = ScanConfig::default();
+    if cfg!(windows) {
+        assert!(sb_scan::native::is_local_fixed(&local));
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let (low, high) = sb_scan::native::LOCAL_WORKERS;
+        let expected = if sb_scan::native::no_seek_penalty(&local) {
+            cores.clamp(low, high)
+        } else {
+            default.workers
+        };
+        assert_eq!(config.workers, expected);
+    } else {
+        assert_eq!(config.workers, default.workers);
+    }
 }
 
 #[test]
@@ -413,4 +434,32 @@ fn records_an_id_for_every_file_and_folder() {
         .map(|p| tree.id(find(&tree, p)).expect("an id"))
         .collect();
     assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+}
+
+#[test]
+fn lists_folders_whose_names_end_in_a_dot_or_a_space() {
+    let tmp = TempDir::new("odd-names");
+    // Names Windows only keeps through `\\?\` paths.
+    let odd = verbatim(&tmp.0);
+    write(&odd.join("foo.").join("x.bin"), 3);
+    write(&odd.join("foo.").join("inner").join("y.bin"), 4);
+    write(&odd.join("bar ").join("z.bin"), 5);
+    write(&odd.join("foo").join("w.bin"), 6);
+    let (progress, tree) = scan(&tmp.0);
+    assert_eq!(
+        progress.state,
+        ScanState::Complete,
+        "{:?}",
+        progress.omissions
+    );
+    assert_eq!(progress.files, 4);
+    let tree = tree.read().unwrap();
+    for (path, size) in [
+        ("foo./x.bin", 3),
+        ("foo./inner/y.bin", 4),
+        ("bar /z.bin", 5),
+        ("foo/w.bin", 6),
+    ] {
+        assert_eq!(tree.logical(find(&tree, path)), size, "{path}");
+    }
 }

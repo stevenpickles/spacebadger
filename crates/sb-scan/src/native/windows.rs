@@ -1,10 +1,11 @@
 //! Windows adapter. Decisions and evidence: `docs/validation/windows-m1.md`.
 //!
-//! - Lists with `FileIdExtdDirectoryInfo` (falling back to
-//!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
-//!   reparse tags, and file IDs come from the listing without opening files.
-//!   Entries are passed on as each 64 KiB buffer is decoded, in batches, so
-//!   a huge folder is never held whole.
+//! - Lists with `NtQueryDirectoryFile(FileIdExtdDirectoryInformation)`
+//!   (falling back to `FileIdBothDirectoryInformation` where unsupported) so
+//!   sizes, attributes, reparse tags, and file IDs come from the listing
+//!   without opening files. Entries are passed on as each 64 KiB buffer (one
+//!   per worker thread) is decoded, in batches, so a huge folder is never
+//!   held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
@@ -31,8 +32,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_INFORMATION_CLASS, FileIdBothDirectoryInformation, FileIdExtdDirectoryInformation,
+    NtQueryDirectoryFile,
+};
 use windows::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID, RtlNtStatusToDosError,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
@@ -44,14 +49,17 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
     FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
-    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
+    FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
+use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
+use windows::Win32::System::Ioctl::{
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY,
+    NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_PROPERTY_QUERY,
+    StorageDeviceSeekPenaltyProperty,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
@@ -125,9 +133,52 @@ fn scan_error(err: windows::core::Error) -> ScanError {
     ScanError::new(kind, err.message())
 }
 
-/// NUL-terminated wide path in the `\\?\` form so long paths work.
+/// Whether `path` is already absolute and normal: a drive or UNC prefix, a
+/// root, and then only names between single `\` separators (no `.`, `..`
+/// or `/`). The scan's paths are: the app makes the root absolute once and
+/// the engine joins listed names onto it. Such a path goes into the `\\?\`
+/// form as it is, because `std::path::absolute` (`GetFullPathNameW`) would
+/// strip trailing dots and spaces from every name, and a listed `foo.` would
+/// then open `foo`.
+fn is_normal(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    let known = matches!(
+        prefix.kind(),
+        Prefix::Disk(_)
+            | Prefix::UNC(..)
+            | Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(..)
+    );
+    if !known || components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let text = path.as_os_str().to_string_lossy();
+    let Some(rest) = text
+        .get(prefix.as_os_str().to_string_lossy().len()..)
+        .and_then(|rest| rest.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    let rest = rest.strip_suffix('\\').unwrap_or(rest);
+    rest.is_empty()
+        || rest
+            .split('\\')
+            .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains('/'))
+}
+
+/// NUL-terminated wide path in the `\\?\` form so long paths work. A path
+/// that isn't [`is_normal`] is made absolute first.
 fn wide(path: &Path) -> Vec<u16> {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = if is_normal(path) {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
     let text: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     let starts = |prefix: &str| text.starts_with(&prefix.encode_utf16().collect::<Vec<_>>());
     let mut out: Vec<u16> = if starts(r"\\?\") || starts(r"\\.\") {
@@ -409,8 +460,24 @@ impl WindowsFs {
 
     fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let handle = open(dir, FILE_LIST_DIRECTORY.0)?;
+        with_list_buffer(|buffer| self.list_handle(&handle, buffer, out))
+    }
+
+    /// Lists an open directory into `buffer`, with the extended class where
+    /// the volume supports it.
+    fn list_handle(
+        &self,
+        handle: &OwnedHandle,
+        buffer: &mut [u64],
+        out: &mut Batcher<'_, '_>,
+    ) -> Result<(), ScanError> {
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
-            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo, out) {
+            match list_with::<FILE_ID_EXTD_DIR_INFO>(
+                handle,
+                FileIdExtdDirectoryInformation,
+                buffer,
+                out,
+            ) {
                 // Only before any entry was read, so none is listed twice.
                 Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
                     self.use_both_dir_info.store(true, Ordering::Relaxed);
@@ -418,7 +485,7 @@ impl WindowsFs {
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo, out)
+        list_with::<FILE_ID_BOTH_DIR_INFO>(handle, FileIdBothDirectoryInformation, buffer, out)
     }
 }
 
@@ -501,27 +568,81 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
     }
 }
 
+/// Bytes of directory records read per call.
+const LIST_BUFFER_BYTES: usize = 64 * 1024;
+// Held as u64s, which keep records 8-byte aligned as the call requires.
+const _: () = assert!(LIST_BUFFER_BYTES.is_multiple_of(size_of::<u64>()));
+
+thread_local! {
+    /// Each listing thread's buffer for directory records, allocated once
+    /// rather than per directory.
+    static LIST_BUFFER: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Runs `list` with this thread's listing buffer, which a nested call (none
+/// is expected) would find taken and replace with a new one.
+fn with_list_buffer<R>(list: impl FnOnce(&mut [u64]) -> R) -> R {
+    let mut buffer = LIST_BUFFER.take();
+    if buffer.is_empty() {
+        buffer = vec![0u64; LIST_BUFFER_BYTES / size_of::<u64>()];
+    }
+    let result = list(&mut buffer);
+    LIST_BUFFER.set(buffer);
+    result
+}
+
+/// Reads the next directory records into `buffer` with
+/// `NtQueryDirectoryFile` (what `GetFileInformationByHandleEx` calls, minus
+/// its wrapping): the bytes filled, or `None` past the last entry. Errors
+/// are mapped to Win32 codes as that function maps them.
+fn query_dir(
+    handle: &OwnedHandle,
+    class: FILE_INFORMATION_CLASS,
+    buffer: &mut [u64],
+) -> Result<Option<usize>, ScanError> {
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: a synchronous directory handle and a writable, 8-byte-aligned
+    // buffer of the given length.
+    let status = unsafe {
+        NtQueryDirectoryFile(
+            raw(handle),
+            None,
+            None,
+            None,
+            &mut status_block,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(buffer) as u32,
+            class,
+            false,
+            None,
+            false,
+        )
+    };
+    if status.is_ok() {
+        // Nothing filled can't happen; read as the end rather than decode
+        // what an earlier directory left in the buffer.
+        return Ok(Some(status_block.Information).filter(|&n| n > 0));
+    }
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    if code == ERROR_NO_MORE_FILES.0 {
+        return Ok(None);
+    }
+    Err(scan_error(windows::core::Error::from_hresult(
+        windows::core::HRESULT::from_win32(code),
+    )))
+}
+
 /// Reads a directory a buffer at a time, passing each entry on as it's
 /// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
-    class: FILE_INFO_BY_HANDLE_CLASS,
+    class: FILE_INFORMATION_CLASS,
+    buffer: &mut [u64],
     out: &mut Batcher<'_, '_>,
 ) -> Result<(), ScanError> {
-    let mut buffer = vec![0u64; 8192];
     loop {
-        let result = unsafe {
-            GetFileInformationByHandleEx(
-                raw(handle),
-                class,
-                buffer.as_mut_ptr().cast(),
-                (buffer.len() * size_of::<u64>()) as u32,
-            )
-        };
-        match result {
-            Ok(()) => {}
-            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(()),
-            Err(err) => return Err(scan_error(err)),
+        if query_dir(handle, class, buffer)?.is_none() {
+            return Ok(());
         }
         let base = buffer.as_ptr().cast::<u8>();
         let mut offset = 0usize;
@@ -625,8 +746,6 @@ impl FsAdapter for WindowsFs {
                 .encode_utf16()
                 .chain([0])
                 .collect();
-            const DRIVE_FIXED: u32 = 3;
-            const DRIVE_RAMDISK: u32 = 6;
             let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
             known[slot] = if matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK) {
                 1
@@ -707,19 +826,85 @@ fn try_enable_backup_privilege() -> windows::core::Result<bool> {
     Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
 }
 
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+const DRIVE_RAMDISK: u32 = 6;
+
 /// Whether `path` is on a network share (UNC path or mapped network drive).
 pub fn is_remote(path: &Path) -> bool {
+    drive_type(path) == Some(DRIVE_REMOTE)
+}
+
+/// Whether `path` is on a local fixed disk or a RAM disk.
+pub fn is_local_fixed(path: &Path) -> bool {
+    matches!(drive_type(path), Some(DRIVE_FIXED | DRIVE_RAMDISK))
+}
+
+/// Whether the disk under `path`'s volume has no seek penalty (an SSD or
+/// NVMe drive), by `IOCTL_STORAGE_QUERY_PROPERTY` on the volume opened for
+/// no access, which needs no rights. `None` when the volume or its driver
+/// doesn't say (a volume spanning disks, say).
+pub fn no_seek_penalty(path: &Path) -> Option<bool> {
     let path = wide(path);
-    let unc: Vec<u16> = r"\?\UNC\".encode_utf16().collect();
+    let mut mount = vec![0u16; path.len() + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut mount) }.ok()?;
+    let mut volume = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut volume) }.ok()?;
+    // "\\?\Volume{...}\" names the root folder; without the backslash, the
+    // volume device.
+    let len = volume.iter().position(|&c| c == 0)?;
+    if len == 0 || volume[len - 1] != u16::from(b'\\') {
+        return None;
+    }
+    volume[len - 1] = 0;
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(volume.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: CreateFileW returned a valid handle that we now own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        ..Default::default()
+    };
+    let mut answer = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            raw(&handle),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some((&raw const query).cast::<c_void>()),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some((&raw mut answer).cast::<c_void>()),
+            size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .ok()?;
+    (returned as usize >= size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>())
+        .then_some(!answer.IncursSeekPenalty)
+}
+
+/// `GetDriveTypeW` of the volume holding `path`; a UNC path is remote.
+fn drive_type(path: &Path) -> Option<u32> {
+    let path = wide(path);
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
     if path.starts_with(&unc) {
-        return true;
+        return Some(DRIVE_REMOTE);
     }
     let mut volume = vec![0u16; path.len() + 1];
-    if unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.is_err() {
-        return false;
-    }
-    const DRIVE_REMOTE: u32 = 4;
-    unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) == DRIVE_REMOTE }
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.ok()?;
+    Some(unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) })
 }
 
 /// Capacity and free space of the volume holding `path`, whether `path` is
@@ -873,6 +1058,53 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn keeps_trailing_dots_and_spaces_in_normal_paths() {
+        let text = |p: &str| String::from_utf16(&wide(Path::new(p))[..]).unwrap();
+        assert_eq!(text(r"C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        assert_eq!(text(r"C:\a\bar "), "\\\\?\\C:\\a\\bar \0");
+        assert_eq!(text(r"C:\"), "\\\\?\\C:\\\0");
+        assert_eq!(
+            text(r"\\server\share\x."),
+            "\\\\?\\UNC\\server\\share\\x.\0"
+        );
+        assert_eq!(text(r"\\?\C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        // Anything else is made absolute first.
+        assert_eq!(text(r"C:\a\.\b\..\c"), "\\\\?\\C:\\a\\c\0");
+        assert_eq!(text("C:/a/b"), "\\\\?\\C:\\a\\b\0");
+        assert_eq!(text(r"C:\a\\b"), "\\\\?\\C:\\a\\b\0");
+        assert!(!is_normal(Path::new("relative")));
+        assert!(!is_normal(Path::new(r"C:relative")));
+    }
+
+    #[test]
+    fn listings_spanning_several_buffers_miss_nothing() {
+        let dir = std::env::temp_dir().join(format!("sb-long-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Longest names fill a buffer with a few hundred records; short
+        // ones with thousands.
+        let mut names: Vec<String> = (0..400)
+            .map(|i| format!("{}{i:05}", "n".repeat(250)))
+            .chain((0..3000).map(|i| format!("s{i}")))
+            .collect();
+        for name in &names {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let fs = WindowsFs::new();
+        assert_eq!(fs.open_root(&dir), Ok(RootKind::Directory));
+        let mut listed = Vec::new();
+        fs.read_dir(&dir, &mut |batch| {
+            listed.extend(batch.into_iter().map(|e| e.name.into_string().unwrap()));
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        listed.sort();
+        names.sort();
+        assert_eq!(listed, names);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
