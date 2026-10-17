@@ -501,6 +501,27 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
     }
 }
 
+/// Bytes of directory records read per call.
+const LIST_BUFFER_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// Each listing thread's buffer for directory records, allocated once
+    /// rather than per directory.
+    static LIST_BUFFER: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Runs `list` with this thread's listing buffer, which a nested call (none
+/// is expected) would find taken and replace with a new one.
+fn with_list_buffer<R>(list: impl FnOnce(&mut [u64]) -> R) -> R {
+    let mut buffer = LIST_BUFFER.take();
+    if buffer.is_empty() {
+        buffer = vec![0u64; LIST_BUFFER_BYTES / size_of::<u64>()];
+    }
+    let result = list(&mut buffer);
+    LIST_BUFFER.set(buffer);
+    result
+}
+
 /// Reads a directory a buffer at a time, passing each entry on as it's
 /// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
@@ -508,7 +529,15 @@ fn list_with<T: DirInfo>(
     class: FILE_INFO_BY_HANDLE_CLASS,
     out: &mut Batcher<'_, '_>,
 ) -> Result<(), ScanError> {
-    let mut buffer = vec![0u64; 8192];
+    with_list_buffer(|buffer| list_into::<T>(handle, class, buffer, out))
+}
+
+fn list_into<T: DirInfo>(
+    handle: &OwnedHandle,
+    class: FILE_INFO_BY_HANDLE_CLASS,
+    buffer: &mut [u64],
+    out: &mut Batcher<'_, '_>,
+) -> Result<(), ScanError> {
     loop {
         let result = unsafe {
             GetFileInformationByHandleEx(
