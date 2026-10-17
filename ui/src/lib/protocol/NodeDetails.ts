@@ -39,4 +39,11 @@ matching: Matching | null,
  * Where the node stands in Git; `None` when the scan found no
  * repositories.
  */
-git: GitDetails | null, };
+git: GitDetails | null, 
+/**
+ * While a rescan runs: when the earlier scan finished (milliseconds
+ * since the Unix epoch) whose sizes stand in on the map for the
+ * folders at or under this one not yet listed. `None` once nothing
+ * under it is estimated. Never a size: the sizes here are measured.
+ */
+estimatedFrom: number | null, };

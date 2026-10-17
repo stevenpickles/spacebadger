@@ -27,9 +27,12 @@
     /** A name filter is on: tiles show matching files, but changes are
      * of all files. */
     filtered?: boolean;
+    /** The map shows areas estimated from the last scan (a rescan is
+     * under way). */
+    estimated?: boolean;
   }
 
-  let { mode = "type", since = "", filtered = false }: Props = $props();
+  let { mode = "type", since = "", filtered = false, estimated = false }: Props = $props();
 
   const dark = $derived(theme.dark);
   const listId = $props.id();
@@ -133,6 +136,9 @@
           </span>Colors show folder depth
         </li>
       {/if}
+      {#if estimated}
+        <li class="wide"><span class="swatch estimated" class:dark></span>Estimated from last scan</li>
+      {/if}
       <li><span class="swatch incomplete"></span>Not fully scanned</li>
       <li><span class="swatch selected" class:dark></span>Selected</li>
     </ul>
@@ -164,6 +170,23 @@
   }
   ul.row li.wide {
     flex-basis: 100%;
+  }
+  /* As the map draws estimated areas: faded toward the background, with
+     dense lines the other way from Git metadata's. */
+  .swatch.estimated {
+    background-color: color-mix(in srgb, var(--muted) 45%, var(--bg));
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0 2px,
+      rgb(0 0 0 / 0.25) 2px 3px
+    );
+  }
+  .swatch.estimated.dark {
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0 2px,
+      rgb(255 255 255 / 0.3) 2px 3px
+    );
   }
   .swatch.hatched {
     background-image: repeating-linear-gradient(

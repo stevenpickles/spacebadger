@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 mod compare;
 #[cfg(test)]
 mod load;
+mod prior;
 
 /// Files narrower or shorter than this (CSS px) get no label.
 const FILE_LABEL_MIN: (f32, f32) = (40.0, 14.0);
@@ -201,7 +202,20 @@ impl Session {
             saved: Arc::clone(&saved_snapshot),
             protect: carried.as_ref().map(|c| c.id().to_owned()),
         });
+        let estimates = snapshots.as_ref().map(|store| {
+            prior::Estimates::start(
+                Arc::clone(store),
+                root.clone(),
+                started_ms,
+                Arc::clone(&tree_cell),
+            )
+        });
         let scan = Scan::start(root.clone(), adapter, config, move |p| {
+            // Before the status goes out, so the map asked for once the scan
+            // is over has no estimates left to carry.
+            if let Some(estimates) = &estimates {
+                estimates.progress(&p.state);
+            }
             nudge.nudge(p.revision);
             sink(status(&display, p));
             if let Some(saver) = &saver {
@@ -348,8 +362,18 @@ impl Session {
                     RectKind::OtherSmall => 0,
                 },
                 parent: r.parent(&tree).index() as u32,
+                more_flags: if r.provisional {
+                    proto::wire::RECT_PROVISIONAL
+                } else {
+                    0
+                },
             });
         }
+        let provisional = result.rects.iter().any(|r| r.provisional);
+        let estimated_from = match tree.prior_created_ms() {
+            Some(ms) if provisional => u32::try_from(ms / 1000).unwrap_or(u32::MAX),
+            _ => 0,
+        };
         drop(tree);
         let labels: Vec<(u32, &str)> = names.iter().map(|(i, s)| (*i, s.as_str())).collect();
         let mut header_flags = 0;
@@ -359,6 +383,9 @@ impl Session {
         if finished {
             header_flags |= proto::wire::LAYOUT_FINAL;
         }
+        if provisional {
+            header_flags |= proto::wire::LAYOUT_PROVISIONAL;
+        }
         let header = proto::wire::Header {
             generation: self.generation(),
             revision: progress.revision,
@@ -366,6 +393,7 @@ impl Session {
             view: req.view,
             total: result.total,
             flags: header_flags,
+            estimated_from,
         };
         Ok(proto::wire::encode(&header, &rects, &labels))
     }
@@ -889,6 +917,10 @@ impl Session {
             ancestors,
             matching,
             git: git::details(&tree, n, filter),
+            estimated_from: tree
+                .is_provisional(n)
+                .then(|| tree.prior_created_ms())
+                .flatten(),
         })
     }
 

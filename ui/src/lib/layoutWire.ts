@@ -55,10 +55,15 @@ export const FILE_TYPES = [
 
 export const LAYOUT_TRUNCATED = 1 << 0;
 export const LAYOUT_FINAL = 1 << 1;
+export const LAYOUT_PROVISIONAL = 1 << 2;
+
+/** A rectangle's byte 40: part of its area is estimated from an earlier
+ * scan (sb_protocol::wire::RECT_PROVISIONAL). */
+const RECT_PROVISIONAL = 1 << 0;
 
 const MAGIC = 0x314c4253; // "SBL1" read as little-endian u32
-const FORMAT_VERSION = 4;
-const RECT_LEN = 40;
+const FORMAT_VERSION = 5;
+const RECT_LEN = 44;
 
 /** Rectangles as parallel typed arrays, parent before child. */
 export interface DecodedLayout {
@@ -68,6 +73,9 @@ export interface DecodedLayout {
   view: number;
   total: number;
   flags: number;
+  /** When the scan the estimated areas come from finished, in seconds since
+   * the Unix epoch; 0 when nothing is estimated. */
+  estimatedFrom: number;
   count: number;
   x: Float32Array;
   y: Float32Array;
@@ -85,6 +93,9 @@ export interface DecodedLayout {
   /** The folder whose contents each rectangle is part of. Siblings are
    * consecutive, largest first. */
   parent: Uint32Array;
+  /** 1 where part of the area stands for folders not yet listed, sized from
+   * an earlier scan; the weight never counts them. */
+  provisional: Uint8Array;
   labels: Map<number, string>;
 }
 
@@ -107,6 +118,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     view: v.getUint32(28, true),
     total: Number(v.getBigUint64(32, true)),
     flags: v.getUint32(48, true),
+    estimatedFrom: v.getUint32(52, true),
     count,
     x: new Float32Array(count),
     y: new Float32Array(count),
@@ -120,6 +132,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     rflags: new Uint8Array(count),
     ftype: new Uint8Array(count),
     parent: new Uint32Array(count),
+    provisional: new Uint8Array(count),
     labels: new Map(),
   };
   let o = headerLen;
@@ -136,6 +149,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     out.rflags[i] = v.getUint8(o + 34);
     out.ftype[i] = v.getUint8(o + 35);
     out.parent[i] = v.getUint32(o + 36, true);
+    out.provisional[i] = v.getUint8(o + 40) & RECT_PROVISIONAL ? 1 : 0;
   }
   const text = new TextDecoder();
   const bytes = new Uint8Array(buffer);
@@ -148,9 +162,19 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
   return out;
 }
 
-/** Index of the deepest rectangle containing the point, or -1. */
+/** Whether rectangle `i` is the estimated filler of a folder still being
+ * listed: the part of its earlier size nothing found so far stands for
+ * (merged small items with none in it). It isn't an item of its own:
+ * pointing at it points at its folder. */
+export function isFiller(l: DecodedLayout, i: number): boolean {
+  return l.kind[i] === KIND_OTHER && l.items[i] === 0;
+}
+
+/** Index of the deepest rectangle containing the point, or -1. Fillers
+ * are passed over for the folder they're in. */
 export function hitTest(l: DecodedLayout, px: number, py: number): number {
   for (let i = l.count - 1; i >= 0; i--) {
+    if (isFiller(l, i)) continue;
     const x = l.x[i]!;
     const y = l.y[i]!;
     if (px >= x && py >= y && px < x + l.w[i]! && py < y + l.h[i]!) return i;

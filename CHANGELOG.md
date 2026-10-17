@@ -18,6 +18,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 ### Scanning
 - macOS lists folders with `getattrlistbulk`, one call per batch of entries instead of two per entry, with the same results; `SB_MACOS_LISTING=readdir` switches back to the old listing.
 
+### Map
+- Rescanning a folder draws the map at once: folders not scanned yet take the size they had in the last saved scan, faded and hatched, until their own contents arrive. Their tooltips and details say which scan the estimate comes from; every number shown, exported, compared, or totalled is still only what this scan has found.
+
 ## [0.3.0] - 2026-10-14
 
 ### Filter
