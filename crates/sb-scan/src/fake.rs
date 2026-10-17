@@ -4,6 +4,7 @@ use crate::adapter::{
     Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
     read_capped, refused,
 };
+use sb_core::git::paths::Style;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,9 @@ pub struct FakeFs {
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
     read_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
     read_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Every path given to `read_small` or `stat_kind`, in order.
+    reads: Arc<Mutex<Vec<PathBuf>>>,
+    style: Arc<Mutex<Option<Style>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
 
@@ -306,6 +310,18 @@ impl FakeFs {
         self
     }
 
+    /// Sets how paths in Git metadata read (by default as on this platform).
+    pub fn set_path_style(&self, style: Style) -> &Self {
+        *self.style.lock().unwrap() = Some(style);
+        self
+    }
+
+    /// Every path [`FsAdapter::read_small`] or [`FsAdapter::stat_kind`]
+    /// was asked about so far, in order.
+    pub fn reads(&self) -> Vec<PathBuf> {
+        self.reads.lock().unwrap().clone()
+    }
+
     pub fn set_root_kind(&self, kind: RootKind) -> &Self {
         *self.root_kind.lock().unwrap() = Some(kind);
         self
@@ -376,6 +392,7 @@ impl FsAdapter for FakeFs {
     }
 
     fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
         let gate = self.read_gates.lock().unwrap().get(path).cloned();
         if let Some(gate) = gate {
             gate.wait();
@@ -405,12 +422,22 @@ impl FsAdapter for FakeFs {
     }
 
     fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
         match self.nodes.lock().unwrap().get(path) {
             Some(Node::Dir) => Ok(EntryKind::Directory),
             Some(Node::File { .. }) => Ok(EntryKind::File),
             Some(Node::Other(kind)) => Ok(*kind),
             None => Err(ScanError::new(ErrorKind::Vanished, "no such file")),
         }
+    }
+
+    fn path_style(&self) -> Style {
+        self.style.lock().unwrap().unwrap_or_else(Style::native)
+    }
+
+    /// Every drive is a local disk.
+    fn local_drive(&self, _letter: u8) -> bool {
+        true
     }
 }
 

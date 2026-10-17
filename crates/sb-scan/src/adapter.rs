@@ -1,6 +1,7 @@
 //! The filesystem interface the scan engine drives. Native adapters implement
 //! it per platform; [`crate::fake::FakeFs`] implements it in memory for tests.
 
+use sb_core::git::paths::Style;
 use std::ffi::OsString;
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -260,6 +261,19 @@ pub trait FsAdapter: Send + Sync + 'static {
     fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
         let _ = path;
         Err(ScanError::new(ErrorKind::Unavailable, "not supported"))
+    }
+
+    /// How paths written in Git metadata read on this filesystem.
+    fn path_style(&self) -> Style {
+        Style::native()
+    }
+
+    /// Whether drive `letter` (Windows, upper case) is a local fixed disk,
+    /// where Git metadata outside the scan may be read. Network, removable
+    /// and unknown drives aren't.
+    fn local_drive(&self, letter: u8) -> bool {
+        let _ = letter;
+        false
     }
 }
 

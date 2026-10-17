@@ -28,8 +28,8 @@ use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
@@ -47,7 +47,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
     FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
     GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -394,6 +395,8 @@ fn filetime(ticks: i64) -> Option<SystemTime> {
 pub struct WindowsFs {
     /// Set once the extended class is found unsupported on this volume.
     use_both_dir_info: AtomicBool,
+    /// Per drive letter: 0 not asked yet, 1 local, 2 not.
+    local_drives: Mutex<[u8; 26]>,
 }
 
 impl WindowsFs {
@@ -582,11 +585,14 @@ impl FsAdapter for WindowsFs {
     fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
         // Backup semantics so a folder or junction opens too, to be refused
         // for what it is.
-        let probe = open(path, FILE_READ_ATTRIBUTES.0)?;
+        let probe = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
         let compressed = small_readable(&probe)?;
         let id = file_id(&probe);
         drop(probe);
-        let mut flags = FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN;
+        let mut flags = FILE_FLAG_OPEN_NO_RECALL
+            | FILE_FLAG_SEQUENTIAL_SCAN
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION;
         if !compressed {
             flags |= FILE_FLAG_OPEN_REPARSE_POINT;
         }
@@ -602,10 +608,50 @@ impl FsAdapter for WindowsFs {
     }
 
     fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
-        let handle = open(path, FILE_READ_ATTRIBUTES.0)?;
+        let handle = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
         let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(&handle, FileAttributeTagInfo)?;
         Ok(classify(tag_info.FileAttributes, tag_info.ReparseTag))
     }
+
+    /// A fixed or RAM disk, by `GetDriveTypeW`, asked once per drive.
+    fn local_drive(&self, letter: u8) -> bool {
+        if !letter.is_ascii_uppercase() {
+            return false;
+        }
+        let slot = usize::from(letter - b'A');
+        let mut known = self.local_drives.lock().unwrap();
+        if known[slot] == 0 {
+            let root: Vec<u16> = format!("{}:\\", char::from(letter))
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            const DRIVE_FIXED: u32 = 3;
+            const DRIVE_RAMDISK: u32 = 6;
+            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            known[slot] = if matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK) {
+                1
+            } else {
+                2
+            };
+        }
+        known[slot] == 1
+    }
+}
+
+/// Opens Git metadata for its attributes as [`open`] does, and as the
+/// file's owner only identifies us: a path that reaches a server anyway
+/// can't act with our credentials.
+fn open_metadata(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
+    open_with(
+        path,
+        access,
+        FILE_FLAG_BACKUP_SEMANTICS
+            | FILE_FLAG_OPEN_REPARSE_POINT
+            | FILE_FLAG_OPEN_NO_RECALL
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION,
+    )
+    .map_err(scan_error)
 }
 
 /// Whether [`FsAdapter::read_small`] may read a handle's file, as

@@ -108,6 +108,14 @@ impl<A: FsAdapter> FsAdapter for Watched<A> {
     fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
         self.inner.stat_kind(path)
     }
+
+    fn path_style(&self) -> sb_core::git::paths::Style {
+        self.inner.path_style()
+    }
+
+    fn local_drive(&self, letter: u8) -> bool {
+        self.inner.local_drive(letter)
+    }
 }
 
 /// Longest and 99th-percentile waits for the read lock while `done` is unset.
