@@ -11,7 +11,11 @@ export type GitDetails = {
  */
 content: GitContent | null, 
 /**
- * The nearest listed root at or above the node.
+ * The nearest listed root at or above the node, or the repository
+ * above the scan root (`outside`) when the node is only in that one.
+ * Its `size` and `matching` are logical sizes, like the details' own;
+ * `own`, `metadata` and `nested` are summed up only for the list
+ * (`GitRootsPage`) and are 0 here.
  */
 root: GitRootRow | null, 
 /**
