@@ -8,6 +8,7 @@
 //! cargo run --release -p sb-bench -- [--lod N]...
 //! cargo run --release -p sb-bench -- --floor PATH [--threads N]... [--strategy S]... [--runs R] [--no-warmup]
 //! cargo run --release -p sb-bench -- --engine PATH [--threads N]... [--strategy S] [--runs R] [--no-warmup]
+//!                                    [--snapshot FILE [--found-order]]
 //! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N]
 //! ```
 //!
@@ -39,6 +40,11 @@
 //!
 //! `--exact-hard-links` makes `--engine` and `--wide-dir` scans re-measure
 //! every name of a hard-linked file (`ScanConfig::exact_hard_links`).
+//!
+//! With `--engine`, `--snapshot` gives each scan that snapshot as its prior,
+//! as a rescan in the app has, so folders are listed in the order it
+//! suggests; `--found-order` lists them in the order found all the same
+//! (`ScanConfig::list_by_prior`).
 
 mod cpu;
 mod engine;
@@ -113,7 +119,7 @@ struct Ruler {
 
 const USAGE: &str = "usage: sb-bench [--nodes N]... [--seed S] [--wide N]... [--wide-slow N]... \
                      [--wide-dir PATH]... [--lod N]... [--floor PATH]... [--engine PATH]... \
-                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]] [--exact-hard-links]";
+                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]] [--exact-hard-links] \n                     [--snapshot FILE [--found-order]]";
 
 /// Set by `--exact-hard-links`: real-folder scans re-measure every name of
 /// a hard-linked file, and children are told so.
@@ -122,6 +128,14 @@ static EXACT_HARD_LINKS: AtomicBool = AtomicBool::new(false);
 fn exact_hard_links() -> bool {
     EXACT_HARD_LINKS.load(Ordering::Relaxed)
 }
+
+/// Set by `--snapshot` outside `--provisional`: the prior engine scans get,
+/// and children are told so.
+static ENGINE_SNAPSHOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set by `--found-order`: engine scans with a prior list folders in the
+/// order found.
+static FOUND_ORDER: AtomicBool = AtomicBool::new(false);
 
 /// Below this much floor CPU time, Windows' 15.6 ms CPU clock makes the CPU
 /// ratio too coarse to compare.
@@ -179,12 +193,16 @@ fn main() {
             "--seed" => seed = value(),
             "--child" => child = true,
             "--exact-hard-links" => EXACT_HARD_LINKS.store(true, Ordering::Relaxed),
+            "--found-order" => FOUND_ORDER.store(true, Ordering::Relaxed),
             _ => panic!("unknown argument {arg}\n{USAGE}"),
         }
     }
     if let Some(root) = provisional {
         provisional::run(&root, snapshot.as_deref(), rounds);
         return;
+    }
+    if let Some(file) = snapshot {
+        ENGINE_SNAPSHOT.set(file).expect("set once");
     }
     if cases.is_empty() {
         cases.extend(DEFAULT_SIZES.map(Case::Nodes));
@@ -205,7 +223,12 @@ fn main() {
                 Case::WideDir(p) => wide::real(p, exact_hard_links()),
                 Case::Lod(n) => lod::run(*n, seed),
                 Case::Floor(p) => floor::run(p, ruler.threads[0], ruler.strategies[0]),
-                Case::Engine(p) => engine::run(p, ruler.threads[0]),
+                Case::Engine(p) => engine::run(
+                    p,
+                    ruler.threads[0],
+                    ENGINE_SNAPSHOT.get().map(PathBuf::as_path),
+                    !FOUND_ORDER.load(Ordering::Relaxed),
+                ),
             }
         }
         return;
@@ -248,6 +271,17 @@ fn spawn(args: &[String]) -> Reported {
     let mut child = Command::new(&exe)
         .arg("--child")
         .args(exact_hard_links().then_some("--exact-hard-links"))
+        .args(
+            FOUND_ORDER
+                .load(Ordering::Relaxed)
+                .then_some("--found-order"),
+        )
+        .args(
+            ENGINE_SNAPSHOT
+                .get()
+                .into_iter()
+                .flat_map(|f| [std::ffi::OsStr::new("--snapshot"), f.as_os_str()]),
+        )
         .args(args)
         .stdout(Stdio::piped())
         .spawn()

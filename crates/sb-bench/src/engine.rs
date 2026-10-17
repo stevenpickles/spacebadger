@@ -5,6 +5,8 @@
 
 use crate::cpu::{Cpu, Threads, print_roles, without_watcher};
 use crate::ms;
+use sb_core::prior::Prior;
+use sb_core::snapshot::Snapshot;
 use sb_scan::{HoldProbe, NativeFs, Scan, ScanConfig, ScanState};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -31,14 +33,34 @@ impl Holds {
     }
 }
 
-/// Scans `root` once with `workers` workers and prints the measurements.
-pub fn run(root: &Path, workers: usize) {
+/// Scans `root` once with `workers` workers and prints the measurements;
+/// with `snapshot` as its prior, given as the scan starts (as the app gives
+/// a rescan its prior), listing folders in the order it suggests if
+/// `by_prior`.
+pub fn run(root: &Path, workers: usize, snapshot: Option<&Path>, by_prior: bool) {
     println!("\n== engine {}: {workers} workers ==", root.display());
+    // Read before the clock starts, as the app reads it on its own thread.
+    let prior = snapshot.map(|file| {
+        let bytes = std::fs::read(file).expect("read snapshot");
+        let prior = Prior::new(Snapshot::decode(&bytes).expect("decode snapshot"));
+        println!(
+            "prior:   {} ({}), {}",
+            file.display(),
+            if by_prior {
+                "prior order"
+            } else {
+                "found order"
+            },
+            crate::mib(prior.memory_bytes() as u64)
+        );
+        Arc::new(prior)
+    });
     let holds = Arc::new(Mutex::new(Holds::default()));
     let config = ScanConfig {
         workers,
         write_holds: Some(Holds::probe(&holds)),
         exact_hard_links: crate::exact_hard_links(),
+        list_by_prior: by_prior,
         // As the app scans the root, but for the worker count.
         ..sb_scan::native::scan_config(root)
     };
@@ -47,6 +69,9 @@ pub fn run(root: &Path, workers: usize) {
     let started = Instant::now();
     let scan = Scan::start(root.to_path_buf(), NativeFs::new(), config, |_| {});
     let tree = scan.tree();
+    if let Some(prior) = prior {
+        tree.write().unwrap().set_prior(prior);
+    }
     let p = scan.wait();
     let wall = started.elapsed();
     let process = Cpu::process().zip(before).map(|(a, b)| a.since(b));
