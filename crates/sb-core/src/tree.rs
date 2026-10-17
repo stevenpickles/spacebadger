@@ -683,6 +683,23 @@ impl Tree {
         self.pending_estimate(node) > 0
     }
 
+    /// How much of the root folder `dir` held in the prior scan, in
+    /// millionths, while it waits for its listing (0 once listed, and
+    /// without a prior or a namesake in it). For ordering listings only, so
+    /// a scan can list the folders that dominate the map first: a share,
+    /// not a size, so it can't be shown or added up as one.
+    pub fn listing_priority(&self, dir: NodeId) -> u32 {
+        let Some(p) = self.prior.as_deref() else {
+            return 0;
+        };
+        let Some(waiting) = p.entries.get(&dir.0) else {
+            return 0;
+        };
+        let whole = u128::from(p.prior.logical(0).max(1));
+        let share = u128::from(p.prior.logical(waiting.entry)) * 1_000_000 / whole;
+        u32::try_from(share).unwrap_or(u32::MAX)
+    }
+
     /// Adds a file under `parent` and adds its sizes to every ancestor.
     /// `modified` is its last-modified time, if the listing gave one.
     pub fn add_file(
@@ -2005,6 +2022,33 @@ mod tests {
         t.clear_prior();
         assert_eq!(t.prior_created_ms(), None);
         assert_eq!(t.pending_estimate(root), 0);
+    }
+
+    #[test]
+    fn waiting_folders_are_prioritised_by_their_share_of_the_prior_root() {
+        let mut t = Tree::new("/r");
+        let root = NodeId::ROOT;
+        let early = t.add_dir(root, "a".as_ref()).unwrap();
+        assert_eq!(t.listing_priority(early), 0, "no prior, no priority");
+        let mut t = Tree::new("/r");
+        t.set_prior(prior());
+        assert_eq!(t.listing_priority(root), 1_000_000);
+        let a = t.add_dir(root, "a".as_ref()).unwrap();
+        let d = t.add_dir(root, "d".as_ref()).unwrap();
+        let e = t.add_dir(root, "e".as_ref()).unwrap();
+        // 510 and 50 of 561 bytes; a new folder has no share.
+        assert_eq!(
+            [a, d, e].map(|n| t.listing_priority(n)),
+            [909_090, 89_126, 0]
+        );
+        // Taken as the prior's size, whatever was found in it so far.
+        t.add_file(a, "big".as_ref(), sizes(500, 500), None, 0)
+            .unwrap();
+        assert_eq!(t.listing_priority(a), 909_090);
+        t.set_dir_state(a, DirState::Listed);
+        assert_eq!(t.listing_priority(a), 0, "listed");
+        t.clear_prior();
+        assert_eq!(t.listing_priority(d), 0);
     }
 
     #[test]

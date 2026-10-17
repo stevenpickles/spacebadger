@@ -12,7 +12,10 @@
 //! exports, comparisons, searches, selections, Git summaries and deletes
 //! read the tree's measured sizes, which estimates never touch; the tree
 //! keeps the estimates in a column only the layout reads (see
-//! [`Tree::set_prior`](crate::tree::Tree::set_prior)).
+//! [`Tree::set_prior`](crate::tree::Tree::set_prior)). The scanner may also
+//! ask which waiting folders were biggest, as a share of the root, to list
+//! them first (see
+//! [`Tree::listing_priority`](crate::tree::Tree::listing_priority)).
 
 use crate::compare::ChildIndex;
 use crate::snapshot::{Snapshot, fold};
@@ -142,6 +145,13 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["layout.rs", "ranking.rs"]);
+        // The scanner's listing order: defined in tree.rs, used by no
+        // reader of sizes here.
+        let order: Vec<String> = readers(["listing_", "priority("].concat())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(order, ["tree.rs"]);
     }
 
     #[test]
