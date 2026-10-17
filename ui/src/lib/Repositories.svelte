@@ -272,6 +272,14 @@
     padding-bottom: var(--space-2);
     border-bottom: 1px solid var(--line);
   }
+  /* In a narrow panel the counts wrap under the heading, not into it. */
+  header .panel-head {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+  header h3 {
+    white-space: nowrap;
+  }
   header p {
     margin: 0;
     padding: 0 var(--space-3);

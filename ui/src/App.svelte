@@ -1555,9 +1555,10 @@
      dangle at the row's start. */
   .filter {
     border-left: none;
-    flex: 1 1 150px;
-    max-width: 420px;
-    min-width: 150px;
+    /* Room for the quick filters beside a box of at least 150px. */
+    flex: 1 1 340px;
+    max-width: 600px;
+    min-width: 340px;
   }
   .filter-help {
     position: relative;
