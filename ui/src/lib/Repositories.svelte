@@ -188,7 +188,9 @@
   function rowLabel(r: GitRootRow): string {
     const kind = GIT_BADGES[KIND_BADGE[r.kind]]!.name;
     const match = r.matching !== null ? `, ${formatBytes(r.matching)} matching` : "";
-    return `${kind}: ${r.path}, ${formatBytes(r.size)} scanned${match}`;
+    const label = `${kind}: ${r.path}, ${formatBytes(r.size)} scanned${match}`;
+    // A problem can be longer than its line in the row; the tooltip has it whole.
+    return r.problem ? `${label}\n${r.problem}` : label;
   }
 
   function sizeTitle(r: GitRootRow): string {
