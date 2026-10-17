@@ -55,11 +55,17 @@ impl Estimates {
                 let Some(tree) = cell.wait().upgrade() else {
                     return;
                 };
+                // Matched with only a read lock held, so the scanner waits
+                // just for the estimates to be put in place.
+                let matched = match tree.read() {
+                    Ok(t) => t.match_prior(prior),
+                    Err(_) => return,
+                };
                 let Ok(mut tree) = tree.write() else {
                     return;
                 };
                 if !done.load(Ordering::SeqCst) {
-                    tree.set_prior(prior);
+                    tree.apply_prior(matched);
                 }
             });
         if let Err(e) = spawned {
@@ -79,10 +85,15 @@ impl Estimates {
             self.finished.store(true, Ordering::SeqCst);
             return;
         };
-        if let Ok(mut tree) = tree.write() {
-            self.finished.store(true, Ordering::SeqCst);
-            tree.clear_prior();
-        }
+        let estimates = match tree.write() {
+            Ok(mut tree) => {
+                self.finished.store(true, Ordering::SeqCst);
+                tree.clear_prior()
+            }
+            Err(_) => None,
+        };
+        // Freed with the lock released.
+        drop(estimates);
     }
 }
 
