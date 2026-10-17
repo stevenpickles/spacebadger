@@ -26,7 +26,11 @@
 //! - A file seen under a second name is counted once, as an alias of its
 //!   first name. Names whose listings may be stale are re-measured: by
 //!   default only a file whose names' listings disagree, once, after every
-//!   folder is listed (the scan is still running then); see [`links`].
+//!   folder is listed (the scan is still running then); see [`links`]. A
+//!   scan that stops before then (cancelled, failed, or out of tree
+//!   capacity) keeps the listed sizes of such names, as it keeps
+//!   everything else it found. Once complete, each file's allocation goes
+//!   to a name chosen by path, not by listing order.
 
 use crate::adapter::{
     BATCH_ENTRIES, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,

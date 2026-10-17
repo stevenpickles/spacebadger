@@ -9,11 +9,20 @@
 //! taken as listed (both could only be stale if the file was last changed
 //! through a name the scan never lists), and a file whose names disagree is
 //! re-measured once, by its first name, after every folder is listed, with
-//! the result applied to all its names; so is a file whose stamp says its
-//! listings can be wrong under every name alike. Without a stamp, or with
+//! the result applied to all its names if the re-measure found that file's
+//! ID (otherwise to the measured name alone, and the others are
+//! re-measured one by one); so is a file whose stamp says its listings can
+//! be wrong under every name alike. Without a stamp, or with
 //! [`ScanConfig::exact_hard_links`](super::ScanConfig::exact_hard_links),
 //! every later name and (once) its first name are re-measured as they're
-//! found.
+//! found. A scan that stops before every folder is listed (cancelled,
+//! failed, or out of tree capacity) never gets to the re-measures, so
+//! names whose listings disagreed keep their listed sizes.
+//!
+//! Once a scan completes, each file's allocation goes to the name with the
+//! fewest path components, then the first in name order (see
+//! [`name_order`]), on every platform, so the owner doesn't depend on which
+//! worker listed first.
 
 use crate::adapter::{Entry, LinkStamp};
 use sb_core::tree::{NodeId, Tree};
