@@ -240,14 +240,22 @@ impl Links {
     /// that name and the owner's other aliases, to hand to
     /// [`Tree::promote_alias`], so which name owns the allocation doesn't
     /// depend on which folder was listed first. Only reads the tree, so it
-    /// can run under a read lock.
-    pub(super) fn settle(&mut self, tree: &Tree) -> Vec<(NodeId, Vec<NodeId>)> {
+    /// can run under a read lock. Stops early, with the moves found so far,
+    /// once `stop` says so (checked every [`SETTLE_CHECK`] files).
+    pub(super) fn settle(
+        &mut self,
+        tree: &Tree,
+        stop: impl Fn() -> bool,
+    ) -> Vec<(NodeId, Vec<NodeId>)> {
         let mut groups: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for (owner, alias) in std::mem::take(&mut self.aliases) {
             groups.entry(owner).or_default().push(alias);
         }
         let mut moves = Vec::new();
-        for (owner, aliases) in groups {
+        for (i, (owner, aliases)) in groups.into_iter().enumerate() {
+            if i % SETTLE_CHECK == 0 && stop() {
+                break;
+            }
             let best = aliases.iter().copied().fold(owner, |best, name| {
                 if name_order(tree, name, best).is_lt() {
                     name
@@ -302,6 +310,9 @@ impl Links {
     }
 }
 
+/// How many files [`Links::settle`] weighs between looks at its stop flag.
+const SETTLE_CHECK: usize = 4096;
+
 /// The order in which names of one file are preferred as its owner: fewer
 /// path components first (`System32\x.dll` before
 /// `WinSxS\<component>\x.dll`), then path order by component, ignoring
@@ -332,18 +343,15 @@ fn name_order(tree: &Tree, a: NodeId, b: NodeId) -> std::cmp::Ordering {
     };
     let (ca, cb) = (chain(a), chain(b));
     let bytes = |n: NodeId| tree.name(n).as_encoded_bytes();
+    // Same depth, so the chains pair up component by component.
     let pairs = || ca.iter().zip(&cb).filter(|(x, y)| x != y);
-    ca.len()
-        .cmp(&cb.len())
-        .then_with(|| {
-            pairs()
-                .map(|(&x, &y)| {
-                    let fold = |n| bytes(n).iter().map(u8::to_ascii_lowercase);
-                    fold(x).cmp(fold(y))
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
+    pairs()
+        .map(|(&x, &y)| {
+            let fold = |n| bytes(n).iter().map(u8::to_ascii_lowercase);
+            fold(x).cmp(fold(y))
         })
+        .find(|o| o.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| {
             pairs()
                 .map(|(&x, &y)| bytes(x).cmp(bytes(y)))
@@ -357,6 +365,28 @@ fn name_order(tree: &Tree, a: NodeId, b: NodeId) -> std::cmp::Ordering {
 mod tests {
     use super::*;
     use std::hash::BuildHasher;
+
+    #[test]
+    fn settling_prefers_the_shortest_path_and_stops_when_told() {
+        use sb_core::size::Allocated;
+        use sb_core::tree::FileSizes;
+        let mut tree = Tree::new("/r");
+        let deep = tree.add_dir(NodeId::ROOT, "z".as_ref()).unwrap();
+        let sizes = FileSizes {
+            logical: 1,
+            allocated: Allocated::known(4096),
+        };
+        let first = tree.add_file(deep, "a".as_ref(), sizes, None, 0).unwrap();
+        let near = tree
+            .add_file(NodeId::ROOT, "b".as_ref(), sizes, None, 0)
+            .unwrap();
+        tree.mark_alias(near, first);
+        let mut links = Links::new(false);
+        links.aliases.push((first, near));
+        assert_eq!(links.settle(&tree, || true), []);
+        links.aliases.push((first, near));
+        assert_eq!(links.settle(&tree, || false), [(near, vec![])]);
+    }
 
     #[test]
     fn owner_map_entries_stay_small() {

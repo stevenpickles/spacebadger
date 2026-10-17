@@ -812,10 +812,17 @@ impl<A: FsAdapter> Aggregator<A> {
     /// to the name a fixed order of paths prefers, whatever was listed
     /// first (see [`links`]): chosen under the read lock, then moved in
     /// holds of the write lock bounded like a batch's. Skipped for a
-    /// stopped scan, so a cancel is acknowledged at once.
+    /// stopped scan, and given up part way (totals stay exact, owners as
+    /// found) when a cancel arrives meanwhile, so a cancel is acknowledged
+    /// at once; the scan still reports the state it completed with.
     fn settle_owners(&mut self) {
-        let moves = self.links.settle(&self.tree.read().unwrap());
+        let shared = Arc::clone(&self.shared);
+        let stop = || shared.cancel.load(Ordering::Relaxed);
+        let moves = self.links.settle(&self.tree.read().unwrap(), stop);
         for chunk in moves.chunks(BATCH_ENTRIES) {
+            if stop() {
+                break;
+            }
             let mut tree = write(&self.tree, self.config.write_holds.as_ref());
             for (heir, others) in chunk {
                 tree.promote_alias(*heir, others);
