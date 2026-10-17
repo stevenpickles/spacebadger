@@ -587,9 +587,17 @@ enum Outcome {
     Stopped { dir: NodeId },
 }
 
-/// Workers' jobs in two levels: listings of folders that were big in the
-/// prior scan, biggest first, then everything else in the order queued.
-/// Without a prior every priority is 0 and it's a plain FIFO.
+/// Workers' jobs in three lanes:
+///
+/// - Git probes and re-measures, which are few, small, and wanted soon;
+/// - listings of folders a prior puts ahead (see [`listing_priority`]),
+///   highest priority first;
+/// - other listings, in the order queued.
+///
+/// While the ordered lane has listings, the first lane is served before
+/// it; otherwise the first and last lanes are served together in the order
+/// queued. Without a prior the ordered lane stays empty, so the queue is a
+/// plain FIFO of every job.
 #[derive(Default)]
 struct Queue {
     state: Mutex<Jobs>,
@@ -598,11 +606,47 @@ struct Queue {
 
 #[derive(Default)]
 struct Jobs {
+    /// Git probes and re-measures, with when each was queued.
+    soon: VecDeque<(u64, Job)>,
     big: BinaryHeap<Big>,
-    fifo: VecDeque<Job>,
-    /// Ties among big listings go to the one queued first.
+    /// Other listings, with when each was queued.
+    fifo: VecDeque<(u64, Job)>,
+    /// Jobs queued so far: the order they were queued in.
     queued: u64,
     closed: bool,
+}
+
+impl Jobs {
+    fn seq(&mut self) -> u64 {
+        self.queued += 1;
+        self.queued
+    }
+
+    /// Queues `job`; see [`Queue`].
+    fn put(&mut self, job: Job, priority: u32) {
+        let seq = self.seq();
+        match job {
+            Job::Measure { .. } | Job::Git { .. } => self.soon.push_back((seq, job)),
+            Job::List { .. } if priority >= BIG_SHARE => self.big.push(Big { priority, seq, job }),
+            Job::List { .. } => self.fifo.push_back((seq, job)),
+        }
+    }
+
+    fn take(&mut self) -> Option<Job> {
+        let soon_first = match (self.soon.front(), self.fifo.front()) {
+            (None, _) => false,
+            _ if !self.big.is_empty() => true,
+            (Some(_), None) => true,
+            (Some((s, _)), Some((f, _))) => s < f,
+        };
+        if soon_first {
+            return self.soon.pop_front().map(|(_, job)| job);
+        }
+        if let Some(big) = self.big.pop() {
+            return Some(big.job);
+        }
+        self.fifo.pop_front().map(|(_, job)| job)
+    }
 }
 
 /// A listing ahead of the FIFO: ordered by priority, then by when queued.
@@ -635,18 +679,10 @@ impl Ord for Big {
 }
 
 impl Queue {
-    /// Queues `job`; a priority of [`BIG_SHARE`] or more goes ahead of the
-    /// FIFO.
+    /// Queues `job`: a listing with a priority of [`BIG_SHARE`] or more
+    /// goes ahead of the others (see [`Queue`]).
     fn push(&self, job: Job, priority: u32) {
-        let mut jobs = self.state.lock().unwrap();
-        if priority >= BIG_SHARE {
-            let seq = jobs.queued;
-            jobs.queued += 1;
-            jobs.big.push(Big { priority, seq, job });
-        } else {
-            jobs.fifo.push_back(job);
-        }
-        drop(jobs);
+        self.state.lock().unwrap().put(job, priority);
         self.ready.notify_one();
     }
 
@@ -657,10 +693,7 @@ impl Queue {
             if jobs.closed {
                 return None;
             }
-            if let Some(big) = jobs.big.pop() {
-                return Some(big.job);
-            }
-            if let Some(job) = jobs.fifo.pop_front() {
+            if let Some(job) = jobs.take() {
                 return Some(job);
             }
             jobs = self.ready.wait(jobs).unwrap();
@@ -671,6 +704,7 @@ impl Queue {
         let mut jobs = self.state.lock().unwrap();
         jobs.closed = true;
         self.ready.notify_all();
+        jobs.soon.clear();
         jobs.big.clear();
         jobs.fifo.clear();
     }
@@ -680,23 +714,20 @@ impl Queue {
     /// keeping their order among equals.
     fn reorder(&self, mut priority: impl FnMut(NodeId, Option<SystemTime>) -> u32) {
         let mut jobs = self.state.lock().unwrap();
-        let jobs = &mut *jobs;
         let waiting = std::mem::take(&mut jobs.fifo);
-        for job in waiting {
+        for (seq, job) in waiting {
             let p = match &job {
                 Job::List { dir, modified, .. } => priority(*dir, *modified),
                 _ => 0,
             };
             if p >= BIG_SHARE {
-                let seq = jobs.queued;
-                jobs.queued += 1;
                 jobs.big.push(Big {
                     priority: p,
                     seq,
                     job,
                 });
             } else {
-                jobs.fifo.push_back(job);
+                jobs.fifo.push_back((seq, job));
             }
         }
     }
@@ -1433,9 +1464,10 @@ mod tests {
         );
         q.push(list(7), 500_000);
         let order: Vec<String> = (0..8).map(|_| name(q.pop().unwrap())).collect();
-        // Ties go to the one queued first; below the threshold, and every
-        // other job, in the order queued.
-        assert_eq!(order, ["4", "7", "2", "5", "1", "3", "probe", "6"]);
+        // The Git probe and the re-measure go ahead of the ordered
+        // listings; those go highest first, ties to the one queued first;
+        // then the rest in the order queued.
+        assert_eq!(order, ["probe", "6", "4", "7", "2", "5", "1", "3"]);
     }
 
     #[test]
@@ -1477,11 +1509,61 @@ mod tests {
     fn without_priorities_the_queue_is_first_in_first_out() {
         let q = Queue::default();
         for n in 0..50 {
-            q.push(list(n), 0);
+            if n % 7 == 3 {
+                q.push(
+                    Job::Git {
+                        path: n.to_string().into(),
+                        plan: Plan::Ancestors,
+                    },
+                    0,
+                );
+            } else if n % 7 == 5 {
+                q.push(
+                    Job::Measure {
+                        file: NodeId::from_index(n),
+                        path: n.to_string().into(),
+                    },
+                    0,
+                );
+            } else {
+                q.push(list(n), 0);
+            }
         }
         for n in 0..50 {
             assert_eq!(name(q.pop().unwrap()), n.to_string());
         }
+    }
+
+    #[test]
+    fn a_git_probe_goes_ahead_of_many_ordered_listings() {
+        let q = Queue::default();
+        q.push(list(0), 0);
+        for n in 1..1_000 {
+            q.push(list(n), 500_000 + n);
+        }
+        q.push(
+            Job::Git {
+                path: "probe".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        assert_eq!(name(q.pop().unwrap()), "probe");
+        assert_eq!(name(q.pop().unwrap()), "999");
+        // Once the ordered listings are done, the rest go in the order
+        // queued again.
+        for _ in 1..999 {
+            q.pop().unwrap();
+        }
+        q.push(
+            Job::Git {
+                path: "later".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        assert_eq!(name(q.pop().unwrap()), "0");
+        assert_eq!(name(q.pop().unwrap()), "later");
     }
 
     #[test]
