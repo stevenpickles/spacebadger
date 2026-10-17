@@ -1,6 +1,6 @@
 [package]
 name = "sb-bench"
-description = "Scale benchmark for SpaceBadger's tree, search, layout, wire format, and wide-folder scans"
+description = "Scale benchmark for SpaceBadger's tree, search, layout, wire format, wide-folder scans, and the scan floor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,9 +15,19 @@ sb-scan.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"
+
+# The same listing calls as sb-scan's Linux adapter, for the floor.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs"] }
 
 [lints]
 workspace = true
