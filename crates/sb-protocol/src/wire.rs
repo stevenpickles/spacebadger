@@ -24,17 +24,31 @@
 //!  24  u64  weight
 //!  32  u8   depth (1 = child of the view)
 //!  33  u8   kind (0 file, 1 folder, 2 other small items)
-//!  34  u8   flags (see sb_core::layout::rect_flags)
-//!  35  u8   file type for files (see sb_core::filetype), else 0
+//!  34  u8   flags (see sb_core::layout::rect_flags); bits 6-7 are the
+//!           Git class: 0 other, 1 checkout, 2 linked worktree, 3 metadata
+//!  35  u8   files: file type (see sb_core::filetype); folders: Git root
+//!           badge (see git_badge), 0 for none; other small items: 0
 //!  36  u32  parent: the folder whose contents the rectangle is part of
 //! labels, for rectangles large enough to show text
 //!   u32 rectangle index, u16 byte length, UTF-8 bytes
 //! ```
 
 pub const LAYOUT_MAGIC: [u8; 4] = *b"SBL1";
-pub const LAYOUT_FORMAT_VERSION: u16 = 3;
+pub const LAYOUT_FORMAT_VERSION: u16 = 4;
 pub const HEADER_LEN: usize = 56;
 pub const RECT_LEN: usize = 40;
+
+/// A folder's byte 35: the kind of Git root it is, if any.
+pub mod git_badge {
+    pub const NONE: u8 = 0;
+    pub const REPOSITORY: u8 = 1;
+    pub const LINKED_WORKTREE: u8 = 2;
+    pub const SUBMODULE: u8 = 3;
+    pub const SEPARATE_GIT_DIR: u8 = 4;
+    pub const BARE: u8 = 5;
+    pub const GIT_DIR: u8 = 6;
+    pub const UNRESOLVED: u8 = 7;
+}
 
 /// More rectangles would have been drawn with a larger budget.
 pub const LAYOUT_TRUNCATED: u32 = 1 << 0;
@@ -63,7 +77,8 @@ pub struct Rect {
     pub depth: u8,
     pub kind: u8,
     pub flags: u8,
-    /// `sb_core::filetype::FileType` for files, else 0.
+    /// `sb_core::filetype::FileType` for files; a [`git_badge`] for
+    /// folders; 0 for other small items.
     pub file_type: u8,
     /// The folder whose contents this rectangle is part of; for "other small
     /// items", the same as `node`.
@@ -147,6 +162,7 @@ mod tests {
         };
         let bytes = encode(&header, &[rect], &[(0, "naïve.txt")]);
         assert_eq!(&bytes[0..4], b"SBL1");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
         assert_eq!(
             u16::from_le_bytes([bytes[6], bytes[7]]) as usize,
             HEADER_LEN
@@ -168,6 +184,38 @@ mod tests {
         let len = u16::from_le_bytes([l[4], l[5]]) as usize;
         assert_eq!(std::str::from_utf8(&l[6..6 + len]).unwrap(), "naïve.txt");
         assert_eq!(bytes.len(), HEADER_LEN + RECT_LEN + 6 + len);
+    }
+
+    #[test]
+    fn git_class_and_badge_ride_in_bytes_34_and_35() {
+        let header = Header {
+            generation: 1,
+            revision: 1,
+            request: 1,
+            view: 0,
+            total: 1,
+            flags: 0,
+        };
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            node: 1,
+            count: 1,
+            weight: 1,
+            depth: 1,
+            kind: 1,
+            // Worktree class (2) in bits 6-7, with the header bit.
+            flags: 2 << 6 | 1,
+            file_type: git_badge::UNRESOLVED,
+            parent: 0,
+        };
+        let bytes = encode(&header, &[rect], &[]);
+        let r = &bytes[HEADER_LEN..HEADER_LEN + RECT_LEN];
+        assert_eq!(r[34] >> 6, 2);
+        assert_eq!(r[34] & 0x3F, 1);
+        assert_eq!(r[35], 7);
     }
 
     #[test]

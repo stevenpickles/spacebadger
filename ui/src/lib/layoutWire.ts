@@ -12,6 +12,16 @@ export const RF_PENDING = 1 << 2;
 export const RF_INCOMPLETE = 1 << 3;
 export const RF_CLOUD = 1 << 4;
 export const RF_HARDLINKED = 1 << 5;
+const RF_GIT_SHIFT = 6;
+
+/** Mirrors sb_core::git::GitClass, in value order. */
+export const GIT_OTHER = 0;
+export const GIT_CHECKOUT = 1;
+export const GIT_WORKTREE = 2;
+export const GIT_METADATA = 3;
+
+/** The Git class a rectangle's flags carry in bits 6-7. */
+export const gitClassOf = (rflags: number): number => (rflags >> RF_GIT_SHIFT) & 3;
 
 /** Mirrors sb_core::filetype::FileType, in value order. */
 export const FILE_TYPES = [
@@ -30,7 +40,7 @@ export const LAYOUT_TRUNCATED = 1 << 0;
 export const LAYOUT_FINAL = 1 << 1;
 
 const MAGIC = 0x314c4253; // "SBL1" read as little-endian u32
-const FORMAT_VERSION = 3;
+const FORMAT_VERSION = 4;
 const RECT_LEN = 40;
 
 /** Rectangles as parallel typed arrays, parent before child. */
@@ -52,7 +62,8 @@ export interface DecodedLayout {
   depth: Uint8Array;
   kind: Uint8Array;
   rflags: Uint8Array;
-  /** File type for files (see FILE_TYPES), else 0. */
+  /** File type for files (see FILE_TYPES); Git root badge for folders
+   * (sb_protocol::wire::git_badge, 0 for none); 0 for other small items. */
   ftype: Uint8Array;
   /** The folder whose contents each rectangle is part of. Siblings are
    * consecutive, largest first. */
