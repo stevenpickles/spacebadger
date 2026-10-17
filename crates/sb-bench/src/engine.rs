@@ -38,7 +38,8 @@ pub fn run(root: &Path, workers: usize) {
     let config = ScanConfig {
         workers,
         write_holds: Some(Holds::probe(&holds)),
-        ..ScanConfig::default()
+        // As the app scans the root, but for the worker count.
+        ..sb_scan::native::scan_config(root)
     };
     let threads = Threads::watch();
     let before = Cpu::process();
