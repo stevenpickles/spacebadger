@@ -166,21 +166,18 @@
             >
           </div>
         {/if}
-        <div title={isRoot ? undefined : "The whole repository or worktree as scanned, nested ones included"}>
-          <span class="label">{isRoot ? "Scanned" : "Root scanned"}</span>
-          <span>{formatBytes(root.size)}</span>
-        </div>
-        {#if root.matching !== null}
-          <div title="Of the scanned size, what the filter matches">
-            <span class="label">{isRoot ? "Matching filter" : "Root matching"}</span>
-            <span>{formatBytes(root.matching)}</span>
+        <!-- The root's own sizes are the item's, above, so they agree. -->
+        {#if !isRoot}
+          <div title="The whole repository or worktree as scanned, nested ones included">
+            <span class="label">Root scanned</span>
+            <span>{formatBytes(root.size)}</span>
           </div>
-        {/if}
-        {#if root.metadata > 0}
-          <div title="Git's own data this root accounts for, where it was found">
-            <span class="label">Git data</span>
-            <span>{formatBytes(root.metadata)}</span>
-          </div>
+          {#if root.matching !== null}
+            <div title="Of the root's scanned size, what the filter matches">
+              <span class="label">Root matching</span>
+              <span>{formatBytes(root.matching)}</span>
+            </div>
+          {/if}
         {/if}
         {#if !isRoot || g.content}
           <div>
@@ -201,17 +198,14 @@
           {/if}
         </p>
       {/if}
-      {#if root.kind === "linkedWorktree"}
+      {#if root.kind === "linkedWorktree" && root.repository?.node === null}
+        <p class="note muted">Its shared Git data is in the main repository, outside the scan, so it isn't counted.</p>
+      {:else if root.kind === "linkedWorktree"}
         <p class="note muted">Its shared Git data is counted where it is, in the main repository, not here.</p>
       {/if}
       {#if g.worktreesRegistered}
         {@const [registered, found] = g.worktreesRegistered}
         <p class="note">Linked worktrees: {registered.toLocaleString()} registered, {found.toLocaleString()} in this scan</p>
-      {/if}
-      {#if root.nested > 0}
-        <p class="note muted">
-          Includes {plural(root.nested, "nested repository", "nested repositories")}; totals count their content once.
-        </p>
       {/if}
       {#if root.worktree}
         <p class="note muted">
