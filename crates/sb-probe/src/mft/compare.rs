@@ -88,6 +88,10 @@ pub struct Explained {
     /// entry of a name it wasn't written through) and whose re-measure
     /// agreed with the record.
     pub hard_link_remeasured: u64,
+    /// A single-name file whose listed sizes were stale (directory entries
+    /// of files open and growing, such as logs and databases, are updated
+    /// lazily) and whose re-measure agreed with the record.
+    pub listing_stale_remeasured: u64,
     /// A WOF-compressed file whose listed allocation is its compressed
     /// stream's (which the record also holds).
     pub wof_compressed_stream: u64,
@@ -219,15 +223,18 @@ pub fn compare(
             let sizes = (r.logical, Some(r.allocated));
             let listed_sizes = (listed.entry.logical, listed.entry.allocated);
             if sizes != listed_sizes {
-                let remeasured = table.names_of(record).len() > 1
-                    && probe
-                        .remeasure(&listed.path)
-                        .is_some_and(|m| (m.logical, m.allocated) == sizes);
+                // Any listing may be stale; the adapter's re-measure is
+                // what counts, and only when it equals the record.
+                let remeasured = probe
+                    .remeasure(&listed.path)
+                    .is_some_and(|m| (m.logical, m.allocated) == sizes);
                 let wof = listed_sizes.0 == r.logical
                     && r.wof_allocated.is_some()
                     && listed_sizes.1 == r.wof_allocated;
-                if remeasured {
+                if remeasured && table.names_of(record).len() > 1 {
                     out.explained.hard_link_remeasured += 1;
+                } else if remeasured {
+                    out.explained.listing_stale_remeasured += 1;
                 } else if wof {
                     out.explained.wof_compressed_stream += 1;
                 } else {
@@ -253,7 +260,11 @@ pub fn compare(
                     } else {
                         0
                     };
-                    if listed_tag != r.reparse_tag {
+                    // Cloud tags count as one: the filter may report
+                    // another CLOUD_n variant than the one stored.
+                    let same = listed_tag == r.reparse_tag
+                        || (tag::is_cloud(listed_tag) && tag::is_cloud(r.reparse_tag));
+                    if !same {
                         if tag::is_cloud(r.reparse_tag) && listed_tag == 0 {
                             out.explained.cloud_tag_disguised += 1;
                         } else {

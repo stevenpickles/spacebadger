@@ -310,6 +310,72 @@ fn cloud_placeholders_and_wof_files() {
 }
 
 #[test]
+fn a_stale_single_name_entry_settles_only_when_the_re_measure_matches() {
+    // A log open and growing: its directory entry trails the record.
+    let (table, mut listing, mut probe) = simple();
+    listing.nodes[2].entry.logical = 64;
+    listing.nodes[2].entry.allocated = Some(64);
+    let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
+    assert!(!c.pass, "no re-measure: a disagreement");
+
+    probe.sizes.insert(
+        "C:\\docs\\a.txt".into(),
+        Measured {
+            logical: 100,
+            allocated: Some(104),
+        },
+    );
+    let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
+    assert!(c.pass, "{:?}", c.disagreements);
+    assert_eq!(c.explained.listing_stale_remeasured, 1);
+    assert_eq!(c.explained.hard_link_remeasured, 0);
+
+    // A re-measure that disagrees with the record still fails.
+    probe.sizes.insert(
+        "C:\\docs\\a.txt".into(),
+        Measured {
+            logical: 200,
+            allocated: Some(208),
+        },
+    );
+    let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
+    assert!(!c.pass);
+    assert_eq!(c.disagreements.get("logical"), Some(&1));
+    assert_eq!(c.explained.listing_stale_remeasured, 0);
+}
+
+#[test]
+fn cloud_tag_variants_count_as_one() {
+    let mut cloud = file(41, &[(ROOT_REF, "doc.docx")], 5000, 0);
+    cloud.standard.as_mut().unwrap().attributes = attr::REPARSE_POINT | attr::PINNED;
+    cloud.reparse_tag = Some(0x9000_601A);
+    let table = Table::build([vec![root(), cloud]], 64);
+    let mut node = sized(
+        listed(5, "C:", "doc.docx", EntryKind::File, frn(41, 1)),
+        5000,
+        0,
+    );
+    node.entry.cloud = true;
+    let listing = Listing {
+        nodes: vec![node],
+        listed_dirs: [5].into(),
+        failures: Vec::new(),
+    };
+    let mut probe = FakeProbe::default();
+    probe
+        .tags
+        .insert("C:\\doc.docx".into(), (attr::REPARSE_POINT, 0x9000_001A));
+    let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
+    assert!(c.pass, "{:?}", c.disagreements);
+    assert_eq!(c.explained.cloud_tag_disguised, 0);
+    probe
+        .tags
+        .insert("C:\\doc.docx".into(), (attr::REPARSE_POINT, tag::SYMLINK));
+    let c = compare(&table, ROOT, &listing, &HashSet::new(), &probe, 5, 0);
+    assert_eq!(c.disagreements.get("reparse_tag"), Some(&1));
+}
+
+#[test]
 fn reads_drive_letters() {
     assert_eq!(drive_letter("c"), Some('C'));
     assert_eq!(drive_letter("C:"), Some('C'));
