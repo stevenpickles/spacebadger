@@ -77,7 +77,11 @@ The filter box matches file names (not paths), ignoring case. Separate patterns 
 
 `size:` and `older:`/`newer:` narrow the matches by size and modified date; every one you add must hold. `size:>500MB`, `size:>=1GB`, `size:<10KB`, and `size:<=2GB` compare a file's size, and `size:10MB..1GB` is a range, ends included. Units are B, KB, MB, GB, and TB, in any case, decimals allowed (`1.5GB`); a bare number is bytes. A KB is 1,024 bytes on Windows and 1,000 on macOS and Linux, as sizes are shown. `older:1y` finds files last modified over a year ago and `newer:30d` those modified in the last 30 days, with `h`, `d`, `w`, `mo`, and `y` (a month is 30 days, a year 365), or a date: `older:2024-01-01`, `newer:2024-06-30` (from local midnight). A fractional size such as `1.3KB` rounds the way the comparison means, so `size:<1.3KB` keeps every whole byte below it. On their own they match every file that passes: `size:>1GB` is every file over 1 GB, and `*.iso; size:>1GB; older:1y` finds large disk images untouched for a year. A leading `!` turns one around (`!size:>1GB`). Files whose modified time is unknown never pass an age term. Times before 1970 or after 2106 aren't kept exactly: the details leave them out, and every file from before 1970 counts as older than any date from 1970 on, so dates before 1970 aren't told apart.
 
-As you type, the filter suggests keywords, file types after `is:`, common sizes and ages after `size:`, `older:`, and `newer:`, folder names from the scan after `dir:`, and extensions from the scan after `*.`, with their counts and sizes. Press ↓ or Ctrl+Space to open the suggestions, Enter or Tab to use one, and Escape to close them. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
+`git:` narrows the matches by where files are in Git (see [Git repositories](#git-repositories)): `git:repo` keeps files in any repository or linked worktree, its `.git` data included; `git:worktree` files in linked worktree checkouts; and `git:metadata` Git's own data, such as `.git` folders and bare repositories. Like `dir:`, a Git term narrows everything else, so `is:code; git:worktree` finds code in linked worktrees and `git:metadata; size:>500MB` large files in Git's data. Several Git values widen each other (`git:repo; git:worktree` is the same as `git:repo`), and `!` leaves one out: `git:repo; !git:metadata` is repository files without Git's data. Separate terms with `;` as usual. `size:`, `older:`, and `newer:` still compare each file, never a repository's total size or when it was last used. Any unambiguous start works (`git:w`); `repository` and `meta` are accepted too.
+
+Beside the filter box, **All**, **Repos**, and **Worktrees** are quick filters for All files, Git repositories, and Linked worktrees. They show which one the filter amounts to (none, when its Git terms are something else, like `git:metadata`) and choosing one changes only its Git terms: the rest of the filter stays as you typed it, and exclusions like `!git:metadata` stay with Repos and Worktrees.
+
+As you type, the filter suggests keywords, Git values after `git:`, file types after `is:`, common sizes and ages after `size:`, `older:`, and `newer:`, folder names from the scan after `dir:`, and extensions from the scan after `*.`, with their counts and sizes. Press ↓ or Ctrl+Space to open the suggestions, Enter or Tab to use one, and Escape to close them. In the result list, Enter or double-click opens the file's folder in the map with the file selected; Escape in the filter box clears it.
 
 To see what grew, scan a folder again later and compare. Each time a scan completes (not when it's cancelled), SpaceBadger saves a compact snapshot of it in its local data folder (`snapshots` in `%LOCALAPPDATA%\app.spacebadger.desktop` on Windows, `~/Library/Application Support/app.spacebadger.desktop` on macOS, `~/.local/share/app.spacebadger.desktop` on Linux). Once a later scan of the same folder completes, **Compare…** in the toolbar lists the earlier scans by date and size; choose one to compare with, and **Stop comparing** in the same list ends it. Rescanning keeps comparing with the same earlier scan. While comparing:
 
@@ -114,6 +118,31 @@ Press <kbd>`</kbd> (backquote) while the map has focus to show a timing overlay:
 `cargo build`/`cargo test` without `--workspace` cover only the library crates, so they don't need the webview toolchain.
 
 After changing a type in `sb-protocol`, run `cargo test -p sb-protocol` and commit the regenerated bindings. CI fails if they are stale.
+
+## Git repositories
+
+While it scans, SpaceBadger looks for Git repositories and linked worktrees. It reads a few small files Git keeps (`HEAD`, a `.git` file's `gitdir:` line, `commondir`, `gitdir`, and `[core]` in `config`) and never runs Git, changes anything, or downloads cloud files. A folder counts only when its Git data checks out: a `HEAD` naming a branch or commit, plus `objects` and `refs` folders or a pointer to another Git directory. Folders merely named `.git`, `worktrees`, or `.codex` don't count, and a `.git` folder without Git data is listed as unresolved.
+
+- **Repository**: a folder with a `.git` folder, or a `.git` file pointing to a Git directory elsewhere. Submodules are recognized by their Git directory inside the superproject's `.git/modules`.
+- **Linked worktree**: a folder whose `.git` file points to a `worktrees` entry of another repository (made with `git worktree add`).
+- **Bare repository** and **Git directory**: Git data with no checkout, such as `repo.git` with `core.bare = true`. Their content is Git metadata.
+- **Unresolved**: something that looks like Git but couldn't be confirmed, with the reason: a `.git` link (never followed), unreadable or malformed data, a pointer to a folder that's gone, or a scan stopped before it was checked.
+
+The **Repositories** tab lists them, largest first, with each one's kind, path, branch (or "detached at" a commit, as `HEAD` names it), and size as scanned; with a filter on, also what matches in it. Selecting one selects its folder in the map and the details; Enter or double-click opens it. In the map, repository and worktree folders have a thin colored line along their top and a small badge (`repo`, `worktree`, `submodule`, `bare`, `git`, or `git?` for unresolved) in every color mode. **Color by Git** colors the map by repository content, linked-worktree content, Git metadata (also hatched), and everything else. The details show a selected item's repository, its kind and branch, the main repository of a worktree or the superproject of a submodule, and the repository's scanned size apart from what matches the filter.
+
+How sizes add up:
+
+- A file belongs to the nearest repository or worktree folder above it, so nested repositories and submodules are never counted twice in the totals. A row's size is its whole folder as the map shows it, nested repositories included (the row says how many).
+- Git data counts where it is. A linked worktree's shared history lives in its main repository's `.git` folder and counts there once, not again for each worktree. Git data outside the scanned folder is read to tell what a folder is, but never scanned or added to any size.
+- Nothing here says whether a repository or worktree is still in use, and SpaceBadger never suggests deleting one. Deleting a `.git` folder from the app makes its repository unresolved ("Git metadata was deleted").
+
+Limitations:
+
+- A scan that starts inside a checkout (say, `repo/src`) looks up to 64 folders above the scan root for the repository, not stopping at drive or mount boundaries, and lists it as "above the scan root"; that repository's `.git` data isn't scanned or counted.
+- Paths in Git's files are read as written, without following links; a link in the middle of such a path can make a Git directory look inside or outside the scan when it isn't. A `.git` that is a link or junction, or a cloud placeholder, is never followed or downloaded and shows as unresolved.
+- Not interpreted: `include` in `config`, a `core.worktree` setting (shown, but content stays where it is), and the `GIT_DIR` environment variables. The branch comes from `HEAD` alone; packed refs and commit times aren't read.
+- A Git directory with `HEAD`, `objects`, and `refs` but an unreadable `config` counts as a Git directory, not a bare repository. Submodules whose Git directory isn't under `.git/modules` show as repositories with a separate Git directory.
+- Comparisons with earlier scans don't record Git data.
 
 ## License
 
