@@ -866,26 +866,49 @@ mod tests {
             let _ = sink.send(u);
         });
         let id = session.search_set("git:repo").unwrap().unwrap().search;
-        until("the job catches up", || {
-            totals(&session.search_summary(id).unwrap()) == fresh(&session, "git:repo")
+        // b's Git directory is still being listed: wait until only c is
+        // left (a status published once its last listing is in, possibly
+        // coalesced late) and the job has caught up with that status. Read
+        // directly, so these checks aren't requests reading behind. From
+        // here the only work left that can change the tree is b's probe.
+        until("only c is left to list and the job has caught up", || {
+            let p = session.scan.progress();
+            p.pending_dirs == 1
+                && session.filter.nudged.load(Ordering::SeqCst) == p.revision
+                && session
+                    .filter
+                    .active
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|a| a.revision == p.revision)
         });
-        let before = session.search_summary(id).unwrap().files;
+        let quiet = session.scan.progress().revision;
+        let caught = session.search_summary(id).unwrap();
+        assert_eq!(caught.revision, quiet);
+        assert_eq!(totals(&caught), fresh(&session, "git:repo"));
+        let before = caught.files;
         assert_eq!(before, 300 + 3, "a's checkout and Git data");
+        assert!(!session.filter.read_behind.load(Ordering::SeqCst));
         let held = &session.filter.steps_left;
         held.store(0, Ordering::SeqCst);
         // b's probe answers: a revision that only changes Git data. Then
-        // the scan stalls on c.
+        // the scan stalls on c. Wait for that revision's status, not for
+        // the tree to show b confirmed: the scanner writes the tree first
+        // and can coalesce the status, publishing it late, and a newer
+        // status rightly drops the announcement, as it brings requests of
+        // its own. Nothing can follow this one.
         gates.b_head.release();
-        until("the last status reaches the job", || {
+        until("b's revision reaches the job", || {
             let p = session.scan.progress();
-            repo_kind(&session, "b") == Some(RootKind::Repository)
-                && p.pending_dirs == 1
-                && session.filter.nudged.load(Ordering::SeqCst) == p.revision
+            p.revision > quiet && session.filter.nudged.load(Ordering::SeqCst) == p.revision
         });
         let last = session.scan.progress().revision;
+        assert_eq!(last, quiet + 1, "b's probe is the only revision");
+        assert_eq!(repo_kind(&session, "b"), Some(RootKind::Repository));
+        assert_eq!(session.scan.progress().pending_dirs, 1);
         let behind = session.search_summary(id).unwrap();
-        assert!(behind.revision < last);
-        assert_eq!(behind.files, before);
+        assert_eq!((behind.files, behind.revision), (before, quiet));
         assert!(session.filter.read_behind.load(Ordering::SeqCst));
         held.store(usize::MAX, Ordering::SeqCst);
         let u = updates
