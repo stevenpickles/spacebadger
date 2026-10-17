@@ -39,7 +39,7 @@ use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -70,14 +70,22 @@ pub struct ScanConfig {
     /// Most listed folders kept open at once so their subfolders can be
     /// opened relative to them (where the adapter supports it, see
     /// [`FsAdapter::list_dir`]); past it, subfolders are opened by path.
+    /// 0, the default, opens every folder by path;
+    /// [`native::scan_config`](crate::native::scan_config) sets
+    /// [`OPEN_DIRS`] for local fixed disks.
     pub open_dirs: usize,
 }
 
-/// Default for [`ScanConfig::open_dirs`]. Folders are listed breadth first,
-/// so a folder stays open until the scan has worked through the rest of its
-/// level; the cap bounds the kernel memory open folders pin, and past it
-/// folders open by path (about half of them on `C:\Windows`).
+/// [`ScanConfig::open_dirs`] for local fixed disks. A folder kept open
+/// can't have it or any folder above it renamed or moved by others
+/// (`MoveFileEx` fails with access denied), so the cap and
+/// [`OPEN_DIR_MAX_AGE`] keep that window small.
 pub const OPEN_DIRS: usize = 4096;
+
+/// How long a folder kept open may be used for opening its subfolders;
+/// a subfolder whose job waited longer opens by path, and the folder is
+/// closed once no job holds it.
+pub const OPEN_DIR_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// Called after the scanner releases the tree's write lock with how long it
 /// held it and how many nodes the tree had then. Runs on the scan thread
@@ -106,7 +114,7 @@ impl Default for ScanConfig {
             sample_limit: 50,
             write_holds: None,
             git_grace: GIT_GRACE,
-            open_dirs: OPEN_DIRS,
+            open_dirs: 0,
         }
     }
 }
@@ -496,10 +504,14 @@ struct ListingEnd {
 }
 
 /// A listed folder kept open for opening its subfolders relative to it,
-/// counted against [`ScanConfig::open_dirs`] until the last job holding it
-/// is done with it.
+/// counted against [`ScanConfig::open_dirs`] until closed: when the last
+/// job holding it is done with it, or once it's [`OPEN_DIR_MAX_AGE`] old
+/// (by the aggregator's sweep or a job that finds it too old), whichever
+/// comes first. A listing using it then holds the handle until its open is
+/// done.
 struct OpenDir {
-    handle: DirHandle,
+    handle: Mutex<Option<Arc<DirHandle>>>,
+    kept: Instant,
     open: Arc<AtomicUsize>,
 }
 
@@ -511,15 +523,36 @@ impl OpenDir {
             return None;
         }
         Some(Arc::new(Self {
-            handle,
+            handle: Mutex::new(Some(Arc::new(handle))),
+            kept: Instant::now(),
             open: Arc::clone(open),
         }))
+    }
+
+    fn expired(&self) -> bool {
+        self.kept.elapsed() > OPEN_DIR_MAX_AGE
+    }
+
+    /// The handle, unless it's too old (then closed) or closed already.
+    fn get(&self) -> Option<Arc<DirHandle>> {
+        if self.expired() {
+            self.close();
+            return None;
+        }
+        self.handle.lock().unwrap().clone()
+    }
+
+    fn close(&self) {
+        let handle = self.handle.lock().unwrap().take();
+        if handle.is_some() {
+            self.open.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 impl Drop for OpenDir {
     fn drop(&mut self) {
-        self.open.fetch_sub(1, Ordering::Relaxed);
+        self.close();
     }
 }
 
@@ -620,6 +653,8 @@ struct Aggregator<A> {
     queue: Arc<Queue>,
     /// Folders kept open for their subfolders (see [`OpenDir`]).
     open_dirs: Arc<AtomicUsize>,
+    /// Folders kept open, oldest first, for closing once too old.
+    kept: VecDeque<Weak<OpenDir>>,
     outstanding: u64,
     pending_dirs: u64,
     owners: HashMap<u128, NodeId>,
@@ -664,6 +699,7 @@ impl<A: FsAdapter> Aggregator<A> {
             started: now,
             queue: Arc::new(Queue::default()),
             open_dirs: Arc::new(AtomicUsize::new(0)),
+            kept: VecDeque::new(),
             outstanding: 0,
             pending_dirs: 0,
             owners: HashMap::new(),
@@ -731,6 +767,7 @@ impl<A: FsAdapter> Aggregator<A> {
                     continue;
                 }
             }
+            self.close_old_dirs();
             if self.stop.is_some() {
                 continue;
             }
@@ -761,6 +798,20 @@ impl<A: FsAdapter> Aggregator<A> {
             {
                 self.publish(ScanState::Scanning);
             }
+        }
+    }
+
+    /// Closes the folders kept open longer than [`OPEN_DIR_MAX_AGE`], so
+    /// none blocks renames above it for long; their waiting subfolders open
+    /// by path.
+    fn close_old_dirs(&mut self) {
+        while let Some(front) = self.kept.front() {
+            match front.upgrade() {
+                Some(dir) if !dir.expired() => break,
+                Some(dir) => dir.close(),
+                None => {}
+            }
+            self.kept.pop_front();
         }
     }
 
@@ -797,9 +848,10 @@ impl<A: FsAdapter> Aggregator<A> {
                                 // one). The cancel flag ends the listing.
                                 let mut held: Option<Vec<Entry>> = None;
                                 let mut stopped = false;
+                                let parent_handle = parent.and_then(|p| p.get());
                                 let at = DirRef {
                                     path: &path,
-                                    parent: parent.as_ref().map(|p| &p.handle),
+                                    parent: parent_handle.as_deref(),
                                 };
                                 let result = adapter.list_dir(at, &mut |entries| {
                                     if shared.cancel.load(Ordering::Relaxed) {
@@ -819,7 +871,7 @@ impl<A: FsAdapter> Aggregator<A> {
                                     }
                                     ControlFlow::Continue(())
                                 });
-                                drop(parent);
+                                drop(parent_handle);
                                 let entries = held.unwrap_or_default();
                                 // Kept only for the subdirectories in the
                                 // last batch; earlier ones open by path.
@@ -901,6 +953,9 @@ impl<A: FsAdapter> Aggregator<A> {
                 self.pending_dirs -= 1;
                 let partial = self.partial.remove(&dir) || !entries.is_empty();
                 let end = ListingEnd { result, partial };
+                if let Some(open) = &open {
+                    self.kept.push_back(Arc::downgrade(open));
+                }
                 // The last batch and the listing's end share one hold.
                 let probe = if entries.is_empty() {
                     if self.stop.is_some() {

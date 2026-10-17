@@ -2,8 +2,8 @@ use sb_core::size::Allocated;
 use sb_core::tree::{DirState, NodeId, Tree, fingerprint, flags};
 use sb_scan::fake::{FakeFs, Gate};
 use sb_scan::{
-    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, HoldProbe, OPEN_DIRS, OmissionReason, Progress,
-    RootKind, Scan, ScanConfig, ScanState,
+    BATCH_ENTRIES, EntryKind, ErrorKind, GIT_GRACE, HoldProbe, OPEN_DIR_MAX_AGE, OPEN_DIRS,
+    OmissionReason, Progress, RootKind, Scan, ScanConfig, ScanState,
 };
 use std::path::Path;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -703,4 +703,58 @@ fn a_cancel_mid_listing_closes_every_open_folder() {
         assert!(Instant::now() < deadline, "{:?}", fs.dir_stats());
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn a_folder_kept_open_is_closed_once_too_old_even_while_its_subfolders_wait() {
+    let fs = FakeFs::new();
+    fs.file("p/b/f", 1, 4096);
+    let gate = fs.gate_dir("a/x");
+    fs.keep_dirs_open();
+    let config = ScanConfig {
+        workers: 1,
+        open_dirs: OPEN_DIRS,
+        ..config()
+    };
+    let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
+    assert!(gate.entered(HANG), "the listing never reached the gate");
+    // a and p are kept for x and b; x blocks, holding a's handle, and b
+    // waits. p is closed by age alone.
+    let deadline = Instant::now() + HANG;
+    while fs.dir_stats().open > 1 {
+        assert!(Instant::now() < deadline, "{:?}", fs.dir_stats());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    gate.release();
+    assert_eq!(s.wait().state, ScanState::Complete);
+    let stats = fs.dir_stats();
+    // The root and b by path; a, p and x relative.
+    assert_eq!((stats.relative, stats.by_path), (3, 2), "{stats:?}");
+    assert_eq!(stats.open, 0);
+}
+
+#[test]
+fn a_folder_kept_open_too_long_is_closed_and_its_subfolders_open_by_path() {
+    let fs = FakeFs::new();
+    fs.file("p/b/f", 1, 4096);
+    let gate = fs.gate_dir("p/a");
+    fs.keep_dirs_open();
+    let config = ScanConfig {
+        workers: 1,
+        open_dirs: OPEN_DIRS,
+        ..config()
+    };
+    let s = Scan::start(fs.root(), fs.clone(), config, |_| {});
+    assert!(gate.entered(HANG), "the listing never reached the gate");
+    // a is listed relative to p (and holds p's handle while it blocks); b
+    // waits behind it until p is too old to use.
+    std::thread::sleep(OPEN_DIR_MAX_AGE * 2);
+    gate.release();
+    let progress = s.wait();
+    assert_eq!(progress.state, ScanState::Complete);
+    assert_eq!(progress.files, 1);
+    let stats = fs.dir_stats();
+    // p and a relative; the root and b, opened after p closed, by path.
+    assert_eq!((stats.relative, stats.by_path), (2, 2), "{stats:?}");
+    assert_eq!(stats.open, 0);
 }

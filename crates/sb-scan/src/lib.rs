@@ -16,7 +16,7 @@ pub use adapter::{
     Measured, RootKind, ScanError, Sink, batched, read_capped, refused,
 };
 pub use engine::{
-    GIT_GRACE, HoldProbe, OPEN_DIRS, OmissionReason, OmissionSample, Omissions, Progress, Scan,
-    ScanConfig, ScanState,
+    GIT_GRACE, HoldProbe, OPEN_DIR_MAX_AGE, OPEN_DIRS, OmissionReason, OmissionSample, Omissions,
+    Progress, Scan, ScanConfig, ScanState,
 };
 pub use native::NativeFs;
