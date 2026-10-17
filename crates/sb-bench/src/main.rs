@@ -842,6 +842,7 @@ fn encode(tree: &Tree, l: &layout::Layout) -> Vec<u8> {
             flags: r.flags,
             file_type: 0,
             parent: r.parent(tree).index() as u32,
+            more_flags: 0,
         })
         .collect();
     // Label every large-enough rectangle, as the desktop session does.
@@ -860,6 +861,7 @@ fn encode(tree: &Tree, l: &layout::Layout) -> Vec<u8> {
         view: 0,
         total: l.total,
         flags: 0,
+        estimated_from: 0,
     };
     wire::encode(&header, &rects, &labels)
 }

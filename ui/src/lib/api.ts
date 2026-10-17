@@ -44,7 +44,7 @@ import type { Suggestion } from "./protocol/Suggestion";
 import type { VolumeInfo } from "./protocol/VolumeInfo";
 import { enableTrace, timed } from "./metrics";
 
-export const EXPECTED_PROTOCOL_VERSION = 5;
+export const EXPECTED_PROTOCOL_VERSION = 6;
 
 /** Must match `sb_protocol::SCAN_STATUS_EVENT`. */
 const SCAN_STATUS_EVENT = "scan-status";
