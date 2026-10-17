@@ -750,17 +750,24 @@ mod tests {
         (session, b, c, d)
     }
 
-    /// Records `folder` (in the root) and its `.git` folder as a repository
-    /// under the tree's write lock, as the scanner does with a probe's
-    /// finding; the scan's next status carries it.
+    /// Records `folder` (in the root) as a repository candidate and then,
+    /// in a second hold of the tree's write lock, it and its `.git` folder
+    /// as a confirmed repository, as the scanner does when it sees a `.git`
+    /// folder and later gets its probe's finding; the scan's next status
+    /// carries them.
     fn found_repository(session: &Session, folder: &str) {
         use sb_core::git::{GitRoot, RootKind};
         let tree = session.scan.tree();
+        let repo = {
+            let mut tree = tree.write().unwrap();
+            let repo = tree
+                .children(NodeId::ROOT)
+                .find(|&c| tree.name(c) == folder)
+                .unwrap();
+            tree.set_git(GitRoot::pending(repo));
+            repo
+        };
         let mut tree = tree.write().unwrap();
-        let repo = tree
-            .children(NodeId::ROOT)
-            .find(|&c| tree.name(c) == folder)
-            .unwrap();
         let dot = tree.children(repo).find(|&c| tree.name(c) == ".git");
         tree.set_git(GitRoot::new(repo, RootKind::Repository));
         if let Some(dot) = dot {
