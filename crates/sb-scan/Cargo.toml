@@ -8,6 +8,11 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# NTFS master file table parsing for the elevated scan. A prototype: only
+# `sb-probe mft` enables it until the agreement test passes elevated.
+mft = []
+
 [dependencies]
 sb-core.workspace = true
 blake3 = "=1.8.7"
