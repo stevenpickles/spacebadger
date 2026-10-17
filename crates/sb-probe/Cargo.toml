@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sb-scan = { workspace = true, features = ["mft"] }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -20,6 +21,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_Storage_CloudFilters",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
