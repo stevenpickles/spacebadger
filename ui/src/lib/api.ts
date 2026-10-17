@@ -23,6 +23,8 @@ import type { ExportRequest } from "./protocol/ExportRequest";
 import type { FilterUpdated } from "./protocol/FilterUpdated";
 import type { FolderFilesPage } from "./protocol/FolderFilesPage";
 import type { FolderFilesRequest } from "./protocol/FolderFilesRequest";
+import type { GitRootsPage } from "./protocol/GitRootsPage";
+import type { GitRootsRequest } from "./protocol/GitRootsRequest";
 import type { ItemChange } from "./protocol/ItemChange";
 import type { Lane } from "./protocol/Lane";
 import type { LayoutRequest } from "./protocol/LayoutRequest";
@@ -138,6 +140,12 @@ export function smallItems(request: SmallItemsRequest, lane?: Lane): Promise<Sma
 /** The largest files anywhere under a folder. */
 export function folderFiles(request: FolderFilesRequest, lane?: Lane): Promise<FolderFilesPage> {
   return timed("folder_files", invoke<FolderFilesPage>("folder_files", { request, lane: lane ?? null }));
+}
+
+/** Git repositories, linked worktrees, and unresolved candidates found in
+ * the scan, largest first, with matching sizes when given a search. */
+export function gitRoots(request: GitRootsRequest, lane?: Lane): Promise<GitRootsPage> {
+  return timed("git_roots", invoke<GitRootsPage>("git_roots", { request, lane: lane ?? null }));
 }
 
 /** Capacity of the scanned volume; `null` where unavailable. */
