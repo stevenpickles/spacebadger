@@ -119,7 +119,7 @@ Against the design's targets:
 | Engine/floor ≤ 1.4 | met (1.16) |
 | `C:\` warm ≤ 13 s | not met (15–17 s, against a floor of about 9.5 s measured in the design) |
 
-The rest of the `C:\` gap is the roughly 68K compressed (WOF) files that are still re-measured once each, plus kernel contention at 16 workers.
+The rest of the `C:\` gap is not yet attributed. The likely parts are the roughly 68K compressed (WOF) files that are still re-measured once each, and kernel contention at 16 workers.
 
 ## Reproducibility
 
