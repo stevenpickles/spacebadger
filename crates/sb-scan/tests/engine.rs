@@ -181,20 +181,20 @@ const STAMP: LinkStamp = LinkStamp {
     changed: 2000,
 };
 
-/// Three names of one file in one folder (so `d/1.bin` is found first and
-/// owns the allocation) and one in another; the names of other files
-/// agree.
+/// Three names of one file in one folder and one in its subfolder, which is
+/// listed after it, so `d/1.bin` is always found first and owns the
+/// allocation; the names of another file agree.
 fn three_names_and_a_fourth(fs: &FakeFs, third: LinkStamp, third_logical: u64) {
     fs.stamped_link("d/1.bin", 5000, 8192, 7, STAMP)
         .stamped_link("d/2.bin", 5000, 8192, 7, STAMP)
         .stamped_link("d/3.bin", third_logical, 8192, 7, third)
-        .stamped_link("e/4.bin", 5000, 8192, 7, STAMP)
+        .stamped_link("d/z/4.bin", 5000, 8192, 7, STAMP)
         .stamped_link("d/other.bin", 10, 4096, 8, STAMP)
-        .stamped_link("e/other.bin", 10, 4096, 8, STAMP)
+        .stamped_link("d/z/other.bin", 10, 4096, 8, STAMP)
         .set_measured("d/1.bin", 9000, 12_288)
         .set_measured("d/2.bin", 9000, 12_288)
         .set_measured("d/3.bin", 9000, 12_288)
-        .set_measured("e/4.bin", 9000, 12_288);
+        .set_measured("d/z/4.bin", 9000, 12_288);
 }
 
 fn run_with(fs: &FakeFs, config: ScanConfig) -> (Progress, Arc<std::sync::RwLock<Tree>>) {
@@ -216,7 +216,7 @@ fn hard_links_whose_listings_agree_are_taken_as_listed() {
     assert_eq!(progress.logical, 4 * 5000 + 2 * 10);
     assert_eq!(progress.allocated, 8192 + 4096, "allocated once per file");
     let owner = find(&tree, "d/1.bin");
-    for name in ["d/2.bin", "d/3.bin", "e/4.bin"] {
+    for name in ["d/2.bin", "d/3.bin", "d/z/4.bin"] {
         assert_eq!(tree.alias_owner(find(&tree, name)), Some(owner), "{name}");
     }
 }
@@ -252,7 +252,7 @@ fn a_hard_link_whose_names_disagree_is_remeasured_once_for_all_names() {
         );
         assert_eq!(progress.state, ScanState::Complete);
         assert_eq!(progress.hardlink_aliases, 4);
-        for name in ["d/1.bin", "d/2.bin", "d/3.bin", "e/4.bin"] {
+        for name in ["d/1.bin", "d/2.bin", "d/3.bin", "d/z/4.bin"] {
             assert_eq!(tree.logical(find(&tree, name)), 9000, "{name}");
         }
         assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
@@ -274,7 +274,7 @@ fn a_failed_remeasure_tries_the_files_next_name() {
     );
     assert_eq!(progress.logical, 4 * 9000 + 2 * 10);
     assert_eq!(progress.allocated, 12_288 + 4096);
-    assert_eq!(tree.logical(find(&tree, "e/4.bin")), 9000);
+    assert_eq!(tree.logical(find(&tree, "d/z/4.bin")), 9000);
 }
 
 #[test]
@@ -297,8 +297,8 @@ fn exact_hard_links_remeasures_every_name_as_found() {
         "d/2.bin",
         "d/3.bin",
         "d/other.bin",
-        "e/4.bin",
-        "e/other.bin",
+        "d/z/4.bin",
+        "d/z/other.bin",
     ]
     .map(|p| Path::new("/fake").join(p))
     .into_iter()
@@ -323,7 +323,7 @@ fn the_scan_runs_until_remeasures_after_the_listings_finish() {
     {
         let tree = s.tree();
         let tree = tree.read().unwrap();
-        for dir in ["d", "e"] {
+        for dir in ["d", "d/z"] {
             assert_eq!(tree.dir_state(find(&tree, dir)), DirState::Listed);
         }
         assert_eq!(tree.file_count(NodeId::ROOT), 6);

@@ -305,6 +305,33 @@ fn hard_links_whose_listings_agree_are_not_remeasured() {
     assert_eq!(progress.allocated, 8192);
 }
 
+/// A WOF-compressed file lists 0 allocated under every name, so agreeing
+/// listings prove nothing: its names are re-measured as before.
+#[cfg(windows)]
+#[test]
+fn compressed_hard_links_are_remeasured_though_their_listings_agree() {
+    let tmp = TempDir::new("wof-link");
+    let root = tmp.0.join("root");
+    let file = root.join("x/a.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"compressible ".repeat(20_000)).unwrap();
+    let compact = std::process::Command::new("compact")
+        .args(["/c", "/exe:xpress4k"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(compact.status.success(), "compact failed: {compact:?}");
+    std::fs::create_dir_all(root.join("y")).unwrap();
+    std::fs::hard_link(&file, root.join("y/b.bin")).unwrap();
+    let measured = NativeFs::new().measure_file(&file).unwrap();
+
+    let (progress, _, measures) = scan_counted(&root, false);
+    assert_eq!(measures.len(), 2, "the alias and its owner: {measures:?}");
+    assert_eq!(progress.hardlink_aliases, 1);
+    assert_eq!(Some(progress.allocated), measured.allocated);
+    assert_eq!(progress.logical, 2 * 260_000);
+}
+
 #[test]
 fn rejects_a_link_as_the_root() {
     let tmp = TempDir::new("linkroot");

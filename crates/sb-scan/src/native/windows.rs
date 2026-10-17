@@ -11,7 +11,10 @@
 //! - A file listed under several names may be stale under all but the one
 //!   it was last changed through, so each entry also carries its listed
 //!   `LastWriteTime` and `ChangeTime` (see [`LinkStamp`]): the engine
-//!   re-measures a file only when its names' listings disagree.
+//!   re-measures a file only when its names' listings disagree. Files whose
+//!   listed allocation can be wrong under every name (WOF-compressed ones
+//!   list 0; compressed, sparse and cloud files) carry none and are always
+//!   re-measured.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -70,7 +73,9 @@ use windows::core::PCWSTR;
 mod attr {
     pub const DIRECTORY: u32 = 0x10;
     pub const DEVICE: u32 = 0x40;
+    pub const SPARSE: u32 = 0x200;
     pub const REPARSE_POINT: u32 = 0x400;
+    pub const COMPRESSED: u32 = 0x800;
     pub const OFFLINE: u32 = 0x1000;
     pub const RECALL_ON_OPEN: u32 = 0x40000;
     pub const PINNED: u32 = 0x80000;
@@ -496,6 +501,21 @@ impl WindowsFs {
 }
 
 impl Listed {
+    /// The stamp to compare this name's listing with its file's other
+    /// names'; none where the listing's allocation can be wrong under every
+    /// name alike: less allocated than the file's length (WOF-compressed
+    /// files list 0 allocated, and the WOF filter hides their reparse
+    /// point from listings), or a reparse point, compressed, sparse, or in
+    /// the cloud. Such a file's names are all re-measured, as before.
+    fn stamp(&self) -> Option<LinkStamp> {
+        let unreliable = attr::REPARSE_POINT | attr::COMPRESSED | attr::SPARSE | attr::CLOUD;
+        let plain = self.attributes & unreliable == 0 && self.allocation_size >= self.end_of_file;
+        plain.then_some(LinkStamp {
+            written: self.last_write,
+            changed: self.change_time,
+        })
+    }
+
     fn entry(self) -> Entry {
         Entry {
             kind: classify(self.attributes, self.reparse_tag),
@@ -511,10 +531,7 @@ impl Listed {
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),
-            stamp: Some(LinkStamp {
-                written: self.last_write,
-                changed: self.change_time,
-            }),
+            stamp: self.stamp(),
             name: self.name,
         }
     }
@@ -1045,6 +1062,54 @@ mod tests {
             filetime(epoch - 10_000_000),
             UNIX_EPOCH.checked_sub(Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn stamps_only_listings_whose_sizes_can_be_compared() {
+        let listed = |attributes, reparse_tag| Listed {
+            name: "f".into(),
+            end_of_file: 5000,
+            allocation_size: 8192,
+            attributes,
+            reparse_tag,
+            file_id: 7,
+            last_write: 10,
+            change_time: 20,
+        };
+        assert_eq!(
+            listed(0x20, 0).entry().stamp,
+            Some(LinkStamp {
+                written: 10,
+                changed: 20
+            })
+        );
+        let resident = Listed {
+            end_of_file: 439,
+            allocation_size: 440,
+            ..listed(0x20, 0)
+        };
+        assert!(resident.entry().stamp.is_some());
+        // How a WOF-compressed file lists: plain attributes, nothing
+        // allocated.
+        let wof = Listed {
+            allocation_size: 0,
+            ..listed(0x20, 0)
+        };
+        assert_eq!(wof.entry().stamp, None);
+        let rp = attr::REPARSE_POINT;
+        for (attributes, tag) in [
+            (0x20 | rp, tag::WOF),
+            (0x20 | rp, 0x8000_0013),
+            (0x20 | attr::COMPRESSED, 0),
+            (0x20 | attr::SPARSE, 0),
+            (0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
+        ] {
+            assert_eq!(
+                listed(attributes, tag).entry().stamp,
+                None,
+                "{attributes:#x}"
+            );
+        }
     }
 
     #[test]
