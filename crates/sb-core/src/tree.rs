@@ -1075,16 +1075,17 @@ impl Tree {
     /// Makes `alias` the owner of its file's allocation in place of its
     /// owner, which becomes an alias of it, as do `others` (the owner's
     /// other aliases, which the caller knows; any that aren't are left
-    /// alone). Totals don't change: the owner's allocation moves as it is
-    /// (none when unknown), and each name keeps its own unknown-allocation
-    /// mark, as names do from when they're added. Returns `false`, changing
-    /// nothing, when `alias` isn't an alias or either name was removed.
+    /// alone). Totals don't change. Returns `false`, changing nothing, when
+    /// `alias` isn't an alias, either name was removed, or one name's
+    /// allocation is unknown and the other's isn't (moving it would leave a
+    /// name marked unknown holding the allocation, which removing it would
+    /// then lose).
     pub fn promote_alias(&mut self, alias: NodeId, others: &[NodeId]) -> bool {
         let Some(owner) = self.alias_owner(alias) else {
             return false;
         };
         let (a, o) = (alias.index(), owner.index());
-        if self.is_removed(alias) || self.is_removed(owner) {
+        if self.is_removed(alias) || self.is_removed(owner) || self.unknown[a] != self.unknown[o] {
             return false;
         }
         let allocated = std::mem::take(&mut self.allocated[o]);
@@ -1418,15 +1419,16 @@ mod tests {
     }
 
     #[test]
-    fn promoting_keeps_totals_when_an_allocation_is_unknown() {
+    fn promoting_needs_both_names_to_agree_on_whether_allocation_is_known() {
         let unknown = FileSizes {
             logical: 100,
             allocated: Allocated::UNKNOWN,
         };
-        for (owner_sizes, alias_sizes) in [
-            (unknown, unknown),
-            (unknown, sizes(100, 4096)),
-            (sizes(100, 4096), unknown),
+        for (owner_sizes, alias_sizes, promotes) in [
+            (unknown, unknown, true),
+            (sizes(100, 4096), sizes(100, 4096), true),
+            (unknown, sizes(100, 4096), false),
+            (sizes(100, 4096), unknown, false),
         ] {
             let mut t = Tree::new("/root");
             let (d, e) = (
@@ -1436,24 +1438,53 @@ mod tests {
             let owner = t.add_file(d, "a".as_ref(), owner_sizes, None, 0).unwrap();
             let alias = t.add_file(e, "b".as_ref(), alias_sizes, None, 0).unwrap();
             t.mark_alias(alias, owner);
-            let before = (
-                t.allocated(NodeId::ROOT),
-                t.unknown_allocation_files(NodeId::ROOT),
-                t.logical(NodeId::ROOT),
-            );
-            assert!(t.promote_alias(alias, &[]));
-            assert_eq!(t.alias_owner(owner), Some(alias));
-            assert_eq!(
+            let totals = |t: &Tree| {
                 (
                     t.allocated(NodeId::ROOT),
                     t.unknown_allocation_files(NodeId::ROOT),
                     t.logical(NodeId::ROOT),
-                ),
-                before
+                    t.allocated(d),
+                    t.allocated(e),
+                )
+            };
+            let before = totals(&t);
+            assert_eq!(t.promote_alias(alias, &[]), promotes);
+            let after = totals(&t);
+            assert_eq!(
+                (after.0, after.1, after.2),
+                (before.0, before.1, before.2),
+                "totals"
             );
-            assert_eq!(t.allocated(d), 0);
-            assert_eq!(t.allocated(e), before.0);
+            if promotes {
+                assert_eq!(t.alias_owner(owner), Some(alias));
+                assert_eq!((after.3, after.4), (0, before.3), "moved");
+            } else {
+                assert_eq!(t.alias_owner(alias), Some(owner));
+                assert_eq!(after, before, "unchanged");
+            }
         }
+    }
+
+    #[test]
+    fn removing_a_promoted_owner_hands_its_allocation_back() {
+        let mut t = Tree::new("/root");
+        let (d, e) = (
+            t.add_dir(NodeId::ROOT, "d".as_ref()).unwrap(),
+            t.add_dir(NodeId::ROOT, "e".as_ref()).unwrap(),
+        );
+        let owner = t
+            .add_file(d, "a".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        let heir = t
+            .add_file(e, "b".as_ref(), sizes(100, 4096), None, 0)
+            .unwrap();
+        t.mark_alias(heir, owner);
+        assert!(t.promote_alias(heir, &[]));
+        assert!(t.remove(heir));
+        assert_eq!(t.allocated(NodeId::ROOT), 4096, "the data is still there");
+        assert_eq!(t.allocated(d), 4096);
+        assert_eq!(t.alias_owner(owner), None);
+        assert_eq!(t.alias_count(), 0);
     }
 
     #[test]

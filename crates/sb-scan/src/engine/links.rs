@@ -265,13 +265,21 @@ impl Links {
             if i % SETTLE_CHECK == 0 && stop() {
                 break;
             }
-            let best = aliases.iter().copied().fold(owner, |best, name| {
-                if name_order(tree, name, best).is_lt() {
-                    name
-                } else {
-                    best
-                }
-            });
+            // Only among names whose allocation is known (or not) as the
+            // owner's is, which is all of them unless a re-measure of some
+            // couldn't tell; see `Tree::promote_alias`.
+            let unknown = tree.unknown_allocation_files(owner);
+            let best = aliases
+                .iter()
+                .copied()
+                .filter(|&name| tree.unknown_allocation_files(name) == unknown)
+                .fold(owner, |best, name| {
+                    if name_order(tree, name, best).is_lt() {
+                        name
+                    } else {
+                        best
+                    }
+                });
             if best != owner {
                 let others = aliases.into_iter().filter(|&a| a != best).collect();
                 moves.push((best, others));
