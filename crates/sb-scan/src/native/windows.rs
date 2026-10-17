@@ -163,7 +163,11 @@ fn open(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
 /// Opens the directory `name` (one component, UTF-16) inside the open
 /// directory `parent` for listing, as [`open`] would open it by path:
 /// the same access `CreateFileW` asks for, sharing everything, with backup
-/// intent, never through a reparse point, never recalling. `None` when that
+/// intent, never through a reparse point, never recalling. These are the
+/// create options `CreateFileW` derives from [`open`]'s flags
+/// (`FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT |
+/// FILE_OPEN_NO_RECALL`, synchronous); like it, no `FILE_DIRECTORY_FILE`,
+/// which NTFS refuses together with `FILE_OPEN_NO_RECALL`. `None` when that
 /// fails, for the caller to open by path.
 fn open_relative(parent: &OwnedHandle, name: &[u16]) -> Option<OwnedHandle> {
     let bytes = u16::try_from(size_of_val(name)).ok()?;
@@ -1070,6 +1074,25 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn opens_a_folder_relative_to_its_parent_with_the_path_opens_options() {
+        let dir = std::env::temp_dir().join(format!("sb-relative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("child")).unwrap();
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        let parent = open(&dir, FILE_LIST_DIRECTORY.0).unwrap();
+        let name = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let child = open_relative(&parent, &name("child")).expect("opened relative");
+        let by_path = open(&dir.join("child"), FILE_LIST_DIRECTORY.0).unwrap();
+        assert_eq!(file_id(&child), file_id(&by_path));
+        // Like the path open, it doesn't insist on a folder; listing a file
+        // then fails as it would by path.
+        assert!(open_relative(&parent, &name("file")).is_some());
+        assert!(open_relative(&parent, &name("missing")).is_none());
+        drop((child, by_path, parent));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
