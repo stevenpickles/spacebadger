@@ -9,7 +9,7 @@
 //! cargo run --release -p sb-bench -- --floor PATH [--threads N]... [--strategy S]... [--runs R] [--no-warmup]
 //! cargo run --release -p sb-bench -- --engine PATH [--threads N]... [--strategy S] [--runs R] [--no-warmup]
 //!                                    [--snapshot FILE [--found-order]]
-//! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N]
+//! cargo run --release -p sb-bench -- --provisional PATH [--snapshot FILE] [--rounds N] [--prior-after MS]
 //! ```
 //!
 //! Without arguments it runs 1,000,000 and 5,000,000 nodes. `--wide` scans a
@@ -36,7 +36,9 @@
 //!
 //! `--provisional` rescans a real folder and measures how soon its map,
 //! estimated from a snapshot, matches the final one (see [`provisional`]);
-//! it runs in this process, on its own.
+//! it runs in this process, on its own. `--prior-after` gives the scan its
+//! prior that many milliseconds after it starts, as the app does once it
+//! has read the snapshot.
 //!
 //! `--exact-hard-links` makes `--engine` and `--wide-dir` scans re-measure
 //! every name of a hard-linked file (`ScanConfig::exact_hard_links`).
@@ -119,7 +121,7 @@ struct Ruler {
 
 const USAGE: &str = "usage: sb-bench [--nodes N]... [--seed S] [--wide N]... [--wide-slow N]... \
                      [--wide-dir PATH]... [--lod N]... [--floor PATH]... [--engine PATH]... \
-                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N]] [--exact-hard-links] \n                     [--snapshot FILE [--found-order]]";
+                     [--threads N]... [--strategy current|ntdll|relative]... [--runs R] [--no-warmup] \n                     [--provisional PATH [--snapshot FILE] [--rounds N] [--prior-after MS]] [--exact-hard-links] \n                     [--snapshot FILE [--found-order]]";
 
 /// Set by `--exact-hard-links`: real-folder scans re-measure every name of
 /// a hard-linked file, and children are told so.
@@ -154,6 +156,7 @@ fn main() {
     let mut provisional = None;
     let mut snapshot = None;
     let mut rounds = 3;
+    let mut prior_after = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut text = || {
@@ -190,6 +193,7 @@ fn main() {
             "--provisional" => provisional = Some(PathBuf::from(text())),
             "--snapshot" => snapshot = Some(PathBuf::from(text())),
             "--rounds" => rounds = value() as usize,
+            "--prior-after" => prior_after = value(),
             "--seed" => seed = value(),
             "--child" => child = true,
             "--exact-hard-links" => EXACT_HARD_LINKS.store(true, Ordering::Relaxed),
@@ -198,7 +202,12 @@ fn main() {
         }
     }
     if let Some(root) = provisional {
-        provisional::run(&root, snapshot.as_deref(), rounds);
+        provisional::run(
+            &root,
+            snapshot.as_deref(),
+            rounds,
+            Duration::from_millis(prior_after),
+        );
         return;
     }
     if let Some(file) = snapshot {

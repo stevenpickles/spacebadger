@@ -38,7 +38,7 @@ const HEIGHT: f32 = 860.0;
 /// The rectangles of one level of a layout, by path below the view.
 type Level = HashMap<String, (f32, f32, f32, f32)>;
 
-pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize) {
+pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize, prior_after: Duration) {
     println!("provisional map: rescanning {}", root.display());
     let snap = match snapshot {
         Some(file) => {
@@ -55,7 +55,7 @@ pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize) {
             snap
         }
         None => {
-            let (tree, took) = scan(root, None, true, |_, _| {});
+            let (tree, took) = scan(root, None, true, Duration::ZERO, |_, _| {});
             println!("first scan to take a snapshot from: {}", ms(took));
             let tree = tree.read().unwrap();
             Snapshot::capture(&tree, 0, CASE_INSENSITIVE)
@@ -70,7 +70,7 @@ pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize) {
         for i in 0..VARIANTS.len() {
             let variant = (round + i) % VARIANTS.len();
             let prior = (variant < 2).then(|| Arc::clone(&prior));
-            let curve = replay(root, prior, variant == 0);
+            let curve = replay(root, prior, variant == 0, prior_after);
             println!(
                 "round {round} {}: scan {}, {} layouts",
                 VARIANTS[variant],
@@ -100,6 +100,7 @@ fn scan(
     root: &Path,
     prior: Option<Arc<Prior>>,
     by_prior: bool,
+    prior_after: Duration,
     mut tick: impl FnMut(&Tree, Duration),
 ) -> (Arc<std::sync::RwLock<Tree>>, Duration) {
     let started = Instant::now();
@@ -110,6 +111,7 @@ fn scan(
     let scan = Scan::start(root.to_path_buf(), NativeFs::new(), config, |_| {});
     let tree = scan.tree();
     if let Some(prior) = prior {
+        std::thread::sleep(prior_after);
         tree.write().unwrap().set_prior(prior);
     }
     let mut next = started;
@@ -126,11 +128,11 @@ fn scan(
     (tree, took)
 }
 
-fn replay(root: &Path, prior: Option<Arc<Prior>>, by_prior: bool) -> Curve {
+fn replay(root: &Path, prior: Option<Arc<Prior>>, by_prior: bool, prior_after: Duration) -> Curve {
     let params = LayoutParams::new(WIDTH, HEIGHT);
     let mut cache = OrderCache::default();
     let mut shots = Vec::new();
-    let (tree, took) = scan(root, prior, by_prior, |tree, at| {
+    let (tree, took) = scan(root, prior, by_prior, prior_after, |tree, at| {
         let l = layout::layout(
             tree,
             NodeId::ROOT,
