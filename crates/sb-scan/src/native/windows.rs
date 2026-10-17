@@ -1,10 +1,11 @@
 //! Windows adapter. Decisions and evidence: `docs/validation/windows-m1.md`.
 //!
-//! - Lists with `FileIdExtdDirectoryInfo` (falling back to
-//!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
-//!   reparse tags, and file IDs come from the listing without opening files.
-//!   Entries are passed on as each 64 KiB buffer is decoded, in batches, so
-//!   a huge folder is never held whole.
+//! - Lists with `NtQueryDirectoryFile(FileIdExtdDirectoryInformation)`
+//!   (falling back to `FileIdBothDirectoryInformation` where unsupported) so
+//!   sizes, attributes, reparse tags, and file IDs come from the listing
+//!   without opening files. Entries are passed on as each 64 KiB buffer (one
+//!   per worker thread) is decoded, in batches, so a huge folder is never
+//!   held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
@@ -31,8 +32,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_INFORMATION_CLASS, FileIdBothDirectoryInformation, FileIdExtdDirectoryInformation,
+    NtQueryDirectoryFile,
+};
 use windows::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID, RtlNtStatusToDosError,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
@@ -44,13 +49,12 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
     FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
-    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
+    FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
@@ -409,8 +413,24 @@ impl WindowsFs {
 
     fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let handle = open(dir, FILE_LIST_DIRECTORY.0)?;
+        with_list_buffer(|buffer| self.list_handle(&handle, buffer, out))
+    }
+
+    /// Lists an open directory into `buffer`, with the extended class where
+    /// the volume supports it.
+    fn list_handle(
+        &self,
+        handle: &OwnedHandle,
+        buffer: &mut [u64],
+        out: &mut Batcher<'_, '_>,
+    ) -> Result<(), ScanError> {
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
-            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo, out) {
+            match list_with::<FILE_ID_EXTD_DIR_INFO>(
+                handle,
+                FileIdExtdDirectoryInformation,
+                buffer,
+                out,
+            ) {
                 // Only before any entry was read, so none is listed twice.
                 Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
                     self.use_both_dir_info.store(true, Ordering::Relaxed);
@@ -418,7 +438,7 @@ impl WindowsFs {
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo, out)
+        list_with::<FILE_ID_BOTH_DIR_INFO>(handle, FileIdBothDirectoryInformation, buffer, out)
     }
 }
 
@@ -522,35 +542,58 @@ fn with_list_buffer<R>(list: impl FnOnce(&mut [u64]) -> R) -> R {
     result
 }
 
+/// Reads the next directory records into `buffer` with
+/// `NtQueryDirectoryFile` (what `GetFileInformationByHandleEx` calls, minus
+/// its wrapping): the bytes filled, or `None` past the last entry. Errors
+/// are mapped to Win32 codes as that function maps them.
+fn query_dir(
+    handle: &OwnedHandle,
+    class: FILE_INFORMATION_CLASS,
+    buffer: &mut [u64],
+) -> Result<Option<usize>, ScanError> {
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: a synchronous directory handle and a writable, 8-byte-aligned
+    // buffer of the given length.
+    let status = unsafe {
+        NtQueryDirectoryFile(
+            raw(handle),
+            None,
+            None,
+            None,
+            &mut status_block,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(buffer) as u32,
+            class,
+            false,
+            None,
+            false,
+        )
+    };
+    if status.is_ok() {
+        // Nothing filled can't happen; read as the end rather than decode
+        // what an earlier directory left in the buffer.
+        return Ok(Some(status_block.Information).filter(|&n| n > 0));
+    }
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    if code == ERROR_NO_MORE_FILES.0 {
+        return Ok(None);
+    }
+    Err(scan_error(windows::core::Error::from_hresult(
+        windows::core::HRESULT::from_win32(code),
+    )))
+}
+
 /// Reads a directory a buffer at a time, passing each entry on as it's
 /// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
-    class: FILE_INFO_BY_HANDLE_CLASS,
-    out: &mut Batcher<'_, '_>,
-) -> Result<(), ScanError> {
-    with_list_buffer(|buffer| list_into::<T>(handle, class, buffer, out))
-}
-
-fn list_into<T: DirInfo>(
-    handle: &OwnedHandle,
-    class: FILE_INFO_BY_HANDLE_CLASS,
+    class: FILE_INFORMATION_CLASS,
     buffer: &mut [u64],
     out: &mut Batcher<'_, '_>,
 ) -> Result<(), ScanError> {
     loop {
-        let result = unsafe {
-            GetFileInformationByHandleEx(
-                raw(handle),
-                class,
-                buffer.as_mut_ptr().cast(),
-                (buffer.len() * size_of::<u64>()) as u32,
-            )
-        };
-        match result {
-            Ok(()) => {}
-            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(()),
-            Err(err) => return Err(scan_error(err)),
+        if query_dir(handle, class, buffer)?.is_none() {
+            return Ok(());
         }
         let base = buffer.as_ptr().cast::<u8>();
         let mut offset = 0usize;
