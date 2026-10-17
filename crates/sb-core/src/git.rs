@@ -700,9 +700,10 @@ pub mod paths {
         None,
         /// `C:`; the letter upper case.
         Drive(u8),
-        /// `\\server\share`.
+        /// `\\server\share`; the share empty for a bare `\\server`.
         Unc(OsString, OsString),
-        /// `\\?\…` kept as written, through its first component.
+        /// Another `\\?\` path, through its first component, such as
+        /// `\\?\Volume{GUID}` or `\\?\GLOBALROOT`.
         Verbatim(OsString),
     }
 
@@ -730,9 +731,9 @@ pub mod paths {
         let mut absolute = false;
         if style.windows {
             if let Some(after) = bytes.strip_prefix(br"\\?\") {
-                // Verbatim: only `\` separates and nothing is normalized,
-                // but `C:` and `UNC\server\share` read as their usual forms
-                // so they compare with them.
+                // Verbatim: only `\` separates. `C:` and `UNC\server\share`
+                // read as their usual forms so they compare with them; any
+                // other first component is a prefix like a drive.
                 let parts: Vec<&[u8]> = after.split(|&b| b == b'\\').collect();
                 if let Some(first) = parts.first()
                     && first.len() == 2
@@ -788,10 +789,29 @@ pub mod paths {
                         parts: components(&bytes[used.min(bytes.len())..], style),
                     };
                 }
+                if !server.is_empty() {
+                    // `\\server` without a share names no folder; it's kept
+                    // as written rather than read as rooted on a drive.
+                    let parts = components(&bytes[2 + server.len()..], style);
+                    return Parsed {
+                        prefix: Prefix::Unc(os(server), OsString::new()),
+                        absolute: !parts.is_empty(),
+                        parts,
+                    };
+                }
             }
-            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-                prefix = Prefix::Drive(bytes[0].to_ascii_uppercase());
-                rest = &bytes[2..];
+            // `/C:/x`, as some tools write Windows paths.
+            if bytes.len() >= 3
+                && is_sep(bytes[0], style)
+                && bytes[1].is_ascii_alphabetic()
+                && bytes[2] == b':'
+                && bytes.get(3).is_none_or(|&b| is_sep(b, style))
+            {
+                rest = &bytes[1..];
+            }
+            if rest.len() >= 2 && rest[1] == b':' && rest[0].is_ascii_alphabetic() {
+                prefix = Prefix::Drive(rest[0].to_ascii_uppercase());
+                rest = &rest[2..];
                 // `C:x` (relative to the drive's current folder) has no
                 // meaning here; it's read as `C:\x`.
                 absolute = true;
@@ -817,9 +837,6 @@ pub mod paths {
 
     /// Drops `.` and empty names and applies `..`, never above the root.
     fn fold(parsed: &mut Parsed) {
-        if matches!(parsed.prefix, Prefix::Verbatim(_)) {
-            return;
-        }
         let mut out: Vec<OsString> = Vec::with_capacity(parsed.parts.len());
         for part in parsed.parts.drain(..) {
             match part.as_encoded_bytes() {
@@ -846,8 +863,10 @@ pub mod paths {
             Prefix::Unc(server, share) => {
                 out.push(r"\\");
                 out.push(server);
-                out.push(r"\");
-                out.push(share);
+                if !share.is_empty() {
+                    out.push(r"\");
+                    out.push(share);
+                }
             }
             Prefix::Verbatim(first) => {
                 out.push(r"\\?\");
@@ -870,8 +889,8 @@ pub mod paths {
     }
 
     /// `path` with `.` and `..` applied by name alone, `..` never climbing
-    /// above the root; on Windows with `\` separators and an upper-case
-    /// drive letter. `\\?\` paths are kept as written.
+    /// above the root (a drive, UNC share, or `\\?\` prefix); on Windows
+    /// with `\` separators and an upper-case drive letter.
     pub fn normalize(path: &Path, style: Style) -> PathBuf {
         let mut parsed = parse(path.as_os_str().as_encoded_bytes(), style);
         fold(&mut parsed);
@@ -880,8 +899,9 @@ pub mod paths {
 
     /// A path as written in a metadata file, relative to `base` unless
     /// absolute, normalized. On Windows, MSYS and Cygwin paths (`/c/x`,
-    /// `/cygdrive/c/x`) read as `C:\x`, `//server/share` as a UNC path, and
-    /// a path rooted without a drive takes `base`'s.
+    /// `/cygdrive/c/x`) and `/C:/x` read as `C:\x`, `//server/share` as a
+    /// UNC path, and a path rooted without a drive takes `base`'s. A UNC
+    /// path without a share (`\\server`) is kept as written.
     pub fn resolve(base: &Path, raw: &str, style: Style) -> PathBuf {
         let raw = raw.trim();
         let converted;
@@ -1018,12 +1038,38 @@ mod tests {
         );
         assert_eq!(normalize(&p("//server/share/x"), w), p(r"\\server\share\x"));
         assert_eq!(normalize(&p(r"\\?\C:\a\..\b"), w), p(r"C:\b"));
+        // Other verbatim prefixes are roots like a drive.
         assert_eq!(
             normalize(&p(r"\\?\GLOBALROOT\Device\x\..\y"), w),
-            p(r"\\?\GLOBALROOT\Device\x\..\y"),
-            "other verbatim paths are kept as written"
+            p(r"\\?\GLOBALROOT\Device\y"),
+        );
+        assert_eq!(
+            normalize(&p(r"\\?\Volume{0123-ab}\a\..\..\b"), w),
+            p(r"\\?\Volume{0123-ab}\b"),
         );
         assert_eq!(normalize(&p(r"a\.\b/c"), w), p(r"a\b\c"));
+        assert_eq!(normalize(&p("/C:/x/./y"), w), p(r"C:\x\y"));
+        assert_eq!(normalize(&p("/C:"), w), p(r"C:\"));
+    }
+
+    #[test]
+    fn resolves_against_verbatim_bases_and_keeps_shareless_unc() {
+        let w = Style::WINDOWS;
+        assert_eq!(
+            resolve(&p(r"\\?\Volume{0123-ab}\w\app"), r"..\main\.git", w),
+            p(r"\\?\Volume{0123-ab}\w\main\.git")
+        );
+        assert_eq!(
+            resolve(&p(r"\\?\GLOBALROOT\Device\Vol\w"), "../../../../x", w),
+            p(r"\\?\GLOBALROOT\x")
+        );
+        assert_eq!(resolve(&p(r"C:\w"), r"\\server", w), p(r"\\server"));
+        assert_eq!(resolve(&p(r"C:\w"), "//server", w), p(r"\\server"));
+        assert_eq!(resolve(&p(r"D:\w"), "/C:/x/../y", w), p(r"C:\y"));
+        assert_eq!(
+            relative_to(&p(r"C:\w"), &resolve(&p(r"C:\w"), r"\\server", w), w),
+            None
+        );
     }
 
     #[test]
