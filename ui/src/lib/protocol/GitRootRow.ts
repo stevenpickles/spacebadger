@@ -5,6 +5,10 @@ import type { GitRootKind } from "./GitRootKind";
 
 /**
  * One listed repository, worktree, or unresolved candidate.
+ *
+ * Two rows can have node 0: the repository above the scan root
+ * (`outside`) and the scan root's own entry. A row is identified by
+ * `(node, outside)`, and its parent by `(parent, parentOutside)`.
  */
 export type GitRootRow = { 
 /**
@@ -16,6 +20,11 @@ node: number, name: string, path: string, kind: GitRootKind, head: GitHead | nul
  * The nearest listed repository around this one.
  */
 parent: number | null, 
+/**
+ * `parent` is the repository above the scan root (the `outside` row)
+ * rather than the scan root's own row.
+ */
+parentOutside: boolean, 
 /**
  * For a linked worktree, the main repository; for a submodule, the
  * superproject; for a separate Git directory, the Git directory.

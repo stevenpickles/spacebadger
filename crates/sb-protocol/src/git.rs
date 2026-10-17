@@ -66,6 +66,10 @@ pub struct GitLink {
 }
 
 /// One listed repository, worktree, or unresolved candidate.
+///
+/// Two rows can have node 0: the repository above the scan root
+/// (`outside`) and the scan root's own entry. A row is identified by
+/// `(node, outside)`, and its parent by `(parent, parentOutside)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -79,6 +83,9 @@ pub struct GitRootRow {
     pub head: Option<GitHead>,
     /// The nearest listed repository around this one.
     pub parent: Option<u32>,
+    /// `parent` is the repository above the scan root (the `outside` row)
+    /// rather than the scan root's own row.
+    pub parent_outside: bool,
     /// For a linked worktree, the main repository; for a submodule, the
     /// superproject; for a separate Git directory, the Git directory.
     pub repository: Option<GitLink>,
@@ -211,6 +218,7 @@ mod tests {
             kind: GitRootKind::LinkedWorktree,
             head: None,
             parent: None,
+            parent_outside: false,
             repository: Some(GitLink {
                 path: "/w/main".into(),
                 node: Some(2),
