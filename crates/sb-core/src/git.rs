@@ -359,9 +359,14 @@ pub struct RootSummary {
     pub matching: Option<u64>,
     /// Files in the subtree.
     pub files: u32,
-    /// The nearest listed entry with a class enclosing this one.
+    /// The nearest listed entry with a class enclosing this one. Unresolved
+    /// rows have no class, so they're skipped: a root inside one gets the
+    /// repository around both. `Some(ROOT)` can be the repository above the
+    /// scan root (the `outside` row), which encloses every other row,
+    /// including one for the scan root's own entry.
     pub parent: Option<NodeId>,
-    /// The repository found above the scan root (`node` is the root).
+    /// The repository found above the scan root (`node` is the root). It's
+    /// a row of its own, separate from any entry of the root itself.
     pub outside: bool,
 }
 
@@ -397,33 +402,36 @@ pub fn summarize(
     metric: Metric,
 ) -> (Vec<RootSummary>, GitTotals) {
     let git = tree.git();
-    // The kind each node with a say stands for: its own entry, or for the
-    // root without one, the repository above the scan.
-    let effective = |n: NodeId| -> Option<(RootKind, bool)> {
-        if let Some(r) = tree.git_entry(n)
-            && (r.kind.class().is_some() || r.kind.listed())
-        {
-            return Some((r.kind, false));
-        }
-        if n == NodeId::ROOT {
-            return git.above().map(|(_, r)| (r.kind, true));
-        }
-        None
-    };
     let weight = |n: NodeId| metric.weight(tree, n);
     let matching = |n: NodeId| filter.map_or(0, |s| s.weight(metric, n));
+    let counts = |k: RootKind| k.class().is_some() || k.listed();
 
-    // Every node with a say: entries with a class (overrides) and listed
-    // entries (rows).
+    // Every entry with a say: those with a class (overrides) and listed
+    // ones (rows). The repository above the scan root is an item of its
+    // own, around the root's own entry if it has one.
     let mut nodes: Vec<(NodeId, RootKind, bool)> = git
         .roots()
-        .filter(|r| !tree.is_removed(r.node))
-        .filter_map(|r| effective(r.node).map(|(k, o)| (r.node, k, o)))
+        .filter(|r| !tree.is_removed(r.node) && counts(r.kind))
+        .map(|r| (r.node, r.kind, false))
         .collect();
-    if let Some((kind, true)) = effective(NodeId::ROOT) {
-        nodes.push((NodeId::ROOT, kind, true));
-    }
     let at: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, e)| (e.0, i)).collect();
+    let outside = match git.above() {
+        Some((_, r)) if counts(r.kind) => {
+            nodes.push((NodeId::ROOT, r.kind, true));
+            Some(nodes.len() - 1)
+        }
+        _ => None,
+    };
+    // The items around item `i`, nearest first.
+    let around = |i: usize| {
+        let (node, _, is_outside) = nodes[i];
+        let inside = (!is_outside).then_some(());
+        inside
+            .into_iter()
+            .flat_map(move |()| std::iter::successors(tree.parent(node), |&a| tree.parent(a)))
+            .filter_map(|a| at.get(&a).copied())
+            .chain(outside.filter(|_| !is_outside))
+    };
 
     let mut own: Vec<u64> = nodes.iter().map(|e| weight(e.0)).collect();
     let mut own_matching: Vec<u64> = nodes.iter().map(|e| matching(e.0)).collect();
@@ -432,25 +440,21 @@ pub fn summarize(
         // An override's whole subtree comes off the nearest override
         // around it, and off any unresolved rows in between.
         let mut taken = kind.class().is_none();
-        let mut cur = tree.parent(node);
-        while let Some(a) = cur {
-            if let Some(&j) = at.get(&a) {
-                let k = nodes[j].1;
-                if !taken {
-                    own[j] = own[j].saturating_sub(weight(node));
-                    if k.class().is_some() {
-                        own_matching[j] = own_matching[j].saturating_sub(matching(node));
-                        taken = true;
-                    }
-                }
-                if parent[i].is_none() && k.listed() && k.class().is_some() {
-                    parent[i] = Some(a);
-                }
-                if taken && parent[i].is_some() {
-                    break;
+        for j in around(i) {
+            let k = nodes[j].1;
+            if !taken {
+                own[j] = own[j].saturating_sub(weight(node));
+                if k.class().is_some() {
+                    own_matching[j] = own_matching[j].saturating_sub(matching(node));
+                    taken = true;
                 }
             }
-            cur = tree.parent(a);
+            if parent[i].is_none() && k.listed() && k.class().is_some() {
+                parent[i] = Some(nodes[j].0);
+            }
+            if taken && parent[i].is_some() {
+                break;
+            }
         }
     }
 
@@ -458,21 +462,19 @@ pub fn summarize(
         matching: filter.map(|_| 0),
         ..GitTotals::default()
     };
-    let mut metadata: HashMap<NodeId, u64> = HashMap::new();
-    for (i, &(node, kind, _)) in nodes.iter().enumerate() {
+    let mut metadata: Vec<u64> = vec![0; nodes.len()];
+    for (i, &(_, kind, _)) in nodes.iter().enumerate() {
         match kind.class() {
             Some(GitClass::Checkout) => totals.checkout += own[i],
             Some(GitClass::Worktree) => totals.worktree += own[i],
             Some(GitClass::Metadata) => {
                 totals.metadata += own[i];
-                // Counted with the nearest listed entry at or above it.
-                let mut cur = Some(node);
-                while let Some(a) = cur {
-                    if at.get(&a).is_some_and(|&j| nodes[j].1.listed()) {
-                        *metadata.entry(a).or_default() += own[i];
-                        break;
-                    }
-                    cur = tree.parent(a);
+                // Counted with the nearest listed item at or around it.
+                if let Some(j) = std::iter::once(i)
+                    .chain(around(i))
+                    .find(|&j| nodes[j].1.listed())
+                {
+                    metadata[j] += own[i];
                 }
             }
             Some(GitClass::Other) | None => {}
@@ -500,14 +502,20 @@ pub fn summarize(
             node,
             size: weight(node),
             own: own[i],
-            metadata: metadata.get(&node).copied().unwrap_or(0),
+            metadata: metadata[i],
             matching: filter.map(|s| s.weight(metric, node)),
             files: tree.file_count(node),
             parent: parent[i],
             outside,
         })
         .collect();
-    rows.sort_by(|a, b| b.size.cmp(&a.size).then(a.node.cmp(&b.node)));
+    // The row above the scan root first among equals: it encloses the rest.
+    rows.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then(b.outside.cmp(&a.outside))
+            .then(a.node.cmp(&b.node))
+    });
     (rows, totals)
 }
 
@@ -1276,7 +1284,7 @@ mod tests {
         t.set_git(GitRoot::new(inner, RootKind::Repository));
         t.set_git(GitRoot::new(inner_dot, RootKind::DotGit));
 
-        let (rows, totals) = summarize(&t, None, Metric::Logical);
+        let (rows, totals) = summarize_checked(&t);
         assert_eq!(
             rows.iter().map(|r| r.node).collect::<Vec<_>>(),
             [outer, inner]
@@ -1321,7 +1329,7 @@ mod tests {
         t.set_git(GitRoot::new(wt, RootKind::LinkedWorktree));
         t.set_git(GitRoot::new(pointer, RootKind::DotGit));
 
-        let (rows, totals) = summarize(&t, None, Metric::Logical);
+        let (rows, totals) = summarize_checked(&t);
         assert_eq!(rows.len(), 2, "the admin folder isn't listed");
         let m = row(&rows, main);
         assert_eq!((m.own, m.metadata), (20, 401));
@@ -1356,7 +1364,7 @@ mod tests {
             GitRoot::new(NodeId::ROOT, RootKind::Repository),
         );
 
-        let (rows, totals) = summarize(&t, None, Metric::Logical);
+        let (rows, totals) = summarize_checked(&t);
         assert_eq!(rows.len(), 5);
         let top = row(&rows, NodeId::ROOT);
         assert!(top.outside);
@@ -1402,6 +1410,93 @@ mod tests {
         assert_eq!(totals.matching, Some(22), "nested matches counted once");
     }
 
+    /// Summarizes, checking that every listed entry has a row and that the
+    /// union is exactly the files with a class.
+    fn summarize_checked(t: &Tree) -> (Vec<RootSummary>, GitTotals) {
+        let (rows, totals) = summarize(t, None, Metric::Logical);
+        assert_eq!(rows.len(), t.git().listed_count() as usize);
+        let classed: u64 = (0..t.len() as u32)
+            .map(NodeId::from_index)
+            .filter(|&n| !t.is_dir(n) && t.git_class(n) != GitClass::Other)
+            .map(|n| t.logical(n))
+            .sum();
+        assert_eq!(totals.union, classed);
+        assert_eq!(
+            totals.union,
+            totals.checkout + totals.worktree + totals.metadata
+        );
+        (rows, totals)
+    }
+
+    #[test]
+    fn the_repository_above_is_separate_from_the_roots_own_entry() {
+        let above = || GitRoot::new(NodeId::ROOT, RootKind::Repository);
+        let tree = |root: Option<GitRoot>, above_root: GitRoot| {
+            let mut t = Tree::new("/s/outer/inner");
+            let d = dir(&mut t, NodeId::ROOT, "d");
+            file(&mut t, d, "a", 10);
+            file(&mut t, NodeId::ROOT, "b", 5);
+            if let Some(r) = root {
+                t.set_git(r);
+            }
+            t.set_git_above(p("/s/outer"), above_root);
+            t
+        };
+
+        // Pending: only the row above, covering everything.
+        let t = tree(Some(GitRoot::pending(NodeId::ROOT)), above());
+        let (rows, totals) = summarize_checked(&t);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].outside);
+        assert_eq!((rows[0].own, totals.checkout, totals.union), (15, 15, 15));
+
+        // Unresolved: its own row inside the one above, which still
+        // classifies its bytes.
+        let t = tree(
+            Some(GitRoot::unresolved(NodeId::ROOT, Problem::NotGit)),
+            above(),
+        );
+        let (rows, totals) = summarize_checked(&t);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].outside && !rows[1].outside);
+        assert_eq!(rows[1].parent, Some(NodeId::ROOT));
+        assert_eq!(
+            (rows[0].own, totals.checkout, totals.unresolved),
+            (15, 15, 1)
+        );
+
+        // A repository of its own (scanning outer/inner): nested in the one
+        // above, which keeps nothing of its own.
+        let t = tree(
+            Some(GitRoot::new(NodeId::ROOT, RootKind::Repository)),
+            above(),
+        );
+        let (rows, totals) = summarize_checked(&t);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].outside);
+        assert_eq!(
+            (rows[0].own, rows[1].own, rows[1].parent),
+            (0, 15, Some(NodeId::ROOT))
+        );
+        assert_eq!((totals.roots, totals.checkout), (2, 15));
+
+        // Scanning repo/.git: metadata, counted with the row above.
+        let t = tree(Some(GitRoot::new(NodeId::ROOT, RootKind::DotGit)), above());
+        let (rows, totals) = summarize_checked(&t);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].own, rows[0].metadata), (0, 15));
+        assert_eq!((totals.metadata, totals.checkout), (15, 0));
+
+        // Scanning repo/.git/worktrees/x: no rows, all metadata.
+        let t = tree(
+            Some(GitRoot::new(NodeId::ROOT, RootKind::WorktreeAdmin)),
+            GitRoot::new(NodeId::ROOT, RootKind::DotGit),
+        );
+        let (rows, totals) = summarize_checked(&t);
+        assert!(rows.is_empty());
+        assert_eq!(totals.metadata, 15);
+    }
+
     #[test]
     fn summarize_skips_removed_entries() {
         let mut t = Tree::new("/s");
@@ -1409,7 +1504,7 @@ mod tests {
         file(&mut t, r, "a", 10);
         t.set_git(GitRoot::new(r, RootKind::Repository));
         assert!(t.remove(r));
-        let (rows, totals) = summarize(&t, None, Metric::Logical);
+        let (rows, totals) = summarize_checked(&t);
         assert!(rows.is_empty());
         assert_eq!(totals, GitTotals::default());
         assert_eq!(t.git().listed_count(), 0);
