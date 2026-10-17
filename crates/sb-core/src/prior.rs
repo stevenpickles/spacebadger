@@ -146,12 +146,29 @@ mod tests {
             .collect();
         assert_eq!(names, ["layout.rs", "ranking.rs"]);
         // The scanner's listing order: defined in tree.rs, used by no
-        // reader of sizes here.
-        let order: Vec<String> = readers(["listing_", "priority("].concat())
+        // reader of sizes here, nor anywhere in the app.
+        let needle = ["listing_", "priority("].concat();
+        let order: Vec<String> = readers(needle.clone())
             .into_iter()
             .map(|(n, _)| n)
             .collect();
         assert_eq!(order, ["tree.rs"]);
+        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
+        let mut dirs = vec![app];
+        let mut files = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(!text.contains(&needle), "{}", path.display());
+                }
+            }
+        }
+        assert!(files > 0, "the app's sources were found");
     }
 
     #[test]
