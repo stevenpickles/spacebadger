@@ -15,6 +15,9 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 - `git:repo`, `git:worktree`, and `git:metadata` keep files in repositories and worktrees, in linked worktrees, or in Git's own data. They narrow everything else (`is:code; git:worktree`), and `!` leaves one out (`git:repo; !git:metadata`); `!git:repo` leaves out worktrees and Git's data too. Suggestions offer them.
 - **All**, **Repos**, and **Worktrees** beside the filter box switch between all files, Git repositories, and linked worktrees, keeping the rest of the filter as typed.
 
+### Scanning
+- macOS lists folders with `getattrlistbulk`, one call per batch of entries instead of two per entry, with the same results; `SB_MACOS_LISTING=readdir` switches back to the old listing.
+
 ## [0.3.0] - 2026-10-14
 
 ### Filter
