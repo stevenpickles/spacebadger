@@ -367,6 +367,7 @@ fn bulk_listing_matches_readdir_and_lstat() {
     assert_eq!(
         fallbacks,
         Fallbacks {
+            volume: false,
             folders: 0,
             entries: 1
         },
@@ -426,6 +427,30 @@ fn bulk_listing_matches_readdir_on_other_filesystems() {
         let _socket = fixture(&root, false);
         let (seen, fallbacks) = assert_same(&root);
         report += &format!("  {filesystem}: {} entries, {fallbacks:?}\n", seen.len());
+        // Only HFS+ (like APFS) is listed in bulk; on the others, record
+        // how the bulk call would differ.
+        assert_eq!(fallbacks.volume, filesystem != "HFS+", "{filesystem}");
+        if fallbacks.volume {
+            let (old, _) = walk(Listing::Readdir, &root);
+            let (new, _) = walk(Listing::BulkOnAnyVolume, &root);
+            let diff = differences(&old, &new);
+            let mut fields: BTreeMap<String, usize> = BTreeMap::new();
+            for line in &diff {
+                let field = line.rsplit_once("\" ").map_or("entry", |(_, rest)| {
+                    rest.split(':').next().unwrap_or("entry")
+                });
+                *fields.entry(field.to_owned()).or_default() += 1;
+            }
+            report += &format!(
+                "    bulk would differ in {} places {fields:?}, such as:\n      {}\n",
+                diff.len(),
+                diff.iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n      ")
+            );
+        }
     }
 
     // A mount point under a non-APFS folder: a FAT image inside an HFS+ one.
