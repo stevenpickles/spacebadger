@@ -711,6 +711,165 @@ mod tests {
         assert!(session.search_summary(new).is_err(), "cleared");
     }
 
+    /// A scan of repository `a` (300 files) and `b` (30,000 files, more
+    /// than a step), `b` listed once its gate is released; `d`, empty, and
+    /// `c` listed once theirs are. Nothing is classified until a test
+    /// records Git entries itself, as the scanner's probes would.
+    fn repos() -> (Session, Gate, Gate, Gate) {
+        let fs = FakeFs::new();
+        for i in 0..300 {
+            fs.file(&format!("a/src/{i}.rs"), 10 + i, 4096);
+        }
+        fs.file("a/.git/HEAD", 23, 4096);
+        for i in 0..30_000 {
+            fs.file(&format!("b/{i}.txt"), i, 4096);
+        }
+        fs.file("b/.git/HEAD", 23, 4096);
+        fs.dir("d");
+        fs.file("c/last.txt", 7, 4096);
+        let b = fs.gate_dir("b");
+        let c = fs.gate_dir("c");
+        let d = fs.gate_dir("d");
+        let config = ScanConfig {
+            workers: 5,
+            progress_interval: Duration::from_millis(1),
+            ..ScanConfig::default()
+        };
+        let session = Session::start_on(fs.root(), fs, config, None, None, |_| {});
+        until("a's files are in", || {
+            let tree = session.scan.tree();
+            let tree = tree.read().unwrap();
+            tree.children(NodeId::ROOT).any(|a| {
+                tree.name(a) == "a"
+                    && tree
+                        .children(a)
+                        .all(|c| tree.dir_state(c) == DirState::Listed)
+                    && tree.file_count(a) == 301
+            })
+        });
+        (session, b, c, d)
+    }
+
+    /// Records `folder` (in the root) and its `.git` folder as a repository
+    /// under the tree's write lock, as the scanner does with a probe's
+    /// finding; the scan's next status carries it.
+    fn found_repository(session: &Session, folder: &str) {
+        use sb_core::git::{GitRoot, RootKind};
+        let tree = session.scan.tree();
+        let mut tree = tree.write().unwrap();
+        let repo = tree
+            .children(NodeId::ROOT)
+            .find(|&c| tree.name(c) == folder)
+            .unwrap();
+        let dot = tree.children(repo).find(|&c| tree.name(c) == ".git");
+        tree.set_git(GitRoot::new(repo, RootKind::Repository));
+        if let Some(dot) = dot {
+            tree.set_git(GitRoot::new(dot, RootKind::DotGit));
+        }
+    }
+
+    #[test]
+    fn repositories_found_while_scanning_reclassify_files_already_filtered() {
+        let (session, b, c, d) = repos();
+        let query = "git:repo; !git:metadata";
+        let id = session.search_set(query).unwrap().unwrap().search;
+        assert_eq!(session.search_summary(id).unwrap().files, 0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let _stop = Stop(&stop);
+            // Every step leaves every folder's totals the sum of its
+            // contents', a rewalk's included.
+            let reader = s.spawn(|| {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let tree = session.scan.tree();
+                    let (search, tree, _) = session.read_locked(&tree, true).unwrap();
+                    let active = current(&search, id).unwrap();
+                    let root = active.search.totals(NodeId::ROOT);
+                    let (files, logical) = tree
+                        .children(NodeId::ROOT)
+                        .map(|c| active.search.totals(c))
+                        .fold((0, 0), |(f, l), t| (f + t.files, l + t.logical));
+                    assert_eq!((root.files, root.logical), (files, logical));
+                    reads += 1;
+                    drop((search, tree));
+                    std::thread::yield_now();
+                }
+                reads
+            });
+
+            // a was examined before it was known to be a repository.
+            found_repository(&session, "a");
+            b.release();
+            until("b is listed", || listed(&session, "b"));
+            until("a's files join", || {
+                totals(&session.search_summary(id).unwrap()) == fresh(&session, query)
+            });
+            assert_eq!(session.search_summary(id).unwrap().files, 300);
+
+            // b, 30,000 files examined over several steps, is found to be a
+            // repository; the next status (d listed, nothing new) carries it.
+            found_repository(&session, "b");
+            d.release();
+            until("d is listed", || listed(&session, "d"));
+            until("b's files join", || {
+                totals(&session.search_summary(id).unwrap()) == fresh(&session, query)
+            });
+            assert_eq!(session.search_summary(id).unwrap().files, 30_300);
+            assert!(!finished(&session), "caught up while scanning");
+
+            c.release();
+            until("the scan finishes", || finished(&session));
+            stop.store(true, Ordering::Relaxed);
+            assert!(reader.join().unwrap() > 0);
+        });
+        let last = session.search_summary(id).unwrap();
+        assert_eq!(totals(&last), fresh(&session, query));
+        assert_eq!(last.revision, session.scan.progress().revision);
+    }
+
+    #[test]
+    fn says_when_the_filter_caught_up_after_only_git_data_changed() {
+        let (session, b, _c, d) = repos();
+        b.release();
+        until("b is listed", || listed(&session, "b"));
+        let (sink, updates) = std::sync::mpsc::channel();
+        session.on_filter_updated(move |u| {
+            let _ = sink.send(u);
+        });
+        let id = session.search_set("git:repo").unwrap().unwrap().search;
+        let held = &session.filter.steps_left;
+        held.store(0, Ordering::SeqCst);
+        // b becomes a repository, and the status after it adds nothing
+        // else: d is empty. Then the scan stalls on c.
+        found_repository(&session, "b");
+        d.release();
+        until("the last status reaches the job", || {
+            let p = session.scan.progress();
+            listed(&session, "d")
+                && p.pending_dirs == 1
+                && session.filter.nudged.load(Ordering::SeqCst) == p.revision
+        });
+        let last = session.scan.progress().revision;
+        let behind = session.search_summary(id).unwrap();
+        assert!(behind.revision < last);
+        assert_eq!(behind.files, 0);
+        assert!(session.filter.read_behind.load(Ordering::SeqCst));
+        held.store(usize::MAX, Ordering::SeqCst);
+        let u = updates
+            .recv_timeout(Duration::from_secs(10))
+            .expect("an update is announced");
+        assert_eq!(
+            session.scan.progress().revision,
+            last,
+            "the scan stayed quiet"
+        );
+        assert_eq!((u.search, u.revision), (id, last));
+        let now = session.search_summary(id).unwrap();
+        assert_eq!((now.files, now.revision), (30_001, last));
+        assert_eq!(totals(&now), fresh(&session, "git:repo"));
+    }
+
     #[test]
     fn the_completion_index_is_rebuilt_in_the_background_while_scanning() {
         let (session, b, c) = scan();
