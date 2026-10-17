@@ -19,6 +19,7 @@ fn config() -> ScanConfig {
         write_holds: None,
         git_grace: GIT_GRACE,
         exact_hard_links: false,
+        list_by_prior: true,
     }
 }
 
