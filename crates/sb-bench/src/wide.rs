@@ -6,6 +6,7 @@
 //! as the tree grows, and how soon a cancel is acknowledged once the
 //! listing's entries are being added to the tree.
 
+use crate::cpu::{Cpu, Threads, print_roles};
 use crate::{memory, mib, ms};
 use sb_scan::{
     BATCH_ENTRIES, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured, NativeFs, RootKind,
@@ -190,6 +191,8 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     };
     let before = memory::current();
     let delivered = Arc::new(AtomicBool::new(false));
+    let threads = Threads::watch();
+    let cpu_before = Cpu::process();
     let started = Instant::now();
     let scan = Scan::start(
         root.clone(),
@@ -208,6 +211,8 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     let tree = scan.tree();
     let p = scan.wait();
     let elapsed = started.elapsed();
+    let cpu = Cpu::process().zip(cpu_before).map(|(a, b)| a.since(b));
+    let roles = threads.finish();
     done.store(true, Ordering::Relaxed);
     let waits = reader.join().unwrap();
     let (nodes, tree_bytes) = {
@@ -233,6 +238,17 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
         ms(pct(0.5))
     );
     report_holds(std::mem::take(&mut *holds.lock().unwrap()));
+    if let Some(cpu) = cpu {
+        println!(
+            "cpu:     process kernel {}, user {} ({:.1} cores busy)",
+            ms(cpu.kernel),
+            ms(cpu.user),
+            cpu.total().as_secs_f64() / elapsed.as_secs_f64()
+        );
+    }
+    if let Some(roles) = &roles {
+        print_roles(roles);
+    }
     println!(
         "memory:  peak working set {}; grew by {} at peak; tree estimate {}",
         memory::peak().map_or("unknown".into(), mib),

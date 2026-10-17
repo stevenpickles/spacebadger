@@ -15,6 +15,7 @@
 //! in a fresh child process so peak memory belongs to that case alone.
 //! Real-disk scans are otherwise measured with the `sb-scan` `scan` example.
 
+mod cpu;
 mod lod;
 mod memory;
 mod synth;
