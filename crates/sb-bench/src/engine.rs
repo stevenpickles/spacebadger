@@ -64,6 +64,15 @@ pub fn run(root: &Path, workers: usize) {
         p.omissions.total(),
         ms(wall)
     );
+    // For checking that two builds found the same, on a tree that didn't
+    // change in between.
+    println!(
+        "totals:  logical={} allocated={} unknown_allocation_files={} omissions={:?}",
+        p.logical,
+        p.allocated,
+        p.unknown_allocation_files,
+        p.omissions.iter().collect::<Vec<_>>()
+    );
     println!(
         "rate:    {:.0} entries/s",
         (p.files + p.dirs) as f64 / wall.as_secs_f64()
