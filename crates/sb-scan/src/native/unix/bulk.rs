@@ -123,6 +123,58 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+/// `struct statfs` from `<sys/mount.h>` (the 64-bit-inode layout).
+#[repr(C)]
+struct StatFs {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_owner: u32,
+    f_type: u32,
+    f_flags: u32,
+    f_fssubtype: u32,
+    f_fstypename: [u8; 16],
+    f_mntonname: [u8; 1024],
+    f_mntfromname: [u8; 1024],
+    f_flags_ext: u32,
+    f_reserved: [u32; 7],
+}
+
+unsafe extern "C" {
+    #[cfg_attr(target_arch = "x86_64", link_name = "statfs$INODE64")]
+    fn statfs(path: *const std::ffi::c_char, buf: *mut StatFs) -> c_int;
+}
+
+/// Filesystems whose bulk listing matches `readdir` + `lstat` exactly, as
+/// the tests compare them. Others are listed with `readdir`: exFAT makes up
+/// file IDs differently for the two calls (the IDs that bind deletes to the
+/// scanned object) and reports folder times that differ by up to 120 ms;
+/// FAT is built the same way; network and other filesystems are untested.
+const TRUSTED: [&[u8]; 2] = [b"apfs", b"hfs"];
+
+/// Whether the filesystem holding `root` is listed in bulk. A scan never
+/// crosses into another filesystem, so the root's decides for all of it.
+pub fn trusted(root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<StatFs>::zeroed();
+    // SAFETY: a NUL-terminated path and a buffer of the size `statfs` fills.
+    if unsafe { statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: zeroed, then filled by a successful call.
+    let name = unsafe { fs.assume_init() }.f_fstypename;
+    let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    TRUSTED.contains(&&name[..len])
+}
+
 thread_local! {
     /// Each listing thread's buffer, `u64`s so every field is aligned at
     /// least as the kernel packs it.

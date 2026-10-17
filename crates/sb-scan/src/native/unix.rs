@@ -17,7 +17,10 @@
 //! compares them). Entries the bulk call can't describe exactly as `lstat`
 //! does (firmlinks, mount points, autofs triggers, missing attributes) are
 //! `lstat`ed, and a filesystem that refuses the call (`ENOTSUP`, `EINVAL`) is
-//! listed with `readdir`. [`UnixFs::fallbacks`] counts both. Setting `SB_MACOS_LISTING=readdir` forces the
+//! listed with `readdir`. Only APFS and HFS+ scans use the bulk call at all:
+//! on exFAT it gives other file IDs and folder times than `lstat`, and other
+//! filesystems are untested, so they are listed with `readdir`.
+//! [`UnixFs::fallbacks`] counts all of these. Setting `SB_MACOS_LISTING=readdir` forces the
 //! `readdir` listing, for comparison. Neither listing opens a file.
 //!
 //! On macOS the process I/O policy is set so dataless (cloud-only) files are
@@ -83,6 +86,9 @@ pub enum Listing {
     Bulk,
     /// `readdir` and an `lstat` per entry.
     Readdir,
+    /// `getattrlistbulk` even on filesystems it doesn't match `readdir` on;
+    /// for tests that record how. Never use it to scan.
+    BulkOnAnyVolume,
 }
 
 impl Listing {
@@ -98,8 +104,11 @@ impl Listing {
 /// How often an adapter's bulk listing (macOS) fell back to the slower way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Fallbacks {
-    /// Folders listed with `readdir`: the filesystem refused
-    /// `getattrlistbulk`, or gave a record without a name first.
+    /// The scan root's filesystem isn't one the bulk listing is used on
+    /// (see `bulk::trusted`), so every folder is listed with `readdir`.
+    pub volume: bool,
+    /// Folders listed with `readdir`: on such a volume, or the filesystem
+    /// refused `getattrlistbulk`, or gave a record without a name first.
     pub folders: u64,
     /// Entries `lstat`ed: firmlinks, mount points, autofs triggers, errors
     /// and records missing an attribute.
@@ -110,6 +119,8 @@ pub struct Fallbacks {
 pub struct UnixFs {
     root_dev: OnceLock<u64>,
     listing: Listing,
+    /// Whether the scan root's filesystem is listed in bulk (macOS).
+    bulk_volume: OnceLock<bool>,
     readdir_folders: AtomicU64,
     lstat_entries: AtomicU64,
 }
@@ -130,6 +141,7 @@ impl UnixFs {
         Self {
             root_dev: OnceLock::new(),
             listing,
+            bulk_volume: OnceLock::new(),
             readdir_folders: AtomicU64::new(0),
             lstat_entries: AtomicU64::new(0),
         }
@@ -138,6 +150,7 @@ impl UnixFs {
     /// How often this adapter's bulk listing fell back so far.
     pub fn fallbacks(&self) -> Fallbacks {
         Fallbacks {
+            volume: self.listing == Listing::Bulk && self.bulk_volume.get() == Some(&false),
             folders: self.readdir_folders.load(Ordering::Relaxed),
             entries: self.lstat_entries.load(Ordering::Relaxed),
         }
@@ -162,6 +175,14 @@ impl FsAdapter for UnixFs {
         })?;
         let meta = std::fs::symlink_metadata(root)?;
         let _ = self.root_dev.set(meta.dev());
+        #[cfg(target_os = "macos")]
+        if meta.is_dir() {
+            let _ = self.bulk_volume.set(match self.listing {
+                Listing::Bulk => bulk::trusted(root),
+                Listing::BulkOnAnyVolume => true,
+                Listing::Readdir => false,
+            });
+        }
         Ok(if meta.file_type().is_symlink() {
             RootKind::Link
         } else if meta.is_dir() {
@@ -178,7 +199,9 @@ impl FsAdapter for UnixFs {
             .expect("open_root must run before read_dir");
         batched(sink, |out| {
             #[cfg(target_os = "macos")]
-            if self.listing == Listing::Bulk {
+            if self.listing != Listing::Readdir && self.bulk_volume.get() != Some(&true) {
+                self.readdir_folders.fetch_add(1, Ordering::Relaxed);
+            } else if self.listing != Listing::Readdir {
                 match bulk::list(dir, root_dev, &self.lstat_entries, out)? {
                     bulk::Listed::Done => return Ok(()),
                     bulk::Listed::Unsupported => {
