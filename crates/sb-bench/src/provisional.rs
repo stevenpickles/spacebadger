@@ -9,17 +9,20 @@
 //! one missing from either side counts whole), divided by the two layouts'
 //! areas at that level together, so 0 is identical and 1 shares nothing.
 //!
-//! The same rescan runs twice, interleaved: with the prior and without, so
-//! the curve without estimates is the baseline. The snapshot is the file
-//! given with `--snapshot`, or else one captured from a first scan (an
-//! immediate rescan, the easiest case).
+//! The same rescan runs three times per round, interleaved and starting
+//! with a different one each round: with the prior and folders listed in
+//! the order it suggests (as the app scans; see `ScanConfig::list_by_prior`),
+//! with the prior and folders listed in the order found, and without the
+//! prior, so the last two are the baselines for the order and for the
+//! estimates. The snapshot is the file given with `--snapshot`, or else one
+//! captured from a first scan (an immediate rescan, the easiest case).
 
 use crate::ms;
 use sb_core::layout::{self, Layout, LayoutParams, Metric, OrderCache, RectKind};
 use sb_core::prior::Prior;
 use sb_core::snapshot::{CASE_INSENSITIVE, Snapshot};
 use sb_core::tree::{NodeId, Tree};
-use sb_scan::{NativeFs, Scan, native};
+use sb_scan::{NativeFs, Scan, ScanConfig, native};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +55,7 @@ pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize) {
             snap
         }
         None => {
-            let (tree, took) = scan(root, None, |_, _| {});
+            let (tree, took) = scan(root, None, true, |_, _| {});
             println!("first scan to take a snapshot from: {}", ms(took));
             let tree = tree.read().unwrap();
             Snapshot::capture(&tree, 0, CASE_INSENSITIVE)
@@ -62,26 +65,27 @@ pub fn run(root: &Path, snapshot: Option<&Path>, rounds: usize) {
     let prior = Arc::new(Prior::new(snap));
     println!("prior indexed in {}", ms(t.elapsed()));
 
-    let mut with = Vec::new();
-    let mut without = Vec::new();
+    let mut curves: [Vec<Curve>; 3] = Default::default();
     for round in 0..rounds.max(1) {
-        for estimated in [true, false] {
-            let curve = replay(root, estimated.then(|| Arc::clone(&prior)));
+        for i in 0..VARIANTS.len() {
+            let variant = (round + i) % VARIANTS.len();
+            let prior = (variant < 2).then(|| Arc::clone(&prior));
+            let curve = replay(root, prior, variant == 0);
             println!(
                 "round {round} {}: scan {}, {} layouts",
-                if estimated { "with prior" } else { "without" },
+                VARIANTS[variant],
                 ms(curve.took),
                 curve.points.len()
             );
-            if estimated {
-                with.push(curve);
-            } else {
-                without.push(curve);
-            }
+            curves[variant].push(curve);
         }
     }
-    report(&with, &without);
+    report(&curves);
 }
+
+/// Listed in the order the prior suggests, in the order found, and
+/// without the prior.
+const VARIANTS: [&str; 3] = ["prior order", "found order", "no prior"];
 
 struct Curve {
     took: Duration,
@@ -95,15 +99,15 @@ struct Curve {
 fn scan(
     root: &Path,
     prior: Option<Arc<Prior>>,
+    by_prior: bool,
     mut tick: impl FnMut(&Tree, Duration),
 ) -> (Arc<std::sync::RwLock<Tree>>, Duration) {
     let started = Instant::now();
-    let scan = Scan::start(
-        root.to_path_buf(),
-        NativeFs::new(),
-        native::scan_config(root),
-        |_| {},
-    );
+    let config = ScanConfig {
+        list_by_prior: by_prior,
+        ..native::scan_config(root)
+    };
+    let scan = Scan::start(root.to_path_buf(), NativeFs::new(), config, |_| {});
     let tree = scan.tree();
     if let Some(prior) = prior {
         tree.write().unwrap().set_prior(prior);
@@ -122,11 +126,11 @@ fn scan(
     (tree, took)
 }
 
-fn replay(root: &Path, prior: Option<Arc<Prior>>) -> Curve {
+fn replay(root: &Path, prior: Option<Arc<Prior>>, by_prior: bool) -> Curve {
     let params = LayoutParams::new(WIDTH, HEIGHT);
     let mut cache = OrderCache::default();
     let mut shots = Vec::new();
-    let (tree, took) = scan(root, prior, |tree, at| {
+    let (tree, took) = scan(root, prior, by_prior, |tree, at| {
         let l = layout::layout(
             tree,
             NodeId::ROOT,
@@ -258,13 +262,17 @@ fn difference(now: &Level, last: &Level) -> f64 {
     if total == 0.0 { 0.0 } else { diff / total }
 }
 
-fn report(with: &[Curve], without: &[Curve]) {
+fn report(curves: &[Vec<Curve>; 3]) {
     println!();
     println!("error vs the final map (level 1 / level 2), median over rounds:");
-    println!("{:>8}  {:>17}  {:>17}", "t", "with prior", "without");
-    let longest = with
+    print!("{:>8}", "t");
+    for v in VARIANTS {
+        print!("  {v:>17}");
+    }
+    println!();
+    let longest = curves
         .iter()
-        .chain(without)
+        .flatten()
         .map(|c| c.points.len())
         .max()
         .unwrap_or(0);
@@ -285,12 +293,11 @@ fn report(with: &[Curve], without: &[Curve]) {
         _ => format!("{:>17}", "done"),
     };
     for i in 0..longest {
-        println!(
-            "{:>6}ms  {}  {}",
-            i as u128 * TICK.as_millis(),
-            cell(with, i),
-            cell(without, i)
-        );
+        print!("{:>6}ms", i as u128 * TICK.as_millis());
+        for c in curves {
+            print!("  {}", cell(c, i));
+        }
+        println!();
     }
     let first_under = |curves: &[Curve], limit: f64| -> Vec<String> {
         curves
@@ -303,18 +310,31 @@ fn report(with: &[Curve], without: &[Curve]) {
             })
             .collect()
     };
+    // The area of error left over the scan: the mean error on both levels
+    // over the layouts, in error-seconds (lower is better).
+    let mean_error = |c: &Curve| -> f64 {
+        c.points
+            .iter()
+            .map(|p| (p.1 + p.2) / 2.0 * TICK.as_secs_f64())
+            .sum()
+    };
     println!();
-    println!(
-        "first layout under 5% on both levels: with prior {:?}, without {:?}",
-        first_under(with, 0.05),
-        first_under(without, 0.05)
-    );
-    let gate = with.iter().all(|c| {
+    for (v, c) in VARIANTS.iter().zip(curves) {
+        let mut took: Vec<f64> = c.iter().map(|c| c.took.as_secs_f64() * 1e3).collect();
+        took.sort_by(f64::total_cmp);
+        let errors: Vec<String> = c.iter().map(|c| format!("{:.3}", mean_error(c))).collect();
+        println!(
+            "{v:>11}: first under 5% {:?}, under 2% {:?}; error-seconds {errors:?}; scan ms {took:.0?}",
+            first_under(c, 0.05),
+            first_under(c, 0.02),
+        );
+    }
+    let gate = curves[0].iter().all(|c| {
         c.points
             .iter()
             .any(|p| p.0 <= Duration::from_millis(500) && p.1.max(p.2) < 0.05)
     });
-    let exact = with.iter().chain(without).all(|c| c.exact_at_end);
+    let exact = curves.iter().flatten().all(|c| c.exact_at_end);
     println!(
         "gate (< 5% within 0.5 s, every round): {}; nothing estimated at completion: {}",
         if gate { "pass" } else { "FAIL" },
