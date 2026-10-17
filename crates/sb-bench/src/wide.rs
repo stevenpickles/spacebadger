@@ -9,8 +9,8 @@
 use crate::cpu::{Cpu, Threads, print_roles, without_watcher};
 use crate::{memory, mib, ms};
 use sb_scan::{
-    BATCH_ENTRIES, DirHandle, DirRef, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured,
-    NativeFs, RootKind, Scan, ScanConfig, ScanError, Sink, batched,
+    BATCH_ENTRIES, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured, NativeFs, RootKind,
+    Scan, ScanConfig, ScanError, Sink, batched,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,18 +92,6 @@ impl<A: FsAdapter> FsAdapter for Watched<A> {
 
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
         self.inner.read_dir(dir, &mut |batch| {
-            let flow = sink(batch);
-            self.delivered.store(true, Ordering::Relaxed);
-            flow
-        })
-    }
-
-    fn list_dir(
-        &self,
-        dir: DirRef<'_>,
-        sink: &mut Sink<'_>,
-    ) -> Result<Option<DirHandle>, ScanError> {
-        self.inner.list_dir(dir, &mut |batch| {
             let flow = sink(batch);
             self.delivered.store(true, Ordering::Relaxed);
             flow

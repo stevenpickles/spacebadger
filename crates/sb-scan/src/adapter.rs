@@ -164,21 +164,6 @@ pub enum RootKind {
 /// Receives a listing's entries batch by batch; `Break` stops the listing.
 pub type Sink<'a> = dyn FnMut(Vec<Entry>) -> ControlFlow<()> + 'a;
 
-/// A listed directory an adapter left open (see [`FsAdapter::list_dir`]) so
-/// its subdirectories can be opened relative to it. Opaque to the engine,
-/// which only decides how long to keep it.
-pub type DirHandle = Box<dyn std::any::Any + Send + Sync>;
-
-/// A directory to list.
-#[derive(Clone, Copy)]
-pub struct DirRef<'a> {
-    pub path: &'a Path,
-    /// Its parent, still open from the parent's [`FsAdapter::list_dir`],
-    /// when the engine kept it; the directory's name in it is the last
-    /// component of `path`.
-    pub parent: Option<&'a DirHandle>,
-}
-
 /// Gathers entries into batches of [`BATCH_ENTRIES`] for a [`Sink`].
 pub struct Batcher<'s, 'a> {
     sink: &'s mut Sink<'a>,
@@ -257,20 +242,6 @@ pub trait FsAdapter: Send + Sync + 'static {
     /// directory couldn't be listed. Directories on other filesystems must
     /// be reported as [`EntryKind::MountPoint`].
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError>;
-
-    /// Lists one directory as [`FsAdapter::read_dir`] does, and returns it
-    /// still open where the platform can open subdirectories relative to an
-    /// open directory, for their [`DirRef::parent`]. Opening relative to
-    /// `dir.parent` must give the same entries and errors as opening by
-    /// path (falling back to the path when the relative open fails). The
-    /// default lists by path and keeps nothing.
-    fn list_dir(
-        &self,
-        dir: DirRef<'_>,
-        sink: &mut Sink<'_>,
-    ) -> Result<Option<DirHandle>, ScanError> {
-        self.read_dir(dir.path, sink).map(|()| None)
-    }
 
     /// Re-measures one file authoritatively without following links or
     /// hydrating. Used for hard-link owners whose listing may be stale.

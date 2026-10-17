@@ -25,8 +25,7 @@
 //!   cancel leaves the unconfirmed candidates as not checked.
 
 use crate::adapter::{
-    DirHandle, DirRef, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
-    ScanError,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
 use crate::git::{self, Finding, Plan, Scope, Signals, Spot};
 use sb_core::git::{GitRoot, Problem, RootKind as GitKind};
@@ -37,9 +36,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -67,25 +66,7 @@ pub struct ScanConfig {
     /// answer (a read stuck on a share that stopped responding) before the
     /// scan finishes without them, leaving their candidates timed out.
     pub git_grace: Duration,
-    /// Most listed folders kept open at once so their subfolders can be
-    /// opened relative to them (where the adapter supports it, see
-    /// [`FsAdapter::list_dir`]); past it, subfolders are opened by path.
-    /// 0, the default, opens every folder by path;
-    /// [`native::scan_config`](crate::native::scan_config) sets
-    /// [`OPEN_DIRS`] for local fixed disks.
-    pub open_dirs: usize,
 }
-
-/// [`ScanConfig::open_dirs`] for local fixed disks. A folder kept open
-/// can't have it or any folder above it renamed or moved by others
-/// (`MoveFileEx` fails with access denied), so the cap and
-/// [`OPEN_DIR_MAX_AGE`] keep that window small.
-pub const OPEN_DIRS: usize = 4096;
-
-/// How long a folder kept open may be used for opening its subfolders;
-/// a subfolder whose job waited longer opens by path, and the folder is
-/// closed once no job holds it.
-pub const OPEN_DIR_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// Called after the scanner releases the tree's write lock with how long it
 /// held it and how many nodes the tree had then. Runs on the scan thread
@@ -114,7 +95,6 @@ impl Default for ScanConfig {
             sample_limit: 50,
             write_holds: None,
             git_grace: GIT_GRACE,
-            open_dirs: 0,
         }
     }
 }
@@ -503,75 +483,11 @@ struct ListingEnd {
     partial: bool,
 }
 
-/// A listed folder kept open for opening its subfolders relative to it,
-/// counted against [`ScanConfig::open_dirs`] until closed: when the last
-/// job holding it is done with it, or once it's [`OPEN_DIR_MAX_AGE`] old
-/// (by the aggregator's sweep or a job that finds it too old), whichever
-/// comes first. A listing using it then holds the handle until its open is
-/// done.
-struct OpenDir {
-    handle: Mutex<Option<Arc<DirHandle>>>,
-    kept: Instant,
-    open: Arc<AtomicUsize>,
-}
-
-impl OpenDir {
-    /// Keeps `handle` if fewer than `limit` folders are open.
-    fn keep(handle: DirHandle, open: &Arc<AtomicUsize>, limit: usize) -> Option<Arc<Self>> {
-        if open.fetch_add(1, Ordering::Relaxed) >= limit {
-            open.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(Arc::new(Self {
-            handle: Mutex::new(Some(Arc::new(handle))),
-            kept: Instant::now(),
-            open: Arc::clone(open),
-        }))
-    }
-
-    fn expired(&self) -> bool {
-        self.kept.elapsed() > OPEN_DIR_MAX_AGE
-    }
-
-    /// The handle, unless it's too old (then closed) or closed already.
-    fn get(&self) -> Option<Arc<DirHandle>> {
-        if self.expired() {
-            self.close();
-            return None;
-        }
-        self.handle.lock().unwrap().clone()
-    }
-
-    fn close(&self) {
-        let handle = self.handle.lock().unwrap().take();
-        if handle.is_some() {
-            self.open.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for OpenDir {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 /// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
 enum Job {
-    List {
-        dir: NodeId,
-        path: PathBuf,
-        /// The folder's parent, still open.
-        parent: Option<Arc<OpenDir>>,
-    },
-    Measure {
-        file: NodeId,
-        path: PathBuf,
-    },
-    Git {
-        path: PathBuf,
-        plan: Plan,
-    },
+    List { dir: NodeId, path: PathBuf },
+    Measure { file: NodeId, path: PathBuf },
+    Git { path: PathBuf, plan: Plan },
 }
 
 enum Outcome {
@@ -581,14 +497,12 @@ enum Outcome {
         path: PathBuf,
         entries: Vec<Entry>,
     },
-    /// A directory's listing ended, with its last batch (if any) and the
-    /// directory kept open for the subdirectories in that batch.
+    /// A directory's listing ended, with its last batch (if any).
     Listed {
         dir: NodeId,
         path: PathBuf,
         entries: Vec<Entry>,
         result: Result<(), ScanError>,
-        open: Option<Arc<OpenDir>>,
     },
     Measured {
         file: NodeId,
@@ -602,10 +516,6 @@ enum Outcome {
     Stopped { dir: NodeId },
 }
 
-/// Jobs waiting for a worker, in order. Listings stay breadth first
-/// (rather than newest first, which keeps fewer folders open) because the
-/// first name of a hard-linked file to be listed owns its allocation, and
-/// breadth first keeps that the shallowest name, as it has been.
 #[derive(Default)]
 struct Queue {
     state: Mutex<(VecDeque<Job>, bool)>,
@@ -651,10 +561,6 @@ struct Aggregator<A> {
     on_progress: Box<dyn Fn(&Progress) + Send>,
     started: Instant,
     queue: Arc<Queue>,
-    /// Folders kept open for their subfolders (see [`OpenDir`]).
-    open_dirs: Arc<AtomicUsize>,
-    /// Folders kept open, oldest first, for closing once too old.
-    kept: VecDeque<Weak<OpenDir>>,
     outstanding: u64,
     pending_dirs: u64,
     owners: HashMap<u128, NodeId>,
@@ -698,8 +604,6 @@ impl<A: FsAdapter> Aggregator<A> {
             on_progress,
             started: now,
             queue: Arc::new(Queue::default()),
-            open_dirs: Arc::new(AtomicUsize::new(0)),
-            kept: VecDeque::new(),
             outstanding: 0,
             pending_dirs: 0,
             owners: HashMap::new(),
@@ -746,7 +650,7 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         drop(tx);
 
-        self.enqueue_list(NodeId::ROOT, self.root.clone(), None);
+        self.enqueue_list(NodeId::ROOT, self.root.clone());
         self.enqueue_git(self.root.clone(), Plan::Ancestors);
         loop {
             if self.cancelled() {
@@ -767,7 +671,6 @@ impl<A: FsAdapter> Aggregator<A> {
                     continue;
                 }
             }
-            self.close_old_dirs();
             if self.stop.is_some() {
                 continue;
             }
@@ -801,20 +704,6 @@ impl<A: FsAdapter> Aggregator<A> {
         }
     }
 
-    /// Closes the folders kept open longer than [`OPEN_DIR_MAX_AGE`], so
-    /// none blocks renames above it for long; their waiting subfolders open
-    /// by path.
-    fn close_old_dirs(&mut self) {
-        while let Some(front) = self.kept.front() {
-            match front.upgrade() {
-                Some(dir) if !dir.expired() => break,
-                Some(dir) => dir.close(),
-                None => {}
-            }
-            self.kept.pop_front();
-        }
-    }
-
     /// Whether only Git probes are left and none has answered for
     /// [`ScanConfig::git_grace`].
     fn git_stalled(&mut self) -> bool {
@@ -831,8 +720,6 @@ impl<A: FsAdapter> Aggregator<A> {
         let adapter = Arc::clone(&self.adapter);
         let shared = Arc::clone(&self.shared);
         let scope = Arc::clone(&self.scope);
-        let open_dirs = Arc::clone(&self.open_dirs);
-        let open_limit = self.config.open_dirs;
         std::thread::Builder::new()
             .name(format!("sb-scan-worker-{index}"))
             .spawn(move || {
@@ -841,19 +728,14 @@ impl<A: FsAdapter> Aggregator<A> {
                         Outcome::Skipped
                     } else {
                         match job {
-                            Job::List { dir, path, parent } => {
+                            Job::List { dir, path } => {
                                 // Each batch goes to the aggregator once the
                                 // next is read, so the last one travels with
                                 // the listing's end (most directories fit in
                                 // one). The cancel flag ends the listing.
-                                let mut held: Option<Vec<Entry>> = None;
+                                let mut held = None;
                                 let mut stopped = false;
-                                let parent_handle = parent.and_then(|p| p.get());
-                                let at = DirRef {
-                                    path: &path,
-                                    parent: parent_handle.as_deref(),
-                                };
-                                let result = adapter.list_dir(at, &mut |entries| {
+                                let result = adapter.read_dir(&path, &mut |entries| {
                                     if shared.cancel.load(Ordering::Relaxed) {
                                         stopped = true;
                                         return ControlFlow::Break(());
@@ -871,30 +753,14 @@ impl<A: FsAdapter> Aggregator<A> {
                                     }
                                     ControlFlow::Continue(())
                                 });
-                                drop(parent_handle);
-                                let entries = held.unwrap_or_default();
-                                // Kept only for the subdirectories in the
-                                // last batch; earlier ones open by path.
-                                let (result, open) = match result {
-                                    Ok(Some(handle))
-                                        if entries
-                                            .iter()
-                                            .any(|e| e.kind == EntryKind::Directory) =>
-                                    {
-                                        (Ok(()), OpenDir::keep(handle, &open_dirs, open_limit))
-                                    }
-                                    Ok(_) => (Ok(()), None),
-                                    Err(err) => (Err(err), None),
-                                };
                                 if stopped {
                                     Outcome::Stopped { dir }
                                 } else {
                                     Outcome::Listed {
                                         dir,
                                         path,
-                                        entries,
+                                        entries: held.unwrap_or_default(),
                                         result,
-                                        open,
                                     }
                                 }
                             }
@@ -915,10 +781,10 @@ impl<A: FsAdapter> Aggregator<A> {
             .expect("spawn scan worker");
     }
 
-    fn enqueue_list(&mut self, dir: NodeId, path: PathBuf, parent: Option<Arc<OpenDir>>) {
+    fn enqueue_list(&mut self, dir: NodeId, path: PathBuf) {
         self.outstanding += 1;
         self.pending_dirs += 1;
-        self.queue.push(Job::List { dir, path, parent });
+        self.queue.push(Job::List { dir, path });
     }
 
     fn enqueue_measure(&mut self, file: NodeId, path: PathBuf) {
@@ -940,7 +806,7 @@ impl<A: FsAdapter> Aggregator<A> {
         match outcome {
             Outcome::Batch { dir, path, entries } => {
                 self.partial.insert(dir);
-                self.apply_batch(dir, &path, entries, None, None);
+                self.apply_batch(dir, &path, entries, None);
                 self.revision += 1;
             }
             Outcome::Listed {
@@ -948,14 +814,10 @@ impl<A: FsAdapter> Aggregator<A> {
                 path,
                 entries,
                 result,
-                open,
             } => {
                 self.pending_dirs -= 1;
                 let partial = self.partial.remove(&dir) || !entries.is_empty();
                 let end = ListingEnd { result, partial };
-                if let Some(open) = &open {
-                    self.kept.push_back(Arc::downgrade(open));
-                }
                 // The last batch and the listing's end share one hold.
                 let probe = if entries.is_empty() {
                     if self.stop.is_some() {
@@ -965,7 +827,7 @@ impl<A: FsAdapter> Aggregator<A> {
                     let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
                     self.end_listing(&mut tree, dir, &path, end)
                 } else {
-                    self.apply_batch(dir, &path, entries, open.as_ref(), Some(end))
+                    self.apply_batch(dir, &path, entries, Some(end))
                 };
                 self.revision += 1;
                 if let Some((path, plan)) = probe {
@@ -1015,15 +877,13 @@ impl<A: FsAdapter> Aggregator<A> {
 
     /// Adds one batch of `dir`'s entries under one hold of the write lock,
     /// ending the listing there too when it's the last batch, then queues
-    /// the subdirectories (to open relative to `open` where given) and
-    /// re-measures it found. Returns the Git probe the listing's end asks
-    /// for.
+    /// the subdirectories and re-measures it found. Returns the Git probe
+    /// the listing's end asks for.
     fn apply_batch(
         &mut self,
         dir: NodeId,
         path: &Path,
         entries: Vec<Entry>,
-        open: Option<&Arc<OpenDir>>,
         end: Option<ListingEnd>,
     ) -> Option<(PathBuf, Plan)> {
         if self.stop.is_some() {
@@ -1131,7 +991,7 @@ impl<A: FsAdapter> Aggregator<A> {
             return None;
         }
         for (id, path) in subdirs {
-            self.enqueue_list(id, path, open.cloned());
+            self.enqueue_list(id, path);
         }
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);

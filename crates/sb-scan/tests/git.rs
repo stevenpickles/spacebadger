@@ -24,7 +24,6 @@ fn config() -> ScanConfig {
         sample_limit: 2,
         write_holds: None,
         git_grace: GIT_GRACE,
-        ..ScanConfig::default()
     }
 }
 

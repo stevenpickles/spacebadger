@@ -1,8 +1,8 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    DirHandle, DirRef, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
-    ScanError, Sink, batched, read_capped, refused,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
+    read_capped, refused,
 };
 use sb_core::git::paths::Style;
 use std::collections::BTreeMap;
@@ -62,37 +62,6 @@ pub struct FakeFs {
     reads: Arc<Mutex<Vec<PathBuf>>>,
     style: Arc<Mutex<Option<Style>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
-    /// Set by [`FakeFs::keep_dirs_open`].
-    dirs: Arc<Mutex<Option<DirStats>>>,
-}
-
-/// How [`FsAdapter::list_dir`] was used, once [`FakeFs::keep_dirs_open`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DirStats {
-    /// Listings given their open parent.
-    pub relative: usize,
-    /// Listings opened by path.
-    pub by_path: usize,
-    /// Listings given a parent that isn't theirs.
-    pub wrong_parent: usize,
-    /// Listed folders open now, and the most at once.
-    pub open: usize,
-    pub most_open: usize,
-}
-
-/// A fake open folder: its path, counted in [`DirStats::open`] until
-/// dropped.
-struct FakeDir {
-    path: PathBuf,
-    stats: Arc<Mutex<Option<DirStats>>>,
-}
-
-impl Drop for FakeDir {
-    fn drop(&mut self) {
-        if let Some(stats) = self.stats.lock().unwrap().as_mut() {
-            stats.open -= 1;
-        }
-    }
 }
 
 /// Releases a gated directory listing when dropped or sent to.
@@ -367,19 +336,6 @@ impl FakeFs {
     pub fn root(&self) -> PathBuf {
         PathBuf::from(Self::ROOT)
     }
-
-    /// Makes [`FsAdapter::list_dir`] return each listed folder open, as an
-    /// adapter that opens folders relative to their parent does, and count
-    /// how it's used (see [`FakeFs::dir_stats`]).
-    pub fn keep_dirs_open(&self) -> &Self {
-        *self.dirs.lock().unwrap() = Some(DirStats::default());
-        self
-    }
-
-    /// How folders were opened since [`FakeFs::keep_dirs_open`].
-    pub fn dir_stats(&self) -> DirStats {
-        self.dirs.lock().unwrap().unwrap_or_default()
-    }
 }
 
 impl FsAdapter for FakeFs {
@@ -424,39 +380,6 @@ impl FsAdapter for FakeFs {
             }
             Ok(())
         })
-    }
-
-    /// Once [`FakeFs::keep_dirs_open`], checks a given parent is the
-    /// folder's own and returns the folder open.
-    fn list_dir(
-        &self,
-        dir: DirRef<'_>,
-        sink: &mut Sink<'_>,
-    ) -> Result<Option<DirHandle>, ScanError> {
-        if self.dirs.lock().unwrap().is_none() {
-            return self.read_dir(dir.path, sink).map(|()| None);
-        }
-        let own_parent = dir.parent.map(|parent| {
-            parent
-                .downcast_ref::<FakeDir>()
-                .is_some_and(|p| Some(p.path.as_path()) == dir.path.parent())
-        });
-        if let Some(stats) = self.dirs.lock().unwrap().as_mut() {
-            match own_parent {
-                Some(true) => stats.relative += 1,
-                Some(false) => stats.wrong_parent += 1,
-                None => stats.by_path += 1,
-            }
-        }
-        self.read_dir(dir.path, sink)?;
-        if let Some(stats) = self.dirs.lock().unwrap().as_mut() {
-            stats.open += 1;
-            stats.most_open = stats.most_open.max(stats.open);
-        }
-        Ok(Some(Box::new(FakeDir {
-            path: dir.path.to_path_buf(),
-            stats: Arc::clone(&self.dirs),
-        })))
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {

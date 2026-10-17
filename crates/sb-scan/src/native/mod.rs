@@ -102,19 +102,15 @@ pub fn no_seek_penalty(root: &Path) -> bool {
     }
 }
 
-/// Scan settings suited to `root`: fewer workers for network shares; on
-/// local fixed disks, folders opened relative to their parent, and more
-/// workers when the disk has no seek penalty.
+/// Scan settings suited to `root`: fewer workers for network shares, more
+/// for local fixed disks without a seek penalty.
 pub fn scan_config(root: &Path) -> ScanConfig {
     let mut config = ScanConfig::default();
     if is_remote(root) {
         config.workers = config.workers.min(REMOTE_WORKERS);
-    } else if is_local_fixed(root) {
-        config.open_dirs = crate::engine::OPEN_DIRS;
-        if no_seek_penalty(root) {
-            let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-            config.workers = cores.clamp(LOCAL_WORKERS.0, LOCAL_WORKERS.1);
-        }
+    } else if is_local_fixed(root) && no_seek_penalty(root) {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        config.workers = cores.clamp(LOCAL_WORKERS.0, LOCAL_WORKERS.1);
     }
     config
 }
