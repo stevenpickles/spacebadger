@@ -15,6 +15,10 @@
 //! With a [`Search`], only matching files are listed, and folders only when
 //! they contain matches, with matching totals, as in the filtered map.
 //!
+//! CSV rows end with the item's Git class (`checkout`, `worktree`,
+//! `metadata`, or empty), and a report lists the Git repositories under the
+//! folder, with what's in repositories counted once, nested ones included.
+//!
 //! CSV follows RFC 4180: fields with commas, quotes, or line breaks are
 //! quoted, with quotes doubled, and rows end in CRLF. The file starts with a
 //! UTF-8 byte order mark, so spreadsheet apps read non-ASCII names
@@ -28,6 +32,7 @@
 //! tree only knows the time is before 1970 or after early 2106.
 
 use crate::filetype::FileType;
+use crate::git::{self, GitClass, Head, RootKind};
 use crate::layout::Metric;
 use crate::search::Search;
 use crate::tree::{NodeId, Tree};
@@ -258,7 +263,17 @@ pub struct Csv {
 
 /// The CSV header row.
 pub const CSV_HEADER: &str =
-    "Path,Name,Type,Size (bytes),Size,Files,File type,Share of folder (%),Modified\r\n";
+    "Path,Name,Type,Size (bytes),Size,Files,File type,Share of folder (%),Modified,Git\r\n";
+
+/// What the CSV's Git column says about content of a Git class.
+fn git_keyword(class: GitClass) -> &'static str {
+    match class {
+        GitClass::Other => "",
+        GitClass::Checkout => "checkout",
+        GitClass::Worktree => "worktree",
+        GitClass::Metadata => "metadata",
+    }
+}
 
 impl Csv {
     pub fn new(folder: NodeId, scope: Scope, metric: Metric) -> Self {
@@ -328,6 +343,12 @@ impl Csv {
             if let Some(secs) = known_modified(tree, node) {
                 push_field(out, &time(secs));
             }
+            out.push(',');
+            // Looked up through the folders above, as the path is; a scan
+            // without repositories skips that.
+            if !tree.git().is_empty() {
+                out.push_str(git_keyword(tree.git_class(node)));
+            }
             out.push_str("\r\n");
             *rows += 1;
         })
@@ -361,6 +382,9 @@ pub struct Report {
     /// The largest so far, smallest on top: (weight, earlier ID first).
     top_folders: BinaryHeap<Reverse<(u64, Reverse<NodeId>)>>,
     top_files: BinaryHeap<Reverse<(u64, Reverse<NodeId>)>>,
+    /// Weight of the files examined, by [`GitClass`]: each file counted
+    /// once, so nested repositories and shared metadata are too.
+    git_bytes: [u64; 4],
 }
 
 fn keep_top(heap: &mut BinaryHeap<Reverse<(u64, Reverse<NodeId>)>>, weight: u64, node: NodeId) {
@@ -383,6 +407,7 @@ impl Report {
             files: 0,
             top_folders: BinaryHeap::new(),
             top_files: BinaryHeap::new(),
+            git_bytes: [0; 4],
         }
     }
 
@@ -408,6 +433,8 @@ impl Report {
         let metric = self.walk.metric;
         let (folders, files) = (&mut self.folders, &mut self.files);
         let (top_folders, top_files) = (&mut self.top_folders, &mut self.top_files);
+        let git_bytes = &mut self.git_bytes;
+        let repositories = !tree.git().is_empty();
         self.walk.step(tree, filter, budget, |node| {
             let weight = metric.weight_in(tree, filter, node);
             if tree.is_dir(node) {
@@ -419,6 +446,9 @@ impl Report {
                 *files += 1;
                 if weight > 0 {
                     keep_top(top_files, weight, node);
+                    if repositories {
+                        git_bytes[tree.git_class(node) as usize] += weight;
+                    }
                 }
             }
         })
@@ -528,6 +558,61 @@ impl Report {
             }
         }
 
+        // Repositories at or under the folder: the one around the scan
+        // root, if any, isn't.
+        let mut roots: Vec<(NodeId, u64)> = if tree.git().is_empty() {
+            Vec::new()
+        } else {
+            git::summarize(tree, filter, metric)
+                .0
+                .into_iter()
+                .filter(|r| !r.outside && within(tree, r.node, folder))
+                .map(|r| (r.node, r.matching.unwrap_or(r.size)))
+                .filter(|&(_, size)| filter.is_none() || size > 0)
+                .collect()
+        };
+        if !roots.is_empty() {
+            // Matching sizes can order them differently.
+            roots.sort_by_key(|&(n, size)| (Reverse(size), n));
+            let all = roots.len();
+            roots.truncate(REPORT_TOP);
+            line("");
+            line(&format!(
+                "Git repositories ({} of {})",
+                format_count(roots.len() as u64),
+                format_count(all as u64)
+            ));
+            line(&format!(
+                "{:>10}  {:<16}  {:<20}  Path",
+                "Size", "Kind", "Branch"
+            ));
+            for &(n, size) in &roots {
+                let entry = tree.git_entry(n);
+                let kind = entry.map_or("", |r| kind_label(r.kind));
+                let head = entry
+                    .and_then(|r| r.head.as_ref())
+                    .map_or(String::new(), |h| match h {
+                        Head::Branch(name) | Head::Ref(name) => name.clone(),
+                        Head::Detached(commit) => format!("detached at {commit}"),
+                    });
+                let mut text = format!(
+                    "{:>10}  {kind:<16}  {head:<20}  {}",
+                    format_bytes(size, kilo),
+                    tree.path(n).to_string_lossy()
+                );
+                if let Some(problem) = entry.and_then(|r| r.problem.as_ref()) {
+                    let _ = write!(text, " ({problem})");
+                }
+                line(&text);
+            }
+            let [_, checkout, worktree, metadata] = self.git_bytes;
+            line(&format!(
+                "In Git repositories: {} (Git data {}), nested repositories counted once.",
+                format_bytes(checkout + worktree + metadata, kilo),
+                format_bytes(metadata, kilo)
+            ));
+        }
+
         line("");
         line("Not counted (whole scan)");
         if info.not_counted.is_empty() {
@@ -539,6 +624,32 @@ impl Report {
         }
         out.write_all(text.as_bytes())?;
         Ok(listed)
+    }
+}
+
+/// Whether `node` is `folder` or inside it.
+fn within(tree: &Tree, node: NodeId, folder: NodeId) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if n == folder {
+            return true;
+        }
+        cur = tree.parent(n);
+    }
+    false
+}
+
+/// A listed Git root's kind, for reading.
+fn kind_label(kind: RootKind) -> &'static str {
+    match kind {
+        RootKind::Repository => "repository",
+        RootKind::LinkedWorktree => "linked worktree",
+        RootKind::Submodule => "submodule",
+        RootKind::SeparateGitDir => "separate Git dir",
+        RootKind::Bare => "bare repository",
+        RootKind::GitDir => "Git directory",
+        RootKind::Unresolved => "unresolved",
+        RootKind::Pending | RootKind::DotGit | RootKind::WorktreeAdmin => "",
     }
 }
 
@@ -673,7 +784,8 @@ mod tests {
                 "".into(),
                 "image".into(),
                 "62.50".into(),
-                "2023-11-14T22:13:20Z".into()
+                "2023-11-14T22:13:20Z".into(),
+                "".into()
             ]
         );
         assert_eq!(
@@ -687,6 +799,7 @@ mod tests {
                 "2".into(),
                 "".into(),
                 "31.25".into(),
+                "".into(),
                 "".into()
             ]
         );
@@ -847,6 +960,136 @@ mod tests {
         assert!(text.contains(&path(&["f69"])));
         assert!(!text.contains(&format!("{}\n", path(&["f19"]))));
         assert!(text.contains("Nothing was left out."));
+    }
+
+    /// root/
+    ///   app/ repository on main (src/main.rs 300, .git/pack 100,
+    ///        lib/ nested repository (lib.rs 50, .git file 10))
+    ///   wt/ linked worktree, detached (a.txt 70)
+    ///   broken/ unresolved (x.txt 5)
+    ///   loose.txt 1000
+    fn repos() -> (Tree, [NodeId; 4]) {
+        use crate::git::{GitRoot, Problem};
+        let mut t = Tree::new(std::path::Path::new("root"));
+        let app = dir(&mut t, NodeId::ROOT, "app");
+        let src = dir(&mut t, app, "src");
+        file(&mut t, src, "main.rs", 300);
+        let dot = dir(&mut t, app, ".git");
+        file(&mut t, dot, "pack", 100);
+        let lib = dir(&mut t, app, "lib");
+        file(&mut t, lib, "lib.rs", 50);
+        let pointer = file(&mut t, lib, ".git", 10);
+        let wt = dir(&mut t, NodeId::ROOT, "wt");
+        file(&mut t, wt, "a.txt", 70);
+        let broken = dir(&mut t, NodeId::ROOT, "broken");
+        file(&mut t, broken, "x.txt", 5);
+        file(&mut t, NodeId::ROOT, "loose.txt", 1000);
+        t.set_git(GitRoot {
+            head: Some(Head::Branch("main".into())),
+            ..GitRoot::new(app, RootKind::Repository)
+        });
+        t.set_git(GitRoot::new(dot, RootKind::DotGit));
+        t.set_git(GitRoot::new(lib, RootKind::Repository));
+        t.set_git(GitRoot::new(pointer, RootKind::DotGit));
+        t.set_git(GitRoot {
+            head: Some(Head::Detached("0123456789ab".into())),
+            ..GitRoot::new(wt, RootKind::LinkedWorktree)
+        });
+        t.set_git(GitRoot::unresolved(broken, Problem::NotGit));
+        (t, [app, lib, wt, broken])
+    }
+
+    #[test]
+    fn csv_rows_end_with_the_git_class() {
+        let (t, _) = repos();
+        let text = csv(&t, None, NodeId::ROOT, Scope::Everything);
+        assert!(text.contains(",Modified,Git\r\n"));
+        let git: Vec<(String, String)> = rows(&text)
+            .into_iter()
+            .map(|r| (r[1].clone(), r[9].clone()))
+            .collect();
+        let of = |name: &str| {
+            let found: Vec<&str> = git
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, g)| g.as_str())
+                .collect();
+            found.join("|")
+        };
+        assert_eq!(of("loose.txt"), "");
+        assert_eq!(of("app"), "checkout");
+        assert_eq!(of("main.rs"), "checkout");
+        assert_eq!(of("pack"), "metadata");
+        assert_eq!(of(".git"), "metadata|metadata", "the folder and the file");
+        assert_eq!(of("lib.rs"), "checkout");
+        assert_eq!(of("a.txt"), "worktree");
+        assert_eq!(of("broken"), "", "unresolved has no class of its own");
+        assert_eq!(of("x.txt"), "");
+    }
+
+    #[test]
+    fn report_lists_git_repositories_counting_each_byte_once() {
+        let (t, [app, ..]) = repos();
+        let report = |folder, filter: Option<&Search>| {
+            let mut report = Report::new(folder, Metric::Logical).with_kilo(1024);
+            while !report.step(&t, filter, 3) {}
+            let mut out = Vec::new();
+            report
+                .write(&t, filter, &ReportInfo::default(), &mut out)
+                .unwrap();
+            String::from_utf8(out).unwrap().replace("\r\n", "\n")
+        };
+        let text = report(NodeId::ROOT, None);
+        assert!(text.contains("Git repositories (4 of 4)\n"), "{text}");
+        assert!(text.contains("      Size  Kind              Branch                Path\n"));
+        assert!(text.contains(&format!(
+            "     460 B  repository        main                  {}\n",
+            path(&["app"])
+        )));
+        assert!(text.contains(&format!(
+            "      70 B  linked worktree   detached at 0123456789ab  {}\n",
+            path(&["wt"])
+        )));
+        assert!(text.contains(&format!(
+            "       5 B  unresolved                              {} (folder named .git without Git data)\n",
+            path(&["broken"])
+        )));
+        let app_at = text.find(&path(&["app"])).unwrap();
+        let lib_at = text
+            .find(&format!("  {}\n", path(&["app", "lib"])))
+            .unwrap();
+        assert!(app_at < lib_at, "largest first");
+        // app (460, its nested lib included) and wt (70), each byte once;
+        // Git data is app's .git (100) and lib's .git file (10).
+        assert!(text.contains(
+            "In Git repositories: 530 B (Git data 110 B), nested repositories counted once.\n"
+        ));
+
+        // Only the repositories under the folder.
+        let text = report(app, None);
+        assert!(text.contains("Git repositories (2 of 2)\n"), "{text}");
+        assert!(!text.contains(&path(&["wt"])));
+        assert!(text.contains("In Git repositories: 460 B (Git data 110 B)"));
+
+        // With a filter, matching sizes, and only roots with matches.
+        let mut s = Search::new(Matcher::new("*.rs").unwrap());
+        assert!(s.catch_up(&t, usize::MAX));
+        let text = report(NodeId::ROOT, Some(&s));
+        assert!(text.contains("Git repositories (2 of 2)\n"), "{text}");
+        assert!(text.contains(&format!(
+            "     350 B  repository        main                  {}\n",
+            path(&["app"])
+        )));
+        assert!(text.contains("In Git repositories: 350 B (Git data 0 B)"));
+
+        // Nothing about Git without repositories.
+        let plain = sample();
+        let mut r = Report::new(NodeId::ROOT, Metric::Logical);
+        assert!(r.step(&plain, None, usize::MAX));
+        let mut out = Vec::new();
+        r.write(&plain, None, &ReportInfo::default(), &mut out)
+            .unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("Git"));
     }
 
     #[test]
