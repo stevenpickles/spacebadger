@@ -390,6 +390,7 @@ pub(super) fn current<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sb_core::git::RootKind;
     use sb_core::search::Matcher;
     use sb_core::tree::{DirState, NodeId};
     use sb_protocol as proto;
@@ -711,73 +712,78 @@ mod tests {
         assert!(session.search_summary(new).is_err(), "cleared");
     }
 
-    /// A scan of repository `a` (300 files) and `b` (30,000 files, more
-    /// than a step), `b` listed once its gate is released; `d`, empty, and
-    /// `c` listed once theirs are. Nothing is classified until a test
-    /// records Git entries itself, as the scanner's probes would.
-    fn repos() -> (Session, Gate, Gate, Gate) {
+    /// Gates holding back parts of [`repos`]' scan.
+    struct Held {
+        /// Reading `a/.git/HEAD`: `a` stays a candidate until released.
+        a_head: Gate,
+        /// Listing `b`.
+        b: Gate,
+        /// Reading `b/.git/HEAD`.
+        b_head: Gate,
+        /// Listing `c`, so the scan doesn't finish until released.
+        c: Gate,
+    }
+
+    /// A scan of two Git repositories detection finds as it would on disk:
+    /// `a` (300 files in its checkout) and `b` (30,000, more than a step),
+    /// listed once its gate is released. Each is confirmed only once its
+    /// `HEAD` can be read, as a revision of its own, after its files were
+    /// examined. Returns once `a` is listed and still a candidate.
+    fn repos() -> (Session, Held) {
         let fs = FakeFs::new();
+        for repo in ["a", "b"] {
+            fs.text(&format!("{repo}/.git/HEAD"), "ref: refs/heads/main\n")
+                .text(&format!("{repo}/.git/config"), "[core]\n")
+                .file(&format!("{repo}/.git/objects/pack/p.pack"), 500, 4096)
+                .dir(&format!("{repo}/.git/refs/heads"));
+        }
         for i in 0..300 {
             fs.file(&format!("a/src/{i}.rs"), 10 + i, 4096);
         }
-        fs.file("a/.git/HEAD", 23, 4096);
         for i in 0..30_000 {
             fs.file(&format!("b/{i}.txt"), i, 4096);
         }
-        fs.file("b/.git/HEAD", 23, 4096);
-        fs.dir("d");
         fs.file("c/last.txt", 7, 4096);
-        let b = fs.gate_dir("b");
-        let c = fs.gate_dir("c");
-        let d = fs.gate_dir("d");
+        let held = Held {
+            a_head: fs.gate_read("a/.git/HEAD"),
+            b: fs.gate_dir("b"),
+            b_head: fs.gate_read("b/.git/HEAD"),
+            c: fs.gate_dir("c"),
+        };
+        // Enough workers that the ones waiting at the gates leave some free.
         let config = ScanConfig {
-            workers: 5,
+            workers: 6,
             progress_interval: Duration::from_millis(1),
             ..ScanConfig::default()
         };
         let session = Session::start_on(fs.root(), fs, config, None, None, |_| {});
-        until("a's files are in", || {
-            let tree = session.scan.tree();
-            let tree = tree.read().unwrap();
-            tree.children(NodeId::ROOT).any(|a| {
-                tree.name(a) == "a"
-                    && tree
-                        .children(a)
-                        .all(|c| tree.dir_state(c) == DirState::Listed)
-                    && tree.file_count(a) == 301
-            })
+        until("a is listed, a candidate", || {
+            repo_kind(&session, "a") == Some(RootKind::Pending) && listed(&session, "a") && {
+                let tree = session.scan.tree();
+                let tree = tree.read().unwrap();
+                tree.file_count(
+                    tree.children(NodeId::ROOT)
+                        .find(|&c| tree.name(c) == "a")
+                        .unwrap(),
+                ) == 303
+            }
         });
-        (session, b, c, d)
+        (session, held)
     }
 
-    /// Records `folder` (in the root) as a repository candidate and then,
-    /// in a second hold of the tree's write lock, it and its `.git` folder
-    /// as a confirmed repository, as the scanner does when it sees a `.git`
-    /// folder and later gets its probe's finding; the scan's next status
-    /// carries them.
-    fn found_repository(session: &Session, folder: &str) {
-        use sb_core::git::{GitRoot, RootKind};
+    /// The kind of Git entry the folder `name` in the root has.
+    fn repo_kind(session: &Session, name: &str) -> Option<RootKind> {
         let tree = session.scan.tree();
-        let repo = {
-            let mut tree = tree.write().unwrap();
-            let repo = tree
-                .children(NodeId::ROOT)
-                .find(|&c| tree.name(c) == folder)
-                .unwrap();
-            tree.set_git(GitRoot::pending(repo));
-            repo
-        };
-        let mut tree = tree.write().unwrap();
-        let dot = tree.children(repo).find(|&c| tree.name(c) == ".git");
-        tree.set_git(GitRoot::new(repo, RootKind::Repository));
-        if let Some(dot) = dot {
-            tree.set_git(GitRoot::new(dot, RootKind::DotGit));
-        }
+        let tree = tree.read().unwrap();
+        let folder = tree
+            .children(NodeId::ROOT)
+            .find(|&c| tree.name(c) == name)?;
+        tree.git_entry(folder).map(|r| r.kind)
     }
 
     #[test]
     fn repositories_found_while_scanning_reclassify_files_already_filtered() {
-        let (session, b, c, d) = repos();
+        let (session, held) = repos();
         let query = "git:repo; !git:metadata";
         let id = session.search_set(query).unwrap().unwrap().search;
         assert_eq!(session.search_summary(id).unwrap().files, 0);
@@ -806,26 +812,36 @@ mod tests {
             });
 
             // a was examined before it was known to be a repository.
-            found_repository(&session, "a");
-            b.release();
-            until("b is listed", || listed(&session, "b"));
+            held.a_head.release();
+            until("a is confirmed", || {
+                repo_kind(&session, "a") == Some(RootKind::Repository)
+            });
             until("a's files join", || {
                 totals(&session.search_summary(id).unwrap()) == fresh(&session, query)
             });
             assert_eq!(session.search_summary(id).unwrap().files, 300);
 
-            // b, 30,000 files examined over several steps, is found to be a
-            // repository; the next status (d listed, nothing new) carries it.
-            found_repository(&session, "b");
-            d.release();
-            until("d is listed", || listed(&session, "d"));
+            // b's 30,000 files are examined over several steps while it's a
+            // candidate, then it's confirmed by a revision with nothing else.
+            held.b.release();
+            until("b is listed, a candidate", || {
+                listed(&session, "b") && repo_kind(&session, "b") == Some(RootKind::Pending)
+            });
+            until("b's files are examined", || {
+                totals(&session.search_summary(id).unwrap()) == fresh(&session, query)
+            });
+            assert_eq!(session.search_summary(id).unwrap().files, 300);
+            held.b_head.release();
+            until("b is confirmed", || {
+                repo_kind(&session, "b") == Some(RootKind::Repository)
+            });
             until("b's files join", || {
                 totals(&session.search_summary(id).unwrap()) == fresh(&session, query)
             });
             assert_eq!(session.search_summary(id).unwrap().files, 30_300);
             assert!(!finished(&session), "caught up while scanning");
 
-            c.release();
+            held.c.release();
             until("the scan finishes", || finished(&session));
             stop.store(true, Ordering::Relaxed);
             assert!(reader.join().unwrap() > 0);
@@ -837,30 +853,39 @@ mod tests {
 
     #[test]
     fn says_when_the_filter_caught_up_after_only_git_data_changed() {
-        let (session, b, _c, d) = repos();
-        b.release();
-        until("b is listed", || listed(&session, "b"));
+        let (session, gates) = repos();
+        gates.a_head.release();
+        gates.b.release();
+        until("a is confirmed and b listed, a candidate", || {
+            repo_kind(&session, "a") == Some(RootKind::Repository)
+                && listed(&session, "b")
+                && repo_kind(&session, "b") == Some(RootKind::Pending)
+        });
         let (sink, updates) = std::sync::mpsc::channel();
         session.on_filter_updated(move |u| {
             let _ = sink.send(u);
         });
         let id = session.search_set("git:repo").unwrap().unwrap().search;
+        until("the job catches up", || {
+            totals(&session.search_summary(id).unwrap()) == fresh(&session, "git:repo")
+        });
+        let before = session.search_summary(id).unwrap().files;
+        assert_eq!(before, 300 + 3, "a's checkout and Git data");
         let held = &session.filter.steps_left;
         held.store(0, Ordering::SeqCst);
-        // b becomes a repository, and the status after it adds nothing
-        // else: d is empty. Then the scan stalls on c.
-        found_repository(&session, "b");
-        d.release();
+        // b's probe answers: a revision that only changes Git data. Then
+        // the scan stalls on c.
+        gates.b_head.release();
         until("the last status reaches the job", || {
             let p = session.scan.progress();
-            listed(&session, "d")
+            repo_kind(&session, "b") == Some(RootKind::Repository)
                 && p.pending_dirs == 1
                 && session.filter.nudged.load(Ordering::SeqCst) == p.revision
         });
         let last = session.scan.progress().revision;
         let behind = session.search_summary(id).unwrap();
         assert!(behind.revision < last);
-        assert_eq!(behind.files, 0);
+        assert_eq!(behind.files, before);
         assert!(session.filter.read_behind.load(Ordering::SeqCst));
         held.store(usize::MAX, Ordering::SeqCst);
         let u = updates
@@ -873,7 +898,7 @@ mod tests {
         );
         assert_eq!((u.search, u.revision), (id, last));
         let now = session.search_summary(id).unwrap();
-        assert_eq!((now.files, now.revision), (30_001, last));
+        assert_eq!((now.files, now.revision), (before + 30_003, last));
         assert_eq!(totals(&now), fresh(&session, "git:repo"));
     }
 
