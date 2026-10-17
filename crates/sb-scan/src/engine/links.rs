@@ -291,9 +291,11 @@ impl Links {
     /// What a re-measure of `file` that found `id` (`Some`), or failed
     /// (`None`), means. A re-measure after the listings applies to every
     /// name of the file only when it found the file's ID; if it found
-    /// another file (the name was replaced since it was listed, or IDs on
-    /// that filesystem aren't unique) or none, it applies to the measured
-    /// name alone and the other names are re-measured one by one. If it
+    /// another file (the name was replaced since it was listed) or none, it
+    /// applies to the measured name alone and the other names are
+    /// re-measured one by one. Distinct files sharing an ID (a filesystem
+    /// whose IDs aren't unique) pass the check, as they already share one
+    /// allocation as one file's names. If it
     /// failed, the file's next name is tried. A failure otherwise keeps the
     /// listings' values.
     pub(super) fn measured(&mut self, file: NodeId, id: Option<Option<u128>>) -> Measuring {

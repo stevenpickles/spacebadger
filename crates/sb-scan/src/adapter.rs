@@ -98,9 +98,10 @@ pub struct Measured {
     pub allocated: Option<u64>,
     /// The file's identity as [`Identity::MaybeShared`] gives it, read from
     /// the same handle or call as the sizes, so a re-measure meant for every
-    /// name of one file can tell the name led somewhere else (replaced
-    /// since it was listed, or a filesystem whose IDs aren't unique);
-    /// `None` when unknown.
+    /// name of one file can tell the name now leads to another file (it was
+    /// replaced since it was listed); `None` when unknown. It can't tell
+    /// distinct files that share an ID apart (some shares and NAS boxes),
+    /// which are counted as one file's names anyway.
     pub id: Option<u128>,
 }
 
