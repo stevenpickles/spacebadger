@@ -167,8 +167,7 @@ fn a_prior_given_late_reorders_the_folders_already_queued() {
         .iter()
         .map(|p| p.strip_prefix(fs.root()).unwrap().display().to_string())
         .collect();
-    // Their modified times are gone by then, so e is just big.
-    assert_eq!(order, ["c", "d", "b", "e", "a", "f"]);
+    assert_eq!(order, ["e", "c", "d", "b", "a", "f"]);
 }
 
 #[test]

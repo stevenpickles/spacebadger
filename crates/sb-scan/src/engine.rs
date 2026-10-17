@@ -544,9 +544,21 @@ struct ListingEnd {
 
 /// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
 enum Job {
-    List { dir: NodeId, path: PathBuf },
-    Measure { file: NodeId, path: PathBuf },
-    Git { path: PathBuf, plan: Plan },
+    /// Lists folder `dir`, last modified at `modified` as its parent's
+    /// listing said (kept to order the listing by, see [`Queue::reorder`]).
+    List {
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+    },
+    Measure {
+        file: NodeId,
+        path: PathBuf,
+    },
+    Git {
+        path: PathBuf,
+        plan: Plan,
+    },
 }
 
 enum Outcome {
@@ -663,15 +675,16 @@ impl Queue {
         jobs.fifo.clear();
     }
 
-    /// Moves the listings waiting in order found to which `priority` puts
-    /// ahead (see [`Queue::push`]), keeping their order among equals.
-    fn reorder(&self, mut priority: impl FnMut(NodeId) -> u32) {
+    /// Moves the listings waiting in order found to which `priority` (of
+    /// the folder and its modified time) puts ahead (see [`Queue::push`]),
+    /// keeping their order among equals.
+    fn reorder(&self, mut priority: impl FnMut(NodeId, Option<SystemTime>) -> u32) {
         let mut jobs = self.state.lock().unwrap();
         let jobs = &mut *jobs;
         let waiting = std::mem::take(&mut jobs.fifo);
         for job in waiting {
             let p = match &job {
-                Job::List { dir, .. } => priority(*dir),
+                Job::List { dir, modified, .. } => priority(*dir, *modified),
                 _ => 0,
             };
             if p >= BIG_SHARE {
@@ -791,7 +804,7 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         drop(tx);
 
-        self.enqueue_list(NodeId::ROOT, self.root.clone(), 0);
+        self.enqueue_list(NodeId::ROOT, self.root.clone(), None, 0);
         self.enqueue_git(self.root.clone(), Plan::Ancestors);
         loop {
             if self.cancelled() {
@@ -873,7 +886,7 @@ impl<A: FsAdapter> Aggregator<A> {
                         Outcome::Skipped
                     } else {
                         match job {
-                            Job::List { dir, path } => {
+                            Job::List { dir, path, .. } => {
                                 // Each batch goes to the aggregator once the
                                 // next is read, so the last one travels with
                                 // the listing's end (most directories fit in
@@ -928,10 +941,21 @@ impl<A: FsAdapter> Aggregator<A> {
 
     /// Queues `dir`'s listing, ahead of others by `priority` (see
     /// [`listing_priority`]).
-    fn enqueue_list(&mut self, dir: NodeId, path: PathBuf, priority: u32) {
+    fn enqueue_list(
+        &mut self,
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        priority: u32,
+    ) {
         self.outstanding += 1;
         self.pending_dirs += 1;
-        self.queue.push(Job::List { dir, path }, priority);
+        let job = Job::List {
+            dir,
+            path,
+            modified,
+        };
+        self.queue.push(job, priority);
     }
 
     fn enqueue_measure(&mut self, file: NodeId, path: PathBuf) {
@@ -1112,12 +1136,11 @@ impl<A: FsAdapter> Aggregator<A> {
             None
         };
         // A prior handed over once the scan has begun orders the listings
-        // already queued too, as far as it can without their folders'
-        // modified times: new folders first, then the big ones.
+        // already queued too.
         if let (Some(since), false) = (since, self.ordered) {
             self.ordered = true;
             self.queue
-                .reorder(|dir| listing_priority(&tree, dir, None, since));
+                .reorder(|dir, modified| listing_priority(&tree, dir, modified, since));
         }
         let mut unreadable = false;
         for (entry, known) in entries.into_iter().zip(known) {
@@ -1147,7 +1170,7 @@ impl<A: FsAdapter> Aggregator<A> {
                     let priority = since.map_or(0, |since| {
                         listing_priority(&tree, id, entry.modified, since)
                     });
-                    subdirs.push((id, path.join(&entry.name), priority));
+                    subdirs.push((id, path.join(&entry.name), entry.modified, priority));
                 })
             } else {
                 let sizes = FileSizes {
@@ -1200,8 +1223,8 @@ impl<A: FsAdapter> Aggregator<A> {
         if self.stop.is_some() {
             return None;
         }
-        for (id, path, priority) in subdirs {
-            self.enqueue_list(id, path, priority);
+        for (id, path, modified, priority) in subdirs {
+            self.enqueue_list(id, path, modified, priority);
         }
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);
@@ -1374,6 +1397,7 @@ mod tests {
         Job::List {
             dir: NodeId::from_index(n),
             path: PathBuf::from(n.to_string()),
+            modified: None,
         }
     }
 
