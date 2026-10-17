@@ -16,11 +16,9 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxFs as NativeFs;
 #[cfg(all(unix, not(target_os = "linux")))]
-pub use unix::Listing;
-#[cfg(all(unix, not(target_os = "linux")))]
 pub use unix::UnixFs as NativeFs;
-#[cfg(target_os = "macos")]
-pub use unix::readdir_fallbacks;
+#[cfg(all(unix, not(target_os = "linux")))]
+pub use unix::{Fallbacks, Listing};
 #[cfg(windows)]
 pub use windows::WindowsFs as NativeFs;
 

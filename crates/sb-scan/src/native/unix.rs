@@ -17,7 +17,7 @@
 //! compares them). Entries the bulk call can't describe exactly as `lstat`
 //! does (firmlinks, mount points, autofs triggers, missing attributes) are
 //! `lstat`ed, and a filesystem that refuses the call (`ENOTSUP`, `EINVAL`) is
-//! listed with `readdir`. Setting `SB_MACOS_LISTING=readdir` forces the
+//! listed with `readdir`. [`UnixFs::fallbacks`] counts both. Setting `SB_MACOS_LISTING=readdir` forces the
 //! `readdir` listing, for comparison. Neither listing opens a file.
 //!
 //! On macOS the process I/O policy is set so dataless (cloud-only) files are
@@ -34,6 +34,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "macos")]
 mod bulk;
@@ -94,23 +95,23 @@ impl Listing {
     }
 }
 
-/// Folders listed with `readdir` because the filesystem refused
-/// `getattrlistbulk`, in this process.
-#[cfg(target_os = "macos")]
-static READDIR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How many folders this process listed with `readdir` because the
-/// filesystem refused `getattrlistbulk`; for tests.
-#[cfg(target_os = "macos")]
-#[doc(hidden)]
-pub fn readdir_fallbacks() -> u64 {
-    READDIR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+/// How often an adapter's bulk listing (macOS) fell back to the slower way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fallbacks {
+    /// Folders listed with `readdir`: the filesystem refused
+    /// `getattrlistbulk`, or gave a record without a name first.
+    pub folders: u64,
+    /// Entries `lstat`ed: firmlinks, mount points, autofs triggers, errors
+    /// and records missing an attribute.
+    pub entries: u64,
 }
 
 /// Portable Unix adapter. Create one per scan.
 pub struct UnixFs {
     root_dev: OnceLock<u64>,
     listing: Listing,
+    readdir_folders: AtomicU64,
+    lstat_entries: AtomicU64,
 }
 
 impl Default for UnixFs {
@@ -129,6 +130,16 @@ impl UnixFs {
         Self {
             root_dev: OnceLock::new(),
             listing,
+            readdir_folders: AtomicU64::new(0),
+            lstat_entries: AtomicU64::new(0),
+        }
+    }
+
+    /// How often this adapter's bulk listing fell back so far.
+    pub fn fallbacks(&self) -> Fallbacks {
+        Fallbacks {
+            folders: self.readdir_folders.load(Ordering::Relaxed),
+            entries: self.lstat_entries.load(Ordering::Relaxed),
         }
     }
 }
@@ -168,10 +179,10 @@ impl FsAdapter for UnixFs {
         batched(sink, |out| {
             #[cfg(target_os = "macos")]
             if self.listing == Listing::Bulk {
-                match bulk::list(dir, root_dev, out)? {
+                match bulk::list(dir, root_dev, &self.lstat_entries, out)? {
                     bulk::Listed::Done => return Ok(()),
                     bulk::Listed::Unsupported => {
-                        READDIR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.readdir_folders.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
