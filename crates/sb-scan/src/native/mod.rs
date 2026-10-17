@@ -17,6 +17,8 @@ mod windows;
 pub use linux::LinuxFs as NativeFs;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub use unix::UnixFs as NativeFs;
+#[cfg(all(unix, not(target_os = "linux")))]
+pub use unix::{Fallbacks, Listing};
 #[cfg(windows)]
 pub use windows::WindowsFs as NativeFs;
 

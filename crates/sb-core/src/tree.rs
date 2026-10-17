@@ -892,11 +892,16 @@ pub fn unix_object_id(inode: u64, birth_secs: Option<i64>) -> u128 {
 /// platform and filesystem keep one (`statx` on Linux, `st_birthtime` on
 /// macOS), for [`unix_object_id`].
 pub fn birth_secs(meta: &std::fs::Metadata) -> Option<i64> {
-    let created = meta.created().ok()?;
-    Some(match created.duration_since(UNIX_EPOCH) {
+    meta.created().ok().map(birth_secs_of)
+}
+
+/// [`birth_secs`] of a birth time read some other way (macOS
+/// `getattrlistbulk`).
+pub fn birth_secs_of(created: SystemTime) -> i64 {
+    match created.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_secs() as i64,
         Err(before) => -(before.duration().as_secs_f64().ceil() as i64),
-    })
+    }
 }
 
 /// Eight bytes standing for a filesystem object's ID (a file ID with
