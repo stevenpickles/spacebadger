@@ -1,8 +1,10 @@
 //! In-memory filesystem for exercising the engine without touching disk.
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink, batched,
+    Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured, RootKind, ScanError,
+    Sink, batched, read_capped, refused,
 };
+use sb_core::git::paths::Style;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,11 @@ enum Node {
         identity: Identity,
         cloud: bool,
         modified: Option<SystemTime>,
+        /// The listed times of a linked name; see [`FakeFs::stamped_link`].
+        stamp: Option<LinkStamp>,
+        /// What [FsAdapter::read_small] returns; zeros of the logical size
+        /// when not given.
+        contents: Option<Arc<[u8]>>,
     },
     Other(EntryKind),
 }
@@ -51,6 +58,21 @@ pub struct FakeFs {
     /// Listings that block after this many entries.
     late_gates: Arc<Mutex<BTreeMap<PathBuf, (usize, GateReceiver)>>>,
     measured: Arc<Mutex<BTreeMap<PathBuf, Measured>>>,
+    measure_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
+    /// IDs `measure_file` gives instead of the listed file's.
+    measured_ids: Arc<Mutex<BTreeMap<PathBuf, Option<u128>>>>,
+    measure_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Every path given to `measure_file`, in order.
+    measures: Arc<Mutex<Vec<PathBuf>>>,
+    read_errors: Arc<Mutex<BTreeMap<PathBuf, ScanError>>>,
+    read_gates: Arc<Mutex<BTreeMap<PathBuf, GateReceiver>>>,
+    /// Every path given to `read_small` or `stat_kind`, in order.
+    reads: Arc<Mutex<Vec<PathBuf>>>,
+    /// Every folder given to `read_dir`, in order.
+    listings: Arc<Mutex<Vec<PathBuf>>>,
+    /// Folders' modified times, as their parents' listings give them.
+    dir_modified: Arc<Mutex<BTreeMap<PathBuf, SystemTime>>>,
+    style: Arc<Mutex<Option<Style>>>,
     root_kind: Arc<Mutex<Option<RootKind>>>,
 }
 
@@ -103,7 +125,11 @@ impl FakeFs {
     }
 
     fn insert(&self, path: &str, node: Node) -> &Self {
-        let abs = Self::abs(path);
+        self.insert_abs(Self::abs(path), node)
+    }
+
+    /// Adds `node` at `abs` with any missing folders above it.
+    fn insert_abs(&self, abs: PathBuf, node: Node) -> &Self {
         let mut nodes = self.nodes.lock().unwrap();
         let mut ancestor = abs.parent();
         while let Some(a) = ancestor {
@@ -130,6 +156,8 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                stamp: None,
+                contents: None,
             },
         )
     }
@@ -143,6 +171,8 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: false,
                 modified: None,
+                stamp: None,
+                contents: None,
             },
         )
     }
@@ -156,6 +186,8 @@ impl FakeFs {
                 identity: Identity::Unique,
                 cloud: true,
                 modified: None,
+                stamp: None,
+                contents: None,
             },
         )
     }
@@ -170,16 +202,103 @@ impl FakeFs {
                 identity: Identity::MaybeShared { key },
                 cloud: false,
                 modified: None,
+                stamp: None,
+                contents: None,
             },
         )
     }
 
-    /// Sets the modified time of the file at `path`, added earlier.
+    /// A name of a file sharing `key` with other names, listed with
+    /// `stamp` as a Windows listing gives it: names of one file listed with
+    /// the same sizes and stamp are taken as listed, and a difference makes
+    /// the scan re-measure the file once.
+    pub fn stamped_link(
+        &self,
+        path: &str,
+        logical: u64,
+        allocated: u64,
+        key: u128,
+        stamp: LinkStamp,
+    ) -> &Self {
+        self.insert(
+            path,
+            Node::File {
+                logical,
+                allocated: Some(allocated),
+                identity: Identity::MaybeShared { key },
+                cloud: false,
+                modified: None,
+                stamp: Some(stamp),
+                contents: None,
+            },
+        )
+    }
+
+    /// A small file holding `text`, which [`FsAdapter::read_small`] returns;
+    /// its size is the text's.
+    pub fn text(&self, path: &str, text: &str) -> &Self {
+        self.insert_abs(Self::abs(path), Self::text_node(text))
+    }
+
+    /// A file holding `text` at the absolute `path` outside [`FakeFs::ROOT`]:
+    /// something a scan may read (a Git directory elsewhere) but never lists.
+    pub fn outside_text(&self, path: &str, text: &str) -> &Self {
+        self.insert_abs(PathBuf::from(path), Self::text_node(text))
+    }
+
+    /// An entry of `kind` (a link, say) at the absolute `path` outside
+    /// [`FakeFs::ROOT`].
+    pub fn outside_other(&self, path: &str, kind: EntryKind) -> &Self {
+        self.insert_abs(PathBuf::from(path), Node::Other(kind))
+    }
+
+    /// A folder at the absolute `path` outside [`FakeFs::ROOT`].
+    pub fn outside_dir(&self, path: &str) -> &Self {
+        self.insert_abs(PathBuf::from(path), Node::Dir)
+    }
+
+    fn text_node(text: &str) -> Node {
+        Node::File {
+            logical: text.len() as u64,
+            allocated: Some(text.len() as u64),
+            identity: Identity::Unique,
+            cloud: false,
+            modified: None,
+            stamp: None,
+            contents: Some(Arc::from(text.as_bytes())),
+        }
+    }
+
+    /// Makes [`FsAdapter::read_small`] of `path` fail as access denied.
+    pub fn deny_read(&self, path: &str) -> &Self {
+        self.read_errors.lock().unwrap().insert(
+            Self::abs(path),
+            ScanError::new(ErrorKind::PermissionDenied, "access denied"),
+        );
+        self
+    }
+
+    /// Makes [`FsAdapter::read_small`] of `path` block until the returned
+    /// gate is released or dropped.
+    pub fn gate_read(&self, path: &str) -> Gate {
+        let (gate, receiver) = Gate::new();
+        self.read_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), receiver);
+        gate
+    }
+
+    /// Sets the modified time of the file or folder at `path`, added
+    /// earlier.
     pub fn set_modified(&self, path: &str, time: SystemTime) -> &Self {
-        if let Some(Node::File { modified, .. }) =
-            self.nodes.lock().unwrap().get_mut(&Self::abs(path))
-        {
-            *modified = Some(time);
+        let abs = Self::abs(path);
+        match self.nodes.lock().unwrap().get_mut(&abs) {
+            Some(Node::File { modified, .. }) => *modified = Some(time),
+            Some(Node::Dir) => {
+                self.dir_modified.lock().unwrap().insert(abs, time);
+            }
+            _ => {}
         }
         self
     }
@@ -232,16 +351,79 @@ impl FakeFs {
         gate
     }
 
-    /// Sets what [`FsAdapter::measure_file`] returns for `path`.
+    /// Sets the sizes [`FsAdapter::measure_file`] returns for `path`, with
+    /// the ID of the file listed there.
     pub fn set_measured(&self, path: &str, logical: u64, allocated: u64) -> &Self {
         self.measured.lock().unwrap().insert(
             Self::abs(path),
             Measured {
                 logical,
                 allocated: Some(allocated),
+                id: None,
             },
         );
         self
+    }
+
+    /// Sets what [`FsAdapter::measure_file`] returns for `path` as another
+    /// file's: sizes and ID `id`, as when the name was replaced after it was
+    /// listed (`None`: a filesystem that gives no ID).
+    pub fn set_measured_other(
+        &self,
+        path: &str,
+        logical: u64,
+        allocated: u64,
+        id: Option<u128>,
+    ) -> &Self {
+        self.set_measured(path, logical, allocated);
+        self.measured_ids
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), id);
+        self
+    }
+
+    /// Makes [`FsAdapter::measure_file`] of `path` fail as vanished.
+    pub fn fail_measure(&self, path: &str) -> &Self {
+        self.measure_errors.lock().unwrap().insert(
+            Self::abs(path),
+            ScanError::new(ErrorKind::Vanished, "injected"),
+        );
+        self
+    }
+
+    /// Makes [`FsAdapter::measure_file`] of `path` block until the returned
+    /// gate is released or dropped.
+    pub fn gate_measure(&self, path: &str) -> Gate {
+        let (gate, receiver) = Gate::new();
+        self.measure_gates
+            .lock()
+            .unwrap()
+            .insert(Self::abs(path), receiver);
+        gate
+    }
+
+    /// Every path [`FsAdapter::measure_file`] was asked about so far, in
+    /// order.
+    pub fn measures(&self) -> Vec<PathBuf> {
+        self.measures.lock().unwrap().clone()
+    }
+
+    /// Sets how paths in Git metadata read (by default as on this platform).
+    pub fn set_path_style(&self, style: Style) -> &Self {
+        *self.style.lock().unwrap() = Some(style);
+        self
+    }
+
+    /// Every path [`FsAdapter::read_small`] or [`FsAdapter::stat_kind`]
+    /// was asked about so far, in order.
+    pub fn reads(&self) -> Vec<PathBuf> {
+        self.reads.lock().unwrap().clone()
+    }
+
+    /// Every folder whose listing was started so far, in order.
+    pub fn listings(&self) -> Vec<PathBuf> {
+        self.listings.lock().unwrap().clone()
     }
 
     pub fn set_root_kind(&self, kind: RootKind) -> &Self {
@@ -268,6 +450,7 @@ impl FsAdapter for FakeFs {
     }
 
     fn read_dir(&self, dir: &Path, sink: &mut Sink<'_>) -> Result<(), ScanError> {
+        self.listings.lock().unwrap().push(dir.to_path_buf());
         let gate = self.gates.lock().unwrap().get(dir).cloned();
         if let Some(gate) = gate {
             gate.wait();
@@ -299,18 +482,91 @@ impl FsAdapter for FakeFs {
     }
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
-        if let Some(m) = self.measured.lock().unwrap().get(file) {
-            return Ok(*m);
+        self.measures.lock().unwrap().push(file.to_path_buf());
+        let gate = self.measure_gates.lock().unwrap().get(file).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
         }
-        match self.nodes.lock().unwrap().get(file) {
+        if let Some(err) = self.measure_errors.lock().unwrap().get(file) {
+            return Err(err.clone());
+        }
+        let (listed, listed_id) = match self.nodes.lock().unwrap().get(file) {
             Some(Node::File {
-                logical, allocated, ..
-            }) => Ok(Measured {
-                logical: *logical,
-                allocated: *allocated,
-            }),
-            _ => Err(ScanError::new(ErrorKind::Vanished, "not a file")),
+                logical,
+                allocated,
+                identity,
+                ..
+            }) => (
+                Measured {
+                    logical: *logical,
+                    allocated: *allocated,
+                    id: None,
+                },
+                match identity {
+                    Identity::MaybeShared { key } => Some(*key),
+                    _ => None,
+                },
+            ),
+            _ => return Err(ScanError::new(ErrorKind::Vanished, "not a file")),
+        };
+        let measured = self.measured.lock().unwrap().get(file).copied();
+        let id = match self.measured_ids.lock().unwrap().get(file) {
+            Some(id) => *id,
+            None => listed_id,
+        };
+        Ok(Measured {
+            id,
+            ..measured.unwrap_or(listed)
+        })
+    }
+
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
+        let gate = self.read_gates.lock().unwrap().get(path).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
         }
+        if let Some(err) = self.read_errors.lock().unwrap().get(path) {
+            return Err(err.clone());
+        }
+        let unavailable = |why| Err(ScanError::new(ErrorKind::Unavailable, why));
+        match self.nodes.lock().unwrap().get(path) {
+            Some(Node::File { cloud: true, .. }) => unavailable(refused::CLOUD),
+            Some(Node::File {
+                logical, contents, ..
+            }) => {
+                let bytes = match contents {
+                    Some(bytes) => bytes.to_vec(),
+                    None => vec![0; (*logical).min(cap as u64 + 1) as usize],
+                };
+                read_capped(bytes.as_slice(), cap)
+            }
+            Some(Node::Other(
+                EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse,
+            )) => unavailable(refused::LINK),
+            Some(Node::Other(EntryKind::Failed(kind))) => Err(ScanError::new(*kind, "injected")),
+            Some(_) => unavailable(refused::NOT_FILE),
+            None => Err(ScanError::new(ErrorKind::Vanished, "no such file")),
+        }
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
+        match self.nodes.lock().unwrap().get(path) {
+            Some(Node::Dir) => Ok(EntryKind::Directory),
+            Some(Node::File { .. }) => Ok(EntryKind::File),
+            Some(Node::Other(kind)) => Ok(*kind),
+            None => Err(ScanError::new(ErrorKind::Vanished, "no such file")),
+        }
+    }
+
+    fn path_style(&self) -> Style {
+        self.style.lock().unwrap().unwrap_or_else(Style::native)
+    }
+
+    /// Every drive is a local disk.
+    fn local_drive(&self, _letter: u8) -> bool {
+        true
     }
 }
 
@@ -318,6 +574,7 @@ impl FakeFs {
     /// The direct children of `dir` in name order.
     fn entries(&self, dir: &Path) -> Vec<Entry> {
         let nodes = self.nodes.lock().unwrap();
+        let dir_modified = self.dir_modified.lock().unwrap();
         nodes
             .iter()
             .filter(|(p, _)| p.parent() == Some(dir))
@@ -332,7 +589,8 @@ impl FakeFs {
                         identity: Identity::Unique,
                         id: 0,
                         cloud: false,
-                        modified: None,
+                        modified: dir_modified.get(p).copied(),
+                        stamp: None,
                     },
                     Node::File {
                         logical,
@@ -340,6 +598,8 @@ impl FakeFs {
                         identity,
                         cloud,
                         modified,
+                        stamp,
+                        ..
                     } => Entry {
                         name,
                         kind: EntryKind::File,
@@ -353,6 +613,7 @@ impl FakeFs {
                         },
                         cloud: *cloud,
                         modified: *modified,
+                        stamp: *stamp,
                     },
                     Node::Other(kind) => Entry {
                         name,
@@ -363,6 +624,7 @@ impl FakeFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     },
                 }
             })

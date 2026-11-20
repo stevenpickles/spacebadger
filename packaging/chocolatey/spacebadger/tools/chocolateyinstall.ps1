@@ -6,15 +6,15 @@ $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
   unzipLocation  = $toolsDir
-  url64bit       = 'https://github.com/stevenpickles/spacebadger/releases/download/v0.2.0/SpaceBadger-0.2.0-windows-x64.zip'
-  checksum64     = 'b33d4abbf1fb2e7231be28da7b705c10497792bc5cdc4df3939e25b1e8d573c4'
+  url64bit       = 'https://github.com/stevenpickles/spacebadger/releases/download/v0.3.0/SpaceBadger-0.3.0-windows-x64.zip'
+  checksum64     = '469f8f367fcb8bb19f998e647257337e397b2555323638bf2957cd71971d04b8'
   checksumType64 = 'sha256'
 }
 Install-ChocolateyZipPackage @packageArgs
 
 # Chocolatey shims every .exe in the package as a command (`spacebadger`).
 # The .gui marker makes the shim start the window without waiting for it.
-$exe = Join-Path $toolsDir 'SpaceBadger-0.2.0-windows-x64\SpaceBadger.exe'
+$exe = Join-Path $toolsDir 'SpaceBadger-0.3.0-windows-x64\SpaceBadger.exe'
 if (-not (Test-Path $exe)) {
   throw "SpaceBadger.exe not found at $exe"
 }

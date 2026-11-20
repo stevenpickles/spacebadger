@@ -16,8 +16,14 @@ Copyright: Copyright (c) 2026 Steven Pickles
 ShortDescription: A desktop disk-space explorer with a nested, zoomable treemap.
 Description: |-
   SpaceBadger shows what fills a folder or drive as a nested, zoomable treemap that updates live while it scans.
-  Select, zoom, and follow breadcrumbs; filter by file name, folder, or file type; color the map by folder depth or file type; show items in Explorer; and move selected items to the Recycle Bin behind explicit safeguards.
-  When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file, and free space.
+  - Select, zoom, and follow breadcrumbs through the map.
+  - Filter by file name, folder (dir:), file type (is:video), size (size:>1GB), or age (older:1y), with suggestions as you type.
+  - Color the map by folder depth, by file type, or by change since an earlier scan.
+  - Scan a folder again later and compare: see what grew, what shrank, and what's new.
+  - Find duplicate files among the files in view. File contents are read only when you ask, and cloud files are never downloaded.
+  - Export a folder's contents as CSV or a text report.
+  - Show items in Explorer, and move selected items to the Recycle Bin after a confirmation with safeguards; nothing is ever deleted permanently.
+  - When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file, and free space.
   Portable: nothing is installed beyond the program itself.
 Moniker: spacebadger
 Tags:

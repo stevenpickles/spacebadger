@@ -6,13 +6,17 @@ pub mod adapter;
 pub mod duplicates;
 pub mod engine;
 pub mod fake;
+pub mod git;
+#[cfg(feature = "mft")]
+pub mod mft;
 pub mod native;
 
 pub use adapter::{
-    BATCH_ENTRIES, Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind,
-    ScanError, Sink, batched,
+    BATCH_ENTRIES, Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured,
+    RootKind, ScanError, Sink, batched, read_capped, refused,
 };
 pub use engine::{
-    HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan, ScanConfig, ScanState,
+    BIG_SHARE, GIT_GRACE, HoldProbe, OmissionReason, OmissionSample, Omissions, Progress, Scan,
+    ScanConfig, ScanState,
 };
 pub use native::NativeFs;

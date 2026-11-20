@@ -4,6 +4,30 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-20
+
+### Git repositories
+- The scan finds Git repositories and linked worktrees, along with submodules, bare repositories, and nested repositories, by reading a few small files Git keeps. It never runs Git or changes anything, and a folder only counts when its Git data checks out: folders merely named `.git` or `worktrees` don't. What couldn't be confirmed is listed as unresolved, with the reason. A `.git` file pointing to a network share or removable drive outside the scan, or to Git data reached through a link, isn't followed ("not read"), and Git data still unread 5 seconds after every folder is listed is given up ("didn't answer in time"), so neither can hold up a scan. Some network locations (`/afs`, autofs, macOS firmlinks, and drives that look local such as iSCSI, virtual disks, or Google Drive) can't be told apart and are read, within that 5-second limit. A checkout kept inside a `.git` folder isn't detected.
+- A **Git** tab lists them largest first, with kind, path, branch, and scanned size, and with a filter on, what matches in each. Selecting one selects it in the map and the details; Enter or double-click opens it.
+- Repository and worktree folders get a thin colored line and a small badge such as `repo` or `worktree` in the map, in every color mode. Color by **Git** shows repository content, linked-worktree content, Git metadata (hatched), and everything else.
+- The details show the repository an item is in, its kind and branch (or detached HEAD), a worktree's main repository or a submodule's superproject, and the repository's scanned size apart from what matches the filter.
+- Nested repositories are counted once in totals, and a worktree's shared Git data counts once, in the main repository where it is. Nothing suggests a repository or worktree is unused or safe to delete.
+
+### Filter
+- `git:repo`, `git:worktree`, and `git:metadata` keep files in repositories and worktrees, in linked worktrees, or in Git's own data. They narrow everything else (`is:code; git:worktree`), and `!` leaves one out (`git:repo; !git:metadata`); `!git:repo` leaves out worktrees and Git's data too. Suggestions offer them.
+- **All**, **Repos**, and **Worktrees** beside the filter box switch between all files, Git repositories, and linked worktrees, keeping the rest of the filter as typed.
+
+### Scanning
+- macOS lists folders with `getattrlistbulk`, one call per batch of entries instead of two per entry, with the same results; `SB_MACOS_LISTING=readdir` switches back to the old listing.
+- Scans of SSD and NVMe drives on Windows are faster: up to 16 folders are listed at once (one per core) where the disk has no seek penalty, and listing does less work per folder. Sizes, counts and what's left out are unchanged.
+- Windows: folders and files whose names end in a dot or a space are now scanned; before, such a folder was listed under the name without them or reported as vanished.
+- Scans of folders with many hard links are faster on Windows (about twice as fast on a whole system drive, three times on a folder of pnpm projects): a hard-linked file is now opened to check its size only when its names are listed with different sizes or times, or when it's compressed, once per file rather than once per name, and those checks run after every folder is listed.
+- A hard-linked file's disk space is now always counted under the same one of its names (the one with the fewest path components, then the first in name order), on Windows, macOS and Linux, so folder allocation totals and exports no longer shift between scans of an unchanged disk. Sizes in snapshots and comparisons were never affected.
+
+### Map
+- Rescanning a folder draws the map at once: folders not scanned yet take the size they had in the last saved scan, faded and hatched, until their own contents arrive. Their tooltips and details say which scan the estimate comes from; every number shown, exported, compared, or totalled is still only what this scan has found.
+- While rescanning, folders that are new or have changed since the last saved scan are listed first, then the ones that were biggest, so the estimated parts of the map are replaced by real sizes much sooner (on a folder of projects scanned 3 days earlier, the map is within 1 % of final at 0.3 s instead of near the end of the scan). The scan takes as long as before and finds the same.
+
 ## [0.3.0] - 2026-10-14
 
 ### Filter

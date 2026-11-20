@@ -12,6 +12,33 @@ export const RF_PENDING = 1 << 2;
 export const RF_INCOMPLETE = 1 << 3;
 export const RF_CLOUD = 1 << 4;
 export const RF_HARDLINKED = 1 << 5;
+const RF_GIT_SHIFT = 6;
+
+/** Mirrors sb_core::git::GitClass, in value order. */
+export const GIT_OTHER = 0;
+export const GIT_CHECKOUT = 1;
+export const GIT_WORKTREE = 2;
+export const GIT_METADATA = 3;
+
+/** The Git class a rectangle's flags carry in bits 6-7. */
+export const gitClassOf = (rflags: number): number => (rflags >> RF_GIT_SHIFT) & 3;
+
+/** A folder's Git root badge (its `ftype`), as sb_protocol::wire::git_badge:
+ * the word on its map label, the kind in full, and the Git class of its
+ * content. Index 0 is no root. */
+export const GIT_BADGES: readonly { short: string; name: string; cls: number }[] = [
+  { short: "", name: "", cls: GIT_OTHER },
+  { short: "repo", name: "Repository", cls: GIT_CHECKOUT },
+  { short: "worktree", name: "Linked worktree", cls: GIT_WORKTREE },
+  { short: "submodule", name: "Submodule", cls: GIT_CHECKOUT },
+  { short: "repo", name: "Repository with a separate Git directory", cls: GIT_CHECKOUT },
+  { short: "bare", name: "Bare repository", cls: GIT_METADATA },
+  { short: "git", name: "Git directory", cls: GIT_METADATA },
+  { short: "git?", name: "Unresolved Git metadata", cls: GIT_OTHER },
+];
+export const GIT_BADGE_UNRESOLVED = 7;
+/** The Git class each badge's content has, by badge. */
+export const GIT_BADGE_CLASS = GIT_BADGES.map((b) => b.cls);
 
 /** Mirrors sb_core::filetype::FileType, in value order. */
 export const FILE_TYPES = [
@@ -28,10 +55,15 @@ export const FILE_TYPES = [
 
 export const LAYOUT_TRUNCATED = 1 << 0;
 export const LAYOUT_FINAL = 1 << 1;
+export const LAYOUT_PROVISIONAL = 1 << 2;
+
+/** A rectangle's byte 40: part of its area is estimated from an earlier
+ * scan (sb_protocol::wire::RECT_PROVISIONAL). */
+const RECT_PROVISIONAL = 1 << 0;
 
 const MAGIC = 0x314c4253; // "SBL1" read as little-endian u32
-const FORMAT_VERSION = 3;
-const RECT_LEN = 40;
+const FORMAT_VERSION = 5;
+const RECT_LEN = 44;
 
 /** Rectangles as parallel typed arrays, parent before child. */
 export interface DecodedLayout {
@@ -41,6 +73,9 @@ export interface DecodedLayout {
   view: number;
   total: number;
   flags: number;
+  /** When the scan the estimated areas come from finished, in seconds since
+   * the Unix epoch; 0 when nothing is estimated. */
+  estimatedFrom: number;
   count: number;
   x: Float32Array;
   y: Float32Array;
@@ -52,11 +87,15 @@ export interface DecodedLayout {
   depth: Uint8Array;
   kind: Uint8Array;
   rflags: Uint8Array;
-  /** File type for files (see FILE_TYPES), else 0. */
+  /** File type for files (see FILE_TYPES); Git root badge for folders
+   * (sb_protocol::wire::git_badge, 0 for none); 0 for other small items. */
   ftype: Uint8Array;
   /** The folder whose contents each rectangle is part of. Siblings are
    * consecutive, largest first. */
   parent: Uint32Array;
+  /** 1 where part of the area stands for folders not yet listed, sized from
+   * an earlier scan; the weight never counts them. */
+  provisional: Uint8Array;
   labels: Map<number, string>;
 }
 
@@ -79,6 +118,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     view: v.getUint32(28, true),
     total: Number(v.getBigUint64(32, true)),
     flags: v.getUint32(48, true),
+    estimatedFrom: v.getUint32(52, true),
     count,
     x: new Float32Array(count),
     y: new Float32Array(count),
@@ -92,6 +132,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     rflags: new Uint8Array(count),
     ftype: new Uint8Array(count),
     parent: new Uint32Array(count),
+    provisional: new Uint8Array(count),
     labels: new Map(),
   };
   let o = headerLen;
@@ -108,6 +149,7 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
     out.rflags[i] = v.getUint8(o + 34);
     out.ftype[i] = v.getUint8(o + 35);
     out.parent[i] = v.getUint32(o + 36, true);
+    out.provisional[i] = v.getUint8(o + 40) & RECT_PROVISIONAL ? 1 : 0;
   }
   const text = new TextDecoder();
   const bytes = new Uint8Array(buffer);
@@ -120,9 +162,19 @@ function decode(buffer: ArrayBuffer): DecodedLayout {
   return out;
 }
 
-/** Index of the deepest rectangle containing the point, or -1. */
+/** Whether rectangle `i` is the estimated filler of a folder still being
+ * listed: the part of its earlier size nothing found so far stands for
+ * (merged small items with none in it). It isn't an item of its own:
+ * pointing at it points at its folder. */
+export function isFiller(l: DecodedLayout, i: number): boolean {
+  return l.kind[i] === KIND_OTHER && l.items[i] === 0;
+}
+
+/** Index of the deepest rectangle containing the point, or -1. Fillers
+ * are passed over for the folder they're in. */
 export function hitTest(l: DecodedLayout, px: number, py: number): number {
   for (let i = l.count - 1; i >= 0; i--) {
+    if (isFiller(l, i)) continue;
     const x = l.x[i]!;
     const y = l.y[i]!;
     if (px >= x && py >= y && px < x + l.w[i]! && py < y + l.h[i]!) return i;
