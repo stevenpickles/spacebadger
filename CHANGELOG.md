@@ -4,6 +4,8 @@ All notable changes to SpaceBadger are listed here. Versions follow [semantic ve
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-20
+
 ### Git repositories
 - The scan finds Git repositories and linked worktrees, along with submodules, bare repositories, and nested repositories, by reading a few small files Git keeps. It never runs Git or changes anything, and a folder only counts when its Git data checks out: folders merely named `.git` or `worktrees` don't. What couldn't be confirmed is listed as unresolved, with the reason. A `.git` file pointing to a network share or removable drive outside the scan, or to Git data reached through a link, isn't followed ("not read"), and Git data still unread 5 seconds after every folder is listed is given up ("didn't answer in time"), so neither can hold up a scan. Some network locations (`/afs`, autofs, macOS firmlinks, and drives that look local such as iSCSI, virtual disks, or Google Drive) can't be told apart and are read, within that 5-second limit. A checkout kept inside a `.git` folder isn't detected.
 - A **Git** tab lists them largest first, with kind, path, branch, and scanned size, and with a filter on, what matches in each. Selecting one selects it in the map and the details; Enter or double-click opens it.
