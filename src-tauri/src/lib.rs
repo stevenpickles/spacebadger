@@ -31,10 +31,10 @@ use sb_protocol::{
     DuplicateExtras, DuplicateFilesPage, DuplicateFilesRequest, DuplicatesCheck,
     DuplicatesCheckRequest, DuplicatesList, DuplicatesRequest, DuplicatesStatus,
     EXPORT_PROGRESS_EVENT, ExportFormat, ExportProgress, ExportReport, ExportRequest,
-    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, Lane, LayoutRequest, NodeDetails,
-    PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus, SearchPage, SearchResultsRequest,
-    SearchSummary, SelectionRequest, SelectionSummary, SmallItemsPage, SmallItemsRequest,
-    SuggestRequest, Suggestion, VolumeInfo,
+    FILTER_UPDATED_EVENT, FolderFilesPage, FolderFilesRequest, GitRootsPage, GitRootsRequest, Lane,
+    LayoutRequest, NodeDetails, PROTOCOL_VERSION, SCAN_STATUS_EVENT, ScanStarted, ScanStatus,
+    SearchPage, SearchResultsRequest, SearchSummary, SelectionRequest, SelectionSummary,
+    SmallItemsPage, SmallItemsRequest, SuggestRequest, Suggestion, VolumeInfo,
 };
 use session::Session;
 use std::io::ErrorKind;
@@ -243,6 +243,24 @@ async fn search_results(
         .runner
         .submit(Class::Lists, "search_results", lane, move || {
             session.search_results(&request)
+        })
+        .await
+}
+
+/// A page of the Git repositories and linked worktrees found, largest
+/// first, with matching sizes for a search. Summing up many repositories
+/// takes a moment, and a page stops between rows once superseded.
+#[tauri::command]
+async fn git_roots(
+    state: State<'_, AppState>,
+    request: GitRootsRequest,
+    lane: Option<Lane>,
+) -> Result<GitRootsPage, String> {
+    let session = state.session(request.generation)?;
+    state
+        .runner
+        .submit(Class::Lists, "git_roots", lane, move || {
+            session.git_roots(&request)
         })
         .await
 }
@@ -763,6 +781,7 @@ pub fn run() {
             search_set,
             search_summary,
             search_results,
+            git_roots,
             small_items,
             folder_files,
             filter_suggest,

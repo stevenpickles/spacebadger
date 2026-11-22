@@ -18,6 +18,14 @@
 //! turns a restriction around. Files whose modified time is unknown never
 //! pass an age term, turned around or not.
 //!
+//! `git:repo`, `git:worktree`, and `git:metadata` restrict by where a file
+//! is as far as Git goes (see [`GitClass`]): `repo` is anything in a
+//! detected repository or linked worktree, its Git metadata included;
+//! `worktree` a linked worktree's checkout; `metadata` Git's own data. The
+//! positive ones form a union, and `!git:` leaves a kind out; together they
+//! restrict on top of every other term, like `dir:`. Size and age terms stay
+//! about each file, never about a repository as a whole.
+//!
 //! [`Search`] keeps its own totals for matching files and every folder above
 //! them, so the treemap can be drawn from matching bytes only. It catches up
 //! incrementally: new nodes are examined in ID order (IDs only grow), and
@@ -27,10 +35,21 @@
 //! again and can join or leave the matches. Hard-link ownership is kept: an
 //! alias that matches contributes its logical length but no allocation,
 //! exactly as in the tree.
+//!
+//! Git repositories can be found after the files in them were examined.
+//! With `git:` terms, the nodes logged in [`GitIndex::changes`] are walked
+//! again: a folder whose class changed passes the change on to its examined
+//! contents, a step at a time within the same budget, and files join or
+//! leave the matches as they go, so totals stay whole after every step.
+//! Queries without `git:` terms never look at Git entries.
+//!
+//! [`GitIndex::changes`]: crate::git::GitIndex::changes
 
 use crate::filetype::FileType;
+use crate::git::GitClass;
 use crate::layout::Metric;
 use crate::tree::{NodeId, Tree};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,8 +66,8 @@ const KILO: u64 = if cfg!(windows) { 1024 } else { 1000 };
 /// A file matches when its name matches any included file pattern (or there
 /// are none) and no excluded one, it's inside a folder matching an included
 /// `dir:` pattern (or there are none), inside no folder matching an
-/// excluded one, and its size and modified time pass every `size:`,
-/// `older:`, and `newer:` term.
+/// excluded one, its size and modified time pass every `size:`, `older:`,
+/// and `newer:` term, and where it is in Git passes the `git:` terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     query: String,
@@ -63,6 +82,8 @@ pub struct Matcher {
     sizes: Vec<Range>,
     /// `older:` and `newer:` terms, in seconds since the Unix epoch.
     ages: Vec<Range>,
+    /// `git:` terms.
+    git: GitSet,
     /// Every pattern is ASCII, so ASCII names can be matched bytewise.
     ascii: bool,
     /// Some pattern has `?`, so non-ASCII names are needed as characters.
@@ -234,8 +255,9 @@ impl Matcher {
     /// `Ok(None)` when the query has no patterns. Patterns are separated by
     /// `;` and trimmed; a leading `!` excludes, a `dir:` prefix (any case)
     /// makes a folder pattern, `is:` names a file type, and `size:`,
-    /// `older:`, and `newer:` restrict by size and age, counted from now.
-    /// Fails on an unknown or ambiguous type or a malformed size or age.
+    /// `older:`, and `newer:` restrict by size and age, counted from now,
+    /// and `git:` by Git class. Fails on an unknown or ambiguous type, an
+    /// unknown `git:` kind, or a malformed size or age.
     ///
     /// Dates such as `older:2024-01-01` start at midnight UTC here; the app
     /// uses [`Matcher::parse_at`] to start them at local midnight instead.
@@ -260,6 +282,7 @@ impl Matcher {
         let mut types = TypeSet::default();
         let mut sizes = Vec::new();
         let mut ages = Vec::new();
+        let mut git = GitSet::default();
         for term in query.split(';') {
             let term = term.trim();
             let (excluded, term) = match term.strip_prefix('!') {
@@ -282,6 +305,19 @@ impl Matcher {
             if let Some((value, older)) = age {
                 if let Some(range) = age_range(value.trim(), older, now, midnight)? {
                     ages.push(range.negated(excluded));
+                }
+                continue;
+            }
+            if let Some(word) = strip_prefix_ignore_case(term, "git:") {
+                let word = word.trim();
+                // "git:" alone, still being typed, is no term yet.
+                if !word.is_empty() {
+                    let bit = GitSet::from_keyword(word)?;
+                    if excluded {
+                        git.exclude |= bit;
+                    } else {
+                        git.include |= bit;
+                    }
                 }
                 continue;
             }
@@ -319,7 +355,12 @@ impl Matcher {
                 .chain(&dir_include)
                 .chain(&dir_exclude)
         };
-        if all().next().is_none() && types.is_empty() && sizes.is_empty() && ages.is_empty() {
+        if all().next().is_none()
+            && types.is_empty()
+            && sizes.is_empty()
+            && ages.is_empty()
+            && git == GitSet::default()
+        {
             return Ok(None);
         }
         let ascii = all().all(|p| p.text().is_ascii());
@@ -333,6 +374,7 @@ impl Matcher {
             types,
             sizes,
             ages,
+            git,
             ascii,
             globs,
         }))
@@ -390,6 +432,19 @@ impl Matcher {
         !self.dir_include.is_empty() || !self.dir_exclude.is_empty()
     }
 
+    /// The query has `git:` terms, so what matches depends on the Git
+    /// entries found.
+    pub fn depends_on_git(&self) -> bool {
+        self.git != GitSet::default()
+    }
+
+    /// Whether a file of Git class `class` passes the `git:` terms: an
+    /// included kind holds (or none is included) and no excluded one does.
+    pub fn git_allows(&self, class: GitClass) -> bool {
+        let holds = GitSet::holding(class);
+        (self.git.include == 0 || self.git.include & holds != 0) && self.git.exclude & holds == 0
+    }
+
     /// How a folder's own name meets the `dir:` patterns.
     pub fn folder(&self, name: &OsStr) -> FolderMatch {
         if !self.has_folder_patterns() {
@@ -437,6 +492,54 @@ impl TypeSet {
 
     fn is_empty(self) -> bool {
         self.include == 0 && self.exclude == 0
+    }
+}
+
+/// Included and excluded `git:` kinds, one bit each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GitSet {
+    include: u8,
+    exclude: u8,
+}
+
+impl GitSet {
+    /// In a repository or linked worktree, Git metadata included.
+    const REPO: u8 = 1;
+    /// In a linked worktree's checkout.
+    const WORKTREE: u8 = 2;
+    /// Git's own data.
+    const METADATA: u8 = 4;
+
+    /// The kind a `git:` value names, ignoring case. Any start of a keyword
+    /// works (`r`, `work`, `meta`).
+    fn from_keyword(word: &str) -> Result<u8, String> {
+        const KEYWORDS: [(&str, u8); 5] = [
+            ("repository", GitSet::REPO),
+            ("repositories", GitSet::REPO),
+            ("worktree", GitSet::WORKTREE),
+            ("worktrees", GitSet::WORKTREE),
+            ("metadata", GitSet::METADATA),
+        ];
+        let lower = word.to_ascii_lowercase();
+        KEYWORDS
+            .iter()
+            .find(|(keyword, _)| keyword.starts_with(&lower))
+            .map(|&(_, bit)| bit)
+            .ok_or_else(|| {
+                format!(
+                    "“git:{word}” isn't a Git filter. Use git:repo, git:worktree, or git:metadata."
+                )
+            })
+    }
+
+    /// The kinds content of `class` counts as.
+    fn holding(class: GitClass) -> u8 {
+        match class {
+            GitClass::Other => 0,
+            GitClass::Checkout => Self::REPO,
+            GitClass::Worktree => Self::REPO | Self::WORKTREE,
+            GitClass::Metadata => Self::REPO | Self::METADATA,
+        }
     }
 }
 
@@ -758,8 +861,27 @@ pub struct Search {
     /// Per examined folder, [`FolderMatch`] bits for it and the folders
     /// above it; empty without `dir:` patterns.
     scope: Vec<u8>,
+    /// Per examined folder, its [`GitClass`] as last worked out; empty
+    /// without `git:` terms.
+    git: Vec<u8>,
+    /// Position reached in the tree's Git change log.
+    git_seen: usize,
+    /// Examined nodes whose Git class may have changed, to look at again
+    /// before examining new ones; the next on top.
+    rewalk: Vec<Rewalk>,
     /// Bumped whenever any total changes.
     version: u64,
+}
+
+/// What [`Search::catch_up`] has left to look at again after a Git entry
+/// changed.
+#[derive(Debug, Clone, Copy)]
+enum Rewalk {
+    /// One node.
+    Node(NodeId),
+    /// A node and the siblings after it, so a folder of a million files
+    /// costs one entry rather than a million.
+    From(NodeId),
 }
 
 impl Search {
@@ -773,6 +895,9 @@ impl Search {
             totals: Vec::new(),
             matches: Vec::new(),
             scope: Vec::new(),
+            git: Vec::new(),
+            git_seen: 0,
+            rewalk: Vec::new(),
             version: 0,
         }
     }
@@ -782,11 +907,17 @@ impl Search {
     }
 
     /// Examines up to `budget` new nodes and replays re-measured files.
-    /// Returns `true` once every node in `tree` has been examined.
+    /// With `git:` terms, nodes a changed Git entry may have reclassified
+    /// are looked at again first, out of the same budget, and new nodes
+    /// wait until that's done. Returns `true` once every node in `tree` has
+    /// been examined and none is left to look at again.
     pub fn catch_up(&mut self, tree: &Tree, budget: usize) -> bool {
         let changes = tree.changed_files();
         let recheck = self.matcher.depends_on_size();
-        let mut dropped = false;
+        // Files that stopped matching during this call: still listed in
+        // `matches` until it ends, so one matching again is restored there
+        // rather than listed twice.
+        let mut left = HashSet::new();
         for &raw in &changes[self.changes_seen..] {
             let file = NodeId::from_index(raw);
             // Changes to files not yet examined are picked up when they are.
@@ -809,25 +940,50 @@ impl Search {
                     Totals::default()
                 };
                 self.replace(tree, file, new);
-                dropped |= !matches;
+                if !matches {
+                    left.insert(file);
+                }
             } else if matches {
-                self.add(tree, file);
+                self.join(tree, file, &mut left);
             }
         }
         self.changes_seen = changes.len();
-        if dropped {
+
+        let git = self.matcher.depends_on_git();
+        let mut spent = 0;
+        if git {
+            let log = tree.git().changes();
+            // Entries of nodes not yet examined are read when they are.
+            for &raw in &log[self.git_seen..] {
+                if (raw as usize) < self.next {
+                    self.rewalk.push(Rewalk::Node(NodeId::from_index(raw)));
+                }
+            }
+            self.git_seen = log.len();
+            spent = self.rewalk(tree, budget, &mut left);
+        }
+        if !left.is_empty() {
             let (slot, totals) = (&self.slot, &self.totals);
             self.matches.retain(|f| match slot[f.index()] {
                 NONE => false,
                 s => totals[s as usize].files != 0,
             });
         }
+        // New nodes take their folder's class, so it must be current first.
+        if !self.rewalk.is_empty() {
+            return false;
+        }
 
-        let end = tree.len().min(self.next.saturating_add(budget));
+        let end = tree
+            .len()
+            .min(self.next.saturating_add(budget.saturating_sub(spent)));
         self.slot.resize(end, NONE);
         let folders = self.matcher.has_folder_patterns();
         if folders {
             self.scope.resize(end, 0);
+        }
+        if git {
+            self.git.resize(end, 0);
         }
         for i in self.next..end {
             let node = NodeId::from_index(i as u32);
@@ -837,12 +993,92 @@ impl Search {
                     let own = self.matcher.folder(tree.name(node));
                     self.scope[i] = own.within(self.outer(tree, node)).bits();
                 }
+                if git {
+                    self.git[i] = self.class(tree, node) as u8;
+                }
             } else if self.file_matches(tree, node) {
                 self.add(tree, node);
             }
         }
         self.next = end;
         self.next == tree.len()
+    }
+
+    /// Looks again at up to `budget` nodes whose Git class may have
+    /// changed, and returns how many it looked at. A folder whose class
+    /// changed has its contents looked at in turn; one whose class didn't
+    /// leaves them be, since nothing below it changed but entries of their
+    /// own, which the change log brings separately. A file joins or leaves
+    /// the matches, adjusting the totals above it, so every step leaves
+    /// them whole. A node can be looked at before a folder above it whose
+    /// class changed too, and then again once that folder's change reaches
+    /// it; files that leave go in `left`, as in [`Search::catch_up`].
+    fn rewalk(&mut self, tree: &Tree, budget: usize, left: &mut HashSet<NodeId>) -> usize {
+        let mut spent = 0;
+        while spent < budget {
+            let Some(item) = self.rewalk.pop() else {
+                break;
+            };
+            spent += 1;
+            let node = match item {
+                Rewalk::Node(n) => n,
+                Rewalk::From(n) => {
+                    // A removed node keeps its link to the next sibling.
+                    if let Some(next) = tree.next_sibling(n) {
+                        self.rewalk.push(Rewalk::From(next));
+                    }
+                    n
+                }
+            };
+            // Added after the last examined node, it's examined later with
+            // its class as it is then.
+            if node.index() >= self.next || tree.is_removed(node) {
+                continue;
+            }
+            if tree.is_dir(node) {
+                let class = self.class(tree, node) as u8;
+                if std::mem::replace(&mut self.git[node.index()], class) != class
+                    && let Some(first) = tree.first_child(node)
+                {
+                    self.rewalk.push(Rewalk::From(first));
+                }
+            } else {
+                let matched = self.totals(node).files != 0;
+                let matches = self.file_matches(tree, node);
+                if matched && !matches {
+                    self.replace(tree, node, Totals::default());
+                    left.insert(node);
+                } else if matches && !matched {
+                    self.join(tree, node, left);
+                }
+            }
+        }
+        spent
+    }
+
+    /// Makes a file that doesn't match now match: restored in place if it
+    /// left during this call (it's still in `matches`), else added.
+    fn join(&mut self, tree: &Tree, file: NodeId, left: &mut HashSet<NodeId>) {
+        if left.remove(&file) {
+            self.replace(tree, file, Totals::of_file(tree, file));
+        } else {
+            self.add(tree, file);
+        }
+    }
+
+    /// The Git class an examined node has: its own entry's, or else that of
+    /// the folder it's in, which has a lower ID and so was examined first;
+    /// for the scan root, that of the repository above the scan, if any.
+    fn class(&self, tree: &Tree, node: NodeId) -> GitClass {
+        tree.git_own(node)
+            .unwrap_or_else(|| match tree.parent(node) {
+                Some(p) => GitClass::from_u8(self.git[p.index()]),
+                None => tree
+                    .git()
+                    .above()
+                    .and_then(|(_, r)| r.kind.class())
+                    .unwrap_or_default(),
+            })
     }
 
     /// How the folders above an examined node meet the `dir:` patterns. A
@@ -858,6 +1094,7 @@ impl Search {
     fn file_matches(&self, tree: &Tree, file: NodeId) -> bool {
         !tree.is_removed(file)
             && self.matcher.in_scope(self.outer(tree, file))
+            && (!self.matcher.depends_on_git() || self.matcher.git_allows(self.class(tree, file)))
             && self
                 .matcher
                 .matches_file(tree.name(file), tree.logical(file), tree.modified(file))
@@ -943,12 +1180,21 @@ impl Search {
         self.next
     }
 
-    /// An upper bound on what [`Search::catch_up`] has left to do on
-    /// `tree`: nodes not yet examined plus change-log entries not yet
-    /// replayed, some of which it skips (files not yet examined, repeats).
+    /// About how much [`Search::catch_up`] has left to do on `tree`, zero
+    /// once it's done: nodes not yet examined plus change-log entries not
+    /// yet replayed, some of which it skips (files not yet examined,
+    /// repeats). With `git:` terms, also Git entries changed since and
+    /// nodes waiting to be looked at again, where a folder's contents
+    /// count as one until they're reached.
     pub fn backlog(&self, tree: &Tree) -> usize {
+        let git = if self.matcher.depends_on_git() {
+            tree.git().changes().len().saturating_sub(self.git_seen) + self.rewalk.len()
+        } else {
+            0
+        };
         tree.len().saturating_sub(self.next)
             + tree.changed_files().len().saturating_sub(self.changes_seen)
+            + git
     }
 }
 
@@ -1735,5 +1981,668 @@ mod tests {
         t.update_file(f, sizes(2 << 20, 2 << 20));
         s.catch_up(&t, usize::MAX);
         assert_eq!(s.matches(), [f], "a large one is video");
+    }
+
+    use crate::git::{GitRoot, Problem, RootKind};
+
+    /// A scan holding Git checkouts, worktrees and metadata:
+    ///
+    /// ```text
+    /// /r
+    ///   app/                 repository
+    ///     .git/              (HEAD, objects/pack.pack 300 MB)
+    ///     src/main.rs, src/notes.txt
+    ///     big.iso 200 MB
+    ///     vendor/lib/        nested repository: .git file, lib.rs
+    ///   wt/                  linked worktree: .git file, src/app.rs, huge.iso 600 MB
+    ///   bare.git/            bare repository: HEAD, objects/old.pack 700 MB
+    ///   photos/a.jpg, film.iso 900 MB, notes.txt
+    /// ```
+    struct Repos {
+        t: Tree,
+        app: NodeId,
+        app_git: NodeId,
+        lib: NodeId,
+        lib_git: NodeId,
+        wt: NodeId,
+        wt_git: NodeId,
+        bare: NodeId,
+    }
+
+    const MB: u64 = KILO * KILO;
+
+    impl Repos {
+        /// The tree without any Git entries yet.
+        fn new() -> Self {
+            let mut t = Tree::new("/r");
+            let root = NodeId::ROOT;
+            let dir = |t: &mut Tree, p, name: &str| t.add_dir(p, name.as_ref()).unwrap();
+            let file = |t: &mut Tree, p, name: &str, len: u64| {
+                t.add_file(p, name.as_ref(), sizes(len, len), None, 0)
+                    .unwrap()
+            };
+            let app = dir(&mut t, root, "app");
+            let app_git = dir(&mut t, app, ".git");
+            file(&mut t, app_git, "HEAD", 23);
+            let objects = dir(&mut t, app_git, "objects");
+            file(&mut t, objects, "pack.pack", 300 * MB);
+            let src = dir(&mut t, app, "src");
+            file(&mut t, src, "main.rs", 100);
+            file(&mut t, src, "notes.txt", 40);
+            file(&mut t, app, "big.iso", 200 * MB);
+            let vendor = dir(&mut t, app, "vendor");
+            let lib = dir(&mut t, vendor, "lib");
+            let lib_git = file(&mut t, lib, ".git", 30);
+            file(&mut t, lib, "lib.rs", 50);
+            let wt = dir(&mut t, root, "wt");
+            let wt_git = file(&mut t, wt, ".git", 60);
+            let wt_src = dir(&mut t, wt, "src");
+            file(&mut t, wt_src, "app.rs", 70);
+            file(&mut t, wt, "huge.iso", 600 * MB);
+            let bare = dir(&mut t, root, "bare.git");
+            file(&mut t, bare, "HEAD", 21);
+            let bare_objects = dir(&mut t, bare, "objects");
+            file(&mut t, bare_objects, "old.pack", 700 * MB);
+            let photos = dir(&mut t, root, "photos");
+            file(&mut t, photos, "a.jpg", 5);
+            file(&mut t, root, "film.iso", 900 * MB);
+            file(&mut t, root, "notes.txt", 8);
+            Self {
+                t,
+                app,
+                app_git,
+                lib,
+                lib_git,
+                wt,
+                wt_git,
+                bare,
+            }
+        }
+
+        /// Every Git entry, as detection would record them.
+        fn entries(&self) -> Vec<GitRoot> {
+            vec![
+                GitRoot::new(self.app, RootKind::Repository),
+                GitRoot::new(self.app_git, RootKind::DotGit),
+                GitRoot::new(self.lib, RootKind::Repository),
+                GitRoot::new(self.lib_git, RootKind::DotGit),
+                GitRoot::new(self.wt, RootKind::LinkedWorktree),
+                GitRoot::new(self.wt_git, RootKind::DotGit),
+                GitRoot::new(self.bare, RootKind::Bare),
+            ]
+        }
+
+        fn found() -> Self {
+            let mut r = Self::new();
+            for e in r.entries() {
+                r.t.set_git(e);
+            }
+            r
+        }
+    }
+
+    /// Checks that `s` has caught up to exactly what a fresh search of
+    /// `query` finds: the same matches and the same totals everywhere.
+    fn assert_fresh(s: &Search, t: &Tree, query: &str) {
+        let fresh = search(query, t);
+        assert_eq!(names(s, t), names(&fresh, t), "{query}");
+        let mut matches = s.matches().to_vec();
+        matches.sort_unstable();
+        let listed = matches.len();
+        matches.dedup();
+        assert_eq!(matches.len(), listed, "{query}: a file listed twice");
+        let mut expected = fresh.matches().to_vec();
+        expected.sort_unstable();
+        assert_eq!(matches, expected, "{query}");
+        for i in 0..t.len() {
+            let n = NodeId::from_index(i as u32);
+            assert_eq!(s.totals(n), fresh.totals(n), "{query}: totals of {n:?}");
+        }
+        assert_eq!(s.backlog(t), 0, "{query}");
+    }
+
+    /// Checks that every examined folder's totals are the sum of its
+    /// examined contents': the totals are never torn between steps.
+    fn assert_whole(s: &Search, t: &Tree) {
+        for i in 0..s.examined() {
+            let d = NodeId::from_index(i as u32);
+            if !t.is_dir(d) || t.is_removed(d) {
+                continue;
+            }
+            let (files, logical) = t
+                .children(d)
+                .filter(|c| c.index() < s.examined())
+                .map(|c| s.totals(c))
+                .fold((0, 0), |(f, l), c| (f + c.files, l + c.logical));
+            let own = s.totals(d);
+            assert_eq!((own.files, own.logical), (files, logical), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn git_terms_parse_with_prefixes_and_report_unknown_kinds() {
+        for (query, class, allowed) in [
+            ("git:repo", GitClass::Metadata, true),
+            ("GIT: Repositories", GitClass::Worktree, true),
+            ("git:r", GitClass::Other, false),
+            ("git:repos", GitClass::Checkout, true),
+            ("git:w", GitClass::Worktree, true),
+            ("git:work", GitClass::Checkout, false),
+            ("git:worktrees", GitClass::Metadata, false),
+            ("git:m", GitClass::Metadata, true),
+            ("git:meta", GitClass::Checkout, false),
+            ("!git:metadata", GitClass::Other, true),
+            ("! git:metadata", GitClass::Metadata, false),
+            ("!git:repo", GitClass::Worktree, false),
+        ] {
+            let m = Matcher::new(query).unwrap();
+            assert!(m.depends_on_git(), "{query}");
+            assert_eq!(m.git_allows(class), allowed, "{query} on {class:?}");
+        }
+        for typing in ["git:", "!git: ", "git:  ; "] {
+            assert!(Matcher::parse(typing).unwrap().is_none(), "{typing:?}");
+        }
+        for unknown in ["git:x", "git:repox", "git:worktreeses", "git:wt"] {
+            let err = Matcher::parse(unknown).unwrap_err();
+            assert!(
+                err.contains(&format!("“{unknown}” isn't a Git filter"))
+                    && err.contains("git:repo, git:worktree, or git:metadata"),
+                "{err}"
+            );
+        }
+        assert!(!Matcher::new("*.rs; dir:src").unwrap().depends_on_git());
+        assert!(
+            Matcher::parse("git:repo | git:worktree").is_err(),
+            "terms are separated by ;"
+        );
+    }
+
+    #[test]
+    fn positive_git_kinds_form_a_union() {
+        let r = Repos::found();
+        let t = &r.t;
+        let repo = [
+            "HEAD",
+            "HEAD",
+            "app.rs",
+            "big.iso",
+            "huge.iso",
+            "lib.rs",
+            "main.rs",
+            "notes.txt",
+            "old.pack",
+            "pack.pack",
+            ".git",
+            ".git",
+        ];
+        let mut sorted = repo.map(str::to_owned).to_vec();
+        sorted.sort();
+        assert_eq!(names(&search("git:repo", t), t), sorted);
+        assert_eq!(
+            names(&search("git:repo; git:worktree", t), t),
+            sorted,
+            "worktrees are repositories too"
+        );
+        assert_eq!(
+            names(&search("git:worktree", t), t),
+            ["app.rs", "huge.iso"],
+            "the worktree's .git file is metadata: the nearest entry wins"
+        );
+        assert_eq!(
+            names(&search("git:metadata", t), t),
+            [".git", ".git", "HEAD", "HEAD", "old.pack", "pack.pack"],
+            ".git folders and files, and the bare repository"
+        );
+        let s = search("git:worktree; git:metadata", t);
+        assert_eq!(s.matches().len(), 2 + 6);
+        let s = search("!git:repo", t);
+        assert_eq!(names(&s, t), ["a.jpg", "film.iso", "notes.txt"]);
+        assert_eq!(s.totals(r.app), Totals::default());
+    }
+
+    #[test]
+    fn git_terms_negate_and_intersect_with_every_other_term() {
+        let r = Repos::found();
+        let t = &r.t;
+        let q = |query: &str| names(&search(query, t), t);
+        assert_eq!(
+            q("git:repo; !git:metadata"),
+            [
+                "app.rs",
+                "big.iso",
+                "huge.iso",
+                "lib.rs",
+                "main.rs",
+                "notes.txt"
+            ]
+        );
+        assert_eq!(
+            q("!git:metadata; !git:worktree"),
+            [
+                "a.jpg",
+                "big.iso",
+                "film.iso",
+                "lib.rs",
+                "main.rs",
+                "notes.txt",
+                "notes.txt"
+            ]
+        );
+        assert_eq!(q("*.rs; git:repo"), ["app.rs", "lib.rs", "main.rs"]);
+        assert_eq!(q("*.rs; !git:worktree"), ["lib.rs", "main.rs"]);
+        assert_eq!(q("notes; git:repo"), ["notes.txt"]);
+        assert_eq!(q("is:code; git:repo"), ["app.rs", "lib.rs", "main.rs"]);
+        assert_eq!(q("!is:code; git:worktree"), ["huge.iso"]);
+        assert_eq!(q("dir:src; git:repo"), ["app.rs", "main.rs", "notes.txt"]);
+        assert_eq!(q("dir:objects; !git:repo"), Vec::<String>::new());
+        assert_eq!(
+            q("!dir:objects; git:metadata"),
+            [".git", ".git", "HEAD", "HEAD"]
+        );
+        assert_eq!(
+            q("size:>100MB; git:repo"),
+            ["big.iso", "huge.iso", "old.pack", "pack.pack"]
+        );
+        assert_eq!(
+            q("size:<100; git:metadata"),
+            [".git", ".git", "HEAD", "HEAD"]
+        );
+        assert_eq!(
+            q("older:1d; git:repo"),
+            Vec::<String>::new(),
+            "unknown times never pass an age term"
+        );
+        assert_eq!(q("!newer:1d; !git:repo"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn every_example_query_does_what_it_says() {
+        let r = Repos::found();
+        let t = &r.t;
+        let q = |query: &str| names(&search(query, t), t);
+        let all_repo = q("git:repo");
+        // git:repo | git:worktree: a union, so the same as git:repo.
+        assert_eq!(q("git:repo; git:worktree"), all_repo);
+        assert_eq!(q("git:worktree; git:repo"), all_repo);
+        // !git:metadata | git:repo: repository content without Git's data.
+        assert_eq!(
+            q("!git:metadata; git:repo"),
+            [
+                "app.rs",
+                "big.iso",
+                "huge.iso",
+                "lib.rs",
+                "main.rs",
+                "notes.txt"
+            ]
+        );
+        // is:code | git:worktree: code in linked worktrees.
+        assert_eq!(q("is:code; git:worktree"), ["app.rs"]);
+        // size:>100MB | git:metadata: large files of Git's own; size is the
+        // file's, not the repository's.
+        let s = search("size:>100MB; git:metadata", t);
+        assert_eq!(names(&s, t), ["old.pack", "pack.pack"]);
+        assert_eq!(s.totals(r.app).logical, 300 * MB);
+        assert_eq!(s.totals(r.bare).logical, 700 * MB);
+        assert_eq!(q("size:>500MB; git:metadata"), ["old.pack"]);
+        // size:>500MB alone: files anywhere, as before.
+        assert_eq!(q("size:>500MB"), ["film.iso", "huge.iso", "old.pack"]);
+        let s = search("git:repo", t);
+        assert_eq!(
+            s.totals(NodeId::ROOT).logical,
+            t.logical(r.app) + t.logical(r.wt) + t.logical(r.bare),
+            "matching bytes count each file once"
+        );
+    }
+
+    #[test]
+    fn entries_found_after_their_files_reclassify_them() {
+        for query in [
+            "git:repo",
+            "git:worktree",
+            "git:metadata",
+            "!git:metadata",
+            "*.rs; !git:repo",
+            "size:>100MB; git:repo",
+        ] {
+            let mut r = Repos::new();
+            let mut s = Search::new(Matcher::new(query).unwrap());
+            assert!(s.catch_up(&r.t, usize::MAX));
+            for e in r.entries() {
+                r.t.set_git(e);
+            }
+            assert!(s.backlog(&r.t) > 0, "{query}");
+            assert!(s.catch_up(&r.t, usize::MAX));
+            assert_fresh(&s, &r.t, query);
+        }
+    }
+
+    #[test]
+    fn stepping_one_node_at_a_time_converges_with_whole_totals_each_step() {
+        for query in [
+            "git:repo",
+            "git:worktree; !git:metadata",
+            "!git:repo",
+            "*.iso; git:repo",
+        ] {
+            let mut r = Repos::new();
+            let mut s = Search::new(Matcher::new(query).unwrap());
+            // Part of the tree examined, then entries arrive one at a time
+            // between single steps, as a scan's probes would.
+            for _ in 0..12 {
+                s.catch_up(&r.t, 1);
+                assert_whole(&s, &r.t);
+            }
+            for e in r.entries() {
+                r.t.set_git(e);
+                s.catch_up(&r.t, 1);
+                assert_whole(&s, &r.t);
+            }
+            let mut steps = 0;
+            while !s.catch_up(&r.t, 1) {
+                assert_whole(&s, &r.t);
+                steps += 1;
+                assert!(steps < 10 * r.t.len(), "{query}: never finishes");
+            }
+            assert_fresh(&s, &r.t, query);
+        }
+    }
+
+    #[test]
+    fn a_nested_repository_found_before_or_after_its_outer_one() {
+        for nested_first in [true, false] {
+            let mut r = Repos::new();
+            let mut s = Search::new(Matcher::new("git:repo; !git:metadata").unwrap());
+            assert!(s.catch_up(&r.t, usize::MAX));
+            let outer = [
+                GitRoot::new(r.app, RootKind::Repository),
+                GitRoot::new(r.app_git, RootKind::DotGit),
+            ];
+            let nested = [
+                GitRoot::new(r.lib, RootKind::Repository),
+                GitRoot::new(r.lib_git, RootKind::DotGit),
+            ];
+            let (first, second) = if nested_first {
+                (nested, outer)
+            } else {
+                (outer, nested)
+            };
+            for e in first {
+                r.t.set_git(e);
+            }
+            while !s.catch_up(&r.t, 2) {
+                assert_whole(&s, &r.t);
+            }
+            assert_fresh(&s, &r.t, "git:repo; !git:metadata");
+            for e in second {
+                r.t.set_git(e);
+            }
+            while !s.catch_up(&r.t, 2) {
+                assert_whole(&s, &r.t);
+            }
+            assert_fresh(&s, &r.t, "git:repo; !git:metadata");
+            assert_eq!(
+                names(&s, &r.t),
+                ["big.iso", "lib.rs", "main.rs", "notes.txt"],
+                "nested_first: {nested_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repository_above_the_scan_root_found_late() {
+        let mut r = Repos::found();
+        let mut s = search("!git:repo", &r.t);
+        assert_eq!(s.matches().len(), 3);
+        r.t.set_git_above("/".into(), GitRoot::new(NodeId::ROOT, RootKind::Repository));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert!(s.matches().is_empty(), "everything is in a repository now");
+        assert_fresh(&s, &r.t, "!git:repo");
+        // An entry of the root itself wins over the one above.
+        r.t.set_git(GitRoot::new(NodeId::ROOT, RootKind::LinkedWorktree));
+        let mut w = search("git:worktree", &r.t);
+        assert_eq!(
+            w.matches().len(),
+            5,
+            "a.jpg, film.iso, notes.txt, and the worktree's checkout"
+        );
+        r.t.set_git(GitRoot::unresolved(NodeId::ROOT, Problem::NotGit));
+        assert!(w.catch_up(&r.t, usize::MAX));
+        assert_fresh(&w, &r.t, "git:worktree");
+        assert_eq!(
+            names(&w, &r.t),
+            ["app.rs", "huge.iso"],
+            "back to the repository above"
+        );
+    }
+
+    #[test]
+    fn detection_sequences_converge_step_by_step() {
+        // As the scanner records them: candidates first, each finding later,
+        // some never confirmed; a scan of a `.git` folder itself is
+        // metadata, inside the repository found above it.
+        for query in ["git:repo", "!git:repo", "git:metadata"] {
+            let mut r = Repos::new();
+            let mut s = Search::new(Matcher::new(query).unwrap());
+            let steps = |s: &mut Search, t: &Tree| {
+                while !s.catch_up(t, 3) {
+                    assert_whole(s, t);
+                }
+                assert_fresh(s, t, query);
+            };
+            steps(&mut s, &r.t);
+            for n in [r.app, r.lib, r.wt] {
+                r.t.set_git(GitRoot::pending(n));
+                steps(&mut s, &r.t);
+            }
+            r.t.set_git_above("/".into(), GitRoot::new(NodeId::ROOT, RootKind::Repository));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(NodeId::ROOT, RootKind::DotGit));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+            r.t.set_git(GitRoot::new(r.app_git, RootKind::DotGit));
+            r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+            r.t.set_git(GitRoot::unresolved(r.wt, Problem::NotChecked));
+            steps(&mut s, &r.t);
+            r.t.set_git(GitRoot::new(NodeId::ROOT, RootKind::WorktreeAdmin));
+            steps(&mut s, &r.t);
+        }
+    }
+
+    #[test]
+    fn a_git_file_classified_late_becomes_metadata() {
+        let mut r = Repos::new();
+        let mut s = search("git:metadata", &r.t);
+        assert!(s.matches().is_empty());
+        // The worktree checks out before its `.git` file is marked.
+        r.t.set_git(GitRoot::new(r.wt, RootKind::LinkedWorktree));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert!(s.matches().is_empty());
+        r.t.set_git(GitRoot::new(r.wt_git, RootKind::DotGit));
+        assert_eq!(s.backlog(&r.t), 1, "one change to look at");
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_eq!(s.matches(), [r.wt_git]);
+        assert_eq!(s.totals(r.wt).logical, 60);
+        assert_fresh(&s, &r.t, "git:metadata");
+    }
+
+    #[test]
+    fn deleting_a_repositorys_git_folder_leaves_it_unconfirmed() {
+        let mut r = Repos::found();
+        let mut s = search("git:repo", &r.t);
+        let before = s.matches().len();
+        r.t.remove(r.app_git);
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_fresh(&s, &r.t, "git:repo");
+        // app's checkout is no longer known to be one; its nested library
+        // still is.
+        assert_eq!(s.matches().len(), before - 2 - 3);
+        assert_eq!(s.totals(r.app).files, 2, "lib.rs and lib's .git");
+    }
+
+    #[test]
+    fn queries_without_git_terms_ignore_git_entries() {
+        let mut r = Repos::new();
+        let mut s = search("*.rs", &r.t);
+        let version = s.version();
+        for e in r.entries() {
+            r.t.set_git(e);
+        }
+        assert_eq!(s.backlog(&r.t), 0, "nothing to do");
+        assert!(s.catch_up(&r.t, 1));
+        assert_eq!(s.version(), version);
+        assert!(s.git.is_empty() && s.rewalk.is_empty(), "no memory used");
+    }
+
+    #[test]
+    fn the_backlog_counts_what_is_left_to_look_at_again() {
+        let mut r = Repos::new();
+        let mut s = search("git:worktree", &r.t);
+        assert_eq!(s.backlog(&r.t), 0);
+        r.t.set_git(GitRoot::new(r.wt, RootKind::LinkedWorktree));
+        assert_eq!(s.backlog(&r.t), 1, "one entry changed");
+        assert!(
+            !s.catch_up(&r.t, 1),
+            "the worktree's folder, not its contents"
+        );
+        assert!(s.backlog(&r.t) > 0, "its contents are left");
+        assert!(s.matches().is_empty());
+        while !s.catch_up(&r.t, 1) {}
+        assert_eq!(s.backlog(&r.t), 0);
+        assert_eq!(
+            names(&s, &r.t),
+            [".git", "app.rs", "huge.iso"],
+            "its .git file isn't marked yet"
+        );
+    }
+
+    #[test]
+    fn a_file_dropped_and_restored_in_one_catch_up_is_listed_once() {
+        // The file's own entry goes class-less, so it's looked at with its
+        // folder's stale class and drops out, before its folder's new class
+        // brings it back.
+        let mut t = Tree::new("/r");
+        let a = t.add_dir(NodeId::ROOT, "a".as_ref()).unwrap();
+        let f = t
+            .add_file(a, "f.txt".as_ref(), sizes(10, 10), None, 0)
+            .unwrap();
+        t.set_git(GitRoot::new(f, RootKind::DotGit));
+        let mut s = search("git:repo", &t);
+        assert_eq!(s.matches(), [f]);
+        t.set_git(GitRoot::new(a, RootKind::Repository));
+        t.set_git(GitRoot::unresolved(f, Problem::NotGit));
+        assert!(s.catch_up(&t, usize::MAX));
+        assert_eq!(s.matches(), [f]);
+        assert_fresh(&s, &t, "git:repo");
+    }
+
+    #[test]
+    fn a_nested_repository_left_unchecked_inside_a_new_one_is_listed_once() {
+        let mut r = Repos::new();
+        r.t.set_git(GitRoot::new(r.lib, RootKind::Repository));
+        let mut s = search("git:repo", &r.t);
+        assert_eq!(s.matches().len(), 2, "lib.rs and lib's .git");
+        r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+        r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_fresh(&s, &r.t, "git:repo");
+        // And with a size term, re-measured files judged against classes
+        // not yet walked again.
+        let mut r = Repos::new();
+        r.t.set_git(GitRoot::new(r.lib, RootKind::Repository));
+        let mut s = search("git:repo; size:<1000", &r.t);
+        r.t.set_git(GitRoot::new(r.app, RootKind::Repository));
+        r.t.set_git(GitRoot::unresolved(r.lib, Problem::NotChecked));
+        let lib_rs =
+            r.t.children(r.lib)
+                .find(|&c| r.t.name(c) == "lib.rs")
+                .unwrap();
+        r.t.update_file(lib_rs, sizes(60, 60));
+        assert!(s.catch_up(&r.t, usize::MAX));
+        assert_fresh(&s, &r.t, "git:repo; size:<1000");
+    }
+
+    #[test]
+    fn interleaved_growth_and_discovery_converge_to_a_fresh_search() {
+        // xorshift, so failures repeat.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let kinds = [
+            RootKind::Repository,
+            RootKind::LinkedWorktree,
+            RootKind::DotGit,
+            RootKind::Bare,
+            RootKind::Pending,
+            RootKind::Unresolved,
+        ];
+        let queries = [
+            "git:repo",
+            "git:worktree; !git:metadata",
+            "!git:repo; *1*",
+            "size:>500; git:repo",
+            "!git:metadata; size:<300",
+        ];
+        for round in 0..200 {
+            let query = queries[round % queries.len()];
+            let mut t = Tree::new("/r");
+            let mut dirs = vec![NodeId::ROOT];
+            let mut files = Vec::new();
+            let mut entries: Vec<NodeId> = Vec::new();
+            let mut s = Search::new(Matcher::new(query).unwrap());
+            for _ in 0..300 {
+                match next(14) {
+                    0..=2 => {
+                        let p = dirs[next(dirs.len() as u64) as usize];
+                        let name = format!("d{}", t.len());
+                        dirs.push(t.add_dir(p, name.as_ref()).unwrap());
+                    }
+                    3..=6 => {
+                        let p = dirs[next(dirs.len() as u64) as usize];
+                        let name = format!("f{}", t.len());
+                        let len = next(1000);
+                        files.push(
+                            t.add_file(p, name.as_ref(), sizes(len, len), None, 0)
+                                .unwrap(),
+                        );
+                    }
+                    7 | 8 => {
+                        let n = NodeId::from_index(next(t.len() as u64) as u32);
+                        let kind = kinds[next(kinds.len() as u64) as usize];
+                        t.set_git(GitRoot::new(n, kind));
+                        entries.push(n);
+                    }
+                    // An entry changing kind, often from a class to none
+                    // (confirmed, then unresolved or unchecked).
+                    9 if !entries.is_empty() => {
+                        let n = entries[next(entries.len() as u64) as usize];
+                        let kind = kinds[next(kinds.len() as u64) as usize];
+                        t.set_git(GitRoot::new(n, kind));
+                    }
+                    // A file re-measured, so size terms judge it again.
+                    10 if !files.is_empty() => {
+                        let f = files[next(files.len() as u64) as usize];
+                        let len = next(1000);
+                        t.update_file(f, sizes(len, len));
+                    }
+                    11 => {
+                        assert!(s.catch_up(&t, usize::MAX));
+                        assert_fresh(&s, &t, query);
+                    }
+                    _ => {
+                        s.catch_up(&t, 1 + next(5) as usize);
+                        assert_whole(&s, &t);
+                    }
+                }
+            }
+            while !s.catch_up(&t, 3) {
+                assert_whole(&s, &t);
+            }
+            assert_fresh(&s, &t, query);
+        }
     }
 }

@@ -16,23 +16,95 @@
 //!   batches, and by the aggregator between batches and at least every
 //!   [`CANCEL_POLL`]; the aggregator stops without waiting for OS calls
 //!   already in flight, so a blocked network listing cannot delay it.
+//! - Git detection (see [`crate::git`]) adds jobs, not listings: the
+//!   aggregator spots candidates by name in the batches it applies, a worker
+//!   confirms each with a few small reads, and the aggregator writes what it
+//!   found into the tree as a new revision. Those jobs count as outstanding
+//!   work, so a scan completes only once they're done, or once they've gone
+//!   [`ScanConfig::git_grace`] without an answer after the last listing; a
+//!   cancel leaves the unconfirmed candidates as not checked.
+//! - A file seen under a second name is counted once, as an alias of its
+//!   first name. Names whose listings may be stale are re-measured: by
+//!   default only a file whose names' listings disagree, once, after every
+//!   folder is listed (the scan is still running then); see [`links`]. A
+//!   scan that stops before then (cancelled, failed, or out of tree
+//!   capacity) keeps the listed sizes of such names, as it keeps
+//!   everything else it found. Once complete, each file's allocation goes
+//!   to a name chosen by path, not by listing order.
+//! - Folders are listed in the order found, except while the tree has a
+//!   prior scan to estimate from: then the folders whose estimates are
+//!   least to be trusted, and then the biggest, go first, so the map's
+//!   estimated areas become exact soonest (see [`listing_priority`]).
 
 use crate::adapter::{
-    Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
+    BATCH_ENTRIES, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError,
 };
+use crate::git::{self, Finding, Plan, Scope, Signals, Spot};
+use links::{FileKey, IdHash, Links, Owner};
+use sb_core::git::{GitRoot, Problem, RootKind as GitKind};
 use sb_core::size::Allocated;
 use sb_core::tree::{DirState, FileSizes, NodeId, Tree, fingerprint, flags};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod links;
 
 const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// The share of the root, in millionths, an unchanged folder must have held
+/// in the prior scan for its listing to go ahead of the folders found
+/// before it (see [`listing_priority`]): 0.01 %, an area of about 130 px²
+/// on a full-screen map. Smaller folders hardly move the map, and keeping
+/// them in order of discovery keeps the queue's ordered part small.
+pub const BIG_SHARE: u32 = 100;
+
+/// Added to the priority of a folder the prior scan can't vouch for: more
+/// than any share (at most a million).
+const CHANGED: u32 = 2_000_000;
+
+/// The priority of a `.git` folder's listing: in the lane served first (see
+/// [`Queue`]), since a Git probe waits for it.
+const GIT_DIR: u32 = u32::MAX;
+
+/// Where folder `dir`, just found with modified time `modified`, is listed
+/// while the tree has a prior scan that finished at `since` (milliseconds
+/// since the Unix epoch). Measured on rescans, the map's error comes from
+/// what the prior doesn't know: folders new since (no estimate) and folders
+/// whose entries changed since (a later modified time: entries added,
+/// removed or renamed in them). So those go first, biggest first, then the
+/// unchanged folders that held at least [`BIG_SHARE`] of the root, biggest
+/// first, then the rest in order found (0). Changes inside a file don't
+/// touch its folder's time, so a file that grew in place is found in turn.
+///
+/// Modified times only order listings, never change what's found, so
+/// inexact ones only cost time: the snapshot's time is when its scan
+/// finished, so a folder changed during that scan after it was listed looks
+/// unchanged; network shares keep the server's clock; and FAT and exFAT
+/// keep local time, so after a change of time zone or daylight saving
+/// time, folders on them can look changed or unchanged by up to the shift.
+fn listing_priority(tree: &Tree, dir: NodeId, modified: Option<SystemTime>, since: u64) -> u32 {
+    let newer = modified
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|d| d.as_millis() > u128::from(since));
+    match tree.listing_priority(dir) {
+        Some(share) if !newer => share,
+        // New since, or changed since.
+        share => CHANGED.saturating_add(share.unwrap_or(0)),
+    }
+}
+
+/// How long Git probes may go without an answer once every folder is
+/// listed before the scan finishes without them (see
+/// [`ScanConfig::git_grace`]).
+pub const GIT_GRACE: Duration = Duration::from_secs(5);
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -47,6 +119,20 @@ pub struct ScanConfig {
     /// Told how long each of the scanner's holds of the tree's write lock
     /// lasted, for timings; `None` costs nothing.
     pub write_holds: Option<HoldProbe>,
+    /// Once every folder is listed, how long Git probes may go without an
+    /// answer (a read stuck on a share that stopped responding) before the
+    /// scan finishes without them, leaving their candidates timed out.
+    pub git_grace: Duration,
+    /// Re-measures every name of a file with several names as it's found,
+    /// even when the names' listings agree. Off by default: listings that
+    /// agree can only both be stale when the file was last changed through
+    /// a name outside the scan (or in a folder that couldn't be listed).
+    pub exact_hard_links: bool,
+    /// While the tree has a prior scan, lists first the folders it can't
+    /// vouch for, then the ones that were big in it (see
+    /// [`listing_priority`]). On by default; off lists every folder in the
+    /// order found, as without a prior. Only the order changes.
+    pub list_by_prior: bool,
 }
 
 /// Called after the scanner releases the tree's write lock with how long it
@@ -75,6 +161,9 @@ impl Default for ScanConfig {
             progress_interval: Duration::from_millis(150),
             sample_limit: 50,
             write_holds: None,
+            git_grace: GIT_GRACE,
+            exact_hard_links: false,
+            list_by_prior: true,
         }
     }
 }
@@ -206,6 +295,9 @@ pub struct Progress {
     /// when it hasn't moved.
     pub revision: u64,
     pub omissions: Omissions,
+    /// Git repositories, worktrees and unresolved candidates found so far
+    /// (see `sb_core::git::GitIndex::listed_count`).
+    pub git_roots: u32,
 }
 
 impl Progress {
@@ -223,6 +315,7 @@ impl Progress {
             pending_dirs: 1,
             revision: 0,
             omissions: Omissions::default(),
+            git_roots: 0,
         }
     }
 
@@ -235,6 +328,7 @@ impl Progress {
         self.allocated = tree.allocated(root);
         self.unknown_allocation_files = u64::from(tree.unknown_allocation_files(root));
         self.hardlink_aliases = tree.alias_count() as u64;
+        self.git_roots = tree.git().listed_count();
     }
 }
 
@@ -389,9 +483,92 @@ impl Drop for Written<'_> {
     }
 }
 
+/// What a directory's finished listing says about Git, given what its
+/// batches showed, the listing's error if any, and whether some of it was
+/// read: a folder with a Git directory's layout is worth a probe (outside a
+/// `.git` folder's own data, where only a linked worktree's admin folder is
+/// noted), a folder named `.git` without it leaves its owner unresolved,
+/// and otherwise a `.git` file in the folder is followed.
+fn listed_git(
+    tree: &mut Tree,
+    dir: NodeId,
+    path: &Path,
+    candidate: Candidate,
+    error: Option<ScanError>,
+    partial: bool,
+) -> Option<(PathBuf, Plan)> {
+    let dotgit = path
+        .file_name()
+        .is_some_and(|n| git::name_eq(n.as_encoded_bytes(), b".git"));
+    let signals = candidate.signals;
+    // The scan root has no owner inside the scan; the ancestor probe finds
+    // the repository it belongs to.
+    let owner = if dotgit { tree.parent(dir) } else { None };
+    if signals.qualifies() && (error.is_none() || partial) {
+        if !dotgit && git::inside_dotgit(path) && !signals.is_worktree_admin() {
+            return None;
+        }
+        // A Git directory is probed as one; a `.git` file in it is ignored.
+        return Some((
+            path.to_path_buf(),
+            Plan::AdminDir {
+                dir,
+                dotgit,
+                owner,
+                signals,
+            },
+        ));
+    }
+    if dotgit {
+        if let Some(owner) = owner {
+            let problem = match error {
+                Some(err) => Problem::Unreadable {
+                    kind: err.kind as u8,
+                    message: err.message,
+                },
+                None => Problem::NotGit,
+            };
+            tree.set_git(GitRoot::unresolved(owner, problem));
+        }
+        return None;
+    }
+    let (file, name) = candidate.pointer?;
+    tree.set_git(GitRoot::pending(dir));
+    Some((path.join(name), Plan::Pointer { file, dir }))
+}
+
+/// What a folder's listing has shown of Git so far.
+#[derive(Debug, Default)]
+struct Candidate {
+    signals: Signals,
+    /// A `.git` file in it, and its name as listed.
+    pointer: Option<(NodeId, OsString)>,
+}
+
+/// How a directory's listing ended: its result, and whether any of its
+/// entries were added.
+struct ListingEnd {
+    result: Result<(), ScanError>,
+    partial: bool,
+}
+
+/// A worker's work; `Git` confirms a Git candidate (see [`git::probe`]).
 enum Job {
-    List { dir: NodeId, path: PathBuf },
-    Measure { file: NodeId, path: PathBuf },
+    /// Lists folder `dir`, last modified at `modified` as its parent's
+    /// listing said (kept to order the listing by, see [`Queue::reorder`]).
+    List {
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+    },
+    Measure {
+        file: NodeId,
+        path: PathBuf,
+    },
+    Git {
+        path: PathBuf,
+        plan: Plan,
+    },
 }
 
 enum Outcome {
@@ -412,49 +589,169 @@ enum Outcome {
         file: NodeId,
         result: Result<Measured, ScanError>,
     },
+    /// What a Git probe found.
+    Git { finding: Finding },
     /// The worker saw the cancel flag and didn't run the job.
     Skipped,
     /// The worker saw the cancel flag part way through listing `dir`.
     Stopped { dir: NodeId },
 }
 
+/// Workers' jobs in three lanes:
+///
+/// - Git probes and listings of `.git` folders (which a probe of the folder
+///   above waits for): few, small, and wanted soon;
+/// - listings of folders a prior puts ahead (see [`listing_priority`]),
+///   highest priority first;
+/// - other listings and re-measures, in the order queued.
+///
+/// While the ordered lane has listings, the first lane is served before
+/// it; otherwise the first and last lanes are served together in the order
+/// queued. Without a prior the ordered lane stays empty, so the queue is a
+/// plain FIFO of every job.
 #[derive(Default)]
 struct Queue {
-    state: Mutex<(VecDeque<Job>, bool)>,
+    state: Mutex<Jobs>,
     ready: Condvar,
 }
 
+#[derive(Default)]
+struct Jobs {
+    /// Git probes and `.git` listings, with when each was queued.
+    soon: VecDeque<(u64, Job)>,
+    big: BinaryHeap<Big>,
+    /// Other listings, with when each was queued.
+    fifo: VecDeque<(u64, Job)>,
+    /// Jobs queued so far: the order they were queued in.
+    queued: u64,
+    closed: bool,
+}
+
+impl Jobs {
+    fn seq(&mut self) -> u64 {
+        self.queued += 1;
+        self.queued
+    }
+
+    /// Queues `job`; see [`Queue`].
+    fn put(&mut self, job: Job, priority: u32) {
+        let seq = self.seq();
+        match job {
+            Job::Git { .. } => self.soon.push_back((seq, job)),
+            // Nothing reads a re-measure before the scan ends, so it waits in turn.
+            Job::Measure { .. } => self.fifo.push_back((seq, job)),
+            Job::List { .. } if priority == GIT_DIR => self.soon.push_back((seq, job)),
+            Job::List { .. } if priority >= BIG_SHARE => self.big.push(Big { priority, seq, job }),
+            Job::List { .. } => self.fifo.push_back((seq, job)),
+        }
+    }
+
+    fn take(&mut self) -> Option<Job> {
+        let soon_first = match (self.soon.front(), self.fifo.front()) {
+            (None, _) => false,
+            _ if !self.big.is_empty() => true,
+            (Some(_), None) => true,
+            (Some((s, _)), Some((f, _))) => s < f,
+        };
+        if soon_first {
+            return self.soon.pop_front().map(|(_, job)| job);
+        }
+        if let Some(big) = self.big.pop() {
+            return Some(big.job);
+        }
+        self.fifo.pop_front().map(|(_, job)| job)
+    }
+}
+
+/// A listing ahead of the FIFO: ordered by priority, then by when queued.
+struct Big {
+    priority: u32,
+    seq: u64,
+    job: Job,
+}
+
+impl PartialEq for Big {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Big {}
+
+impl PartialOrd for Big {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Big {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then(other.seq.cmp(&self.seq))
+    }
+}
+
 impl Queue {
-    fn push(&self, job: Job) {
-        self.state.lock().unwrap().0.push_back(job);
+    /// Queues `job`: a listing with a priority of [`BIG_SHARE`] or more
+    /// goes ahead of the others (see [`Queue`]).
+    fn push(&self, job: Job, priority: u32) {
+        self.state.lock().unwrap().put(job, priority);
         self.ready.notify_one();
     }
 
     /// Next job, or `None` once closed.
     fn pop(&self) -> Option<Job> {
-        let mut state = self.state.lock().unwrap();
+        let mut jobs = self.state.lock().unwrap();
         loop {
-            if state.1 {
+            if jobs.closed {
                 return None;
             }
-            if let Some(job) = state.0.pop_front() {
+            if let Some(job) = jobs.take() {
                 return Some(job);
             }
-            state = self.ready.wait(state).unwrap();
+            jobs = self.ready.wait(jobs).unwrap();
         }
     }
 
-    fn close(&self) -> Vec<Job> {
-        let mut state = self.state.lock().unwrap();
-        state.1 = true;
+    fn close(&self) {
+        let mut jobs = self.state.lock().unwrap();
+        jobs.closed = true;
         self.ready.notify_all();
-        state.0.drain(..).collect()
+        jobs.soon.clear();
+        jobs.big.clear();
+        jobs.fifo.clear();
+    }
+
+    /// Moves the listings waiting in order found to which `priority` (of
+    /// the folder and its modified time) puts ahead (see [`Queue::push`]),
+    /// keeping their order among equals.
+    fn reorder(&self, mut priority: impl FnMut(NodeId, Option<SystemTime>) -> u32) {
+        let mut jobs = self.state.lock().unwrap();
+        let waiting = std::mem::take(&mut jobs.fifo);
+        for (seq, job) in waiting {
+            let p = match &job {
+                Job::List { dir, modified, .. } => priority(*dir, *modified),
+                _ => 0,
+            };
+            if p >= BIG_SHARE {
+                jobs.big.push(Big {
+                    priority: p,
+                    seq,
+                    job,
+                });
+            } else {
+                jobs.fifo.push_back((seq, job));
+            }
+        }
     }
 }
 
 struct Aggregator<A> {
     root: PathBuf,
     adapter: Arc<A>,
+    /// What Git probes need to know of the scan.
+    scope: Arc<Scope>,
     config: ScanConfig,
     tree: Arc<RwLock<Tree>>,
     shared: Arc<Shared>,
@@ -463,15 +760,22 @@ struct Aggregator<A> {
     queue: Arc<Queue>,
     outstanding: u64,
     pending_dirs: u64,
-    owners: HashMap<u128, NodeId>,
-    remeasured: HashSet<NodeId>,
+    links: Links,
     /// Directories with batches applied whose listing hasn't ended yet.
     partial: HashSet<NodeId>,
+    /// Git probes queued or running.
+    git_jobs: u64,
+    /// Since when only Git probes have been left, without an answer.
+    git_quiet_since: Option<Instant>,
+    /// Git's names seen so far in directories still being listed.
+    git_signals: HashMap<NodeId, Candidate>,
     omissions: Omissions,
     revision: u64,
     published_revision: u64,
     last_publish: Instant,
     stop: Option<ScanState>,
+    /// Whether the listings queued so far were ordered by a prior.
+    ordered: bool,
 }
 
 impl<A: FsAdapter> Aggregator<A> {
@@ -484,9 +788,15 @@ impl<A: FsAdapter> Aggregator<A> {
         on_progress: Box<dyn Fn(&Progress) + Send>,
     ) -> Self {
         let now = Instant::now();
+        let exact_hard_links = config.exact_hard_links;
+        let scope = Arc::new(Scope {
+            root: root.clone(),
+            style: adapter.path_style(),
+        });
         Self {
             root,
             adapter,
+            scope,
             config,
             tree,
             shared,
@@ -495,14 +805,17 @@ impl<A: FsAdapter> Aggregator<A> {
             queue: Arc::new(Queue::default()),
             outstanding: 0,
             pending_dirs: 0,
-            owners: HashMap::new(),
-            remeasured: HashSet::new(),
+            links: Links::new(exact_hard_links),
             partial: HashSet::new(),
+            git_jobs: 0,
+            git_quiet_since: None,
+            git_signals: HashMap::new(),
             omissions: Omissions::default(),
             revision: 0,
             published_revision: 0,
             last_publish: now,
             stop: None,
+            ordered: false,
         }
     }
 
@@ -536,7 +849,8 @@ impl<A: FsAdapter> Aggregator<A> {
         }
         drop(tx);
 
-        self.enqueue_list(NodeId::ROOT, self.root.clone());
+        self.enqueue_list(NodeId::ROOT, self.root.clone(), None, 0);
+        self.enqueue_git(self.root.clone(), Plan::Ancestors);
         loop {
             if self.cancelled() {
                 self.stop.get_or_insert(ScanState::Cancelled);
@@ -564,13 +878,21 @@ impl<A: FsAdapter> Aggregator<A> {
             if self.cancelled() {
                 continue;
             }
-            if self.outstanding == 0 {
+            if self.pending_dirs == 0 && !self.links.refined() {
+                self.refine();
+            }
+            if self.outstanding == 0 || self.git_stalled() {
                 self.queue.close();
+                if self.outstanding > 0 {
+                    // Answers that come later are dropped with the channel.
+                    self.unconfirmed(Problem::TimedOut);
+                }
                 let state = if self.omissions.total() == 0 {
                     ScanState::Complete
                 } else {
                     ScanState::CompleteWithOmissions
                 };
+                self.settle_owners();
                 self.finish(state);
                 return;
             }
@@ -585,10 +907,22 @@ impl<A: FsAdapter> Aggregator<A> {
         }
     }
 
+    /// Whether only Git probes are left and none has answered for
+    /// [`ScanConfig::git_grace`].
+    fn git_stalled(&mut self) -> bool {
+        if self.pending_dirs > 0 || self.outstanding != self.git_jobs {
+            self.git_quiet_since = None;
+            return false;
+        }
+        let since = *self.git_quiet_since.get_or_insert_with(Instant::now);
+        since.elapsed() >= self.config.git_grace
+    }
+
     fn spawn_worker(&self, index: usize, tx: SyncSender<Outcome>) {
         let queue = Arc::clone(&self.queue);
         let adapter = Arc::clone(&self.adapter);
         let shared = Arc::clone(&self.shared);
+        let scope = Arc::clone(&self.scope);
         std::thread::Builder::new()
             .name(format!("sb-scan-worker-{index}"))
             .spawn(move || {
@@ -597,7 +931,7 @@ impl<A: FsAdapter> Aggregator<A> {
                         Outcome::Skipped
                     } else {
                         match job {
-                            Job::List { dir, path } => {
+                            Job::List { dir, path, .. } => {
                                 // Each batch goes to the aggregator once the
                                 // next is read, so the last one travels with
                                 // the listing's end (most directories fit in
@@ -637,6 +971,9 @@ impl<A: FsAdapter> Aggregator<A> {
                                 file,
                                 result: adapter.measure_file(&path),
                             },
+                            Job::Git { path, plan } => Outcome::Git {
+                                finding: git::probe(&*adapter, &path, &plan, &scope),
+                            },
                         }
                     };
                     if tx.send(outcome).is_err() {
@@ -647,15 +984,65 @@ impl<A: FsAdapter> Aggregator<A> {
             .expect("spawn scan worker");
     }
 
-    fn enqueue_list(&mut self, dir: NodeId, path: PathBuf) {
+    /// Queues `dir`'s listing, ahead of others by `priority` (see
+    /// [`listing_priority`]).
+    fn enqueue_list(
+        &mut self,
+        dir: NodeId,
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        priority: u32,
+    ) {
         self.outstanding += 1;
         self.pending_dirs += 1;
-        self.queue.push(Job::List { dir, path });
+        let job = Job::List {
+            dir,
+            path,
+            modified,
+        };
+        self.queue.push(job, priority);
     }
 
     fn enqueue_measure(&mut self, file: NodeId, path: PathBuf) {
         self.outstanding += 1;
-        self.queue.push(Job::Measure { file, path });
+        self.queue.push(Job::Measure { file, path }, 0);
+    }
+
+    /// Once the scan is complete, gives each hard-linked file's allocation
+    /// to the name a fixed order of paths prefers, whatever was listed
+    /// first (see [`links`]): chosen under the read lock, then moved in
+    /// holds of the write lock bounded like a batch's. Skipped for a
+    /// stopped scan, and given up part way (totals stay exact, owners as
+    /// found) when a cancel arrives meanwhile, so a cancel is acknowledged
+    /// at once; the scan still reports the state it completed with.
+    fn settle_owners(&mut self) {
+        let shared = Arc::clone(&self.shared);
+        let stop = || shared.cancel.load(Ordering::Relaxed);
+        let moves = self.links.settle(&self.tree.read().unwrap(), stop);
+        for chunk in moves.chunks(BATCH_ENTRIES) {
+            if stop() {
+                break;
+            }
+            let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+            for (heir, others) in chunk {
+                tree.promote_alias(*heir, others);
+            }
+        }
+    }
+
+    /// Once every folder is listed, queues the hard-link re-measures left
+    /// for then (see [`links`]).
+    fn refine(&mut self) {
+        let jobs = self.links.refine(&self.tree.read().unwrap());
+        for (file, path) in jobs {
+            self.enqueue_measure(file, path);
+        }
+    }
+
+    fn enqueue_git(&mut self, path: PathBuf, plan: Plan) {
+        self.outstanding += 1;
+        self.git_jobs += 1;
+        self.queue.push(Job::Git { path, plan }, 0);
     }
 
     fn apply(&mut self, outcome: Outcome) {
@@ -666,7 +1053,7 @@ impl<A: FsAdapter> Aggregator<A> {
         match outcome {
             Outcome::Batch { dir, path, entries } => {
                 self.partial.insert(dir);
-                self.apply_batch(dir, &path, entries);
+                self.apply_batch(dir, &path, entries, None);
                 self.revision += 1;
             }
             Outcome::Listed {
@@ -677,40 +1064,22 @@ impl<A: FsAdapter> Aggregator<A> {
             } => {
                 self.pending_dirs -= 1;
                 let partial = self.partial.remove(&dir) || !entries.is_empty();
-                if !entries.is_empty() {
-                    self.apply_batch(dir, &path, entries);
-                }
-                if self.stop.is_some() {
-                    return;
-                }
-                match result {
-                    Ok(()) => write(&self.tree, self.config.write_holds.as_ref())
-                        .set_dir_state(dir, DirState::Listed),
-                    Err(err) => {
-                        let reason = OmissionReason::from_error(err.kind);
-                        self.omissions
-                            .add(reason, self.config.sample_limit, || OmissionSample {
-                                path: path.clone(),
-                                detail: Some(err.message.clone()),
-                            });
-                        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
-                        if partial {
-                            // Listed in part: the entries already added stay,
-                            // and the folder counts as not fully read.
-                            tree.set_dir_state(dir, DirState::Listed);
-                            tree.mark_unreadable_entries(dir);
-                        } else {
-                            tree.set_dir_state(dir, DirState::Failed);
-                            if dir == NodeId::ROOT {
-                                self.stop = Some(ScanState::Failed(format!(
-                                    "The selected folder can't be listed: {}",
-                                    err.message
-                                )));
-                            }
-                        }
+                let end = ListingEnd { result, partial };
+                // The last batch and the listing's end share one hold.
+                let probe = if entries.is_empty() {
+                    if self.stop.is_some() {
+                        return;
                     }
-                }
+                    let tree_lock = Arc::clone(&self.tree);
+                    let mut tree = write(&tree_lock, self.config.write_holds.as_ref());
+                    self.end_listing(&mut tree, dir, &path, end)
+                } else {
+                    self.apply_batch(dir, &path, entries, Some(end))
+                };
                 self.revision += 1;
+                if let Some((path, plan)) = probe {
+                    self.enqueue_git(path, plan);
+                }
             }
             Outcome::Stopped { dir } => {
                 // Left pending, so it ends up as not scanned. Work dropped
@@ -721,15 +1090,49 @@ impl<A: FsAdapter> Aggregator<A> {
                 self.stop.get_or_insert(ScanState::Cancelled);
             }
             Outcome::Measured { file, result } => {
-                // A failed re-measure keeps the listing's values.
-                if let Ok(m) = result {
+                // One measure applies to every name of a file re-measured
+                // after the listings; a failed re-measure tries the file's
+                // next name, or keeps the listings' values.
+                let todo = self
+                    .links
+                    .measured(file, result.as_ref().ok().map(|m| m.id));
+                if let (Ok(m), false) = (&result, todo.apply.is_empty()) {
                     let sizes = FileSizes {
                         logical: m.logical,
                         allocated: m.allocated.map_or(Allocated::UNKNOWN, Allocated::known),
                     };
-                    write(&self.tree, self.config.write_holds.as_ref()).update_file(file, sizes);
+                    let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+                    for name in todo.apply {
+                        tree.update_file(name, sizes);
+                    }
+                    drop(tree);
                     self.revision += 1;
                 }
+                if self.stop.is_none() && !todo.remeasure.is_empty() {
+                    let paths: Vec<PathBuf> = {
+                        let tree = self.tree.read().unwrap();
+                        todo.remeasure.iter().map(|&n| tree.path(n)).collect()
+                    };
+                    for (name, path) in todo.remeasure.into_iter().zip(paths) {
+                        self.enqueue_measure(name, path);
+                    }
+                }
+            }
+            Outcome::Git { finding } => {
+                self.git_jobs -= 1;
+                self.git_quiet_since = None;
+                if self.stop.is_some() || finding.is_empty() {
+                    return;
+                }
+                let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+                for root in finding.roots {
+                    tree.set_git(root);
+                }
+                if let Some((path, root)) = finding.above {
+                    tree.set_git_above(path, root);
+                }
+                drop(tree);
+                self.revision += 1;
             }
             Outcome::Skipped => {
                 self.stop.get_or_insert(ScanState::Cancelled);
@@ -738,10 +1141,18 @@ impl<A: FsAdapter> Aggregator<A> {
     }
 
     /// Adds one batch of `dir`'s entries under one hold of the write lock,
-    /// then queues the subdirectories and re-measures it found.
-    fn apply_batch(&mut self, dir: NodeId, path: &Path, entries: Vec<Entry>) {
+    /// ending the listing there too when it's the last batch, then queues
+    /// the subdirectories and re-measures it found. Returns the Git probe
+    /// the listing's end asks for.
+    fn apply_batch(
+        &mut self,
+        dir: NodeId,
+        path: &Path,
+        entries: Vec<Entry>,
+        end: Option<ListingEnd>,
+    ) -> Option<(PathBuf, Plan)> {
         if self.stop.is_some() {
-            return;
+            return None;
         }
         let limit = self.config.sample_limit;
         let mut subdirs = Vec::new();
@@ -751,19 +1162,34 @@ impl<A: FsAdapter> Aggregator<A> {
         // on Windows, and growing it at millions of entries takes long enough
         // to stall readers. Names sharing a file within this batch are
         // matched under the lock through a map bounded by the batch.
-        let known: Vec<Option<NodeId>> = entries
+        let known: Vec<Option<Owner>> = entries
             .iter()
             .map(|e| match e.identity {
-                Identity::MaybeShared { key } => self.owners.get(&key).copied(),
+                Identity::MaybeShared { key } => self.links.owner(key),
                 _ => None,
             })
             .collect();
-        let mut first_names: HashMap<u128, NodeId> = HashMap::new();
+        let mut first_names: HashMap<FileKey, Owner, IdHash> = HashMap::default();
         let tree_lock = Arc::clone(&self.tree);
         let probe = self.config.write_holds.clone();
         let mut tree = write(&tree_lock, probe.as_ref());
+        // Listings are ordered by the prior scan only if asked to and while
+        // there is one.
+        let since = if self.config.list_by_prior {
+            tree.prior_created_ms()
+        } else {
+            None
+        };
+        // A prior handed over once the scan has begun orders the listings
+        // already queued too.
+        if let (Some(since), false) = (since, self.ordered) {
+            self.ordered = true;
+            self.queue
+                .reorder(|dir, modified| listing_priority(&tree, dir, modified, since));
+        }
         let mut unreadable = false;
         for (entry, known) in entries.into_iter().zip(known) {
+            let spot = git::spot(entry.name.as_encoded_bytes(), entry.kind);
             let skipped = match entry.kind {
                 EntryKind::File | EntryKind::Directory => None,
                 EntryKind::Symlink => Some(OmissionReason::Symlink),
@@ -778,12 +1204,22 @@ impl<A: FsAdapter> Aggregator<A> {
                     path: path.join(&entry.name),
                     detail: None,
                 });
+                if let Some(spot) = spot {
+                    self.spotted(&mut tree, dir, path, spot, &entry, None);
+                }
                 continue;
             }
             let added = if entry.kind == EntryKind::Directory {
-                tree.add_dir(dir, &entry.name).map(|id| {
+                tree.add_dir(dir, &entry.name).inspect(|&id| {
                     tree.set_id(id, fingerprint(entry.id));
-                    subdirs.push((id, path.join(&entry.name)));
+                    let priority = if spot == Some(Spot::DotGit) {
+                        GIT_DIR
+                    } else {
+                        since.map_or(0, |since| {
+                            listing_priority(&tree, id, entry.modified, since)
+                        })
+                    };
+                    subdirs.push((id, path.join(&entry.name), entry.modified, priority));
                 })
             } else {
                 let sizes = FileSizes {
@@ -792,56 +1228,103 @@ impl<A: FsAdapter> Aggregator<A> {
                 };
                 let extra = if entry.cloud { flags::CLOUD } else { 0 };
                 tree.add_file(dir, &entry.name, sizes, entry.modified, extra)
-                    .map(|id| {
+                    .inspect(|&id| {
                         tree.set_id(id, fingerprint(entry.id));
                         let Identity::MaybeShared { key } = entry.identity else {
                             return;
                         };
                         let owner = match known {
                             Some(owner) => owner,
-                            None => match first_names.entry(key) {
+                            None => match first_names.entry(FileKey::of(key)) {
                                 MapEntry::Vacant(v) => {
-                                    v.insert(id);
+                                    v.insert(Owner::new(id, entry.stamp));
                                     return;
                                 }
                                 MapEntry::Occupied(o) => *o.get(),
                             },
                         };
-                        tree.mark_alias(id, owner);
-                        // Listings of other names can be stale (NTFS), so
-                        // re-measure both sides once.
-                        remeasure.push((id, tree.path(id)));
-                        if self.remeasured.insert(owner) {
-                            remeasure.push((owner, tree.path(owner)));
-                        }
+                        tree.mark_alias(id, owner.node);
+                        self.links
+                            .alias(&tree, id, &entry, key, owner, &mut remeasure);
                     })
             };
-            if added.is_err() {
+            let Ok(added) = added else {
                 self.stop = Some(ScanState::Failed(
                     "The scan stopped because the folder tree exceeded SpaceBadger's capacity. \
                      Results so far are kept."
                         .into(),
                 ));
                 break;
+            };
+            if let Some(spot) = spot {
+                self.spotted(&mut tree, dir, path, spot, &entry, Some(added));
             }
         }
         if unreadable {
             tree.mark_unreadable_entries(dir);
         }
+        let probe = match end {
+            Some(end) if self.stop.is_none() => self.end_listing(&mut tree, dir, path, end),
+            _ => None,
+        };
         drop(tree);
-        self.owners.extend(first_names);
+        self.links.add_owners(first_names);
         if self.stop.is_some() {
-            return;
+            return None;
         }
-        for (id, path) in subdirs {
-            self.enqueue_list(id, path);
+        for (id, path, modified, priority) in subdirs {
+            self.enqueue_list(id, path, modified, priority);
         }
         for (id, path) in remeasure {
             self.enqueue_measure(id, path);
         }
+        probe
     }
 
-    /// Stops issuing work and marks every unlisted directory as not scanned.
+    /// Marks `dir` listed (or failed) once its last batch is in, under the
+    /// caller's hold of the write lock, and says what its listing showed of
+    /// Git.
+    fn end_listing(
+        &mut self,
+        tree: &mut Tree,
+        dir: NodeId,
+        path: &Path,
+        end: ListingEnd,
+    ) -> Option<(PathBuf, Plan)> {
+        let ListingEnd { result, partial } = end;
+        let candidate = self.git_signals.remove(&dir).unwrap_or_default();
+        let mut failed = None;
+        match result {
+            Ok(()) => tree.set_dir_state(dir, DirState::Listed),
+            Err(err) => {
+                let reason = OmissionReason::from_error(err.kind);
+                self.omissions
+                    .add(reason, self.config.sample_limit, || OmissionSample {
+                        path: path.to_path_buf(),
+                        detail: Some(err.message.clone()),
+                    });
+                if partial {
+                    // Listed in part: the entries already added stay, and
+                    // the folder counts as not fully read.
+                    tree.set_dir_state(dir, DirState::Listed);
+                    tree.mark_unreadable_entries(dir);
+                } else {
+                    tree.set_dir_state(dir, DirState::Failed);
+                    if dir == NodeId::ROOT {
+                        self.stop = Some(ScanState::Failed(format!(
+                            "The selected folder can't be listed: {}",
+                            err.message
+                        )));
+                    }
+                }
+                failed = Some(err);
+            }
+        }
+        listed_git(tree, dir, path, candidate, failed, partial)
+    }
+
+    /// Stops issuing work, marks every unlisted directory as not scanned and
+    /// every Git candidate not yet confirmed as not checked.
     fn abandon_remaining(&mut self) {
         self.queue.close();
         let mut tree = write(&self.tree, self.config.write_holds.as_ref());
@@ -851,6 +1334,78 @@ impl<A: FsAdapter> Aggregator<A> {
                 tree.set_dir_state(node, DirState::NotScanned);
             }
         }
+        drop(tree);
+        self.unconfirmed(Problem::NotChecked);
+    }
+
+    /// Leaves every Git candidate not yet confirmed unresolved with
+    /// `problem`.
+    fn unconfirmed(&mut self, problem: Problem) {
+        let mut tree = write(&self.tree, self.config.write_holds.as_ref());
+        let pending: Vec<NodeId> = tree
+            .git()
+            .roots()
+            .filter(|r| r.kind == GitKind::Pending)
+            .map(|r| r.node)
+            .collect();
+        for node in pending {
+            tree.set_git(GitRoot::unresolved(node, problem.clone()));
+        }
+    }
+
+    /// Notes what an entry's name says about Git, under the batch's hold of
+    /// the write lock: a `.git` folder makes its folder a candidate, a
+    /// `.git` file is noted to be followed once the folder is listed (unless
+    /// the folder is a Git directory itself), a `.git` link is never
+    /// followed, and Git's other names are signals for the folder. A `.git`
+    /// inside a `.git` folder is ignored: it's data, not a repository.
+    fn spotted(
+        &mut self,
+        tree: &mut Tree,
+        dir: NodeId,
+        path: &Path,
+        spot: Spot,
+        entry: &Entry,
+        added: Option<NodeId>,
+    ) {
+        if spot != Spot::DotGit {
+            if added.is_some() {
+                spot.add_to(&mut self.git_signals.entry(dir).or_default().signals);
+            }
+            return;
+        }
+        let in_git = path
+            .file_name()
+            .is_some_and(|n| git::name_eq(n.as_encoded_bytes(), b".git"))
+            || git::inside_dotgit(path);
+        if in_git {
+            return;
+        }
+        let root = match (entry.kind, added) {
+            (EntryKind::Directory, Some(_)) => GitRoot::pending(dir),
+            (EntryKind::File, Some(file)) => {
+                self.git_signals.entry(dir).or_default().pointer = Some((file, entry.name.clone()));
+                return;
+            }
+            (EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse, _) => {
+                GitRoot::unresolved(dir, Problem::Link)
+            }
+            (EntryKind::Failed(kind), _) => GitRoot::unresolved(
+                dir,
+                Problem::Unreadable {
+                    kind: kind as u8,
+                    message: match kind {
+                        ErrorKind::PermissionDenied => "access denied",
+                        ErrorKind::Vanished => ".git disappeared",
+                        ErrorKind::Disconnected => "the device stopped responding",
+                        ErrorKind::Unavailable | ErrorKind::Other => ".git couldn't be examined",
+                    }
+                    .to_owned(),
+                },
+            ),
+            _ => return,
+        };
+        tree.set_git(root);
     }
 
     fn finish(&mut self, state: ScanState) {
@@ -880,5 +1435,178 @@ impl<A: FsAdapter> Aggregator<A> {
         self.published_revision = self.revision;
         self.last_publish = Instant::now();
         (self.on_progress)(&progress);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(n: u32) -> Job {
+        Job::List {
+            dir: NodeId::from_index(n),
+            path: PathBuf::from(n.to_string()),
+            modified: None,
+        }
+    }
+
+    fn name(job: Job) -> String {
+        match job {
+            Job::List { path, .. } | Job::Measure { path, .. } | Job::Git { path, .. } => {
+                path.display().to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn big_listings_go_first_biggest_first_then_the_rest_in_order() {
+        let q = Queue::default();
+        q.push(list(1), 0);
+        q.push(list(2), BIG_SHARE);
+        q.push(list(3), BIG_SHARE - 1);
+        q.push(
+            Job::Git {
+                path: "probe".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        q.push(list(4), 500_000);
+        q.push(list(5), BIG_SHARE);
+        q.push(
+            Job::Measure {
+                file: NodeId::from_index(6),
+                path: "6".into(),
+            },
+            0,
+        );
+        q.push(list(7), 500_000);
+        let order: Vec<String> = (0..8).map(|_| name(q.pop().unwrap())).collect();
+        // The Git probe goes ahead of the ordered listings; those go
+        // highest first, ties to the one queued first; then the rest,
+        // re-measure included, in the order queued.
+        assert_eq!(order, ["probe", "4", "7", "2", "5", "1", "3", "6"]);
+    }
+
+    #[test]
+    fn folders_the_prior_cant_vouch_for_come_first_then_big_ones() {
+        use sb_core::prior::Prior;
+        use sb_core::size::Allocated;
+        use sb_core::snapshot::Snapshot;
+        let sizes = |n| FileSizes {
+            logical: n,
+            allocated: Allocated::known(n),
+        };
+        let mut before = Tree::new("/r");
+        for (dir, size) in [("big", 999_000), ("small", 10), ("touched", 990)] {
+            let d = before.add_dir(NodeId::ROOT, dir.as_ref()).unwrap();
+            before
+                .add_file(d, "f".as_ref(), sizes(size), None, 0)
+                .unwrap();
+            before.set_dir_state(d, DirState::Listed);
+        }
+        let empty = before.add_dir(NodeId::ROOT, "empty".as_ref()).unwrap();
+        before.set_dir_state(empty, DirState::Listed);
+        before.set_dir_state(NodeId::ROOT, DirState::Listed);
+        let since = 5_000;
+        let prior = Prior::new(Snapshot::capture(&before, since, true));
+
+        let mut t = Tree::new("/r");
+        t.set_prior(Arc::new(prior));
+        let at = |ms| Some(UNIX_EPOCH + Duration::from_millis(ms));
+        let mut order = |name: &str, modified| {
+            let d = t.add_dir(NodeId::ROOT, name.as_ref()).unwrap();
+            listing_priority(&t, d, modified, since)
+        };
+        // Shares of the million bytes the root held.
+        assert_eq!(order("big", at(since)), 999_000, "unchanged since");
+        assert_eq!(order("small", None), 10, "too small to go ahead");
+        assert_eq!(order("touched", at(since + 1)), CHANGED + 990);
+        assert_eq!(order("new", at(1)), CHANGED, "nothing to go by");
+        assert_eq!(order("empty", at(since)), 0, "unchanged and empty");
+    }
+
+    #[test]
+    fn without_priorities_the_queue_is_first_in_first_out() {
+        let q = Queue::default();
+        for n in 0..50 {
+            if n % 7 == 3 {
+                q.push(
+                    Job::Git {
+                        path: n.to_string().into(),
+                        plan: Plan::Ancestors,
+                    },
+                    0,
+                );
+            } else if n % 7 == 5 {
+                q.push(
+                    Job::Measure {
+                        file: NodeId::from_index(n),
+                        path: n.to_string().into(),
+                    },
+                    0,
+                );
+            } else {
+                q.push(list(n), 0);
+            }
+        }
+        for n in 0..50 {
+            assert_eq!(name(q.pop().unwrap()), n.to_string());
+        }
+    }
+
+    #[test]
+    fn a_git_probe_goes_ahead_of_many_ordered_listings() {
+        let q = Queue::default();
+        q.push(list(0), 0);
+        for n in 1..1_000 {
+            q.push(list(n), 500_000 + n);
+        }
+        q.push(
+            Job::Git {
+                path: "probe".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        q.push(list(1_000), GIT_DIR);
+        assert_eq!(name(q.pop().unwrap()), "probe");
+        assert_eq!(name(q.pop().unwrap()), "1000", "a .git folder's listing");
+        assert_eq!(name(q.pop().unwrap()), "999");
+        // Once the ordered listings are done, the rest go in the order
+        // queued again.
+        for _ in 1..999 {
+            q.pop().unwrap();
+        }
+        q.push(
+            Job::Git {
+                path: "later".into(),
+                plan: Plan::Ancestors,
+            },
+            0,
+        );
+        assert_eq!(name(q.pop().unwrap()), "0");
+        assert_eq!(name(q.pop().unwrap()), "later");
+    }
+
+    #[test]
+    fn a_closed_queue_hands_out_nothing_more() {
+        let q = Queue::default();
+        q.push(list(1), 0);
+        q.push(list(2), 1_000);
+        q.close();
+        assert!(q.pop().is_none());
+        // Pushing after closing is harmless.
+        q.push(list(3), 1_000);
+        assert!(q.pop().is_none());
+        // A worker waiting for work wakes up and stops.
+        let idle = Arc::new(Queue::default());
+        let waiter = {
+            let idle = Arc::clone(&idle);
+            std::thread::spawn(move || idle.pop().is_none())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        idle.close();
+        assert!(waiter.join().unwrap());
     }
 }

@@ -6,6 +6,9 @@
     CHANGE_LEGEND,
     changeColor,
     depthColor,
+    gitAccent,
+    gitColor,
+    GIT_LEGEND,
     typeModeFolderColor,
     otherSmallColor,
     TYPE_LEGEND,
@@ -13,6 +16,7 @@
     type ColorMode,
   } from "./colors";
   import { MARK_NEW, MARK_UNCHANGED, MARK_UNKNOWN } from "./compare";
+  import { GIT_METADATA } from "./layoutWire";
   import { theme } from "./theme.svelte";
 
   interface Props {
@@ -23,9 +27,12 @@
     /** A name filter is on: tiles show matching files, but changes are
      * of all files. */
     filtered?: boolean;
+    /** The map shows areas estimated from the last scan (a rescan is
+     * under way). */
+    estimated?: boolean;
   }
 
-  let { mode = "type", since = "", filtered = false }: Props = $props();
+  let { mode = "type", since = "", filtered = false, estimated = false }: Props = $props();
 
   const dark = $derived(theme.dark);
   const listId = $props.id();
@@ -52,11 +59,19 @@
   }
 
   const heading = $derived(
-    mode === "type" ? "File types" : mode === "change" ? (since ? `Change since ${since}` : "Change") : "Colors",
+    mode === "type"
+      ? "File types"
+      : mode === "change"
+        ? since
+          ? `Change since ${since}`
+          : "Change"
+        : mode === "git"
+          ? "Git"
+          : "Colors",
   );
 </script>
 
-<section class="legend" aria-labelledby="{listId}-heading">
+<section class="legend" class:wide={mode === "git"} aria-labelledby="{listId}-heading">
   <div class="head">
     <h2 id="{listId}-heading">{heading}</h2>
     <button
@@ -70,7 +85,7 @@
     >
   </div>
   {#if !collapsed}
-    <ul id={listId}>
+    <ul id={listId} class:row={mode === "git"}>
       {#if mode === "type"}
         {#each TYPE_LEGEND as t (t.type)}
           <li><span class="swatch" style:background={typeColor(t.type, dark)}></span>{t.label}</li>
@@ -101,6 +116,17 @@
         {#if filtered}
           <li class="wide muted note">Colors show the change in all files, not only matching ones</li>
         {/if}
+      {:else if mode === "git"}
+        {#each GIT_LEGEND as g (g.cls)}
+          <li>
+            <span class="swatch" class:hatched={g.cls === GIT_METADATA} style:background-color={gitColor(g.cls, false, dark)}
+            ></span>{g.label}
+          </li>
+        {/each}
+        <li><span class="swatch" style:background={otherSmallColor(dark)}></span>Small items</li>
+        <li class="wide muted note">
+          <span class="pill" aria-hidden="true" style:background={gitAccent(1, dark)}>repo</span> Badges and a top line mark repository and worktree folders
+        </li>
       {:else}
         <li class="wide">
           <span class="depths" aria-hidden="true">
@@ -109,6 +135,9 @@
             {/each}
           </span>Colors show folder depth
         </li>
+      {/if}
+      {#if estimated}
+        <li class="wide"><span class="swatch estimated" class:dark></span>Estimated from last scan</li>
       {/if}
       <li><span class="swatch incomplete"></span>Not fully scanned</li>
       <li><span class="swatch selected" class:dark></span>Selected</li>
@@ -130,6 +159,49 @@
     background: var(--panel);
     box-shadow: 0 2px 8px rgb(0 0 0 / 0.2);
     font-size: var(--fs-xs);
+  }
+  /* Git mode: one compact row of swatches, wrapping as needed. */
+  .legend.wide {
+    max-width: min(420px, calc(100% - 2 * var(--space-2)));
+  }
+  ul.row {
+    display: flex;
+    flex-wrap: wrap;
+  }
+  ul.row li.wide {
+    flex-basis: 100%;
+  }
+  /* As the map draws estimated areas: faded toward the background, with
+     dense lines the other way from Git metadata's. */
+  .swatch.estimated {
+    background-color: color-mix(in srgb, var(--muted) 45%, var(--bg));
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0 2px,
+      rgb(0 0 0 / 0.25) 2px 3px
+    );
+  }
+  .swatch.estimated.dark {
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0 2px,
+      rgb(255 255 255 / 0.3) 2px 3px
+    );
+  }
+  .swatch.hatched {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      transparent 0 2px,
+      color-mix(in srgb, var(--fg) 18%, transparent) 2px 3px
+    );
+  }
+  .pill {
+    padding: 0 4px;
+    border-radius: 2px;
+    color: var(--bg);
+    font-weight: 600;
+    font-size: 9px;
+    line-height: 12px;
   }
   .head {
     display: flex;

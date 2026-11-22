@@ -185,6 +185,7 @@ impl FsAdapter for SynthFs {
                     id: u128::from(seed ^ i),
                     cloud: false,
                     modified: Some(modified),
+                    stamp: None,
                 };
                 if out.push(entry).is_break() {
                     return Ok(());
@@ -203,6 +204,7 @@ impl FsAdapter for SynthFs {
                     id: u128::from(seed ^ (i << 20)),
                     cloud: false,
                     modified: Some(modified),
+                    stamp: None,
                 };
                 if out.push(entry).is_break() {
                     return Ok(());
@@ -216,6 +218,7 @@ impl FsAdapter for SynthFs {
         Ok(Measured {
             logical: 0,
             allocated: Some(0),
+            id: None,
         })
     }
 }
@@ -407,6 +410,11 @@ fn via_runner() -> bool {
     env("SB_LOAD_RUNNER", 1) != 0
 }
 
+/// The scan settings the load scenarios use, also printed with the results.
+fn load_config() -> ScanConfig {
+    ScanConfig::default()
+}
+
 fn run(scenario: &Scenario) -> (Vec<Sample>, Duration, usize) {
     let fs = SynthFs::from_env();
     let query = std::env::var("SB_LOAD_QUERY").unwrap_or_else(|_| "*.log".to_owned());
@@ -416,7 +424,7 @@ fn run(scenario: &Scenario) -> (Vec<Sample>, Duration, usize) {
     let session = Arc::new(Session::start_on(
         PathBuf::from(ROOT),
         fs,
-        ScanConfig::default(),
+        load_config(),
         None,
         None,
         |_| {},
@@ -764,7 +772,7 @@ fn interaction_latency_while_scanning() {
     let cores = std::thread::available_parallelism().map_or(0, |n| n.get());
     println!(
         "cores: {cores}, scan workers: {}, query runner: {}",
-        ScanConfig::default().workers,
+        load_config().workers,
         if via_runner() {
             format!("{} threads", crate::runner::default_threads())
         } else {

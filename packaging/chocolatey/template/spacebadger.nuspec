@@ -21,9 +21,12 @@
     <description><![CDATA[SpaceBadger shows what fills a folder or drive as a nested, zoomable treemap that updates live while it scans.
 
 - Select, zoom, and follow breadcrumbs through the map.
-- Filter by file name, folder (`dir:`), or file type (`is:video`), with suggestions as you type.
-- Color the map by folder depth or by file type.
-- Show items in Explorer, and move selected items to the Recycle Bin behind explicit safeguards; nothing is ever deleted permanently.
+- Filter by file name, folder (`dir:`), file type (`is:video`), size (`size:>1GB`), or age (`older:1y`), with suggestions as you type.
+- Color the map by folder depth, by file type, or by change since an earlier scan.
+- Scan a folder again later and compare: see what grew, what shrank, and what's new.
+- Find duplicate files among the files in view. File contents are read only when you ask, and cloud files are never downloaded.
+- Export a folder's contents as CSV or a text report.
+- Show items in Explorer, and move selected items to the Recycle Bin after a confirmation with safeguards; nothing is ever deleted permanently.
 - When a whole drive is scanned, the volume overview shows files found, used space not attributed to any file, and free space.
 
 This package downloads the portable Windows x64 build from the GitHub release and adds a `spacebadger` command. It needs the WebView2 runtime, which comes with Windows 11 and current Windows 10.

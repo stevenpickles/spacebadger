@@ -1,11 +1,20 @@
 // Treemap colors. Depth mode tints each nesting level; file-type mode colors
-// files by FILE_TYPES and draws folders in one muted slate.
+// files by FILE_TYPES and draws folders in one muted slate; Git mode colors
+// by what Git makes of the content.
 
 import { MARK_GROWN, MARK_LEVELS, MARK_NEW, MARK_SHRUNK, MARK_UNCHANGED } from "./compare";
-import { FILE_TYPES } from "./layoutWire";
+import {
+  FILE_TYPES,
+  GIT_BADGE_CLASS,
+  GIT_BADGE_UNRESOLVED,
+  GIT_CHECKOUT,
+  GIT_METADATA,
+  GIT_OTHER,
+  GIT_WORKTREE,
+} from "./layoutWire";
 
 /** "change" is offered only while comparing with an earlier scan. */
-export type ColorMode = "depth" | "type" | "change";
+export type ColorMode = "depth" | "type" | "change" | "git";
 
 const DEPTH_HUES = [212, 28, 145, 270, 188, 340, 50, 105];
 
@@ -70,6 +79,47 @@ export function changeColor(mark: number, folder: boolean, dark: boolean): strin
   }
   return `hsl(${hue} ${Math.round(s * muted)}% ${l - shade}%)`;
 }
+
+/** Hue per Git class, by GIT_* value; `null` for other content. */
+const GIT_HUES: (number | null)[] = [null, 205, 265, 35];
+
+/**
+ * Git mode, by Git class (see layoutWire.ts): checkout content a muted
+ * blue-teal, linked-worktree content a muted violet, Git's own data a
+ * low-saturation warm grey (also hatched on the map), and everything else
+ * neutral grey. Folders take the same color, muted, so files carry the
+ * contrast.
+ */
+export function gitColor(cls: number, folder: boolean, dark: boolean): string {
+  const hue = GIT_HUES[cls] ?? null;
+  if (hue === null) {
+    if (folder) return dark ? "hsl(220 4% 25%)" : "hsl(220 4% 66%)";
+    return dark ? "hsl(220 4% 34%)" : "hsl(220 5% 83%)";
+  }
+  const s = cls === GIT_METADATA ? (dark ? 20 : 26) : dark ? 34 : 46;
+  if (folder) return dark ? `hsl(${hue} ${Math.round(s * 0.7)}% 27%)` : `hsl(${hue} ${Math.round(s * 0.7)}% 64%)`;
+  return dark ? `hsl(${hue} ${s}% 40%)` : `hsl(${hue} ${s}% 78%)`;
+}
+
+/**
+ * The thin accent and badge of a repository or worktree root folder, by
+ * badge (see GIT_BADGES): its kind's hue, deeper than the fills so it reads
+ * in every color mode; unresolved roots in an amber like "not fully
+ * scanned".
+ */
+export function gitAccent(badge: number, dark: boolean): string {
+  if (badge === GIT_BADGE_UNRESOLVED) return dark ? "hsl(40 65% 58%)" : "hsl(36 90% 33%)";
+  const hue = GIT_HUES[GIT_BADGE_CLASS[badge] ?? GIT_OTHER] ?? 220;
+  return dark ? `hsl(${hue} 50% 66%)` : `hsl(${hue} 55% 36%)`;
+}
+
+/** The legend's rows for Git mode. */
+export const GIT_LEGEND = [
+  { label: "Repository content", cls: GIT_CHECKOUT },
+  { label: "Linked worktree content", cls: GIT_WORKTREE },
+  { label: "Git metadata", cls: GIT_METADATA },
+  { label: "Other", cls: GIT_OTHER },
+];
 
 /** The legend's rows for change mode: grown and shrunk as ramps. */
 export const CHANGE_LEGEND = {

@@ -13,4 +13,9 @@ root: string, phase: ScanPhase, elapsedMs: number, files: number, dirs: number, 
 /**
  * Changes whenever the scanned tree changes.
  */
-revision: number, omissions: Array<OmissionGroup>, };
+revision: number, omissions: Array<OmissionGroup>, 
+/**
+ * Git repositories, worktrees and unresolved candidates found so far
+ * (see [`GitRootsPage`]), including one above the scan root.
+ */
+gitRoots: number, };

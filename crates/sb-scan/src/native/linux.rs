@@ -11,7 +11,7 @@
 
 use crate::adapter::{
     Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched,
+    batched, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use rustix::fs::{
@@ -164,6 +164,33 @@ impl FsAdapter for LinuxFs {
         Ok(Measured {
             logical: stx.stx_size,
             allocated: Some(stx.stx_blocks.saturating_mul(512)),
+            id: Some((u128::from(dev(&stx)) << 64) | u128::from(stx.stx_ino)),
+        })
+    }
+
+    /// `O_NOFOLLOW` refuses a link and `O_NONBLOCK` keeps a FIFO from
+    /// blocking; only a regular file is read.
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        let flags =
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+        let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| match e {
+            rustix::io::Errno::LOOP => ScanError::new(ErrorKind::Unavailable, refused::LINK),
+            e => error(e),
+        })?;
+        let file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            return Err(ScanError::new(ErrorKind::Unavailable, refused::NOT_FILE));
+        }
+        read_capped(file, cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let stx = statx(CWD, path, STAT_FLAGS, StatxFlags::TYPE).map_err(error)?;
+        Ok(match kind_of(&stx) {
+            FileType::RegularFile => EntryKind::File,
+            FileType::Symlink => EntryKind::Symlink,
+            FileType::Directory => EntryKind::Directory,
+            _ => EntryKind::Special,
         })
     }
 }
@@ -200,6 +227,7 @@ impl LinuxFs {
                         id: 0,
                         cloud: false,
                         modified: None,
+                        stamp: None,
                     };
                     if out.push(failed).is_break() {
                         return Ok(());
@@ -245,6 +273,7 @@ impl LinuxFs {
                 id: unix_object_id(stx.stx_ino, birth(&stx)),
                 cloud: false,
                 modified: modified(&stx),
+                stamp: None,
             };
             if out.push(entry).is_break() {
                 return Ok(());

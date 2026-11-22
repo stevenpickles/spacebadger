@@ -24,7 +24,7 @@ export interface Context {
   start: number;
   end: number;
   /** Put before an accepted name: "dir:", "is:", "size:", "older:",
-   * "newer:", "*.", or ".". */
+   * "newer:", "git:", "*.", or ".". */
   prefix: string;
 }
 
@@ -50,7 +50,7 @@ export function contextAt(query: string, caret: number): Context | null {
     end: caret,
     prefix,
   });
-  const keyword = /^(dir|is|size|older|newer):\s*/i.exec(term);
+  const keyword = /^(dir|is|size|older|newer|git):\s*/i.exec(term);
   if (keyword) {
     const typed = term.slice(keyword[0].length);
     const word = keyword[1]!.toLowerCase();
@@ -74,6 +74,7 @@ export interface Keyword {
 
 const DIR: Keyword = { text: "dir:", describe: "files inside folders with this name" };
 const IS: Keyword = { text: "is:", describe: "files of a type: video, image, document…" };
+const GIT: Keyword = { text: "git:", describe: "Git repositories, worktrees, metadata" };
 /** Keywords that narrow by size or age, each with a short example. */
 const RESTRICTIONS: Keyword[] = [
   { text: "size:", describe: "by size: size:>1GB" },
@@ -85,15 +86,17 @@ const RESTRICTIONS: Keyword[] = [
  * every type, "s" `size:`. Empty `typed` offers every keyword. */
 export function keywords(typed: string): Keyword[] {
   const t = typed.toLowerCase();
-  if (t === "") return [DIR, IS, ...RESTRICTIONS];
+  if (t === "") return [DIR, IS, GIT, ...RESTRICTIONS];
   const found: Keyword[] = [];
   if (DIR.text.startsWith(t)) found.push(DIR);
   if (IS.text.startsWith(t)) found.push(...types(""));
+  if (GIT.text.startsWith(t)) found.push(GIT);
   found.push(...RESTRICTIONS.filter((k) => k.text.startsWith(t)));
   return found;
 }
 
-/** Common values after `size:`, `older:`, and `newer:`, by keyword. */
+/** Common values after `size:`, `older:`, and `newer:`, and every value
+ * after `git:`, by keyword. */
 const VALUES: Record<string, [string, string][]> = {
   "size:": [
     [">100MB", "over 100 MB"],
@@ -113,6 +116,11 @@ const VALUES: Record<string, [string, string][]> = {
     ["7d", "in the last week"],
     ["30d", "in the last 30 days"],
     ["1y", "in the last year"],
+  ],
+  "git:": [
+    ["repo", "in repositories and worktrees, .git included"],
+    ["worktree", "in linked worktree checkouts"],
+    ["metadata", "Git's own data: .git folders, bare repos"],
   ],
 };
 

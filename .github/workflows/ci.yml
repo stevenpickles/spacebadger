@@ -47,6 +47,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+      - name: macOS listing timing (informational)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: cargo test -p sb-scan --release --locked --test macos_listing -- --ignored --nocapture
+
       - name: Generated TypeScript bindings are up to date
         shell: bash
         run: git diff --exit-code -- ui/src/lib/protocol

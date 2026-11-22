@@ -1,12 +1,19 @@
 //! Windows adapter. Decisions and evidence: `docs/validation/windows-m1.md`.
 //!
-//! - Lists with `FileIdExtdDirectoryInfo` (falling back to
-//!   `FileIdBothDirectoryInfo` where unsupported) so sizes, attributes,
-//!   reparse tags, and file IDs come from the listing without opening files.
-//!   Entries are passed on as each 64 KiB buffer is decoded, in batches, so
-//!   a huge folder is never held whole.
+//! - Lists with `NtQueryDirectoryFile(FileIdExtdDirectoryInformation)`
+//!   (falling back to `FileIdBothDirectoryInformation` where unsupported) so
+//!   sizes, attributes, reparse tags, and file IDs come from the listing
+//!   without opening files. Entries are passed on as each 64 KiB buffer (one
+//!   per worker thread) is decoded, in batches, so a huge folder is never
+//!   held whole.
 //! - Allocated size is the listing's `AllocationSize`; logical is `EndOfFile`.
 //!   The modified time is the listing's `LastWriteTime`.
+//! - A file listed under several names may be stale under all but the one
+//!   it was last changed through, so each entry also carries its listed
+//!   `LastWriteTime` and `ChangeTime` (see [`LinkStamp`]): the engine
+//!   re-measures a file once, and only when its names' listings disagree
+//!   or its listed allocation can be wrong under every name alike
+//!   (WOF-compressed files list 0; compressed, sparse and cloud files).
 //! - Symlinks and mount points (junctions and volume mounts) are reported, not
 //!   followed, including file symlinks. Cloud-tagged entries are measured.
 //! - Cloud state comes from attributes because Cloud Files disguises
@@ -20,19 +27,23 @@
 //!   local file, and reads with `OPEN_REPARSE_POINT` and `OPEN_NO_RECALL` too.
 
 use crate::adapter::{
-    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, Measured, RootKind, ScanError, Sink,
-    batched, classify_io,
+    Batcher, Entry, EntryKind, ErrorKind, FsAdapter, Identity, LinkStamp, Measured, RootKind,
+    ScanError, Sink, batched, classify_io, read_capped, refused,
 };
 use crate::duplicates::{Fingerprint, Skip};
 use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_INFORMATION_CLASS, FileIdBothDirectoryInformation, FileIdExtdDirectoryInformation,
+    NtQueryDirectoryFile,
+};
 use windows::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID, RtlNtStatusToDosError,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
@@ -44,20 +55,26 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_BOTH_DIR_INFO,
     FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
-    FileIdBothDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
-    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdInfo,
+    FileStandardInfo, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
+use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
+use windows::Win32::System::Ioctl::{
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY,
+    NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery, STORAGE_PROPERTY_QUERY,
+    StorageDeviceSeekPenaltyProperty,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
 mod attr {
     pub const DIRECTORY: u32 = 0x10;
     pub const DEVICE: u32 = 0x40;
+    pub const SPARSE: u32 = 0x200;
     pub const REPARSE_POINT: u32 = 0x400;
+    pub const COMPRESSED: u32 = 0x800;
     pub const OFFLINE: u32 = 0x1000;
     pub const RECALL_ON_OPEN: u32 = 0x40000;
     pub const PINNED: u32 = 0x80000;
@@ -124,9 +141,52 @@ fn scan_error(err: windows::core::Error) -> ScanError {
     ScanError::new(kind, err.message())
 }
 
-/// NUL-terminated wide path in the `\\?\` form so long paths work.
+/// Whether `path` is already absolute and normal: a drive or UNC prefix, a
+/// root, and then only names between single `\` separators (no `.`, `..`
+/// or `/`). The scan's paths are: the app makes the root absolute once and
+/// the engine joins listed names onto it. Such a path goes into the `\\?\`
+/// form as it is, because `std::path::absolute` (`GetFullPathNameW`) would
+/// strip trailing dots and spaces from every name, and a listed `foo.` would
+/// then open `foo`.
+fn is_normal(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    let known = matches!(
+        prefix.kind(),
+        Prefix::Disk(_)
+            | Prefix::UNC(..)
+            | Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(..)
+    );
+    if !known || components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let text = path.as_os_str().to_string_lossy();
+    let Some(rest) = text
+        .get(prefix.as_os_str().to_string_lossy().len()..)
+        .and_then(|rest| rest.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    let rest = rest.strip_suffix('\\').unwrap_or(rest);
+    rest.is_empty()
+        || rest
+            .split('\\')
+            .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains('/'))
+}
+
+/// NUL-terminated wide path in the `\\?\` form so long paths work. A path
+/// that isn't [`is_normal`] is made absolute first.
 fn wide(path: &Path) -> Vec<u16> {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = if is_normal(path) {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
     let text: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     let starts = |prefix: &str| text.starts_with(&prefix.encode_utf16().collect::<Vec<_>>());
     let mut out: Vec<u16> = if starts(r"\\?\") || starts(r"\\.\") {
@@ -373,6 +433,8 @@ struct Listed {
     file_id: u128,
     /// `LastWriteTime`: 100 ns intervals since 1601, 0 when not set.
     last_write: i64,
+    /// `ChangeTime`, likewise.
+    change_time: i64,
 }
 
 /// Seconds from 1601-01-01, where `FILETIME` counts from, to the Unix epoch.
@@ -394,6 +456,8 @@ fn filetime(ticks: i64) -> Option<SystemTime> {
 pub struct WindowsFs {
     /// Set once the extended class is found unsupported on this volume.
     use_both_dir_info: AtomicBool,
+    /// Per drive letter: 0 not asked yet, 1 local, 2 not.
+    local_drives: Mutex<[u8; 26]>,
 }
 
 impl WindowsFs {
@@ -406,8 +470,24 @@ impl WindowsFs {
 
     fn list(&self, dir: &Path, out: &mut Batcher<'_, '_>) -> Result<(), ScanError> {
         let handle = open(dir, FILE_LIST_DIRECTORY.0)?;
+        with_list_buffer(|buffer| self.list_handle(&handle, buffer, out))
+    }
+
+    /// Lists an open directory into `buffer`, with the extended class where
+    /// the volume supports it.
+    fn list_handle(
+        &self,
+        handle: &OwnedHandle,
+        buffer: &mut [u64],
+        out: &mut Batcher<'_, '_>,
+    ) -> Result<(), ScanError> {
         if !self.use_both_dir_info.load(Ordering::Relaxed) {
-            match list_with::<FILE_ID_EXTD_DIR_INFO>(&handle, FileIdExtdDirectoryInfo, out) {
+            match list_with::<FILE_ID_EXTD_DIR_INFO>(
+                handle,
+                FileIdExtdDirectoryInformation,
+                buffer,
+                out,
+            ) {
                 // Only before any entry was read, so none is listed twice.
                 Err(err) if err.kind == ErrorKind::Unavailable && out.pushed() == 0 => {
                     self.use_both_dir_info.store(true, Ordering::Relaxed);
@@ -415,11 +495,26 @@ impl WindowsFs {
                 result => return result,
             }
         }
-        list_with::<FILE_ID_BOTH_DIR_INFO>(&handle, FileIdBothDirectoryInfo, out)
+        list_with::<FILE_ID_BOTH_DIR_INFO>(handle, FileIdBothDirectoryInformation, buffer, out)
     }
 }
 
 impl Listed {
+    /// The stamp to compare this name's listing with its file's other
+    /// names'. Untrusted where the listing's allocation can be wrong under
+    /// every name alike: less allocated than the file's length
+    /// (WOF-compressed files list 0 allocated, and the WOF filter hides
+    /// their reparse point from listings), or a reparse point, compressed,
+    /// sparse, or in the cloud; such a file is always re-measured once.
+    fn stamp(&self) -> LinkStamp {
+        let unreliable = attr::REPARSE_POINT | attr::COMPRESSED | attr::SPARSE | attr::CLOUD;
+        LinkStamp {
+            written: self.last_write,
+            changed: self.change_time,
+            trusted: self.attributes & unreliable == 0 && self.allocation_size >= self.end_of_file,
+        }
+    }
+
     fn entry(self) -> Entry {
         Entry {
             kind: classify(self.attributes, self.reparse_tag),
@@ -435,6 +530,7 @@ impl Listed {
             cloud: self.attributes & attr::CLOUD != 0
                 || (self.attributes & attr::REPARSE_POINT != 0 && tag::is_cloud(self.reparse_tag)),
             modified: filetime(self.last_write),
+            stamp: Some(self.stamp()),
             name: self.name,
         }
     }
@@ -469,6 +565,7 @@ impl DirInfo for FILE_ID_EXTD_DIR_INFO {
             reparse_tag: self.ReparsePointTag,
             file_id: u128::from_le_bytes(self.FileId.Identifier),
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
 }
@@ -494,31 +591,86 @@ impl DirInfo for FILE_ID_BOTH_DIR_INFO {
             reparse_tag: self.EaSize,
             file_id: self.FileId as u64 as u128,
             last_write: self.LastWriteTime,
+            change_time: self.ChangeTime,
         }
     }
+}
+
+/// Bytes of directory records read per call.
+const LIST_BUFFER_BYTES: usize = 64 * 1024;
+// Held as u64s, which keep records 8-byte aligned as the call requires.
+const _: () = assert!(LIST_BUFFER_BYTES.is_multiple_of(size_of::<u64>()));
+
+thread_local! {
+    /// Each listing thread's buffer for directory records, allocated once
+    /// rather than per directory.
+    static LIST_BUFFER: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Runs `list` with this thread's listing buffer, which a nested call (none
+/// is expected) would find taken and replace with a new one.
+fn with_list_buffer<R>(list: impl FnOnce(&mut [u64]) -> R) -> R {
+    let mut buffer = LIST_BUFFER.take();
+    if buffer.is_empty() {
+        buffer = vec![0u64; LIST_BUFFER_BYTES / size_of::<u64>()];
+    }
+    let result = list(&mut buffer);
+    LIST_BUFFER.set(buffer);
+    result
+}
+
+/// Reads the next directory records into `buffer` with
+/// `NtQueryDirectoryFile` (what `GetFileInformationByHandleEx` calls, minus
+/// its wrapping): the bytes filled, or `None` past the last entry. Errors
+/// are mapped to Win32 codes as that function maps them.
+fn query_dir(
+    handle: &OwnedHandle,
+    class: FILE_INFORMATION_CLASS,
+    buffer: &mut [u64],
+) -> Result<Option<usize>, ScanError> {
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: a synchronous directory handle and a writable, 8-byte-aligned
+    // buffer of the given length.
+    let status = unsafe {
+        NtQueryDirectoryFile(
+            raw(handle),
+            None,
+            None,
+            None,
+            &mut status_block,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(buffer) as u32,
+            class,
+            false,
+            None,
+            false,
+        )
+    };
+    if status.is_ok() {
+        // Nothing filled can't happen; read as the end rather than decode
+        // what an earlier directory left in the buffer.
+        return Ok(Some(status_block.Information).filter(|&n| n > 0));
+    }
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    if code == ERROR_NO_MORE_FILES.0 {
+        return Ok(None);
+    }
+    Err(scan_error(windows::core::Error::from_hresult(
+        windows::core::HRESULT::from_win32(code),
+    )))
 }
 
 /// Reads a directory a buffer at a time, passing each entry on as it's
 /// decoded; stops early when the batcher says so.
 fn list_with<T: DirInfo>(
     handle: &OwnedHandle,
-    class: FILE_INFO_BY_HANDLE_CLASS,
+    class: FILE_INFORMATION_CLASS,
+    buffer: &mut [u64],
     out: &mut Batcher<'_, '_>,
 ) -> Result<(), ScanError> {
-    let mut buffer = vec![0u64; 8192];
     loop {
-        let result = unsafe {
-            GetFileInformationByHandleEx(
-                raw(handle),
-                class,
-                buffer.as_mut_ptr().cast(),
-                (buffer.len() * size_of::<u64>()) as u32,
-            )
-        };
-        match result {
-            Ok(()) => {}
-            Err(err) if err.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(()),
-            Err(err) => return Err(scan_error(err)),
+        if query_dir(handle, class, buffer)?.is_none() {
+            return Ok(());
         }
         let base = buffer.as_ptr().cast::<u8>();
         let mut offset = 0usize;
@@ -571,8 +723,104 @@ impl FsAdapter for WindowsFs {
         Ok(Measured {
             logical: standard.EndOfFile as u64,
             allocated: Some(standard.AllocationSize as u64),
+            // The listing's file ID, which NTFS gives in either width with
+            // the same value.
+            id: file_id(&handle).map(|(_, id)| u128::from_le_bytes(id)),
         })
     }
+
+    /// Checked first with an attributes-only open, as finding duplicates
+    /// does, so a link, a cloud file or a file behind another filter is
+    /// refused before anything opens its data; the open that reads uses
+    /// `OPEN_NO_RECALL` (and `OPEN_REPARSE_POINT` but for a WOF-compressed
+    /// file) and must be the same file.
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        // Backup semantics so a folder or junction opens too, to be refused
+        // for what it is.
+        let probe = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
+        let compressed = small_readable(&probe)?;
+        let id = file_id(&probe);
+        drop(probe);
+        let mut flags = FILE_FLAG_OPEN_NO_RECALL
+            | FILE_FLAG_SEQUENTIAL_SCAN
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION;
+        if !compressed {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        let handle = open_with(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, flags)
+            .map_err(scan_error)?;
+        if let (Some(before), Some(now)) = (id, file_id(&handle))
+            && before != now
+        {
+            return Err(ScanError::new(ErrorKind::Vanished, "replaced while read"));
+        }
+        small_readable(&handle)?;
+        read_capped(std::fs::File::from(handle), cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        let handle = open_metadata(path, FILE_READ_ATTRIBUTES.0)?;
+        let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(&handle, FileAttributeTagInfo)?;
+        Ok(classify(tag_info.FileAttributes, tag_info.ReparseTag))
+    }
+
+    /// A fixed or RAM disk, by `GetDriveTypeW`, asked once per drive.
+    fn local_drive(&self, letter: u8) -> bool {
+        if !letter.is_ascii_uppercase() {
+            return false;
+        }
+        let slot = usize::from(letter - b'A');
+        let mut known = self.local_drives.lock().unwrap();
+        if known[slot] == 0 {
+            let root: Vec<u16> = format!("{}:\\", char::from(letter))
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            known[slot] = if matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK) {
+                1
+            } else {
+                2
+            };
+        }
+        known[slot] == 1
+    }
+}
+
+/// Opens Git metadata for its attributes as [`open`] does, allowing a
+/// server only to identify us, not to impersonate us. That doesn't stop
+/// SMB from authenticating (and so sending a credential hash) if a path
+/// reaches a server; what keeps metadata reads off other computers is the
+/// target policy in `crate::git::reachable`.
+fn open_metadata(path: &Path, access: u32) -> Result<OwnedHandle, ScanError> {
+    open_with(
+        path,
+        access,
+        FILE_FLAG_BACKUP_SEMANTICS
+            | FILE_FLAG_OPEN_REPARSE_POINT
+            | FILE_FLAG_OPEN_NO_RECALL
+            | SECURITY_SQOS_PRESENT
+            | SECURITY_IDENTIFICATION,
+    )
+    .map_err(scan_error)
+}
+
+/// Whether [`FsAdapter::read_small`] may read a handle's file, as
+/// [`readable`] decides: `Ok(true)` for a WOF-compressed file.
+fn small_readable(handle: &OwnedHandle) -> Result<bool, ScanError> {
+    let tag_info = info::<FILE_ATTRIBUTE_TAG_INFO>(handle, FileAttributeTagInfo)?;
+    let (attributes, reparse_tag) = (tag_info.FileAttributes, tag_info.ReparseTag);
+    readable(attributes, reparse_tag).map_err(|skip| {
+        let why = match (skip, classify(attributes, reparse_tag)) {
+            (Skip::Cloud, _) => refused::CLOUD,
+            (_, EntryKind::Symlink | EntryKind::MountPoint | EntryKind::UnknownReparse) => {
+                refused::LINK
+            }
+            _ => refused::NOT_FILE,
+        };
+        ScanError::new(ErrorKind::Unavailable, why)
+    })
 }
 
 /// Enables `SeBackupPrivilege` when this process already holds it (it was
@@ -609,19 +857,85 @@ fn try_enable_backup_privilege() -> windows::core::Result<bool> {
     Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
 }
 
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+const DRIVE_RAMDISK: u32 = 6;
+
 /// Whether `path` is on a network share (UNC path or mapped network drive).
 pub fn is_remote(path: &Path) -> bool {
+    drive_type(path) == Some(DRIVE_REMOTE)
+}
+
+/// Whether `path` is on a local fixed disk or a RAM disk.
+pub fn is_local_fixed(path: &Path) -> bool {
+    matches!(drive_type(path), Some(DRIVE_FIXED | DRIVE_RAMDISK))
+}
+
+/// Whether the disk under `path`'s volume has no seek penalty (an SSD or
+/// NVMe drive), by `IOCTL_STORAGE_QUERY_PROPERTY` on the volume opened for
+/// no access, which needs no rights. `None` when the volume or its driver
+/// doesn't say (a volume spanning disks, say).
+pub fn no_seek_penalty(path: &Path) -> Option<bool> {
     let path = wide(path);
-    let unc: Vec<u16> = r"\?\UNC\".encode_utf16().collect();
+    let mut mount = vec![0u16; path.len() + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut mount) }.ok()?;
+    let mut volume = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut volume) }.ok()?;
+    // "\\?\Volume{...}\" names the root folder; without the backslash, the
+    // volume device.
+    let len = volume.iter().position(|&c| c == 0)?;
+    if len == 0 || volume[len - 1] != u16::from(b'\\') {
+        return None;
+    }
+    volume[len - 1] = 0;
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(volume.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+    }
+    .ok()?;
+    // SAFETY: CreateFileW returned a valid handle that we now own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        ..Default::default()
+    };
+    let mut answer = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            raw(&handle),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some((&raw const query).cast::<c_void>()),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some((&raw mut answer).cast::<c_void>()),
+            size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .ok()?;
+    (returned as usize >= size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>())
+        .then_some(!answer.IncursSeekPenalty)
+}
+
+/// `GetDriveTypeW` of the volume holding `path`; a UNC path is remote.
+fn drive_type(path: &Path) -> Option<u32> {
+    let path = wide(path);
+    let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
     if path.starts_with(&unc) {
-        return true;
+        return Some(DRIVE_REMOTE);
     }
     let mut volume = vec![0u16; path.len() + 1];
-    if unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.is_err() {
-        return false;
-    }
-    const DRIVE_REMOTE: u32 = 4;
-    unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) == DRIVE_REMOTE }
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut volume) }.ok()?;
+    Some(unsafe { GetDriveTypeW(PCWSTR(volume.as_ptr())) })
 }
 
 /// Capacity and free space of the volume holding `path`, whether `path` is
@@ -753,6 +1067,52 @@ mod tests {
     }
 
     #[test]
+    fn trusts_only_listings_whose_allocation_can_be_compared() {
+        let listed = |attributes, reparse_tag| Listed {
+            name: "f".into(),
+            end_of_file: 5000,
+            allocation_size: 8192,
+            attributes,
+            reparse_tag,
+            file_id: 7,
+            last_write: 10,
+            change_time: 20,
+        };
+        assert_eq!(
+            listed(0x20, 0).entry().stamp,
+            Some(LinkStamp {
+                written: 10,
+                changed: 20,
+                trusted: true,
+            })
+        );
+        let trusted = |l: Listed| l.entry().stamp.unwrap().trusted;
+        let resident = Listed {
+            end_of_file: 439,
+            allocation_size: 440,
+            ..listed(0x20, 0)
+        };
+        assert!(trusted(resident));
+        // How a WOF-compressed file lists: plain attributes, nothing
+        // allocated.
+        let wof = Listed {
+            allocation_size: 0,
+            ..listed(0x20, 0)
+        };
+        assert!(!trusted(wof));
+        let rp = attr::REPARSE_POINT;
+        for (attributes, tag) in [
+            (0x20 | rp, tag::WOF),
+            (0x20 | rp, 0x8000_0013),
+            (0x20 | attr::COMPRESSED, 0),
+            (0x20 | attr::SPARSE, 0),
+            (0x20 | attr::RECALL_ON_DATA_ACCESS, 0),
+        ] {
+            assert!(!trusted(listed(attributes, tag)), "{attributes:#x}");
+        }
+    }
+
+    #[test]
     fn classifies_reparse_tags_by_category() {
         let rp = attr::REPARSE_POINT;
         let dir = attr::DIRECTORY;
@@ -775,6 +1135,53 @@ mod tests {
             "global reparse"
         );
         assert_eq!(classify(rp, tag::AF_UNIX), EntryKind::Special);
+    }
+
+    #[test]
+    fn keeps_trailing_dots_and_spaces_in_normal_paths() {
+        let text = |p: &str| String::from_utf16(&wide(Path::new(p))[..]).unwrap();
+        assert_eq!(text(r"C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        assert_eq!(text(r"C:\a\bar "), "\\\\?\\C:\\a\\bar \0");
+        assert_eq!(text(r"C:\"), "\\\\?\\C:\\\0");
+        assert_eq!(
+            text(r"\\server\share\x."),
+            "\\\\?\\UNC\\server\\share\\x.\0"
+        );
+        assert_eq!(text(r"\\?\C:\a\foo."), "\\\\?\\C:\\a\\foo.\0");
+        // Anything else is made absolute first.
+        assert_eq!(text(r"C:\a\.\b\..\c"), "\\\\?\\C:\\a\\c\0");
+        assert_eq!(text("C:/a/b"), "\\\\?\\C:\\a\\b\0");
+        assert_eq!(text(r"C:\a\\b"), "\\\\?\\C:\\a\\b\0");
+        assert!(!is_normal(Path::new("relative")));
+        assert!(!is_normal(Path::new(r"C:relative")));
+    }
+
+    #[test]
+    fn listings_spanning_several_buffers_miss_nothing() {
+        let dir = std::env::temp_dir().join(format!("sb-long-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Longest names fill a buffer with a few hundred records; short
+        // ones with thousands.
+        let mut names: Vec<String> = (0..400)
+            .map(|i| format!("{}{i:05}", "n".repeat(250)))
+            .chain((0..3000).map(|i| format!("s{i}")))
+            .collect();
+        for name in &names {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let fs = WindowsFs::new();
+        assert_eq!(fs.open_root(&dir), Ok(RootKind::Directory));
+        let mut listed = Vec::new();
+        fs.read_dir(&dir, &mut |batch| {
+            listed.extend(batch.into_iter().map(|e| e.name.into_string().unwrap()));
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        listed.sort();
+        names.sort();
+        assert_eq!(listed, names);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! as the tree grows, and how soon a cancel is acknowledged once the
 //! listing's entries are being added to the tree.
 
+use crate::cpu::{Cpu, Threads, print_roles, without_watcher};
 use crate::{memory, mib, ms};
 use sb_scan::{
     BATCH_ENTRIES, Entry, EntryKind, FsAdapter, HoldProbe, Identity, Measured, NativeFs, RootKind,
@@ -44,6 +45,7 @@ impl WideFs {
             id: i as u128 + 1,
             cloud: false,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            stamp: None,
         }
     }
 }
@@ -74,6 +76,7 @@ impl FsAdapter for WideFs {
         Ok(Measured {
             logical: 0,
             allocated: Some(0),
+            id: None,
         })
     }
 }
@@ -99,6 +102,22 @@ impl<A: FsAdapter> FsAdapter for Watched<A> {
 
     fn measure_file(&self, file: &Path) -> Result<Measured, ScanError> {
         self.inner.measure_file(file)
+    }
+
+    fn read_small(&self, path: &Path, cap: usize) -> Result<Vec<u8>, ScanError> {
+        self.inner.read_small(path, cap)
+    }
+
+    fn stat_kind(&self, path: &Path) -> Result<EntryKind, ScanError> {
+        self.inner.stat_kind(path)
+    }
+
+    fn path_style(&self) -> sb_core::git::paths::Style {
+        self.inner.path_style()
+    }
+
+    fn local_drive(&self, letter: u8) -> bool {
+        self.inner.local_drive(letter)
     }
 }
 
@@ -162,7 +181,12 @@ fn report_holds(mut holds: Vec<(Duration, usize)>) {
     println!("         longest: {}", longest.join(", "));
 }
 
-fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) {
+fn run_case<A: FsAdapter, F: Fn() -> A>(
+    label: &str,
+    root: PathBuf,
+    adapter: F,
+    exact_hard_links: bool,
+) {
     println!("\n== {label} ==");
     let holds = Arc::new(Mutex::new(Vec::new()));
     let config = ScanConfig {
@@ -170,10 +194,13 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
             let holds = Arc::clone(&holds);
             HoldProbe::new(move |held, nodes| holds.lock().unwrap().push((held, nodes)))
         }),
+        exact_hard_links,
         ..ScanConfig::default()
     };
     let before = memory::current();
     let delivered = Arc::new(AtomicBool::new(false));
+    let threads = Threads::watch();
+    let cpu_before = Cpu::process();
     let started = Instant::now();
     let scan = Scan::start(
         root.clone(),
@@ -192,6 +219,9 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     let tree = scan.tree();
     let p = scan.wait();
     let elapsed = started.elapsed();
+    let process = Cpu::process().zip(cpu_before).map(|(a, b)| a.since(b));
+    let roles = threads.finish();
+    let cpu = process.map(|p| without_watcher(p, roles.as_ref()));
     done.store(true, Ordering::Relaxed);
     let waits = reader.join().unwrap();
     let (nodes, tree_bytes) = {
@@ -200,11 +230,12 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
     };
     drop(tree);
     println!(
-        "scan:    {:?}, {} files, {} folders, {} nodes in {}",
+        "scan:    {:?}, {} files, {} folders, {} nodes, {} Git roots in {}",
         p.state,
         p.files,
         p.dirs,
         nodes,
+        p.git_roots,
         ms(elapsed)
     );
     let pct = |q: f64| waits[((waits.len() - 1) as f64 * q) as usize];
@@ -216,6 +247,17 @@ fn run_case<A: FsAdapter, F: Fn() -> A>(label: &str, root: PathBuf, adapter: F) 
         ms(pct(0.5))
     );
     report_holds(std::mem::take(&mut *holds.lock().unwrap()));
+    if let Some(cpu) = cpu {
+        println!(
+            "cpu:     process kernel {}, user {} ({:.1} cores busy; without the thread watcher)",
+            ms(cpu.kernel),
+            ms(cpu.user),
+            cpu.total().as_secs_f64() / elapsed.as_secs_f64()
+        );
+    }
+    if let Some(roles) = &roles {
+        print_roles(roles);
+    }
     println!(
         "memory:  peak working set {}; grew by {} at peak; tree estimate {}",
         memory::peak().map_or("unknown".into(), mib),
@@ -263,6 +305,7 @@ pub fn synthetic(entries: usize) {
             entries,
             batch_delay: Duration::ZERO,
         },
+        false,
     );
 }
 
@@ -276,14 +319,25 @@ pub fn synthetic_slow(entries: usize) {
             entries,
             batch_delay: Duration::from_millis(2),
         },
+        false,
     );
 }
 
-/// A real folder, scanned with the native adapter.
-pub fn real(root: &Path) {
+/// A real folder, scanned with the native adapter, re-measuring every name
+/// of a hard-linked file if `exact_hard_links`.
+pub fn real(root: &Path, exact_hard_links: bool) {
     run_case(
-        &format!("real folder {}", root.display()),
+        &format!(
+            "real folder {}{}",
+            root.display(),
+            if exact_hard_links {
+                ", exact hard links"
+            } else {
+                ""
+            }
+        ),
         root.to_path_buf(),
         NativeFs::new,
+        exact_hard_links,
     );
 }
